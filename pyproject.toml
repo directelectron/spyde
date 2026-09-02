@@ -18,9 +18,12 @@ classifiers = [
 dependencies = [
     # The shared desktop-app shell (asyncio loop, PLOTAPP IPC, log streaming,
     # window/figure registry, action + wizard framework, anyplotlib plotting).
-    # The shared shell — its own package (see [tool.uv.sources] below), with
-    # the Electron half INSIDE it (de_shell/js), linked into electron/shell.
-    "de-shell",
+    # The shared shell — its own package on PyPI, with the Electron half INSIDE
+    # it (de_shell/js), linked into electron/shell by scripts/shell-link.mjs.
+    # 0.x: a breaking change to the sidecar protocol bumps the minor, so the
+    # pin is a minor range. To hack on the shell and SpyDE together:
+    # `uv pip install -e ../de-shell` after a sync overlays a checkout.
+    "de-shell>=0.2,<0.3",
     "numpy>=1.20.0",
     "pillow",
     "matplotlib",
@@ -112,14 +115,7 @@ name = "pytorch-cu124"
 url = "https://download.pytorch.org/whl/cu124"
 explicit = true
 
-# The shell is its own repository (de-shell): ONE package, the Python at its
-# root and the TypeScript inside it, so both halves of the sidecar protocol
-# move together. Until it is on PyPI it is the sibling checkout, editable —
-# CI clones it beside the repo, the installer stages its wheel
-# (electron/scripts/bundle-python.mjs). Then: a version pin, and this line
-# goes.
 [tool.uv.sources]
-de-shell = { path = "../de-shell", editable = true }
 torch = [
     { index = "pytorch-cu124", marker = "sys_platform == 'win32'" },
 ]

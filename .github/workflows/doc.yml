@@ -32,19 +32,10 @@ jobs:
         with:
           python-version: '3.11'
 
-      # de-shell is a PATH dependency (../de-shell) until it is on PyPI. The
-      # runner's workspace parent is writable, so a sibling clone satisfies it
-      # — for uv, and for the electron/shell junction the TypeScript jobs need.
-      - name: Check out de-shell beside the repo
-        shell: bash
-        run: test -d ../de-shell || git clone --depth 1 https://github.com/CSSFrancis/de-shell ../de-shell
-
-      # de-shell is a path dependency until it is on PyPI; naming the sibling
-      # checkout in the same install lets pip satisfy it.
       - name: Install dependencies and package
         shell: bash
         run: |
-          pip install -U -e ../de-shell -e '.[doc]'
+          pip install -U -e '.[doc]'
 
       - name: Build documentation
         shell: bash

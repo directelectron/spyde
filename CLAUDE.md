@@ -139,11 +139,12 @@ A Direct Electron `.csb` file is a **sparse event stream, not a frame stack** �
 
 ### Update handoff + problem reports (the shell's `main/`)
 Both live in the shared shell, so all three DE apps get them. The shell is the
-`de-shell` package (its own repo, a sibling checkout until it is on PyPI): the
-Python `de_shell` and, inside it, the TypeScript at `de_shell/js` — linked into
-this repo at `electron/shell` by `electron/scripts/shell-link.mjs` (postinstall,
+`de-shell` package on PyPI (github.com/CSSFrancis/de-shell): the Python
+`de_shell` and, inside it, the TypeScript at `de_shell/js` — linked into this
+repo at `electron/shell` by `electron/scripts/shell-link.mjs` (postinstall,
 `npm run shell:link`, and the vite config on every build). A shell fix is made
-in that repo, never in a copy here.
+in that repo and released, never in a copy here; to work on both at once,
+`uv pip install -e ../de-shell` after a sync overlays a checkout.
 
 **The update handoff is a race, and losing it strands the user.** electron-updater spawns the installer FIRST and only then asks the app to quit, so for a second or two both are alive — and the Windows installer opens by refusing to touch a directory anything is still running out of. Two halves keep that from dead-ending in "SpyDE cannot be closed. Please close it manually and click Retry" (whose Retry re-runs the identical check, so the only way out was uninstalling by hand):
 - `updater.ts` `quitAndInstall()` tree-kills the Python sidecar **synchronously** (`stopBackend({immediate: true})` — the ordinary path arms a 1.5 s timer that an exiting process never lives to fire) and force-exits after the handoff rather than trusting Electron's graceful quit to win.

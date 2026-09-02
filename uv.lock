@@ -652,23 +652,17 @@ array = [
 [[package]]
 name = "de-shell"
 version = "0.2.0"
-source = { editable = "../de-shell" }
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "anyplotlib" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "pyyaml" },
 ]
-
-[package.metadata]
-requires-dist = [
-    { name = "anyplotlib", specifier = ">=0.7.3" },
-    { name = "numpy", specifier = ">=1.20.0" },
-    { name = "pytest", marker = "extra == 'tests'", specifier = ">=3.6" },
-    { name = "pytest-timeout", marker = "extra == 'tests'" },
-    { name = "pyyaml" },
+sdist = { url = "https://files.pythonhosted.org/packages/a6/1f/6f6e3859cd25b096754c7a39ca4dc3dc78fd353647f2ac3e9e1e3ec5e23c/de_shell-0.2.0.tar.gz", hash = "sha256:ffe6cb788beb58a4dfb2e227bbc86b1d9b795b4633d6f3b7dda4d82cbc1ac125", size = 115386, upload-time = "2026-09-02T18:21:05.771Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/f0/3d/35e928d968cf9fcd752f9143f2ce2fd0189c33a1d30f815242d93d6a0559/de_shell-0.2.0-py3-none-any.whl", hash = "sha256:b0f99cb315865a37365bdb0f050c339f40f265c6459795c1298188dd6de8e02b", size = 122640, upload-time = "2026-09-02T18:21:04.183Z" },
 ]
-provides-extras = ["tests"]
 
 [[package]]
 name = "decorator"
@@ -3661,7 +3655,7 @@ requires-dist = [
     { name = "atomap", marker = "extra == 'atoms'", specifier = ">=0.4.1" },
     { name = "bokeh" },
     { name = "dask" },
-    { name = "de-shell", editable = "../de-shell" },
+    { name = "de-shell", specifier = ">=0.2,<0.3" },
     { name = "distributed" },
     { name = "em-database", marker = "python_full_version >= '3.12'", specifier = ">=0.2.0" },
     { name = "exspy", marker = "extra == 'eels'", specifier = ">=0.3.2" },

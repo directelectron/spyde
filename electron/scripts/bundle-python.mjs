@@ -112,37 +112,11 @@ execSync(`uv build --wheel --out-dir "${wheelsDir}"`, {
   cwd: repoRoot, stdio: 'inherit', env: scmEnv,
 })
 
-// 2b. The shell. de-shell is a PATH dependency (../de-shell, editable) until
-//     it is on PyPI, and a setuptools project like spyde, so it cannot be
-//     built on the user's machine either — it ships as a wheel, built here
-//     from the checkout the environment resolves it from. And the staged lock
-//     still names the path: `uv sync --frozen` has to find SOMETHING there to
-//     plan the install even though the wheel is what gets installed
-//     (`--no-install-package de-shell`), so the payload carries the shell's
-//     pyproject.toml at a path of its own and the staged lock + pyproject are
-//     re-pointed at it. Once de-shell resolves from PyPI (a registry source
-//     in uv.lock), none of this runs.
-const lockText = readFileSync(join(repoRoot, 'uv.lock'), 'utf8')
-const shellSource = lockText.match(/name = "de-shell"[\s\S]*?source = \{ editable = "([^"]+)" \}/)
-if (shellSource) {
-  const shellRoot = resolve(repoRoot, shellSource[1])
-  if (!existsSync(join(shellRoot, 'pyproject.toml'))) {
-    throw new Error(`de-shell resolves from ${shellRoot}, which has no pyproject.toml to build a wheel from`)
-  }
-  execSync(`uv build --wheel --out-dir "${wheelsDir}" "${shellRoot}"`, {
-    cwd: repoRoot, stdio: 'inherit', env: process.env,
-  })
-  const stagedShell = 'de-shell'
-  mkdirSync(join(outDir, stagedShell), { recursive: true })
-  copyFileSync(join(shellRoot, 'pyproject.toml'), join(outDir, stagedShell, 'pyproject.toml'))
-  for (const f of ['pyproject.toml', 'uv.lock']) {
-    const staged = join(outDir, f)
-    writeFileSync(staged, readFileSync(staged, 'utf8').split(shellSource[1]).join(stagedShell), 'utf8')
-  }
-  log(`staged the shell's metadata at ${stagedShell}/ and re-pointed the lock at it`)
-} else {
-  log('de-shell resolves from a registry; nothing to stage for it')
-}
+// 2b. The shell (de-shell) comes from PyPI like every other dependency: the
+//     staged lock names a registry source, so first launch's `uv sync` fetches
+//     it and nothing is built or staged for it here. (Its TypeScript rides in
+//     that wheel — see de_shell/js — which is how the app's bundle and the
+//     sidecar cannot disagree about the protocol.)
 const builtWheels = readdirSync(wheelsDir).filter((f) => f.endsWith('.whl'))
 if (!builtWheels.length) throw new Error('uv build produced no wheels')
 log(`staged ${builtWheels.length} wheel(s): ${builtWheels.join(', ')}`)

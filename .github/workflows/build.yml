@@ -104,13 +104,6 @@ jobs:
       - name: Set up Python ${{ matrix.python-version }}
         run: uv python install ${{ matrix.python-version }}
 
-      # de-shell is a PATH dependency (../de-shell) until it is on PyPI. The
-      # runner's workspace parent is writable, so a sibling clone satisfies it
-      # — for uv, and for the electron/shell junction the TypeScript jobs need.
-      - name: Check out de-shell beside the repo
-        shell: bash
-        run: test -d ../de-shell || git clone --depth 1 https://github.com/CSSFrancis/de-shell ../de-shell
-
       - name: Install (locked) + tests extra
         run: uv sync --frozen --extra tests --python ${{ matrix.python-version }}
 
@@ -184,13 +177,6 @@ jobs:
 
       # NOT --frozen: the domain extras are not in uv.lock (they are optional
       # and resolve differently per platform), so the lock cannot satisfy them.
-      # de-shell is a PATH dependency (../de-shell) until it is on PyPI. The
-      # runner's workspace parent is writable, so a sibling clone satisfies it
-      # — for uv, and for the electron/shell junction the TypeScript jobs need.
-      - name: Check out de-shell beside the repo
-        shell: bash
-        run: test -d ../de-shell || git clone --depth 1 https://github.com/CSSFrancis/de-shell ../de-shell
-
       - name: Install with all domain extras
         run: uv sync --extra tests --extra all --python 3.12
 
@@ -226,12 +212,16 @@ jobs:
           cache: npm
           cache-dependency-path: package-lock.json
 
-      # de-shell is a PATH dependency (../de-shell) until it is on PyPI. The
-      # runner's workspace parent is writable, so a sibling clone satisfies it
-      # — for uv, and for the electron/shell junction the TypeScript jobs need.
-      - name: Check out de-shell beside the repo
+      # The shell's TypeScript comes from the de-shell wheel, and the
+      # electron/shell junction (postinstall) asks the project's Python where
+      # it is — so this Node-only job gets a venv with just the shell in it,
+      # at the version uv.lock pins.
+      - uses: astral-sh/setup-uv@v5
+      - name: Install de-shell at the locked version
         shell: bash
-        run: test -d ../de-shell || git clone --depth 1 https://github.com/CSSFrancis/de-shell ../de-shell
+        run: |
+          v=$(awk '/^name = "de-shell"$/{getline; print $3}' uv.lock | tr -d '"')
+          uv venv .venv && uv pip install "de-shell==$v"
 
       # Root install: the root lockfile is the authoritative one, and its
       # postinstall links electron/shell to the shell's TypeScript.
@@ -268,12 +258,16 @@ jobs:
           cache: npm
           cache-dependency-path: package-lock.json
 
-      # de-shell is a PATH dependency (../de-shell) until it is on PyPI. The
-      # runner's workspace parent is writable, so a sibling clone satisfies it
-      # — for uv, and for the electron/shell junction the TypeScript jobs need.
-      - name: Check out de-shell beside the repo
+      # The shell's TypeScript comes from the de-shell wheel, and the
+      # electron/shell junction (postinstall) asks the project's Python where
+      # it is — so this Node-only job gets a venv with just the shell in it,
+      # at the version uv.lock pins.
+      - uses: astral-sh/setup-uv@v5
+      - name: Install de-shell at the locked version
         shell: bash
-        run: test -d ../de-shell || git clone --depth 1 https://github.com/CSSFrancis/de-shell ../de-shell
+        run: |
+          v=$(awk '/^name = "de-shell"$/{getline; print $3}' uv.lock | tr -d '"')
+          uv venv .venv && uv pip install "de-shell==$v"
 
       # Root install: the root lockfile is the authoritative one, and its
       # postinstall links electron/shell to the shell's TypeScript.
@@ -342,22 +336,8 @@ jobs:
       # WITH the domain extras: the `requires_package:` gate hides the
       # EELS/EBSD/atoms actions without them, so those specs cannot pass.
       # NOT --frozen: the extras resolve per-platform (same as `test-extras`).
-      # de-shell is a PATH dependency (../de-shell) until it is on PyPI. The
-      # runner's workspace parent is writable, so a sibling clone satisfies it
-      # — for uv, and for the electron/shell junction the TypeScript jobs need.
-      - name: Check out de-shell beside the repo
-        shell: bash
-        run: test -d ../de-shell || git clone --depth 1 https://github.com/CSSFrancis/de-shell ../de-shell
-
       - name: Pre-sync the Python backend env
         run: uv sync --extra tests --extra all
-
-      # de-shell is a PATH dependency (../de-shell) until it is on PyPI. The
-      # runner's workspace parent is writable, so a sibling clone satisfies it
-      # — for uv, and for the electron/shell junction the TypeScript jobs need.
-      - name: Check out de-shell beside the repo
-        shell: bash
-        run: test -d ../de-shell || git clone --depth 1 https://github.com/CSSFrancis/de-shell ../de-shell
 
       # Root install: the root lockfile is the authoritative one, and its
       # postinstall links electron/shell to the shell's TypeScript.
