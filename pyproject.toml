@@ -18,8 +18,12 @@ classifiers = [
 dependencies = [
     # The shared desktop-app shell (asyncio loop, PLOTAPP IPC, log streaming,
     # window/figure registry, action + wizard framework, anyplotlib plotting).
-    # Resolved from packages/de-shell via the uv workspace below.
-    "de-shell",
+    # The shared shell — its own package on PyPI, with the Electron half INSIDE
+    # it (de_shell/js), linked into electron/shell by scripts/shell-link.mjs.
+    # 0.x: a breaking change to the sidecar protocol bumps the minor, so the
+    # pin is a minor range. To hack on the shell and SpyDE together:
+    # `uv pip install -e ../de-shell` after a sync overlays a checkout.
+    "de-shell>=0.2,<0.3",
     "numpy>=1.20.0",
     "pillow",
     "matplotlib",
@@ -111,16 +115,7 @@ name = "pytorch-cu124"
 url = "https://download.pytorch.org/whl/cu124"
 explicit = true
 
-# This repo is a uv workspace root: packages/ holds SpyDE's own copy of the
-# shared shell. Ground Crew and Autopilot live in their own repos
-# (de_ground_crew, de_autopilot), each carrying its own shell copy — developed
-# independently, and converging into one de-shell repo once the shell surface
-# has settled under all three apps.
-[tool.uv.workspace]
-members = ["packages/de-shell"]
-
 [tool.uv.sources]
-de-shell = { workspace = true }
 torch = [
     { index = "pytorch-cu124", marker = "sys_platform == 'win32'" },
 ]
@@ -253,10 +248,9 @@ spyde = "spyde"
 # (The legacy pytest-qt tests were retired: the dead ones deleted, the unique
 # compute/contract nets consolidated here; sped_ag timing lives in benchmark_*.py,
 # run manually. The Playwright suite under electron/ covers the UI.)
-# packages/de-shell/tests is the SHELL's own suite: it builds a Session with no
-# app around it and asserts the shell never acquires hyperspy/dask/pyxem. It has
-# to run somewhere, and it is far too fast to be worth a separate invocation.
-testpaths = ["spyde/tests/migrated", "packages/de-shell/tests"]
+# The shell's own suite (a Session with no app around it; the boundary test
+# that keeps hyperspy/dask/pyxem out of it) runs in the de-shell repo now.
+testpaths = ["spyde/tests/migrated"]
 addopts = "--strict-markers"
 markers = [
     "gpu: tests requiring a physical NVIDIA GPU",

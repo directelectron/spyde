@@ -12,7 +12,8 @@
     "test:build": "electron-vite build && playwright test",
     "bundle:python": "node scripts/bundle-python.mjs",
     "dist": "npm run build && npm run bundle:python && electron-builder --config electron-builder.yml",
-    "dist:dir": "npm run build && npm run bundle:python && electron-builder --dir --config electron-builder.yml"
+    "dist:dir": "npm run build && npm run bundle:python && electron-builder --dir --config electron-builder.yml",
+    "shell:link": "node scripts/shell-link.mjs"
   },
   "dependencies": {
     "dompurify": "^3.4.12",

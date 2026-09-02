@@ -10,12 +10,6 @@ resolution-markers = [
     "python_full_version < '3.11' and sys_platform != 'win32'",
 ]
 
-[manifest]
-members = [
-    "de-shell",
-    "spyde",
-]
-
 [[package]]
 name = "accessible-pygments"
 version = "0.0.5"
@@ -53,7 +47,7 @@ wheels = [
 
 [[package]]
 name = "anyplotlib"
-version = "0.7.1"
+version = "0.8.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "anywidget" },
@@ -62,9 +56,9 @@ dependencies = [
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "traitlets" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/bb/b6/57d129005d23bff384e7a38e4ba7817d86f1e51e429fe5bbc8b76e52916f/anyplotlib-0.7.1.tar.gz", hash = "sha256:5a08931fd2b9d19a2f4ef2070a2c7c8752736266ddef44891f65bf5a17626c64", size = 1515136, upload-time = "2026-08-02T15:42:53.97Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/91/9c/0a6f744a3119ffcdcae3f5fdd84169381fad4fdca8e6449322a718cb3fef/anyplotlib-0.8.0.tar.gz", hash = "sha256:de6e538cf7e9a026ddb4ba2975d3f969c25aaab58bb7fd5840457df30a28ede6", size = 1526980, upload-time = "2026-08-25T15:03:03.593Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/9e/4b/2e6cd8a63b7051deef545e4572a3289bb97fea0bfdd99493eba0a2dc44ae/anyplotlib-0.7.1-py3-none-any.whl", hash = "sha256:e1df4ac57a99567f52afdd98fc83ae540fd09184cdb9405070db0fbaad36c2d6", size = 326343, upload-time = "2026-08-02T15:42:52.069Z" },
+    { url = "https://files.pythonhosted.org/packages/d0/57/c5db02a2ca3c0641d8dbd52a4b4b9014d6ea658d868cdd517d8109d540c3/anyplotlib-0.8.0-py3-none-any.whl", hash = "sha256:8c7fad2f5d203cde5c0dcdc54d7c6ac7dd75335489328380640e7fdc539f7b9b", size = 330531, upload-time = "2026-08-25T15:03:02.134Z" },
 ]
 
 [[package]]
@@ -657,30 +651,18 @@ array = [
 
 [[package]]
 name = "de-shell"
-version = "0.1.0"
-source = { editable = "packages/de-shell" }
+version = "0.2.0"
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "anyplotlib" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "pyyaml" },
 ]
-
-[package.optional-dependencies]
-tests = [
-    { name = "pytest" },
-    { name = "pytest-timeout" },
+sdist = { url = "https://files.pythonhosted.org/packages/a6/1f/6f6e3859cd25b096754c7a39ca4dc3dc78fd353647f2ac3e9e1e3ec5e23c/de_shell-0.2.0.tar.gz", hash = "sha256:ffe6cb788beb58a4dfb2e227bbc86b1d9b795b4633d6f3b7dda4d82cbc1ac125", size = 115386, upload-time = "2026-09-02T18:21:05.771Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/f0/3d/35e928d968cf9fcd752f9143f2ce2fd0189c33a1d30f815242d93d6a0559/de_shell-0.2.0-py3-none-any.whl", hash = "sha256:b0f99cb315865a37365bdb0f050c339f40f265c6459795c1298188dd6de8e02b", size = 122640, upload-time = "2026-09-02T18:21:04.183Z" },
 ]
-
-[package.metadata]
-requires-dist = [
-    { name = "anyplotlib", specifier = ">=0.7.1" },
-    { name = "numpy", specifier = ">=1.20.0" },
-    { name = "pytest", marker = "extra == 'tests'", specifier = ">=3.6" },
-    { name = "pytest-timeout", marker = "extra == 'tests'" },
-    { name = "pyyaml" },
-]
-provides-extras = ["tests"]
 
 [[package]]
 name = "decorator"
@@ -3673,7 +3655,7 @@ requires-dist = [
     { name = "atomap", marker = "extra == 'atoms'", specifier = ">=0.4.1" },
     { name = "bokeh" },
     { name = "dask" },
-    { name = "de-shell", editable = "packages/de-shell" },
+    { name = "de-shell", specifier = ">=0.2,<0.3" },
     { name = "distributed" },
     { name = "em-database", marker = "python_full_version >= '3.12'", specifier = ">=0.2.0" },
     { name = "exspy", marker = "extra == 'eels'", specifier = ">=0.3.2" },

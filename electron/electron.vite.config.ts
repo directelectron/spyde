@@ -1,6 +1,8 @@
 import { defineConfig } from 'electron-vite'
 import react from '@vitejs/plugin-react'
+import { realpathSync } from 'fs'
 import { resolve } from 'path'
+import { ensureShellLink } from './scripts/shell-link.mjs'
 
 // The renderer's coachmark tour renders the single-source guides from the
 // repo-root guides/ dir (shared with the docs website so they never drift).
@@ -35,24 +37,28 @@ const guidesDir = resolve(__dirname, '..', 'guides')
 // connection attempt to the renderer console.
 const noHmr = process.env.SPYDE_NO_HMR === '1'
 
-// The shared main-process shell (@de/shell-main) is consumed as RAW TypeScript
-// via an alias rather than a built artifact, so editing the shell and running
-// the app needs no intermediate build. It must be aliased in BOTH the main and
-// preload configs — each gets its own rollup pass — and the tsconfig `paths`
-// entry in tsconfig.node.json has to agree, or the editor and the bundler
-// disagree about what resolves.
-const shellMain = resolve(__dirname, '..', 'packages', 'shell-main', 'src', 'index.ts')
-const shellPreload = resolve(
-  __dirname, '..', 'packages', 'shell-preload', 'src', 'index.ts')
-const shellRenderer = resolve(
-  __dirname, '..', 'packages', 'shell-renderer', 'src', 'index.ts')
+// The shared shell is consumed as RAW TypeScript via an alias rather than a
+// built artifact, so editing the shell and running the app needs no
+// intermediate build. The TypeScript ships INSIDE the de-shell Python package
+// (de_shell/js), and `electron/shell` is a junction to wherever the installed
+// package keeps it — made or re-pointed here, so a stale link never builds.
+// It must be aliased in BOTH the main and preload configs — each gets its own
+// rollup pass — and the tsconfig `paths` entries have to agree, or the editor
+// and the bundler disagree about what resolves.
+const shell = ensureShellLink(__dirname, { quiet: true })
+const shellMain = resolve(shell, 'main', 'index.ts')
+const shellPreload = resolve(shell, 'preload', 'index.ts')
+const shellRenderer = resolve(shell, 'renderer', 'index.ts')
+// Where the link really points (site-packages, or an editable checkout): the
+// dev server serves files from there.
+const shellRoot = realpathSync(shell)
 
 // Where Help -> Report a Problem sends reports. A Sentry DSN is a write-only
 // public key, so baking it into the build is how Sentry is meant to be used —
 // but it comes from CI's environment rather than the repo so it can be rotated
 // without a code change, and so a fork builds with reporting simply switched
 // off. Absent, reports are written to the user's data directory instead of
-// being sent (packages/shell-main/src/errorReport.ts).
+// being sent (the shell's main/errorReport.ts).
 const sentryDsn = process.env.SPYDE_SENTRY_DSN ?? ''
 
 export default defineConfig({
@@ -69,10 +75,16 @@ export default defineConfig({
     root: 'src/renderer',
     build: { outDir: 'out/renderer' },
     plugins: [react()],
-    resolve: { alias: { '@guides': guidesDir, '@de/shell-renderer': shellRenderer } },
+    resolve: {
+      alias: { '@guides': guidesDir, '@de/shell-renderer': shellRenderer },
+      // An editable shell checkout carries its own node_modules (for its
+      // typecheck); without this the renderer would bundle a second React from
+      // there and every hook in the shell's components would throw.
+      dedupe: ['react', 'react-dom'],
+    },
     server: {
       port: 5173,
-      fs: { allow: [resolve(__dirname, '..')] },
+      fs: { allow: [resolve(__dirname, '..'), shellRoot] },
       ...(noHmr ? { ws: false as const } : {}),
     },
   },

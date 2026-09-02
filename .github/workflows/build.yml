@@ -135,7 +135,7 @@ jobs:
         env:
           NUMBA_DISABLE_JIT: ${{ startsWith(matrix.os, 'macos') && '1' || '0' }}
         run: >
-          uv run pytest spyde/tests/migrated packages/de-shell/tests
+          uv run pytest spyde/tests/migrated
           ${{ matrix.group && format('--splits 2 --group {0} --durations-path spyde/tests/.test_durations', matrix.group) || '' }}
           ${{ (matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12') && '--cov=spyde --cov-report=xml' || '' }}
 
@@ -192,7 +192,7 @@ jobs:
 
       - name: Run tests (extras present)
         run: >
-          uv run pytest spyde/tests/migrated packages/de-shell/tests
+          uv run pytest spyde/tests/migrated
           ${{ matrix.group && format('--splits 2 --group {0} --durations-path spyde/tests/.test_durations', matrix.group) || '' }}
 
   # ── Renderer/main TypeScript typecheck ─────────────────────────────────────
@@ -212,9 +212,19 @@ jobs:
           cache: npm
           cache-dependency-path: package-lock.json
 
-      # Root install: electron/ and packages/* are npm WORKSPACES, so the root
-      # lockfile is the authoritative one and installing here links the shared
-      # shell packages. Installing inside electron/ alone would miss them.
+      # The shell's TypeScript comes from the de-shell wheel, and the
+      # electron/shell junction (postinstall) asks the project's Python where
+      # it is — so this Node-only job gets a venv with just the shell in it,
+      # at the version uv.lock pins.
+      - uses: astral-sh/setup-uv@v5
+      - name: Install de-shell at the locked version
+        shell: bash
+        run: |
+          v=$(awk '/^name = "de-shell"$/{getline; print $3}' uv.lock | tr -d '"')
+          uv venv .venv && uv pip install "de-shell==$v"
+
+      # Root install: the root lockfile is the authoritative one, and its
+      # postinstall links electron/shell to the shell's TypeScript.
       - name: Install Electron dependencies
         run: npm ci
 
@@ -248,14 +258,23 @@ jobs:
           cache: npm
           cache-dependency-path: package-lock.json
 
-      # Root install: electron/ and packages/* are npm WORKSPACES, so the root
-      # lockfile is the authoritative one and installing here links the shared
-      # shell packages. Installing inside electron/ alone would miss them.
+      # The shell's TypeScript comes from the de-shell wheel, and the
+      # electron/shell junction (postinstall) asks the project's Python where
+      # it is — so this Node-only job gets a venv with just the shell in it,
+      # at the version uv.lock pins.
+      - uses: astral-sh/setup-uv@v5
+      - name: Install de-shell at the locked version
+        shell: bash
+        run: |
+          v=$(awk '/^name = "de-shell"$/{getline; print $3}' uv.lock | tr -d '"')
+          uv venv .venv && uv pip install "de-shell==$v"
+
+      # Root install: the root lockfile is the authoritative one, and its
+      # postinstall links electron/shell to the shell's TypeScript.
       - name: Install Electron dependencies
         run: npm ci
 
-      # From the ROOT: the main-process units now live in packages/shell-main,
-      # and the root script fans out across workspaces.
+      # From the ROOT: the shell's unit tests, run against the linked tree.
       - name: Run main-process unit tests
         run: npm run test:unit
 
@@ -320,9 +339,8 @@ jobs:
       - name: Pre-sync the Python backend env
         run: uv sync --extra tests --extra all
 
-      # Root install: electron/ and packages/* are npm WORKSPACES, so the root
-      # lockfile is the authoritative one and installing here links the shared
-      # shell packages. Installing inside electron/ alone would miss them.
+      # Root install: the root lockfile is the authoritative one, and its
+      # postinstall links electron/shell to the shell's TypeScript.
       - name: Install Electron dependencies
         run: npm ci
 

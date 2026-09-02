@@ -15,8 +15,12 @@
  * otherwise copies the `uv` found on PATH. CI should populate vendor/ with the
  * pinned uv for each target OS.
  */
-import { cpSync, existsSync, mkdirSync, rmSync, copyFileSync, chmodSync, readdirSync, readFileSync, writeFileSync } from 'fs'
-import { join, dirname } from 'path'
+import {
+  cpSync, existsSync, mkdirSync, rmSync, copyFileSync, chmodSync, readdirSync, readFileSync, writeFileSync,
+} from 'fs'
+import {
+  join, dirname, resolve,
+} from 'path'
 import { fileURLToPath } from 'url'
 import { execSync } from 'child_process'
 
@@ -58,25 +62,6 @@ function resolveSpydeVersion() {
     if (v) return v
   } catch { /* no git / no uv — leave marker unwritten */ }
   return null
-}
-
-/**
- * The `[tool.uv.workspace] members` of a pyproject, as plain relative paths.
- *
- * Deliberately a small regex rather than a TOML parser: this script has no
- * dependencies, and the list is a literal array of quoted paths. A member the
- * regex misses fails loudly at the copy below, not silently at the user's
- * first launch.
- */
-function workspaceMembers(pyprojectPath) {
-  const text = readFileSync(pyprojectPath, 'utf8')
-  // Up to the next section HEADER — a `[` at the start of a line. `[^[]*`
-  // stops at the `[` of the members ARRAY, which silently yields nothing.
-  const section = text.match(/\[tool\.uv\.workspace\][\s\S]*?(?=\r?\n\[|$)/)
-  if (!section) return []
-  const members = section[0].match(/members\s*=\s*\[([^\]]*)\]/)
-  if (!members) return []
-  return [...members[1].matchAll(/["']([^"']+)["']/g)].map((m) => m[1])
 }
 
 // Fresh staging dir.
@@ -123,39 +108,18 @@ const scmEnv = wheelVersion
   ? { ...process.env, SETUPTOOLS_SCM_PRETEND_VERSION_FOR_SPYDE: wheelVersion,
       SETUPTOOLS_SCM_PRETEND_VERSION: wheelVersion }
   : process.env
-//
-//    --all-packages, because this repo is a uv WORKSPACE: `packages/de-shell`
-//    is a member and a path dependency of spyde. Building only the root project
-//    shipped a lock that points at a directory the payload does not contain, so
-//    first launch died before installing anything:
-//
-//      error: Failed to determine installation plan
-//        Caused by: Distribution not found at: file:///…/packages/de-shell
-//
-//    de-shell is a setuptools project too, so it cannot be built on the user's
-//    machine for exactly the reason spyde cannot — it ships as a wheel or not
-//    at all.
-execSync(`uv build --wheel --all-packages --out-dir "${wheelsDir}"`, {
+execSync(`uv build --wheel --out-dir "${wheelsDir}"`, {
   cwd: repoRoot, stdio: 'inherit', env: scmEnv,
 })
+
+// 2b. The shell (de-shell) comes from PyPI like every other dependency: the
+//     staged lock names a registry source, so first launch's `uv sync` fetches
+//     it and nothing is built or staged for it here. (Its TypeScript rides in
+//     that wheel — see de_shell/js — which is how the app's bundle and the
+//     sidecar cannot disagree about the protocol.)
 const builtWheels = readdirSync(wheelsDir).filter((f) => f.endsWith('.whl'))
 if (!builtWheels.length) throw new Error('uv build produced no wheels')
 log(`staged ${builtWheels.length} wheel(s): ${builtWheels.join(', ')}`)
-
-// 2b. The workspace members' own metadata. `uv sync` reads the workspace from
-//     the staged pyproject.toml, so every declared member directory has to
-//     EXIST even though nothing is built from it (the wheels above are
-//     installed instead). Only pyproject.toml is needed for discovery; the
-//     source is not staged, which also keeps it from being built by accident.
-for (const member of workspaceMembers(join(repoRoot, 'pyproject.toml'))) {
-  const src = join(repoRoot, member, 'pyproject.toml')
-  if (!existsSync(src)) {
-    throw new Error(`workspace member ${member} has no pyproject.toml`)
-  }
-  mkdirSync(join(outDir, member), { recursive: true })
-  copyFileSync(src, join(outDir, member, 'pyproject.toml'))
-  log(`staged workspace member: ${member}`)
-}
 
 // 3. The uv binary.
 const vendored = join(__dirname, '..', 'vendor', 'uv', process.platform, uvName)

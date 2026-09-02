@@ -32,14 +32,10 @@ jobs:
         with:
           python-version: '3.11'
 
-      # de-shell resolves from the uv workspace in dev, but pip knows nothing
-      # about workspaces — naming the local package in the same install lets
-      # pip satisfy spyde's `de-shell` dependency from packages/ instead of
-      # (not) finding it on PyPI.
       - name: Install dependencies and package
         shell: bash
         run: |
-          pip install -U -e ./packages/de-shell -e '.[doc]'
+          pip install -U -e '.[doc]'
 
       - name: Build documentation
         shell: bash

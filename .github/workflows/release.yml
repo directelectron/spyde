@@ -239,9 +239,8 @@ jobs:
           test -f "$dest/cmd/git.exe" || test -f "$dest/bin/git.exe"
           "$dest/cmd/git.exe" --version || "$dest/bin/git.exe" --version
 
-      # Root install: electron/ and packages/* are npm WORKSPACES, so the root
-      # lockfile is the authoritative one and installing here links the shared
-      # shell packages. Installing inside electron/ alone would miss them.
+      # Root install: the root lockfile is the authoritative one, and its
+      # postinstall links electron/shell to the shell's TypeScript.
       - name: Install Electron dependencies
         run: npm ci
 
