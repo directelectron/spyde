@@ -3,19 +3,21 @@
     "electron.vite.config.*", "src/main/**/*", "src/preload/**/*",
     // The shared shell is consumed as RAW TypeScript through a path alias (see
     // `paths` below and the matching resolve.alias in electron.vite.config.ts),
-    // not as a built artifact. That keeps go-to-definition, one typecheck across
-    // the boundary, and no build step between editing the shell and running the
-    // app — the whole point of having it in the workspace.
-    "../packages/shell-main/src/**/*",
-    "../packages/shell-preload/src/**/*"
+    // not as a built artifact: go-to-definition, one typecheck across the
+    // boundary, and no build step between editing the shell and running the
+    // app. `shell/` is the junction to the installed de-shell's de_shell/js.
+    "shell/main/**/*",
+    "shell/preload/**/*"
   ],
   // *.test.ts are run by `node --test` (native TS strip), not compiled into the
-  // app bundle — and they use explicit .ts import specifiers node's ESM resolver
-  // needs, which tsc's bundler resolution rejects (TS5097). Keep them out of the
-  // typecheck; their own run is the gate (npm run test:unit).
-  "exclude": ["src/**/*.test.ts", "../packages/*/src/**/*.test.ts"],
+  // app bundle. Their own run is the gate (npm run test:unit).
+  "exclude": ["src/**/*.test.ts", "shell/**/*.test.ts"],
   "compilerOptions": {
     "composite": true,
+    "noEmit": true,
+    // The shell's modules import their siblings with the .ts extension spelled
+    // out, for node --test's native type stripping.
+    "allowImportingTsExtensions": true,
     "types": ["electron-vite/node"],
     "lib": ["ESNext"],
     "target": "ESNext",
@@ -25,8 +27,8 @@
     "skipLibCheck": true,
     "baseUrl": ".",
     "paths": {
-      "@de/shell-main": ["../packages/shell-main/src/index.ts"],
-      "@de/shell-preload": ["../packages/shell-preload/src/index.ts"]
+      "@de/shell-main": ["./shell/main/index.ts"],
+      "@de/shell-preload": ["./shell/preload/index.ts"]
     }
   }
 }

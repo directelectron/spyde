@@ -1,9 +1,8 @@
 {
   "name": "spyde-workspace",
   "private": true,
-  "description": "SpyDE workspace — the app at electron/ + spyde/, its copy of the shared shell in packages/. Ground Crew and Autopilot live in their own repos (de_ground_crew, de_autopilot), each with its own shell copy.",
+  "description": "SpyDE workspace — the app at electron/ + spyde/. The shared shell is the de-shell package (Python + its TypeScript, linked in at electron/shell by electron/scripts/shell-link.mjs); Ground Crew and Autopilot live in their own repos on the same package.",
   "workspaces": [
-    "packages/*",
     "electron"
   ],
   "//": "electron is declared HERE, at the workspace root, so every root-hoisted tool that resolves 'electron' from its own location (electron-vite's version sniff, playwright-core's bare require('electron/index.js')) finds the SAME version the app declares in electron/package.json. Without this, npm's auto-installed peer once put electron 43 at the root and every e2e silently ran the wrong Electron. EXACT, not a range, and it must match electron/package.json: making this a workspace hoisted electron out of electron/node_modules, and electron-builder resolves the installed version from the project dir — it cannot, so it falls back to parsing this spec and REFUSES a range. That is a release-only failure (nothing else runs electron-builder), so it does not show up until the tag build.",
@@ -16,7 +15,9 @@
     "preview": "npm --workspace spyde-electron run preview",
     "test": "npm --workspace spyde-electron test",
     "typecheck": "npm --workspace spyde-electron run typecheck",
-    "_comment:test:unit": "--if-present SKIPS a workspace with no test:unit script, so this reports success when it has run NOTHING — which it did until shell-main's script was named to match. If you rename a package's test script, check the run still reports the expected test count.",
-    "test:unit": "npm run --workspaces --if-present test:unit"
+    "shell:link": "node electron/scripts/shell-link.mjs",
+    "postinstall": "node electron/scripts/shell-link.mjs --soft",
+    "_comment:test:unit": "The shell's unit tests, run against the linked tree so a shell update is exercised from here too. A missing link makes this fail loudly rather than run nothing — see shell:link.",
+    "test:unit": "node --test \"electron/shell/**/*.test.ts\" \"electron/shell/**/*.test.cjs\""
   }
 }

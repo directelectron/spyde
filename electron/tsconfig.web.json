@@ -1,6 +1,8 @@
 {
   "compilerOptions": {
     "composite": true,
+    "noEmit": true,
+    "allowImportingTsExtensions": true,
     "target": "ESNext",
     "module": "ESNext",
     "moduleResolution": "bundler",
@@ -14,7 +16,7 @@
       "@guides/*": ["../guides/*"],
       // Raw TypeScript through an alias, matching the resolve.alias in
       // electron.vite.config.ts — see the note there.
-      "@de/shell-renderer": ["../packages/shell-renderer/src/index.ts"],
+      "@de/shell-renderer": ["./shell/renderer/index.ts"],
       // Pinned so the shell package, which is compiled under THIS config,
       // resolves the same React types the app does. Two copies of @types/react
       // in one program produce structurally-identical-but-unassignable JSX
@@ -25,11 +27,9 @@
   },
   "include": [
     "src/renderer/src/**/*", "../guides/**/*",
-    "../packages/shell-renderer/src/**/*"
+    "shell/renderer/**/*"
   ],
   // *.test.ts run under `node --test` (native TS strip), not in the browser
-  // bundle, and they use explicit .ts import specifiers that node's ESM
-  // resolver needs but tsc's bundler resolution rejects (TS5097). Their own
-  // run is the gate — see the root `npm run test:unit`.
-  "exclude": ["../packages/*/src/**/*.test.ts"]
+  // bundle. Their own run is the gate — see the root `npm run test:unit`.
+  "exclude": ["shell/**/*.test.ts"]
 }

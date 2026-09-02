@@ -239,9 +239,15 @@ jobs:
           test -f "$dest/cmd/git.exe" || test -f "$dest/bin/git.exe"
           "$dest/cmd/git.exe" --version || "$dest/bin/git.exe" --version
 
-      # Root install: electron/ and packages/* are npm WORKSPACES, so the root
-      # lockfile is the authoritative one and installing here links the shared
-      # shell packages. Installing inside electron/ alone would miss them.
+      # de-shell is a PATH dependency (../de-shell) until it is on PyPI. The
+      # runner's workspace parent is writable, so a sibling clone satisfies it
+      # — for uv, and for the electron/shell junction the TypeScript jobs need.
+      - name: Check out de-shell beside the repo
+        shell: bash
+        run: test -d ../de-shell || git clone --depth 1 https://github.com/directelectron/de-shell ../de-shell
+
+      # Root install: the root lockfile is the authoritative one, and its
+      # postinstall links electron/shell to the shell's TypeScript.
       - name: Install Electron dependencies
         run: npm ci
 

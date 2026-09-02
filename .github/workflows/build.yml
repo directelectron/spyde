@@ -104,6 +104,13 @@ jobs:
       - name: Set up Python ${{ matrix.python-version }}
         run: uv python install ${{ matrix.python-version }}
 
+      # de-shell is a PATH dependency (../de-shell) until it is on PyPI. The
+      # runner's workspace parent is writable, so a sibling clone satisfies it
+      # — for uv, and for the electron/shell junction the TypeScript jobs need.
+      - name: Check out de-shell beside the repo
+        shell: bash
+        run: test -d ../de-shell || git clone --depth 1 https://github.com/directelectron/de-shell ../de-shell
+
       - name: Install (locked) + tests extra
         run: uv sync --frozen --extra tests --python ${{ matrix.python-version }}
 
@@ -135,7 +142,7 @@ jobs:
         env:
           NUMBA_DISABLE_JIT: ${{ startsWith(matrix.os, 'macos') && '1' || '0' }}
         run: >
-          uv run pytest spyde/tests/migrated packages/de-shell/tests
+          uv run pytest spyde/tests/migrated
           ${{ matrix.group && format('--splits 2 --group {0} --durations-path spyde/tests/.test_durations', matrix.group) || '' }}
           ${{ (matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12') && '--cov=spyde --cov-report=xml' || '' }}
 
@@ -177,6 +184,13 @@ jobs:
 
       # NOT --frozen: the domain extras are not in uv.lock (they are optional
       # and resolve differently per platform), so the lock cannot satisfy them.
+      # de-shell is a PATH dependency (../de-shell) until it is on PyPI. The
+      # runner's workspace parent is writable, so a sibling clone satisfies it
+      # — for uv, and for the electron/shell junction the TypeScript jobs need.
+      - name: Check out de-shell beside the repo
+        shell: bash
+        run: test -d ../de-shell || git clone --depth 1 https://github.com/directelectron/de-shell ../de-shell
+
       - name: Install with all domain extras
         run: uv sync --extra tests --extra all --python 3.12
 
@@ -192,7 +206,7 @@ jobs:
 
       - name: Run tests (extras present)
         run: >
-          uv run pytest spyde/tests/migrated packages/de-shell/tests
+          uv run pytest spyde/tests/migrated
           ${{ matrix.group && format('--splits 2 --group {0} --durations-path spyde/tests/.test_durations', matrix.group) || '' }}
 
   # ── Renderer/main TypeScript typecheck ─────────────────────────────────────
@@ -212,9 +226,15 @@ jobs:
           cache: npm
           cache-dependency-path: package-lock.json
 
-      # Root install: electron/ and packages/* are npm WORKSPACES, so the root
-      # lockfile is the authoritative one and installing here links the shared
-      # shell packages. Installing inside electron/ alone would miss them.
+      # de-shell is a PATH dependency (../de-shell) until it is on PyPI. The
+      # runner's workspace parent is writable, so a sibling clone satisfies it
+      # — for uv, and for the electron/shell junction the TypeScript jobs need.
+      - name: Check out de-shell beside the repo
+        shell: bash
+        run: test -d ../de-shell || git clone --depth 1 https://github.com/directelectron/de-shell ../de-shell
+
+      # Root install: the root lockfile is the authoritative one, and its
+      # postinstall links electron/shell to the shell's TypeScript.
       - name: Install Electron dependencies
         run: npm ci
 
@@ -248,14 +268,19 @@ jobs:
           cache: npm
           cache-dependency-path: package-lock.json
 
-      # Root install: electron/ and packages/* are npm WORKSPACES, so the root
-      # lockfile is the authoritative one and installing here links the shared
-      # shell packages. Installing inside electron/ alone would miss them.
+      # de-shell is a PATH dependency (../de-shell) until it is on PyPI. The
+      # runner's workspace parent is writable, so a sibling clone satisfies it
+      # — for uv, and for the electron/shell junction the TypeScript jobs need.
+      - name: Check out de-shell beside the repo
+        shell: bash
+        run: test -d ../de-shell || git clone --depth 1 https://github.com/directelectron/de-shell ../de-shell
+
+      # Root install: the root lockfile is the authoritative one, and its
+      # postinstall links electron/shell to the shell's TypeScript.
       - name: Install Electron dependencies
         run: npm ci
 
-      # From the ROOT: the main-process units now live in packages/shell-main,
-      # and the root script fans out across workspaces.
+      # From the ROOT: the shell's unit tests, run against the linked tree.
       - name: Run main-process unit tests
         run: npm run test:unit
 
@@ -317,12 +342,25 @@ jobs:
       # WITH the domain extras: the `requires_package:` gate hides the
       # EELS/EBSD/atoms actions without them, so those specs cannot pass.
       # NOT --frozen: the extras resolve per-platform (same as `test-extras`).
+      # de-shell is a PATH dependency (../de-shell) until it is on PyPI. The
+      # runner's workspace parent is writable, so a sibling clone satisfies it
+      # — for uv, and for the electron/shell junction the TypeScript jobs need.
+      - name: Check out de-shell beside the repo
+        shell: bash
+        run: test -d ../de-shell || git clone --depth 1 https://github.com/directelectron/de-shell ../de-shell
+
       - name: Pre-sync the Python backend env
         run: uv sync --extra tests --extra all
 
-      # Root install: electron/ and packages/* are npm WORKSPACES, so the root
-      # lockfile is the authoritative one and installing here links the shared
-      # shell packages. Installing inside electron/ alone would miss them.
+      # de-shell is a PATH dependency (../de-shell) until it is on PyPI. The
+      # runner's workspace parent is writable, so a sibling clone satisfies it
+      # — for uv, and for the electron/shell junction the TypeScript jobs need.
+      - name: Check out de-shell beside the repo
+        shell: bash
+        run: test -d ../de-shell || git clone --depth 1 https://github.com/directelectron/de-shell ../de-shell
+
+      # Root install: the root lockfile is the authoritative one, and its
+      # postinstall links electron/shell to the shell's TypeScript.
       - name: Install Electron dependencies
         run: npm ci
 
