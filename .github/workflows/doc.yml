@@ -37,7 +37,7 @@ jobs:
       # — for uv, and for the electron/shell junction the TypeScript jobs need.
       - name: Check out de-shell beside the repo
         shell: bash
-        run: test -d ../de-shell || git clone --depth 1 https://github.com/directelectron/de-shell ../de-shell
+        run: test -d ../de-shell || git clone --depth 1 https://github.com/CSSFrancis/de-shell ../de-shell
 
       # de-shell is a path dependency until it is on PyPI; naming the sibling
       # checkout in the same install lets pip satisfy it.

@@ -109,7 +109,7 @@ jobs:
       # — for uv, and for the electron/shell junction the TypeScript jobs need.
       - name: Check out de-shell beside the repo
         shell: bash
-        run: test -d ../de-shell || git clone --depth 1 https://github.com/directelectron/de-shell ../de-shell
+        run: test -d ../de-shell || git clone --depth 1 https://github.com/CSSFrancis/de-shell ../de-shell
 
       - name: Install (locked) + tests extra
         run: uv sync --frozen --extra tests --python ${{ matrix.python-version }}
@@ -189,7 +189,7 @@ jobs:
       # — for uv, and for the electron/shell junction the TypeScript jobs need.
       - name: Check out de-shell beside the repo
         shell: bash
-        run: test -d ../de-shell || git clone --depth 1 https://github.com/directelectron/de-shell ../de-shell
+        run: test -d ../de-shell || git clone --depth 1 https://github.com/CSSFrancis/de-shell ../de-shell
 
       - name: Install with all domain extras
         run: uv sync --extra tests --extra all --python 3.12
@@ -231,7 +231,7 @@ jobs:
       # — for uv, and for the electron/shell junction the TypeScript jobs need.
       - name: Check out de-shell beside the repo
         shell: bash
-        run: test -d ../de-shell || git clone --depth 1 https://github.com/directelectron/de-shell ../de-shell
+        run: test -d ../de-shell || git clone --depth 1 https://github.com/CSSFrancis/de-shell ../de-shell
 
       # Root install: the root lockfile is the authoritative one, and its
       # postinstall links electron/shell to the shell's TypeScript.
@@ -273,7 +273,7 @@ jobs:
       # — for uv, and for the electron/shell junction the TypeScript jobs need.
       - name: Check out de-shell beside the repo
         shell: bash
-        run: test -d ../de-shell || git clone --depth 1 https://github.com/directelectron/de-shell ../de-shell
+        run: test -d ../de-shell || git clone --depth 1 https://github.com/CSSFrancis/de-shell ../de-shell
 
       # Root install: the root lockfile is the authoritative one, and its
       # postinstall links electron/shell to the shell's TypeScript.
@@ -347,7 +347,7 @@ jobs:
       # — for uv, and for the electron/shell junction the TypeScript jobs need.
       - name: Check out de-shell beside the repo
         shell: bash
-        run: test -d ../de-shell || git clone --depth 1 https://github.com/directelectron/de-shell ../de-shell
+        run: test -d ../de-shell || git clone --depth 1 https://github.com/CSSFrancis/de-shell ../de-shell
 
       - name: Pre-sync the Python backend env
         run: uv sync --extra tests --extra all
@@ -357,7 +357,7 @@ jobs:
       # — for uv, and for the electron/shell junction the TypeScript jobs need.
       - name: Check out de-shell beside the repo
         shell: bash
-        run: test -d ../de-shell || git clone --depth 1 https://github.com/directelectron/de-shell ../de-shell
+        run: test -d ../de-shell || git clone --depth 1 https://github.com/CSSFrancis/de-shell ../de-shell
 
       # Root install: the root lockfile is the authoritative one, and its
       # postinstall links electron/shell to the shell's TypeScript.
