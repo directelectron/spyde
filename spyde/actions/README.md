@@ -133,6 +133,14 @@ is a single 2-D plot); that is a documented no-op, not an error.
    `get_toolbar_actions_for_plot` on a fake plot (see
    `test_vector_vvi_action.py::TestVectorVVIGating`).
 
+**Per-frame display comes free for a `map`-based transform.** A node whose
+method is a hyperspy `map` underneath (`center_direct_beam`, azimuthal
+integration, per-pattern filters) is displayed one frame at a time from its
+parent's frame — the recorded map recipe — without computing the dask block,
+and is tagged local by construction. `is_local_per_frame` remains the switch
+for a per-frame transform that is NOT a `map` (rebin, crop). See
+`spyde/array_cache/readers/recipe.py`.
+
 **Wizard**:
 1. Subclass `WizardController` (set `key`), write the staged handlers
    (`_template_action.py` shows the full open/close/commit set with every

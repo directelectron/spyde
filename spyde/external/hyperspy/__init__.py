@@ -10,7 +10,9 @@ from __future__ import annotations
 
 from spyde.external import register
 from spyde.external.hyperspy.cached_dask_array import apply as _apply_cached_dask_array
+from spyde.external.hyperspy.map_recipe import apply as _apply_map_recipe
 
 register("hyperspy", _apply_cached_dask_array)
+register("hyperspy", _apply_map_recipe)
 
-__all__ = ["_apply_cached_dask_array"]
+__all__ = ["_apply_cached_dask_array", "_apply_map_recipe"]

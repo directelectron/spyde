@@ -1218,19 +1218,33 @@ class Plot:
         except Exception as e:
             logger.debug("block cache focus resize failed: %s", e)
 
+    def _ancestor_signals(self, signal) -> list:
+        """``signal`` and its parents up to the tree root, or [] when it is not
+        a tree node (a dynamic output plot's placeholder)."""
+        try:
+            tree = self.signal_tree
+            node = tree.get_node(signal) if tree is not None else None
+        except Exception:
+            node = None
+        chain = []
+        while node is not None:
+            chain.append(node.signal)
+            node = node.parent
+        return chain
+
     def set_plot_state(self, signal) -> None:
         old_state = self.plot_state
         self.needs_auto_level = True
-        # The displayed node is changing — drop cached decoded frames of the old
-        # node so they don't occupy the budget (keys are per-signal-id, so they'd
-        # never be returned for the new node anyway), and close any readers that
-        # hold real resources (e.g. BinaryReader's open file descriptor).
+        # The displayed node is changing. The old node's frames go (a frame is
+        # ~0 ms to rebuild from a resident block), but the readers and decoded
+        # blocks of the NEW node's ancestor chain stay: a mapped or rebinned node
+        # reads through its parent's frames, and the root's decoded chunks are
+        # the expensive part (a 134 MB zarr chunk is ~110 ms). Everything else,
+        # including a reader's open file descriptor, is released.
         if self._array_cache is not None:
             self._array_cache.clear()
-        if self._block_cache is not None:
-            self._block_cache.clear()
-        from spyde.array_cache import close_all_readers
-        close_all_readers(self)
+        from spyde.array_cache import retain_readers
+        retain_readers(self, self._ancestor_signals(signal))
         # Rebuild the GPU tile backend for the new node (its logical size / dtype may
         # differ; a stale backend would swap a mismatched frame into the old tiling).
         self._gpu_tile_backend = None

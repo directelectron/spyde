@@ -21,6 +21,7 @@ import logging
 
 import numpy as np
 
+from .readers.eager import EagerReader
 from .resolve import resolve_reader
 
 log = logging.getLogger(__name__)
@@ -59,8 +60,15 @@ def _reader_for(plot, signal, data):
         # are recycled, so drop it explicitly at the one place we KNOW the data
         # changed rather than relying on the new reader landing at a new address.
         _invalidate_integrator(plot)
-    reader = _try_per_frame_reader(plot, signal, data) or resolve_reader(
-        signal, data, block_cache=getattr(plot, "_block_cache", None))
+    if isinstance(data, np.ndarray):
+        # Already in RAM (a bundled synthetic root, an eager example): a frame
+        # is an index. Reached as the PARENT of a derived view.
+        reader = EagerReader(data, signal.axes_manager.navigation_dimension)
+    else:
+        reader = (_try_per_frame_reader(plot, signal, data)
+                  or _try_recipe_reader(plot, signal, data)
+                  or resolve_reader(signal, data,
+                                    block_cache=getattr(plot, "_block_cache", None)))
     if reader is not None:
         readers[key] = reader
     return reader
@@ -130,6 +138,38 @@ def _try_per_frame_reader(plot, signal, data):
                                       parent_signal)
     except Exception as e:
         log.debug("per-frame reader resolve failed, using the dask view: %s", e)
+        return None
+
+
+def _try_recipe_reader(plot, signal, data):
+    """A RecipeReader for a node made by a hyperspy ``map`` whose recorded
+    recipe is rooted at the node's tree parent, or None.
+
+    The general form of the per-frame idea above: the recipe IS the function
+    hyperspy runs per position inside every block, so applying it to the
+    parent's frame yields the block's frame, bit for bit (measured 2196 ms ->
+    0.55 ms per chunk crossing on a centred 5-D .zspy). See readers/recipe.py.
+
+    Lives here for the same reason as the per-frame reader: it needs the tree
+    to find the parent, and the parent's reader must come through
+    :func:`_reader_for` so it shares the plot's block cache."""
+    tree = getattr(plot, "signal_tree", None)
+    if tree is None:
+        return None
+    try:
+        from .readers.recipe import RecipeReader, chain_reaches
+
+        node = tree.get_node(signal)
+        parent = getattr(node, "parent", None) if node is not None else None
+        parent_signal = getattr(parent, "signal", None)
+        if parent_signal is None or not chain_reaches(signal, parent_signal):
+            return None
+        parent_reader = _reader_for(plot, parent_signal, parent_signal.data)
+        if parent_reader is None:
+            return None
+        return RecipeReader(signal, data, parent_signal, parent_reader)
+    except Exception as e:
+        log.debug("recipe reader resolve failed, using the dask view: %s", e)
         return None
 
 
@@ -284,22 +324,39 @@ def _get_local_region(plot, signal, data, idx, prof=None):
     return acc
 
 
-def close_all_readers(plot) -> None:
-    """Close every cached reader on ``plot`` (releasing e.g. BinaryReader's
-    open file descriptor) before dropping them — called on node switch and
-    on Plot.close(), mirroring where _array_cache.clear() is already called."""
+def retain_readers(plot, signals) -> None:
+    """Keep the readers, and their decoded blocks, for ``signals``; close and
+    drop every other reader on ``plot`` (releasing e.g. BinaryReader's open
+    file descriptor).
+
+    Called on a node switch with the new node's ancestor chain, the node itself
+    up to the tree root. A mapped or rebinned node reads through its parent's
+    frames, and the root's decoded chunks are the expensive part (a 134 MB zarr
+    chunk is ~110 ms), so they survive the switch. The region running sum
+    belonged to the old node and is dropped."""
     _invalidate_integrator(plot)
     readers = getattr(plot, "_local_transform_readers", None)
     if not readers:
         return
-    for reader in readers.values():
+    keep = {id(signal) for signal in signals}
+    block_cache = getattr(plot, "_block_cache", None)
+    for key in list(readers):
+        if key in keep:
+            continue
+        reader = readers.pop(key)
+        if block_cache is not None:
+            block_cache.drop_owner(id(reader))
         close = getattr(reader, "close", None)
         if close is not None:
             try:
                 close()
             except Exception:
                 pass
-    readers.clear()
+
+
+def close_all_readers(plot) -> None:
+    """Close every cached reader on ``plot`` — called on Plot.close()."""
+    retain_readers(plot, ())
 
 
 def is_local_frame_resident(plot, signal, data, indices) -> bool:

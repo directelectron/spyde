@@ -1164,6 +1164,15 @@ class BaseSignalTree:
         if node_name is None:
             node_name = transformation_name
 
+        # A hyperspy `map` output carries the per-frame recipe it was built with
+        # (spyde.external.hyperspy.map_recipe). When that recipe is rooted at the
+        # parent, one frame of the node is a function of one frame of the parent,
+        # which is exactly what the locality tag asserts: local by construction,
+        # whatever the action declared.
+        from spyde.array_cache.readers.recipe import chain_reaches
+        if chain_reaches(new_signal, parent_signal):
+            local = True
+
         final_name = node_name
         if final_name in parent_node.children:
             count = 1
