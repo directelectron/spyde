@@ -1331,6 +1331,10 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
         case 'drift_trace':
         case 'drift_progress':
         case 'drift_result':
+        // Segment caret (spyde/actions/segment_action.py) — the strokes per
+        // class, whether a classifier is trained, and the run's result.
+        case 'seg_state':
+        case 'seg_result':
         // DPC caret (spyde/actions/dpc_action.py) — the measured descan +
         // available vacuum datasets, the fitted scan/detector rotation, and the
         // derived field's stats. Consumed by DpcWizard; the map itself is a

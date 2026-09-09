@@ -32,12 +32,13 @@ import { FitWizard } from './FitWizard'
 import { BackgroundWizard } from './BackgroundWizard'
 import { DriftWizard } from './DriftWizard'
 import { DpcWizard } from './DpcWizard'
+import { SegmentWizard } from './SegmentWizard'
 
 const WIZARD_ACTIONS = new Set([
   'Orientation Mapping', 'Find Diffraction Vectors', 'Vector Orientation Mapping',
   'EBSD Indexing',
   'Center Zero Beam', 'Strain Mapping', 'Crop', 'Fit', 'Remove Background',
-  'Drift Correction', 'DPC',
+  'Drift Correction', 'DPC', 'Segment',
 ])
 
 /**
@@ -423,6 +424,12 @@ export function FloatingToolbar({
         )}
         {openAction && openAction.name === 'DPC' && (
           <DpcWizard
+            caretPos={caretPos} windowId={windowId} sendAction={sendAction}
+            onClose={() => setOpenName(null)}
+          />
+        )}
+        {openAction && openAction.name === 'Segment' && (
+          <SegmentWizard
             caretPos={caretPos} windowId={windowId} sendAction={sendAction}
             onClose={() => setOpenName(null)}
           />

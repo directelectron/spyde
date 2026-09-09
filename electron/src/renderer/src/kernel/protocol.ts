@@ -859,6 +859,47 @@ export interface IoThroughputMessage extends MsgBase {
   color: 'green' | 'yellow' | 'red'
 }
 
+// ── Segment caret (spyde/actions/segment_action.py) ──────────────────────────
+
+/** One paintable class: `spyde.segmentation.labels.CLASSES` plus the number of
+ *  pixels painted in it so far. `pixels` is how a user notices a class is
+ *  under-trained; a class with zero pixels is listed, not omitted. */
+export interface SegClassInfo {
+  id: number
+  name: string
+  /** CSS hex, the brush widget's colour for this class. */
+  colour: string
+  pixels: number
+}
+
+/** The caret's state, emitted after open, every stroke, train and run. */
+export interface SegStateMessage extends MsgBase {
+  type: 'seg_state'
+  window_id: number | null
+  /** Fields the run will label: 1 for an image or a navigator, frames for a movie. */
+  n_fields: number
+  /** The field the navigator is showing (a movie); 0 otherwise. */
+  field: number
+  /** 'signal' (pixels are image pixels) or 'navigation' (pixels are scan positions). */
+  space: string
+  units: string
+  classes: SegClassInfo[]
+  painted_fields: number[]
+  trained: boolean
+  train_accuracy: number
+  running: boolean
+  params: Record<string, unknown>
+}
+
+/** The run finished and its result tree is open. */
+export interface SegResultMessage extends MsgBase {
+  type: 'seg_result'
+  window_id: number | null
+  n_regions: number
+  n_fields: number
+  cancelled: boolean
+}
+
 // ── Drift Correction caret (spyde/actions/drift_action.py, plan A8) ──────────
 
 /** Caret state. `window_id` is the SOURCE plot's window (where the caret
@@ -1143,6 +1184,8 @@ export type PlotAppMessage =
   | DriftTraceMessage
   | DriftProgressMessage
   | DriftResultMessage
+  | SegStateMessage
+  | SegResultMessage
   | DpcStateMessage
   | DpcEstimateMessage
   | DpcResultMessage

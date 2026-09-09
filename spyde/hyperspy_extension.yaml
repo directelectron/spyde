@@ -29,3 +29,15 @@ signals:
     dtype: real
     lazy: True
     module: spyde.signals.insitu
+  RegionMap:
+    signal_type: regions
+    signal_dimension: 2
+    dtype: real
+    lazy: False
+    module: spyde.signals.region_map
+  LazyRegionMap:
+    signal_type: regions
+    signal_dimension: 2
+    dtype: real
+    lazy: True
+    module: spyde.signals.region_map

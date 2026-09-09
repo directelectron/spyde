@@ -101,6 +101,14 @@ _SPYDE_STAGED_HANDLERS: dict[str, str] = {
     "drift_run":           "spyde.actions.drift_action.drift_run",
     "drift_discard":       "spyde.actions.drift_action.drift_discard",
     "drift_commit":        "spyde.actions.drift_action.drift_commit",
+    # Segment (spyde/actions/segment_action.py).
+    "seg_open":            "spyde.actions.segment_action.seg_open",
+    "seg_close":           "spyde.actions.segment_action.seg_close",
+    "seg_tune":            "spyde.actions.segment_action.seg_tune",
+    "seg_clear":           "spyde.actions.segment_action.seg_clear",
+    "seg_train":           "spyde.actions.segment_action.seg_train",
+    "seg_run":             "spyde.actions.segment_action.seg_run",
+    "seg_stop":            "spyde.actions.segment_action.seg_stop",
     "download_cancel":     "spyde.backend.example_download.download_cancel",
     "compute_configure":   "spyde.backend.compute_config.compute_configure",
     "set_log_level":       "de_shell.log_stream.set_log_level",
@@ -212,6 +220,7 @@ _SPYDE_WIZARD_SCHEMAS: dict[str, tuple[str, str]] = {
     "czb":    ("spyde.actions.center_zero_beam", "PARAMETERS"),
     "drift":  ("spyde.actions.drift_action", "DriftWizard"),
     "dpc":    ("spyde.actions.dpc_action", "DpcWizard"),
+    "seg":    ("spyde.actions.segment_action", "SegmentWizard"),
     # YAML-declared (resolved from spyde.TOOLBAR_ACTIONS):
     "fv":     (YAML_SCHEMA, "Find Diffraction Vectors"),
     "om":     (YAML_SCHEMA, "Orientation Mapping"),
