@@ -697,8 +697,9 @@ class Session(
         if backend is not None:
             try:
                 backend.shutdown_nav_pool()
+                backend.shutdown_overlay_pool()
             except Exception as e:
-                log.debug("compute-backend nav pool shutdown failed: %s", e)
+                log.debug("compute-backend pool shutdown failed: %s", e)
         self.dask_manager.shutdown()
         for tmpdir in self._example_temp_paths:
             try:

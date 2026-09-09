@@ -58,6 +58,10 @@ class _NavPainter:
     def __init__(self) -> None:
         self._lock = _threading.Lock()
         self._pending: "dict[int, tuple]" = {}   # id(plot) -> (plot, ndarray)
+        # Plots with overlay values staged and no base frame to carry them:
+        # an overlay must reach anyplotlib on this thread whether or not the
+        # navigator painted a frame for the same move.
+        self._overlay_plots: "dict[int, object]" = {}
         self._wake = _threading.Event()
         self._thread = _threading.Thread(
             target=self._run, name="nav-paint", daemon=True)
@@ -69,14 +73,25 @@ class _NavPainter:
             self._pending[id(plot)] = (plot, data)
         self._wake.set()
 
+    def submit_overlays(self, plot) -> None:
+        """Wake the painter to draw a plot's staged overlay values. No base
+        frame is re-sent: a paint already queued for this plot draws them,
+        and otherwise they are drawn on their own."""
+        with self._lock:
+            self._overlay_plots[id(plot)] = plot
+        self._wake.set()
+
     def _run(self) -> None:
         while True:
             self._wake.wait()
             with self._lock:
                 jobs = list(self._pending.values())
+                overlay_only = dict(self._overlay_plots)
                 self._pending.clear()
+                self._overlay_plots.clear()
                 self._wake.clear()
             for plot, data in jobs:
+                overlay_only.pop(id(plot), None)
                 try:
                     plot.current_data = data
                     plot._set_array(data)
@@ -99,6 +114,11 @@ class _NavPainter:
                             logger.debug("applying pending layer frames failed: %s", e)
                 except Exception as e:
                     logger.debug("nav paint failed: %s", e)
+            for plot in overlay_only.values():
+                try:
+                    plot._apply_pending_overlays()
+                except Exception as e:
+                    logger.debug("overlay paint failed: %s", e)
 
 
 # One painter for the whole process — the single serial lane nav frames paint on.
@@ -107,6 +127,13 @@ _nav_painter = _NavPainter()
 # The payloads that draw nothing, for an overlay group with no value.
 _EMPTY_OFFSETS = np.zeros((0, 2), dtype=np.float32)
 _EMPTY_SEGMENTS = np.zeros((0, 2, 2), dtype=np.float32)
+
+
+def _overlay_attached(node) -> bool:
+    """True while an overlay node is still a child of its parent. A removed
+    node can have a value in flight, and must not draw or rebuild groups."""
+    parent = node.parent
+    return parent is not None and parent.children.get(node.name) is node
 
 import time as _time
 # Per-frame PAINT profile (the transport/render half of a navigator update): logs
@@ -611,20 +638,27 @@ class Plot:
         self._overlay_futures.pop(id(node), None)
 
     def enqueue_overlay(self, node, value) -> None:
-        """Stage an overlay node's value and wake the painter to draw it.
+        """Stage an overlay node's value for the painter thread.
 
         ``value`` maps group name to the value that group draws; a missing
         name clears that group and an empty value clears them all. Newest
         wins: a value superseded before the painter runs is replaced. The
-        painter is woken with the plot's current base frame so the overlay is
-        pushed right behind it, or applied here when there is no frame yet."""
+        base frame is never re-sent, so an overlay costs one marker push and
+        cannot repaint a frame the navigator has already moved past."""
         with _nav_painter._lock:
             self._pending_overlay_values[id(node)] = (node, value)
-        base = self.current_data
-        if isinstance(base, np.ndarray):
-            self.enqueue_paint(base)
-        else:
-            self._apply_pending_overlays()
+        _nav_painter.submit_overlays(self)
+
+    def cancel_overlay_future(self, node) -> None:
+        """Drop an overlay node's in-flight evaluation, so a value already
+        being computed cannot arrive and draw."""
+        future = self._overlay_futures.pop(id(node), None)
+        if future is None:
+            return
+        try:
+            future.cancel()
+        except Exception as e:
+            logger.debug("[plot] cancelling an overlay evaluation failed: %s", e)
 
     def _apply_pending_overlays(self) -> None:
         """Push every staged overlay value to its groups. Runs on the painter
@@ -635,14 +669,23 @@ class Plot:
             pending = self._pending_overlay_values
             self._pending_overlay_values = {}
         for node, value in pending.values():
-            values = value if isinstance(value, dict) else {}
-            for name, (kind, _style) in node.groups.items():
+            if not _overlay_attached(node):
+                continue
+            # A hidden node draws nothing, whatever landed for it: an
+            # evaluation submitted before it was hidden still returns a value.
+            values = {} if not node.visible else (
+                value if isinstance(value, dict) else {})
+            for name, (kind, style) in node.groups.items():
                 try:
+                    # First value on this plot: the plot may have opened after
+                    # the node was added, and a group is an anyplotlib push, so
+                    # it is created here rather than wherever that happened.
+                    self.ensure_overlay_group(node, name, kind, style)
                     self._push_overlay_group(node, name, kind, values.get(name))
                 except Exception as e:
                     logger.debug("[plot] drawing overlay group %s failed: %s",
                                  name, e)
-            if node.on_value is not None:
+            if node.on_value is not None and node.visible:
                 try:
                     node.on_value(value)
                 except Exception as e:

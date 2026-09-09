@@ -1272,6 +1272,9 @@ class BaseSignalTree:
 
         for plot in list(self.signal_plots):
             try:
+                # Cancel first: a value already being evaluated must not land
+                # on a node that is going away.
+                plot.cancel_overlay_future(node)
                 plot.drop_overlay_groups(node)
                 drop_reader(plot, node.signal)
             except Exception as e:
@@ -1314,6 +1317,7 @@ class BaseSignalTree:
         node.visible = bool(visible)
         if not node.visible:
             for plot in list(self.signal_plots):
+                plot.cancel_overlay_future(node)
                 plot.enqueue_overlay(node, {})
             return
         refresh_overlays_for(self)
@@ -1327,18 +1331,14 @@ class BaseSignalTree:
         For a node whose frames are not in an array: rendered from vectors,
         available only for the blocks a progressive compute has finished, cut
         from an event stream. The reader implements ``read_frame(indices)``,
-        which may return None when there is no frame yet, and ``frame_bytes``;
-        ``sum_points(points, dtype)`` is optional and serves regions."""
-        from spyde.array_cache import drop_reader
-
+        returning None when it has no frame at that position, and may
+        implement ``sum_points(points, dtype)`` to integrate a region in one
+        call. It answers the navigator read directly, so it neither resolves
+        as a frame reader nor fills the frame cache."""
         if reader is None:
             self._reader_overrides.pop(id(signal), None)
         else:
             self._reader_overrides[id(signal)] = (signal, reader)
-        # Frames already decoded for this signal came from the reader being
-        # replaced, so they must go for the change to be visible at all.
-        for plot in list(self.signal_plots):
-            drop_reader(plot, signal)
 
     def reader_override_for(self, signal):
         """The reader pinned for ``signal``, or None. On the read path, so it

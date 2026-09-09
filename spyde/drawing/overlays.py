@@ -101,7 +101,7 @@ def _submit_overlay(plot, tree, node, reader, index) -> None:
         except Exception:
             pass
 
-    future = backend.submit_nav_read(lambda: reader.read_frame(index))
+    future = backend.submit_overlay(lambda: reader.read_frame(index))
     futures[id(node)] = future
 
     def paint_when_done(finished, expected=future):

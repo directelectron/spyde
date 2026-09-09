@@ -1045,6 +1045,55 @@ def _prepare_nav_indices(current_signal, indices, integrating: bool, data=None):
     return indices
 
 
+def _read_through_override(override, current_signal, indices):
+    """The frame a reader pinned on the tree answers with, for a point or an
+    integrating region.
+
+    None means the override has no frame at this position (a progressive
+    result whose block has not landed): the caller paints nothing and the
+    last frame stays up.
+
+    A region is the same sum-and-round the array cache does, either from the
+    override's own ``sum_points`` or one frame at a time, so an override and
+    an ordinary node integrate to the same numbers."""
+    from spyde.array_cache import finalize_sum
+    from spyde.array_cache.nav_read import _region_accum_dtype
+
+    idx = np.asarray(indices)
+    if idx.ndim <= 1:
+        point = tuple(int(v) for v in np.atleast_1d(idx))
+        frame = override.read_frame(point)
+        return None if frame is None else np.asarray(frame)
+
+    n_points = int(idx.shape[0])
+    if n_points == 0:
+        return None
+    data_dtype = np.dtype(getattr(getattr(current_signal, "data", None),
+                                  "dtype", np.float64))
+    summer = getattr(override, "sum_points", None)
+    if summer is not None:
+        try:
+            acc = summer(idx, _region_accum_dtype(data_dtype, n_points))
+            if acc is not None:
+                return finalize_sum(acc, n_points, data_dtype)
+        except Exception as e:
+            log.debug("override region sum failed, per-frame fallback: %s", e)
+
+    total = None
+    source_dtype = None
+    for row in idx:
+        frame = override.read_frame(tuple(int(v) for v in row))
+        if frame is None:
+            return None
+        frame = np.asarray(frame)
+        if total is None:
+            source_dtype = frame.dtype
+            total = frame.astype(_region_accum_dtype(source_dtype, n_points))
+        else:
+            total += frame
+    return None if total is None else finalize_sum(total, n_points, source_dtype)
+
+
 def update_from_navigation_selection(
         selector: "BaseSelector",
         child: "Plot",
@@ -1188,6 +1237,20 @@ def update_from_navigation_selection(
     # same raw selector indices — see _prepare_nav_indices.
     indices = _prepare_nav_indices(current_signal, indices,
                                    selector.is_integrating, data=data_now)
+
+    # A node whose frames are not in its own array answers through a reader
+    # pinned on the tree: disks rendered from vectors, a progressive result
+    # that has only the blocks that have landed, one window of an event
+    # stream. That reader IS the read for this node, so it comes before every
+    # array path below and before the locality gate, which describes reading
+    # the node's array.
+    _tree = getattr(child, "signal_tree", None)
+    _override = (_tree.reader_override_for(current_signal)
+                 if _tree is not None else None)
+    if _override is not None:
+        result = _read_through_override(_override, current_signal, indices)
+        _prof.done("reader override")
+        return result
 
     if current_signal._lazy:
         if is_future_like(data_now[0]):

@@ -27,19 +27,6 @@ from .resolve import resolve_reader
 log = logging.getLogger(__name__)
 
 
-def _reader_override_for(plot, signal):
-    """The reader a signal tree has pinned for ``signal``, or None.
-
-    An override answers for a signal whose frames are not in an array at all:
-    rendered diffraction disks, a progressive result that has only the blocks
-    that have landed, one raw camera frame out of an event stream. It is used
-    whatever the node's locality tag says, because the tag describes reading
-    the node's dask array and the override replaces that read."""
-    tree = getattr(plot, "signal_tree", None)
-    lookup = getattr(tree, "reader_override_for", None)
-    return lookup(signal) if lookup is not None else None
-
-
 def _reader_for(plot, signal, data):
     """Resolve (and cache on the plot, keyed by id(signal)) the best
     FrameReader for this signal's data — reusing it across calls is what
@@ -54,13 +41,7 @@ def _reader_for(plot, signal, data):
     from a recycled fd — i.e. another file's bytes — at worst). BinaryReader's
     ``__del__`` releases the fd once the last in-flight user drops it; the
     explicit close stays in :func:`close_all_readers`, which only runs on node
-    switch / plot close.
-
-    A tree-level override wins over every resolved kind, and is not checked
-    against ``data``: it does not read that array."""
-    override = _reader_override_for(plot, signal)
-    if override is not None:
-        return override
+    switch / plot close."""
     readers = plot._local_transform_readers
     key = id(signal)
     reader = readers.get(key)
@@ -196,15 +177,10 @@ def _resolve_for(plot, signal, data):
     """The reader serving this (signal, data), or None if the signal isn't
     ArrayCache-eligible (an opaque signal-tree node, or no signal_tree).
 
-    A tree-level override answers first, whatever the locality tag says.
-
     An EXISTING reader is itself proof the locality gate already passed — only a
     local-resolved signal ever gets one. That keeps BaseSignalTree.resolve_locality
     (which walks the tree to find the node) off the per-frame path: it runs once
     per view, not once per move."""
-    override = _reader_override_for(plot, signal)
-    if override is not None:
-        return override
     reader = plot._local_transform_readers.get(id(signal))
     if reader is not None and getattr(reader, "data", None) is data:
         return reader
@@ -378,16 +354,51 @@ def retain_readers(plot, signals) -> None:
                 pass
 
 
+class _CachedParentFrames:
+    """An overlay's source frames, read through the plot's frame cache.
+
+    A navigation window re-reads most of the frames it read at the previous
+    position, so it has to go through the cache the base frame uses rather
+    than straight at the reader: a memmap reader keeps nothing, and a 7x7
+    window would be 49 disk reads on every move instead of the 7 that
+    actually moved."""
+
+    def __init__(self, plot, signal):
+        self.plot = plot
+        self.signal = signal
+        self.data = signal.data
+
+    def read_frame(self, indices):
+        return get_local_frame(self.plot, self.signal, self.data, indices)
+
+
+def _grow_cache_for_window(plot, signal, parent_signal) -> None:
+    """Size ``plot``'s frame cache to hold one navigation window, the same
+    growth an integrating region asks for. Without it the window evicts its
+    own frames and every move re-reads all of them."""
+    from spyde.external.hyperspy.map_recipe import recipe_for
+
+    recipe = recipe_for(signal)
+    depth = int(getattr(recipe, "depth", 0) or 0)
+    cache = getattr(plot, "_array_cache", None)
+    if depth <= 0 or cache is None:
+        return
+    navigation_dimension = int(signal.axes_manager.navigation_dimension)
+    data = parent_signal.data
+    frame_shape = data.shape[navigation_dimension:]
+    frame_bytes = int(np.prod(frame_shape)) * data.dtype.itemsize
+    cache.ensure_budget_for((2 * depth + 1) ** navigation_dimension, frame_bytes)
+
+
 def reader_for_overlay(plot, node):
     """The reader that evaluates an overlay ``node`` at one navigation
     position, cached on ``plot`` alongside the frame readers.
 
-    The source frame comes from the node's parent through the parent's own
-    reader, so an overlay costs the function and nothing else: the frame is
-    already decoded for the base display. An overlay whose signal names a
-    ``source_plot`` resolves that parent reader on THAT plot, which is how a
-    layer sourced from another window reads through the other window's
-    blocks."""
+    The source frame comes from the node's parent through the frame cache, so
+    an overlay costs the function and nothing else: the frame is already
+    decoded for the base display. An overlay whose signal names a
+    ``source_plot`` reads on THAT plot, which is how a layer sourced from
+    another window reads through the other window's blocks."""
     from .readers.recipe import RecipeReader
 
     signal = node.signal
@@ -399,11 +410,12 @@ def reader_for_overlay(plot, node):
 
     parent = getattr(node, "parent", None)
     parent_signal = getattr(parent, "signal", None)
-    parent_reader = None
+    parent_frames = None
     if parent_signal is not None and getattr(parent_signal, "data", None) is not None:
         source_plot = getattr(signal, "source_plot", None) or plot
-        parent_reader = _reader_for(source_plot, parent_signal, parent_signal.data)
-    reader = RecipeReader(signal, signal.data, parent_signal, parent_reader)
+        parent_frames = _CachedParentFrames(source_plot, parent_signal)
+        _grow_cache_for_window(source_plot, signal, parent_signal)
+    reader = RecipeReader(signal, signal.data, parent_signal, parent_frames)
     readers[key] = reader
     return reader
 

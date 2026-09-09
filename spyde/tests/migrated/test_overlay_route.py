@@ -18,13 +18,21 @@ import time
 import numpy as np
 import hyperspy.api as hs
 
-from spyde.array_cache import get_local_frame, reader_for_overlay
+from spyde.array_cache import reader_for_overlay
+from spyde.array_cache.readers.binary import BinaryReader
 from spyde.array_cache.readers.recipe import chain_reaches, evaluate
 from spyde.drawing.overlay_node import OverlaySignal
 from spyde.drawing.overlays import refresh_overlays
-from spyde.external.hyperspy.map_recipe import FrameRecipe
+from spyde.external.hyperspy.map_recipe import (
+    FrameRecipe, apply as apply_map_recipe, recipe_for,
+)
 from spyde.tests.migrated.conftest import _settle
+from spyde.tests.migrated.test_array_cache_binary_reader import _write_synthetic_mrc
 from spyde.tests.migrated.test_center_zero_beam import _signal_plot, _wait
+
+# The map wrapper is applied with the heavy imports in the real app; a test
+# that builds a mapped node itself has to ask for it. Idempotent.
+assert apply_map_recipe()
 
 BEAM = (18, 14)          # column, row of the un-centred disk
 CENTRE = (16.0, 16.0)    # where centring puts it on a 32x32 frame
@@ -53,6 +61,14 @@ def _indexed_lazy(nav=(8, 8), sig=(8, 8), chunk=4):
     signal = hs.signals.Signal2D(data).as_lazy()
     signal.data = signal.data.rechunk((chunk, chunk, -1, -1))
     signal.set_signal_type("electron_diffraction")
+    return signal
+
+
+def _spectra_lazy(nav=(4, 4), channels=16):
+    """A lazy spectrum image, for the curve group kind."""
+    data = np.tile(np.arange(channels, dtype=np.float32), nav + (1,))
+    signal = hs.signals.Signal1D(data).as_lazy()
+    signal.data = signal.data.rechunk((2, 2, -1))
     return signal
 
 
@@ -92,6 +108,12 @@ def _navigator_selectors(tree):
     return [sel for sels in manager.navigation_selectors.values() for sel in sels]
 
 
+def _move_navigator(session, tree):
+    for selector in _navigator_selectors(tree):
+        selector.delayed_update_data(force=True)
+    _settle(session)
+
+
 def _group_keys(plot, node):
     return [key for key in plot._overlay_groups if key[0] == id(node)]
 
@@ -127,9 +149,11 @@ class _RowStore:
 
     def __init__(self, rows):
         self._rows = rows
+        self.asked = []
 
     def at(self, *index):
-        return self._rows[tuple(index)]
+        self.asked.append(tuple(index))
+        return self._rows.get(tuple(index))
 
 
 class _ConstantReader:
@@ -145,6 +169,42 @@ class _ConstantReader:
 
     def read_frame(self, indices):
         return self.frame
+
+
+class _RampReader(_ConstantReader):
+    """A reader override whose frame value is the navigation position, so an
+    integrating region has a mean worth asserting on."""
+
+    def __init__(self, shape, dtype=np.float32):
+        super().__init__(None)
+        self.shape = shape
+        self.dtype = np.dtype(dtype)
+
+    def read_frame(self, indices):
+        return np.full(self.shape, float(sum(indices)), dtype=self.dtype)
+
+
+class _SummingReader(_RampReader):
+    """The same, with the block readers' ``sum_points`` fast path."""
+
+    def sum_points(self, points, accumulate_dtype):
+        total = np.zeros(self.shape, dtype=accumulate_dtype)
+        for row in np.asarray(points):
+            total += self.read_frame(tuple(int(v) for v in row))
+        return total
+
+
+class _ThreadRecorder:
+    """Wraps a bound method and records the thread each call ran on."""
+
+    def __init__(self, owner, name):
+        self.threads = []
+        self._wrapped = getattr(owner, name)
+        setattr(owner, name, self)
+
+    def __call__(self, *args, **kwargs):
+        self.threads.append(threading.current_thread().name)
+        return self._wrapped(*args, **kwargs)
 
 
 class TestRecipeSources:
@@ -167,6 +227,42 @@ class TestRecipeSources:
             output_name=None, output_shape=None, output_dtype=None,
         )
         assert chain_reaches(OverlaySignal(parent, recipe), parent)
+
+    def test_a_five_dimensional_store_is_asked_time_first(self):
+        signal = hs.signals.Signal2D(
+            np.zeros((3, 4, 5, 8, 8), dtype=np.float32)).as_lazy()
+        signal.data = signal.data.rechunk((1, 2, 2, -1, -1))
+        session, plot = _open_session(signal)
+        try:
+            tree = plot.signal_tree
+            store = _RowStore({(2, 1, 3): np.array([[7.0, 8.0]])})
+            node = tree.add_overlay(tree.root, lambda *, spots: spots,
+                                    name="spots", groups={}, source=False,
+                                    iterating={"spots": store})
+            value = reader_for_overlay(plot, node).read_frame((2, 1, 3))
+            assert store.asked == [(2, 1, 3)], store.asked
+            assert np.array_equal(value, [[7.0, 8.0]])
+        finally:
+            session.shutdown()
+
+    def test_a_ragged_map_node_evaluates_to_its_block_value(self):
+        signal = _indexed_lazy(nav=(4, 4), sig=(4, 4), chunk=2)
+
+        def spots(frame):
+            return np.array([[float(frame[0, 0]), 1.0], [2.0, 3.0]])
+
+        mapped = signal.map(spots, inplace=False, lazy_output=True, ragged=True)
+        recipe = recipe_for(mapped)
+        assert recipe is not None and recipe.output_shape is None
+
+        def parent_frame(index):
+            return np.asarray(signal.data[index].compute())
+
+        blocks = mapped.deepcopy()
+        blocks.compute()
+        for index in ((0, 0), (1, 2), (3, 3)):
+            value = evaluate(recipe, index, signal, parent_frame)
+            assert np.array_equal(value, blocks.data[index]), index
 
 
 class TestNavigationDepth:
@@ -198,21 +294,15 @@ class TestNavigationDepth:
         finally:
             session.shutdown()
 
-    def test_a_corner_position_gets_a_clipped_window(self):
+    def test_every_corner_is_clipped_on_the_sides_it_touches(self):
         session, plot = _open_session(_off_centre_lazy())
         try:
-            shape, centre = self._window_at(session, plot, (0, 0))
-            assert shape == (2, 2, 32, 32), shape
-            assert centre == (0, 0), centre
-        finally:
-            session.shutdown()
-
-    def test_the_far_corner_is_clipped_on_the_other_side(self):
-        session, plot = _open_session(_off_centre_lazy())
-        try:
-            shape, centre = self._window_at(session, plot, (7, 7))
-            assert shape == (2, 2, 32, 32), shape
-            assert centre == (1, 1), centre
+            corners = {(0, 0): (0, 0), (0, 7): (0, 1),
+                       (7, 0): (1, 0), (7, 7): (1, 1)}
+            for index, expected_centre in corners.items():
+                shape, centre = self._window_at(session, plot, index)
+                assert shape == (2, 2, 32, 32), (index, shape)
+                assert centre == expected_centre, (index, centre)
         finally:
             session.shutdown()
 
@@ -231,6 +321,40 @@ class TestNavigationDepth:
             reader_for_overlay(plot, node).read_frame((4, 4))
             expected = np.asarray(tree.root.data[3:6, 3:6].compute())
             assert np.array_equal(frames[0], expected)
+        finally:
+            session.shutdown()
+
+    def test_a_window_re_reads_only_the_frames_that_moved(self, tmp_path):
+        """On a memmap movie the reader keeps nothing, so a window that did not
+        go through the frame cache would read every frame again on every move."""
+        data = (np.arange(30 * 8 * 8, dtype=np.uint16).reshape(30, 8, 8))
+        path = str(tmp_path / "movie.mrc")
+        _write_synthetic_mrc(path, data)
+
+        session, plot = _open_session(hs.load(path, lazy=True))
+        try:
+            tree = plot.signal_tree
+
+            def take_centre(window, centre):
+                return {}
+
+            node = tree.add_overlay(tree.root, take_centre, name="window",
+                                    groups={}, depth=3)
+            reader = reader_for_overlay(plot, node)
+            reader.read_frame((10,))          # resolves the parent's reader
+
+            source = plot._local_transform_readers[id(tree.root)]
+            assert isinstance(source, BinaryReader), type(source).__name__
+            counter = _ThreadRecorder(source, "read_frame")
+
+            plot._array_cache.clear()
+            reader.read_frame((10,))
+            cold = len(counter.threads)
+            reader.read_frame((11,))
+            moved = len(counter.threads) - cold
+
+            assert cold == 7, cold
+            assert moved == 1, moved
         finally:
             session.shutdown()
 
@@ -279,13 +403,118 @@ class TestOverlayNodeLifecycle:
         finally:
             session.shutdown()
 
+    def test_a_plot_opened_after_the_overlay_still_draws_it(self):
+        session, plot = _open_session(_off_centre_lazy())
+        try:
+            tree = plot.signal_tree
+            node = tree.add_overlay(
+                tree.root,
+                lambda frame: {"found": np.array([[4.0, 5.0]], dtype=np.float32)},
+                name="markers", groups={"found": ("circles", {"radius": 3.0})})
+
+            tree.add_signal_plot()
+            later = tree.signal_plots[-1]
+            assert later is not plot
+            assert _group_keys(later, node) == []
+
+            refresh_overlays(later, _navigator_selectors(tree)[0].current_indices)
+            assert _wait(lambda: (id(node), "found") in later._overlay_groups, 10)
+            group = later._overlay_groups[(id(node), "found")]
+            assert _wait(lambda: len(np.asarray(group._data["offsets"])) == 1, 10)
+        finally:
+            session.shutdown()
+
+
+class TestGroupKinds:
+    """Every kind pushes on the painter thread and clears on a missing value."""
+
+    def _draw_and_clear(self, session, plot, node, recorder, value):
+        plot.enqueue_overlay(node, value)
+        assert _wait(lambda: recorder.threads, 10), "the value never drew"
+        assert set(recorder.threads) == {"nav-paint"}, recorder.threads
+        drawn = len(recorder.threads)
+        plot.enqueue_overlay(node, {})
+        assert _wait(lambda: len(recorder.threads) > drawn, 10), "the clear never ran"
+        assert set(recorder.threads) == {"nav-paint"}, recorder.threads
+
+    def test_lines_and_arrows_and_layer_and_transform(self):
+        session, plot = _open_session(_off_centre_lazy())
+        try:
+            tree = plot.signal_tree
+            node = tree.add_overlay(
+                tree.root, lambda frame: {}, name="kinds",
+                groups={"bands": ("lines", {"linewidths": 1.0}),
+                        "vectors": ("arrows", {}),
+                        "sheet": ("layer", {"alpha": 0.5}),
+                        "detector": ("transform", {})})
+
+            bands = plot._overlay_groups[(id(node), "bands")]
+            self._draw_and_clear(session, plot, node, _ThreadRecorder(bands, "set"),
+                                 {"bands": np.array([[[0.0, 0.0], [4.0, 4.0]]])})
+            assert len(np.asarray(bands._data["segments"])) == 0
+
+            arrows = plot._overlay_groups[(id(node), "vectors")]
+            self._draw_and_clear(
+                session, plot, node, _ThreadRecorder(arrows, "set"),
+                {"vectors": (np.array([[1.0, 2.0]]), np.array([3.0]),
+                             np.array([4.0]))})
+            assert len(np.asarray(arrows._data["offsets"])) == 0
+
+            # A layer is built on its first image, so record the push after
+            # that, and a cleared layer is hidden rather than redrawn empty.
+            plot.enqueue_overlay(node, {"sheet": np.zeros((32, 32), np.float32)})
+            assert _wait(lambda: plot._overlay_groups[(id(node), "sheet")] is not None,
+                         10)
+            sheet = plot._overlay_groups[(id(node), "sheet")]
+            pushed = _ThreadRecorder(sheet, "set_data")
+            plot.enqueue_overlay(node, {"sheet": np.ones((32, 32), np.float32)})
+            assert _wait(lambda: pushed.threads, 10), "the layer never drew"
+            assert set(pushed.threads) == {"nav-paint"}, pushed.threads
+            hidden = _ThreadRecorder(sheet, "set")
+            plot.enqueue_overlay(node, {})
+            assert _wait(lambda: hidden.threads, 10), "the layer never cleared"
+            assert set(hidden.threads) == {"nav-paint"}, hidden.threads
+
+            painted = _ThreadRecorder(plot, "set_transform_image")
+            plot.enqueue_overlay(node, {"detector": np.ones((32, 32), np.float32)})
+            assert _wait(lambda: painted.threads, 10)
+            assert set(painted.threads) == {"nav-paint"}, painted.threads
+            assert plot._fv_transform_active
+            plot.enqueue_overlay(node, {})
+            assert _wait(lambda: not plot._fv_transform_active, 10)
+        finally:
+            session.shutdown()
+
+    def test_curves_grow_and_trim_with_the_value(self):
+        session, plot = _open_session(_spectra_lazy())
+        try:
+            tree = plot.signal_tree
+            node = tree.add_overlay(tree.root, lambda frame: {}, name="model",
+                                    groups={"components": ("curves", {})})
+            x = np.arange(16, dtype=float)
+
+            plot.enqueue_overlay(node, {"components": [(x, x), (x, 2 * x)]})
+            key = (id(node), "components")
+            assert _wait(lambda: len(plot._overlay_groups[key]) == 2, 10), \
+                plot._overlay_groups[key]
+
+            drawn = _ThreadRecorder(plot._overlay_groups[key][0], "set_data")
+            plot.enqueue_overlay(node, {"components": [(x, 3 * x)]})
+            assert _wait(lambda: len(plot._overlay_groups[key]) == 1, 10)
+            assert set(drawn.threads) == {"nav-paint"}, drawn.threads
+
+            plot.enqueue_overlay(node, {})
+            assert _wait(lambda: len(plot._overlay_groups[key]) == 0, 10)
+        finally:
+            session.shutdown()
+
 
 class TestWhereTheWorkRuns:
     def test_a_move_evaluates_on_the_dispatcher_and_draws_on_the_painter(self):
         session, plot = _open_session(_off_centre_lazy())
         try:
             tree = plot.signal_tree
-            evaluated, drawn = [], []
+            evaluated = []
 
             def offsets(frame):
                 evaluated.append(threading.current_thread().name)
@@ -294,44 +523,58 @@ class TestWhereTheWorkRuns:
             node = tree.add_overlay(tree.root, offsets, name="markers",
                                     groups={"found": ("circles", {"radius": 3.0})})
             group = plot._overlay_groups[(id(node), "found")]
-            push = group.set
+            drawn = _ThreadRecorder(group, "set")
 
-            def recording_set(**kwargs):
-                drawn.append(threading.current_thread().name)
-                push(**kwargs)
+            _move_navigator(session, tree)
 
-            group.set = recording_set
-
-            for selector in _navigator_selectors(tree):
-                selector.delayed_update_data(force=True)
-            _settle(session)
-
-            assert _wait(lambda: evaluated and drawn, 10), (evaluated, drawn)
+            assert _wait(lambda: evaluated and drawn.threads, 10), \
+                (evaluated, drawn.threads)
             assert set(evaluated) == {"nav-dispatch"}, evaluated
-            assert set(drawn) == {"nav-paint"}, drawn
+            assert set(drawn.threads) == {"nav-paint"}, drawn.threads
             assert np.array_equal(np.asarray(group._data["offsets"]),
                                   np.array([[4.0, 5.0]], dtype=np.float32))
         finally:
             session.shutdown()
 
-    def test_an_expensive_child_leaves_the_dispatcher_at_once(self):
+    def test_a_value_draws_on_the_painter_with_no_base_frame(self):
         session, plot = _open_session(_off_centre_lazy())
         try:
             tree = plot.signal_tree
+            node = tree.add_overlay(tree.root, lambda frame: {}, name="markers",
+                                    groups={"found": ("circles", {"radius": 3.0})})
+            group = plot._overlay_groups[(id(node), "found")]
+            drawn = _ThreadRecorder(group, "set")
+
+            plot.current_data = None
+            plot.enqueue_overlay(
+                node, {"found": np.array([[1.0, 2.0]], dtype=np.float32)})
+            assert _wait(lambda: drawn.threads, 10), "the value never drew"
+            assert set(drawn.threads) == {"nav-paint"}, drawn.threads
+        finally:
+            session.shutdown()
+
+    def _blocking_overlay(self, tree, painted, gate):
+        """An expensive overlay whose FIRST evaluation blocks on ``gate``."""
+        calls = itertools.count()
+
+        def blocking(frame, *, wait_for):
+            call = next(calls)
+            if call == 0:
+                wait_for.wait(20)
+            return {"found": np.array([[float(call), 0.0]], dtype=np.float32)}
+
+        return tree.add_overlay(
+            tree.root, blocking, name="slow", expensive=True,
+            groups={"found": ("circles", {"radius": 3.0})},
+            static={"wait_for": gate}, on_value=painted.append)
+
+    def test_an_expensive_child_leaves_the_dispatcher_at_once(self):
+        session, plot = _open_session(_off_centre_lazy())
+        gate = threading.Event()
+        try:
+            tree = plot.signal_tree
             painted = []
-            release = threading.Event()
-            calls = itertools.count()
-
-            def blocking(frame, *, gate):
-                call = next(calls)
-                if call == 0:
-                    gate.wait(20)
-                return {"found": np.array([[float(call), 0.0]], dtype=np.float32)}
-
-            node = tree.add_overlay(
-                tree.root, blocking, name="slow", expensive=True,
-                groups={"found": ("circles", {"radius": 3.0})},
-                static={"gate": release}, on_value=painted.append)
+            node = self._blocking_overlay(tree, painted, gate)
             indices = _navigator_selectors(tree)[0].current_indices
 
             # Resolve the reader first: what is being timed is a navigator MOVE,
@@ -344,78 +587,104 @@ class TestWhereTheWorkRuns:
             refresh_overlays(plot, indices)
             elapsed = time.perf_counter() - started
             assert elapsed < 0.002, elapsed
+            assert not painted, painted
 
+            gate.set()
             assert _wait(lambda: painted, 10), painted
-            assert np.array_equal(painted[-1]["found"],
-                                  np.array([[1.0, 0.0]], dtype=np.float32)), painted
         finally:
-            release.set()
+            gate.set()
             session.shutdown()
 
     def test_a_superseded_expensive_future_does_not_paint(self):
         session, plot = _open_session(_off_centre_lazy())
+        gate = threading.Event()
         try:
             tree = plot.signal_tree
             painted = []
-            release = threading.Event()
-            calls = itertools.count()
-
-            def blocking(frame, *, gate):
-                call = next(calls)
-                if call == 0:
-                    gate.wait(20)
-                return {"found": np.array([[float(call), 0.0]], dtype=np.float32)}
-
-            node = tree.add_overlay(
-                tree.root, blocking, name="slow", expensive=True,
-                groups={"found": ("circles", {"radius": 3.0})},
-                static={"gate": release}, on_value=painted.append)
+            node = self._blocking_overlay(tree, painted, gate)
             indices = _navigator_selectors(tree)[0].current_indices
 
             reader_for_overlay(plot, node)
             refresh_overlays(plot, indices)
             assert _wait(lambda: plot._overlay_futures.get(id(node)) is not None, 5)
             refresh_overlays(plot, indices)
-            assert _wait(lambda: painted, 10), painted
 
-            release.set()
+            gate.set()
+            assert _wait(lambda: painted, 10), painted
             time.sleep(0.3)
-            first_call = np.array([[0.0, 0.0]], dtype=np.float32)
-            assert not any(np.array_equal(value["found"], first_call)
+            superseded = np.array([[0.0, 0.0]], dtype=np.float32)
+            assert not any(np.array_equal(value["found"], superseded)
                            for value in painted), painted
         finally:
-            release.set()
+            gate.set()
+            session.shutdown()
+
+    def test_a_hidden_child_does_not_draw_when_its_future_lands(self):
+        session, plot = _open_session(_off_centre_lazy())
+        gate = threading.Event()
+        try:
+            tree = plot.signal_tree
+            painted = []
+            node = self._blocking_overlay(tree, painted, gate)
+            group = plot._overlay_groups[(id(node), "found")]
+            indices = _navigator_selectors(tree)[0].current_indices
+
+            reader_for_overlay(plot, node)
+            refresh_overlays(plot, indices)
+            assert _wait(lambda: plot._overlay_futures.get(id(node)) is not None, 5)
+
+            tree.set_overlay_visible(node, False)
+            gate.set()
+            time.sleep(0.5)
+
+            assert painted == [], painted
+            assert len(np.asarray(group._data["offsets"])) == 0
+        finally:
+            gate.set()
             session.shutdown()
 
 
 class TestReaderOverride:
-    def test_an_override_serves_the_frame(self):
+    def test_an_override_serves_the_displayed_frame(self):
         session, plot = _open_session(_off_centre_lazy())
         try:
             tree = plot.signal_tree
-            signal = tree.root
             frame = np.full((32, 32), 7.0, dtype=np.float32)
-            tree.set_reader_override(signal, _ConstantReader(frame))
-            assert np.array_equal(
-                get_local_frame(plot, signal, signal.data, (2, 3)), frame)
+            tree.set_reader_override(tree.root, _ConstantReader(frame))
+            _move_navigator(session, tree)
+            assert _wait(lambda: np.array_equal(plot.current_data, frame), 10), \
+                plot.current_data
 
-            tree.set_reader_override(signal, None)
-            assert not np.array_equal(
-                get_local_frame(plot, signal, signal.data, (2, 3)), frame)
+            tree.set_reader_override(tree.root, None)
+            _move_navigator(session, tree)
+            assert _wait(lambda: not np.array_equal(plot.current_data, frame), 10)
         finally:
             session.shutdown()
 
-    def test_a_frame_the_override_has_no_value_for_is_not_cached(self):
+    def test_no_frame_from_the_override_keeps_the_last_one(self):
         session, plot = _open_session(_off_centre_lazy())
         try:
             tree = plot.signal_tree
-            signal = tree.root
-            tree.set_reader_override(signal, _ConstantReader(None))
+            _move_navigator(session, tree)
+            before = np.asarray(plot.current_data).copy()
 
-            assert get_local_frame(plot, signal, signal.data, (2, 3)) is None
-            assert not plot._array_cache.is_resident(id(signal), (2, 3))
+            tree.set_reader_override(tree.root, _ConstantReader(None))
+            _move_navigator(session, tree)
+            time.sleep(0.3)
+            assert np.array_equal(plot.current_data, before)
         finally:
             session.shutdown()
+
+    def test_a_region_integrates_through_the_override(self):
+        from spyde.drawing.update_functions import _read_through_override
+
+        signal = _off_centre_lazy()
+        points = np.array([[0, 0], [1, 1], [2, 2], [3, 3]])
+        expected = np.full((4, 4), 3.0, dtype=np.float32)   # mean of 0, 2, 4, 6
+
+        for override in (_RampReader((4, 4)), _SummingReader((4, 4))):
+            got = _read_through_override(override, signal, points)
+            assert np.array_equal(got, expected), type(override).__name__
 
 
 class TestNodeSwitch:
@@ -434,9 +703,7 @@ class TestNodeSwitch:
                 name="markers", groups={"found": ("circles", {"radius": 3.0})})
             group = plot._overlay_groups[(id(node), "found")]
 
-            for selector in _navigator_selectors(tree):
-                selector.delayed_update_data(force=True)
-            _settle(session)
+            _move_navigator(session, tree)
             assert _wait(lambda: len(np.asarray(group._data["offsets"])) == 1, 10)
 
             plot.set_plot_state(sibling)
