@@ -16,12 +16,11 @@ HOW
     ``integrate_plane(path, backend, f0, f0 + 1, bin, dtype)`` — the very call
     the plane stack itself is built from. Same binning, same shape, same cache.
 
-    It is installed by swapping the child's entry in ``selector.children``,
-    which is the seam the vectors tree already uses to COMPUTE a frame rather
-    than slice one; ``_run_update`` paints whatever the function returns. So
-    nothing in the navigator read path changes — the point selector is simply
-    pointed at a different producer while raw mode is on, and back again when
-    it is off.
+    That makes it a reader rather than a slice, so raw mode pins
+    :class:`RawFrameReader` on the tree for the signal the selector's windows
+    display and unpins it again when the mode goes off. Nothing in the
+    navigator read path changes: the read asks the tree which reader answers
+    for the displayed node, and while raw mode is on this one does.
 
 COST
     Bounded and known. The plane readback is ~27 ms and does not depend on the
@@ -66,77 +65,77 @@ def raw_frames_per_plane(signal) -> int:
     if not meta:
         return 0
     try:
-        fpp = list(meta.get("frames_per_plane") or [])
+        frames_per_plane = list(meta.get("frames_per_plane") or [])
     except Exception:
         return 0
-    if not fpp:
+    if not frames_per_plane:
         return 0
-    n = int(fpp[0])
-    return n if n > 1 else 0
+    count = int(frames_per_plane[0])
+    return count if count > 1 else 0
 
 
-def raw_frame_update(selector, child, indices, get_result: bool = False):
-    """Return ONE raw camera frame for the plane under *indices*.
+class RawFrameReader:
+    """One raw camera frame of the plane under a navigation position.
 
-    Returning None lets `_run_update` skip the paint and leave the last good
-    frame up, which is what should happen if this is ever installed on a
-    signal that cannot serve it.
+    ``selector`` supplies ``raw_frame_offset``, which frame within the plane to
+    read, so a caret can walk a plane's own frames without this changing.
     """
-    try:
-        signal = child.plot_state.current_signal
-    except Exception as e:
-        log.debug("raw frame: no current signal (%s)", e)
-        return None
 
-    meta = _csb_meta(signal)
-    if not meta:
-        return None
+    def __init__(self, selector, signal):
+        self.selector = selector
+        self.signal = signal
 
-    try:
-        bounds = meta["plane_frame_bounds"]
-        plane = int(np.ravel(np.asarray(indices))[0])
-        plane = max(0, min(plane, len(bounds) - 1))
-        f0 = int(bounds[plane][0])
-        # Which frame WITHIN the plane, so the caret can walk across a plane's
-        # own frames later without this needing to change.
-        offset = int(getattr(selector, "raw_frame_offset", 0) or 0)
-        f1 = int(bounds[plane][1])
-        f0 = min(f0 + max(0, offset), f1 - 1)
+    @property
+    def frame_bytes(self) -> int:
+        data = self.signal.data
+        navigation_dimension = self.signal.axes_manager.navigation_dimension
+        return (int(np.prod(data.shape[navigation_dimension:]))
+                * data.dtype.itemsize)
 
-        from spyde.external.rsciio_csb._api import integrate_plane
-        img = integrate_plane(str(meta["path"]), str(meta.get("backend", "auto")),
-                              f0, f0 + 1, int(meta.get("bin", 1) or 1),
-                              signal.data.dtype)
-    except Exception as e:
-        log.debug("raw frame read failed: %s", e)
-        return None
+    def read_frame(self, indices):
+        """The raw frame at ``indices``, or None when this signal cannot serve
+        one, so the navigator paints nothing and the last frame stays up."""
+        meta = _csb_meta(self.signal)
+        if not meta:
+            return None
+        try:
+            bounds = meta["plane_frame_bounds"]
+            plane = int(np.ravel(np.asarray(indices))[0])
+            plane = max(0, min(plane, len(bounds) - 1))
+            first, last = int(bounds[plane][0]), int(bounds[plane][1])
+            offset = int(getattr(self.selector, "raw_frame_offset", 0) or 0)
+            first = min(first + max(0, offset), last - 1)
 
-    arr = np.asarray(img)
-    return arr[0] if arr.ndim == 3 else arr
+            from spyde.external.rsciio_csb._api import integrate_plane
+            image = integrate_plane(
+                str(meta["path"]), str(meta.get("backend", "auto")),
+                first, first + 1, int(meta.get("bin", 1) or 1),
+                self.signal.data.dtype)
+        except Exception as e:
+            log.debug("raw frame read failed: %s", e)
+            return None
+
+        frame = np.asarray(image)
+        return frame[0] if frame.ndim == 3 else frame
 
 
 def install(selector, on: bool) -> bool:
-    """Point *selector*'s children at the raw-frame producer, or back.
+    """Read one raw camera frame under *selector*'s point, or go back to the
+    integrated plane. Returns True when the selector ends up in raw mode.
 
-    Returns True when the selector ends up in raw mode. The default function
-    is stashed per child rather than assumed, so a selector that already had a
-    custom producer (a vectors tree's render hook) gets its own back.
+    Turning raw off releases only a reader this put there, so a window whose
+    frames come from somewhere else entirely keeps answering the way it did.
     """
     inner = getattr(selector, "selector", None) or selector
-    if on:
-        saved = getattr(inner, "_pre_raw_children", None)
-        if saved is None:
-            inner._pre_raw_children = dict(inner.children)
-        for chld in list(inner.children):
-            inner.children[chld] = raw_frame_update
-        inner.raw_frame = True
-        return True
-
-    saved = getattr(inner, "_pre_raw_children", None)
-    if saved:
-        for chld, fn in saved.items():
-            if chld in inner.children:
-                inner.children[chld] = fn
-    inner._pre_raw_children = None
-    inner.raw_frame = False
-    return False
+    for child in list(inner.children):
+        tree = getattr(child, "signal_tree", None)
+        state = getattr(child, "plot_state", None)
+        signal = getattr(state, "current_signal", None) if state is not None else None
+        if tree is None or signal is None:
+            continue
+        if on:
+            tree.set_reader_override(signal, RawFrameReader(selector, signal))
+        elif isinstance(tree.reader_override_for(signal), RawFrameReader):
+            tree.set_reader_override(signal, None)
+    inner.raw_frame = bool(on)
+    return bool(on)

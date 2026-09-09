@@ -1048,7 +1048,7 @@ export interface WizardEventMessage extends MsgBase {
 // ── MDI image layering (overlay) ────────────────────────────────────────────
 
 /** One layer's appearance, as tracked by the backend (`spyde/actions/overlay.py`
- *  `PlotLayer.to_state`). */
+ *  `_layer_state`). */
 export interface LayerState {
   id: string
   title: string

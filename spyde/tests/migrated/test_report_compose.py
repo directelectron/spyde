@@ -894,18 +894,11 @@ class TestLayeredAddToReport:
         sig_wid = _signal_wid(session)
         sig_plot = session._plot_by_window_id(sig_wid)
 
-        # Fake a second same-shape source and a live layer on the signal plot,
-        # WITHOUT anyplotlib (headless): construct the PlotLayer directly with a
-        # stub handle, so _snapshot_plot serializes it.
-        class _StubHandle:
-            id = "Lx"
-            def set_data(self, f):
-                pass
-
+        # Fake a second same-shape source and add a live layer node reading it,
+        # so _snapshot_plot serializes the layer without a real second window.
         class _StubSource:
             def __init__(self, frame):
                 self.current_data = frame
-                self._layers = []
                 self.view_label = "Overlay Src"
                 self.is_navigator = False
                 self.signal_tree = sig_plot.signal_tree
@@ -921,9 +914,12 @@ class TestLayeredAddToReport:
 
         src_frame = np.asarray(sig_plot.current_data, dtype=np.float32) + 1.0
         stub_src = _StubSource(src_frame)
-        sig_plot._layers = [ov.PlotLayer(
-            layer_id="Lx", source_plot=stub_src, cmap="magma", alpha=0.5,
-            clim=None, visible=True, handle=_StubHandle(), title="Overlay Src")]
+        sig_plot.signal_tree.add_overlay(
+            sig_plot.plot_state.current_signal, ov.layer_frame,
+            name=ov.LAYER_GROUP, groups={ov.LAYER_GROUP: (ov.LAYER_GROUP, {})},
+            static={"appearance": {"cmap": "magma", "alpha": 0.5, "clim": None}},
+            source=True, source_plot=stub_src, target_plot=sig_plot,
+            expensive=True)
 
         h.report_new(session, None, {})
         h.report_add_figure(session, None, {"source_window_id": sig_wid})

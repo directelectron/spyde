@@ -50,6 +50,11 @@ def refresh_overlays(plot, indices, settle: bool = False) -> None:
     for node in children:
         if not node.visible:
             continue
+        # An overlay put on one window (an image layer) draws there only; one
+        # that belongs to the node draws on every window showing it.
+        target = getattr(node.signal, "target_plot", None)
+        if target is not None and target is not plot:
+            continue
         try:
             reader = reader_for_overlay(plot, node)
             if node.expensive:

@@ -361,22 +361,37 @@ class _CachedParentFrames:
     position, so it has to go through the cache the base frame uses rather
     than straight at the reader: a memmap reader keeps nothing, and a 7x7
     window would be 49 disk reads on every move instead of the 7 that
-    actually moved."""
+    actually moved.
 
-    def __init__(self, plot, signal):
+    ``follow_display`` re-resolves the signal on every read, for frames that
+    come from another window: that window can switch to another node while the
+    overlay is drawn, and the overlay follows what it shows."""
+
+    def __init__(self, plot, signal, follow_display: bool = False):
         self.plot = plot
         self.signal = signal
         self.data = signal.data
+        self.follow_display = follow_display
+
+    def _displayed(self):
+        if not self.follow_display:
+            return self.signal, self.data
+        state = getattr(self.plot, "plot_state", None)
+        signal = getattr(state, "current_signal", None)
+        if signal is None:
+            return self.signal, self.data
+        return signal, signal.data
 
     def read_frame(self, indices):
-        frame = get_local_frame(self.plot, self.signal, self.data, indices)
+        signal, data = self._displayed()
+        frame = get_local_frame(self.plot, signal, data, indices)
         if frame is not None:
             return frame
         # The locality gate rejects this parent (a console-made or untagged
         # node). Its footprint is its dask block, so read the block and keep
         # the frame: correct and slow beats an overlay that draws nothing.
-        reader = _reader_for(self.plot, self.signal, self.data)
-        return self.plot._array_cache.get_frame(id(self.signal), reader, indices)
+        reader = _reader_for(self.plot, signal, data)
+        return self.plot._array_cache.get_frame(id(signal), reader, indices)
 
 
 def _grow_cache_for_window(plot, signal, parent_signal) -> None:
@@ -408,8 +423,9 @@ def reader_for_overlay(plot, node):
     The source frame comes from the node's parent through the frame cache, so
     an overlay costs the function and nothing else: the frame is already
     decoded for the base display. An overlay whose signal names a
-    ``source_plot`` reads on THAT plot, which is how a layer sourced from
-    another window reads through the other window's blocks."""
+    ``source_plot`` reads THAT plot's displayed signal through THAT plot's
+    readers, which is how a layer sourced from another window reads through
+    the other window's blocks."""
     from .readers.recipe import RecipeReader
 
     signal = node.signal
@@ -421,11 +437,22 @@ def reader_for_overlay(plot, node):
 
     parent = getattr(node, "parent", None)
     parent_signal = getattr(parent, "signal", None)
+    # Without a source plot the frame is the node's parent, read on the plot
+    # drawing the overlay. With one it is whatever that window displays, which
+    # need not be in this tree at all.
+    source_plot = getattr(signal, "source_plot", None)
+    frame_plot = plot if source_plot is None else source_plot
+    frame_signal = parent_signal
+    if source_plot is not None:
+        state = getattr(source_plot, "plot_state", None)
+        displayed = getattr(state, "current_signal", None)
+        if displayed is not None:
+            frame_signal = displayed
     parent_frames = None
-    if parent_signal is not None and getattr(parent_signal, "data", None) is not None:
-        source_plot = getattr(signal, "source_plot", None) or plot
-        parent_frames = _CachedParentFrames(source_plot, parent_signal)
-        _grow_cache_for_window(source_plot, signal, parent_signal)
+    if frame_signal is not None and getattr(frame_signal, "data", None) is not None:
+        parent_frames = _CachedParentFrames(frame_plot, frame_signal,
+                                            follow_display=source_plot is not None)
+        _grow_cache_for_window(frame_plot, signal, frame_signal)
     reader = RecipeReader(signal, signal.data, parent_signal, parent_frames)
     readers[key] = reader
     return reader

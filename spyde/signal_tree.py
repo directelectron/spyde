@@ -1210,7 +1210,7 @@ class BaseSignalTree:
 
     def add_overlay(self, parent_signal, function, *, name: str, groups: dict,
                     static: dict = None, iterating: dict = None, depth=0,
-                    source: bool = True, source_plot=None,
+                    source: bool = True, source_plot=None, target_plot=None,
                     expensive: bool = False, on_value=None) -> SignalNode:
         """Add a child of ``parent_signal`` that is drawn on the windows
         showing it, evaluated at the navigator's position.
@@ -1229,8 +1229,10 @@ class BaseSignalTree:
         is for a function that reads no frame at all (see
         :class:`~spyde.external.hyperspy.map_recipe.FrameRecipe`).
         ``source_plot`` reads the frame through another window's readers.
-        ``expensive`` runs the function off the navigator thread as one
-        cancellable future. ``on_value`` receives each drawn value.
+        ``target_plot`` draws on that window alone instead of on every window
+        showing ``parent_signal``. ``expensive`` runs the function off the
+        navigator thread as one cancellable future. ``on_value`` receives each
+        drawn value.
         """
         from spyde.drawing.overlay_node import OverlaySignal
         from spyde.external.hyperspy.map_recipe import FrameRecipe
@@ -1251,7 +1253,8 @@ class BaseSignalTree:
                   else int(depth),
         )
         node = SignalNode(
-            signal=OverlaySignal(parent_signal, recipe, source_plot=source_plot),
+            signal=OverlaySignal(parent_signal, recipe, source_plot=source_plot,
+                                 target_plot=target_plot),
             name=self._unique_child_name(parent_node, name),
             parent=parent_node,
             transformation=name,
@@ -1263,7 +1266,8 @@ class BaseSignalTree:
             on_value=on_value,
         )
         parent_node.children[node.name] = node
-        for plot in list(self.signal_plots):
+        plots = [target_plot] if target_plot is not None else list(self.signal_plots)
+        for plot in plots:
             for group_name, (kind, style) in node.groups.items():
                 plot.ensure_overlay_group(node, group_name, kind, style)
         return node
@@ -1463,7 +1467,7 @@ class BaseSignalTree:
         # is referenced anywhere. Closing the source would then free nothing.
         for attr in ("diffraction_vectors", "orientation_map", "vector_orientation",
                      "_vom_field", "_ipf_result", "_ipf_p3d", "_ipf_picker",
-                     "_ipf_window", "_ipf_pick_fn", "_render_frame_fn",
+                     "_ipf_window", "_ipf_pick_fn",
                      "particles", "_seg_pending_particles", "particle_events",
                      "particle_edits", "nav_traces", "drift",
                      "source_node", "source_tree", "nav_map"):

@@ -1581,13 +1581,12 @@ def _snapshot_plot(plot) -> "tuple[FigureSpec, dict] | None":
     ``color``/``linewidth``/``label`` are read from the live anyplotlib 1-D
     state when reachable (see :func:`_snapshot_line_state`). Extra overlay
     curves (``plot._plot1d``'s ``extra_lines``) become extra LayerSpecs when
-    their y-data is cleanly readable; MDI overlay-LAYER harvesting
-    (``plot._layers``, the 2-D compositing path) does NOT apply to a 1-D plot
-    and is skipped entirely.
+    their y-data is cleanly readable; MDI overlay-LAYER harvesting (the 2-D
+    compositing path) does NOT apply to a 1-D plot and is skipped entirely.
 
-    If the plot carries live MDI overlay layers (``plot._layers``, 2-D only),
-    each is serialized into the same panel as an extra LayerSpec (same
-    cmap / alpha, its own source ref) with its current frame in the snapshot
+    If the plot carries live MDI overlay layers (2-D only), each is serialized
+    into the same panel as an extra LayerSpec (same cmap / alpha, its own
+    source ref) with its current frame in the snapshot
     map — so "Add to report" on a layered plot captures the whole composite.
     Returns None when the plot has no paintable base frame."""
     data = getattr(plot, "current_data", None)
@@ -1651,16 +1650,20 @@ def _snapshot_plot(plot) -> "tuple[FigureSpec, dict] | None":
     snap_map = {("p1", base_layer.id): arr}
 
     # Live MDI overlay layers → extra LayerSpecs on the same panel (base + overlays).
-    for live in list(getattr(plot, "_layers", None) or []):
-        src = getattr(live, "source_plot", None)
+    from spyde.actions.overlay import layer_appearance, layer_nodes, layer_source_plot
+
+    for node in layer_nodes(plot):
+        src = layer_source_plot(node)
         frame = getattr(src, "current_data", None) if src is not None else None
         if not isinstance(frame, np.ndarray) or frame.dtype == object or frame.ndim != 2:
             continue
+        appearance = layer_appearance(node)
+        clim = appearance.get("clim")
         ov = LayerSpec(source=(SignalRef.from_plot(src) if src is not None else SignalRef()),
-                       cmap=str(getattr(live, "cmap", "magma")),
-                       clim=(list(live.clim) if getattr(live, "clim", None) else None),
-                       alpha=float(getattr(live, "alpha", 0.5)),
-                       visible=bool(getattr(live, "visible", True)))
+                       cmap=str(appearance.get("cmap", "magma")),
+                       clim=(list(clim) if clim else None),
+                       alpha=float(appearance.get("alpha", 0.5)),
+                       visible=bool(node.visible))
         layers.append(ov)
         snap_map[("p1", ov.id)] = np.array(frame, copy=True)
 

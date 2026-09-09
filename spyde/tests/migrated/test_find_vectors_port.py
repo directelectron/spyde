@@ -76,12 +76,10 @@ class TestFindVectorsPort:
             # found-vectors marker overlay tracking its count-map navigator.
             iy, ix = map(int, np.argwhere(cm > 0)[0])
 
-            # (a) The navigator now slices via an IN-PROCESS render_frame function
-            # (Qt parity, no async lazy/shm path), so the signal plot paints the
-            # rendered disks directly — NOT the placeholder zeros.
+            # (a) The navigator reads through an in-process renderer pinned on
+            # the result tree, so the signal plot paints the rendered disks
+            # directly, not the placeholder zeros.
             sp = vtree.signal_plots[0]
-            sel = next(s for s in vtree.navigator_plot_manager.all_navigation_selectors
-                       if sp in s.children)
             def _peak(rendered) -> float:
                 """Brightest pixel, or -1 for anything that is not an array of
                 numbers — `None`, or the length-1 object array hyperspy wraps an
@@ -104,20 +102,22 @@ class TestFindVectorsPort:
             # the batch also emits "Finding diffraction vectors…" when it
             # STARTS, so matching the substring alone matches the start message
             # and waits for nothing at all. (It did: this assertion then fired
-            # on windows-py3.13 with the live preview's slice function still
-            # installed, which is exactly right for mid-compute.)
+            # on windows-py3.13 with the live preview still answering the read,
+            # which is exactly right for mid-compute.)
             assert _wait(lambda: any(
                 isinstance(m, dict)
                 and str(m.get("text", "")).startswith("Found ")
                 and "diffraction vectors" in str(m.get("text", ""))
                 for m in captured_messages)), \
                 "the batch never reported that it had finished"
-            # Which makes the two halves separable: is the renderer installed,
-            # and does it draw? A pixel poll could not tell those apart.
-            assert sel.children.get(sp) is getattr(vtree, "_render_frame_fn", None), \
-                "the result window's renderer was never installed"
-            frame = sel.children[sp](sel, sp, np.array([[ix, iy]]))
-            assert _peak(frame) > 0, "the installed renderer still draws zeros"
+            # Which makes the two halves separable: is the renderer pinned, and
+            # does it draw? A pixel poll could not tell those apart.
+            from spyde.actions.find_vectors_action import RenderedVectorsReader
+            reader = vtree.reader_override_for(sp.plot_state.current_signal)
+            assert isinstance(reader, RenderedVectorsReader), \
+                "the result window's renderer was never pinned"
+            frame = reader.read_frame((iy, ix))
+            assert _peak(frame) > 0, "the pinned renderer still draws zeros"
 
             # (b) A found-vectors overlay is attached to the result window and
             # yields markers at a position that actually has vectors.

@@ -106,17 +106,6 @@ class _NavPainter:
                     # to. No-op when the plot has no overlays.
                     if getattr(plot, "_pending_overlay_values", None):
                         plot._apply_pending_overlays()
-                    # Apply any pending MDI-overlay layer frames RIGHT AFTER the base
-                    # paint, still on this ONE painter thread — so every layer
-                    # set_data → stdout push stays serialized behind the base push
-                    # (mirrors the base read/paint decouple). No-op when the plot has
-                    # no layers / nothing pending.
-                    if getattr(plot, "_pending_layer_frames", None):
-                        try:
-                            from spyde.actions.overlay import _apply_pending_layer_frames
-                            _apply_pending_layer_frames(plot)
-                        except Exception as e:
-                            logger.debug("applying pending layer frames failed: %s", e)
                 except Exception as e:
                     logger.debug("nav paint failed: %s", e)
             for plot in overlay_only.values():
@@ -341,13 +330,6 @@ class Plot:
         # the GPU. Lazily built on the first large frame (_maybe_gpu_tile); reset on a
         # node switch / close so a new signal rebuilds it. None = not tiling yet.
         self._gpu_tile_backend = None
-        # MDI live overlay layers (Report Phase 2): a list of spyde.actions.overlay
-        # PlotLayer, each an anyplotlib Layer over this plot's base image, refreshed
-        # from its own source on every navigator move. Empty by default (the fast
-        # non-layered path guards on this being falsy). _pending_layer_frames stages
-        # freshly-read layer frames for the painter thread to push.
-        self._layers: list = []
-        self._pending_layer_frames = None
         # Overlay children of the displayed node (spyde.drawing.overlays).
         # _overlay_groups holds one anyplotlib primitive per (node, group
         # name); _pending_overlay_values stages values for the painter thread;
@@ -1024,16 +1006,20 @@ class Plot:
         # node switch / recompute that changes the frame shape must therefore drop
         # the layers FIRST — cleanly, with a status + layers_state so the dock
         # clears — instead of raising mid-paint.
-        if dims == 2 and getattr(self, "_layers", None) and self._plot2d is not None:
+        if (dims == 2 and getattr(self, "_overlay_groups", None)
+                and self._plot2d is not None):
             st = getattr(self._plot2d, "_state", None) or {}
             bh, bw = st.get("image_height"), st.get("image_width")
             if bh and bw and (data.shape[0] != bh or data.shape[1] != bw):
                 try:
-                    from spyde.actions.overlay import drop_all_layers, _emit_layers_state
-                    drop_all_layers(self)
-                    _emit_layers_state(self)
-                    from de_shell.ipc import emit_status
-                    emit_status("Overlay layers removed: image shape changed.")
+                    from spyde.actions.overlay import (
+                        drop_all_layers, layer_nodes, _emit_layers_state,
+                    )
+                    if layer_nodes(self):
+                        drop_all_layers(self)
+                        _emit_layers_state(self)
+                        from de_shell.ipc import emit_status
+                        emit_status("Overlay layers removed: image shape changed.")
                 except Exception as e:
                     logger.debug("layer drop on shape change failed: %s", e)
 

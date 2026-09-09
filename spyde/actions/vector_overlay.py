@@ -30,8 +30,8 @@ def _indices_to_iyix(indices):
     extra leading coords are dropped here; the caller reads them via
     :func:`_indices_lead_nav`.
 
-    The slice-function overrides (the vectors window's rendered display, the
-    progressive preview) resolve their own indices with these."""
+    For a navigator hook, which is handed the selector's raw indices rather
+    than the prepared ones the read path builds."""
     idx = np.asarray(indices)
     if idx.ndim >= 2:
         idx = idx[0]

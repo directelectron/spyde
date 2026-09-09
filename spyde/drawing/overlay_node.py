@@ -20,14 +20,19 @@ class OverlaySignal:
     None for an overlay that reads the frame of the window it draws on; it is
     the other window's plot for a layer sourced from elsewhere, so that
     window's decoded blocks serve the read instead of a second copy.
+
+    ``target_plot`` narrows the overlay to one window. It is None for an
+    overlay that belongs to the node, and so is drawn on every window showing
+    it; it names a plot for one the user put on a single window.
     """
 
     data = None
 
-    def __init__(self, parent_signal, recipe, source_plot=None):
+    def __init__(self, parent_signal, recipe, source_plot=None, target_plot=None):
         self.axes_manager = parent_signal.axes_manager
         self._map_recipe = recipe
         self.source_plot = source_plot
+        self.target_plot = target_plot
 
     def __repr__(self) -> str:  # pragma: no cover
         return f"OverlaySignal(function={self._map_recipe.function!r})"

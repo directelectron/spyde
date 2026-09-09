@@ -13,8 +13,9 @@ plot comes alive too:
 
 plus the pieces that make it safe: a deterministic-per-block sample position, a
 render that agrees pixel-for-pixel with the finalized display, the hand-back on
-close (which must NOT clobber the real render display), and the no-navigator
-window (the Orientation/EBSD IPF map) being a documented no-op.
+close (which must NOT clobber the real render display, pinned as the tree's
+reader override), and the no-navigator window (the Orientation/EBSD IPF map)
+being a documented no-op.
 """
 from __future__ import annotations
 
@@ -187,8 +188,7 @@ class TestProgressiveSignalPreview:
         store = LiveVectorFrames(sig_hw=(16, 16), kernel_radius_px=2)
         preview = attach_signal_preview(session, tree, render=store.render,
                                         nav_shape=(4, 5))
-        sel = _nav_selector(tree)
-        assert preview.slice_fn(sel, None, [[1, 2]]) is None
+        assert preview.read_frame((2, 1)) is None
         preview.close()
 
     def test_computed_position_renders_on_demand(self, window):
@@ -202,11 +202,10 @@ class TestProgressiveSignalPreview:
         store.add((slice(2, 4), slice(0, 2)), blk)
         preview.note_block((slice(2, 4), slice(0, 2)))
 
-        # indices are [[ix, iy]] → nav (iy=2, ix=1)
-        frame = preview.slice_fn(_nav_selector(tree), None, [[1, 2]])
+        frame = preview.read_frame((2, 1))
         assert frame is not None and frame[6, 7] == pytest.approx(4.0)
         # A position in a block that has NOT landed still returns None.
-        assert preview.slice_fn(_nav_selector(tree), None, [[3, 0]]) is None
+        assert preview.read_frame((0, 3)) is None
         preview.close()
 
     def test_served_and_declined_reads_are_counted(self, window):
@@ -217,9 +216,9 @@ class TestProgressiveSignalPreview:
         counts navigator-driven reads itself and the spec reads that count.
 
         Asserted as DELTAS around each call, not as absolute totals. The preview
-        installs its slice function on the live navigator selector, so the
-        session's own background updates (the initial paint, a settle re-fire)
-        legitimately call it too and bump the same counters. Absolute totals made
+        answers the live navigator's reads, so the session's own background
+        updates (the initial paint, a settle re-fire) legitimately call it too
+        and bump the same counters. Absolute totals made
         this test a race that only lost on a loaded CI machine; what it actually
         means to pin is that a declined read increments `reads_declined` by one
         and a served read increments `frames_served` by one.
@@ -229,14 +228,13 @@ class TestProgressiveSignalPreview:
         store = LiveVectorFrames(sig_hw=(16, 16), kernel_radius_px=2)
         preview = attach_signal_preview(session, tree, render=store.render,
                                         nav_shape=(4, 5))
-        sel = _nav_selector(tree)
 
         def counts():
             return preview.frames_served, preview.reads_declined
 
         # Nothing computed yet → this read is declined, nothing served.
         served, declined = counts()
-        assert preview.slice_fn(sel, None, [[1, 2]]) is None
+        assert preview.read_frame((2, 1)) is None
         assert counts() == (served, declined + 1)
 
         store.add((slice(2, 4), slice(0, 2)),
@@ -245,11 +243,11 @@ class TestProgressiveSignalPreview:
 
         # Now the SAME position is answered from the computed region.
         served, declined = counts()
-        assert preview.slice_fn(sel, None, [[1, 2]]) is not None
+        assert preview.read_frame((2, 1)) is not None
         assert preview.frames_served == served + 1
         # A position outside the landed block is still declined.
         served, declined = counts()
-        assert preview.slice_fn(sel, None, [[3, 0]]) is None
+        assert preview.read_frame((0, 3)) is None
         assert counts() == (served, declined + 1)
         preview.close()
 
@@ -313,7 +311,7 @@ class TestProgressiveSignalPreview:
         preview = attach_signal_preview(session, tree, render=store.render,
                                         nav_shape=(4, 5))
         _nav_selector(tree).current_indices = np.array([[4, 0]])
-        preview.slice_fn(_nav_selector(tree), None, [[0, 0]])   # user read
+        preview.read_frame((0, 0))              # user read
         sl = (slice(0, 2), slice(0, 2))
         store.add(sl, _block(2, 2, 4, {(0, 0): [(4.0, 4.0, 9.0)]}))
         preview.note_block(sl)
@@ -340,36 +338,34 @@ class TestProgressiveSignalPreview:
         assert preview.frames_painted == 0     # the re-fire wins over the sample
         preview.close()
 
-    def test_close_restores_the_original_slice_fn(self, window):
+    def test_close_releases_the_reader_override(self, window):
         session = window["window"]
         tree = _result_tree(session)
-        sel = _nav_selector(tree)
-        child = tree.signal_plots[0]
-        original = sel.children[child]
         preview = attach_signal_preview(session, tree, render=lambda i: None,
                                         nav_shape=(4, 5))
-        assert sel.children[child] is preview.slice_fn
+        assert tree.reader_override_for(tree.root) is preview
         preview.close()
-        assert sel.children[child] is original
+        assert tree.reader_override_for(tree.root) is None
         assert getattr(tree, "_live_signal_preview", None) is None
 
     def test_close_does_not_clobber_the_final_display(self, window):
-        """_finalize installs the real render display BEFORE the preview closes;
-        restoring the placeholder slice over it would paint the finished window
-        black."""
+        """_finalize pins the real render display BEFORE the preview closes;
+        releasing that override would paint the finished window black."""
         session = window["window"]
         tree = _result_tree(session)
-        sel = _nav_selector(tree)
-        child = tree.signal_plots[0]
         preview = attach_signal_preview(session, tree, render=lambda i: None,
                                         nav_shape=(4, 5))
 
-        def final_fn(selector, plot, indices):
-            return np.ones((16, 16), dtype=np.float32)
+        class _FinalReader:
+            frame_bytes = 0
 
-        sel.children[child] = final_fn          # what _install_render_display does
+            def read_frame(self, indices):
+                return np.ones((16, 16), dtype=np.float32)
+
+        final = _FinalReader()
+        tree.set_reader_override(tree.root, final)   # what _finalize does
         preview.close()
-        assert sel.children[child] is final_fn
+        assert tree.reader_override_for(tree.root) is final
 
     def test_out_of_bounds_index_is_not_ready(self, window):
         session = window["window"]
@@ -432,7 +428,7 @@ class TestFindVectorsWiring:
             # from in here.
             drain_loop(session)
             captured["ready"] = preview.ready_count
-            captured["frame"] = preview.slice_fn(None, None, [[1, 1]])
+            captured["frame"] = preview.read_frame((1, 1))
             captured["painted"] = preview.frames_painted
             captured["landed"] = preview.frames_landed
             captured["done"] = True

@@ -143,9 +143,11 @@ class TestFiveDResultDisplay:
             self.painted = []
             self.needs_auto_level = False
 
-        def set_data(self, arr):
+        def enqueue_paint(self, arr):
             self.painted.append(np.asarray(arr))
             self.current_data = np.asarray(arr)
+
+        set_data = enqueue_paint
 
     class _Sel:
         def __init__(self):
@@ -273,53 +275,51 @@ class TestFiveDResultWiringOnARealTree:
         finally:
             session.shutdown()
 
-    def test_render_fn_goes_to_the_dp_and_the_count_map_to_the_navigator(self):
+    def test_the_dp_renders_vectors_and_the_navigator_shows_counts(self):
         from spyde.actions.find_vectors_action import (
-            _install_render_display, _all_nav_plots,
+            CountMapReader, RenderedVectorsReader, _all_nav_plots,
+            _install_result_readers,
         )
         session, tree = self._session_with_5d()
         try:
             v = _make_5d()
-            _install_render_display(tree, v)
+            _install_result_readers(tree, v)
             dp = tree.signal_plots[0]
             spatial = [p for p in _all_nav_plots(tree)
                        if getattr(p, "is_navigator", False)
                        and getattr(p, "current_data", None) is not None
                        and np.asarray(p.current_data).shape == v.nav_shape]
 
-            installed = {}
-            for sel in tree.navigator_plot_manager.all_navigation_selectors:
-                for child, fn in sel.children.items():
-                    installed[id(child)] = getattr(fn, "__name__", str(fn))
-
-            assert installed.get(id(dp)) == "_fn", (
-                "the DP is not driven by the vectors renderer: "
-                f"{installed.get(id(dp))}")
+            assert isinstance(tree.reader_override_for(dp.plot_state.current_signal),
+                              RenderedVectorsReader), \
+                "the DP is not driven by the vectors renderer"
             for nav in spatial:
-                assert installed.get(id(nav)) != "_fn", (
+                reader = tree.reader_override_for(nav.plot_state.current_signal)
+                assert not isinstance(reader, RenderedVectorsReader), (
                     "the real-space navigator got the DP renderer — this is the "
                     "'real space shows a diffraction pattern' bug")
-                assert installed.get(id(nav)) == "_count_fn", (
-                    "the real-space navigator should slice the per-slice count "
-                    f"map, got {installed.get(id(nav))}")
+                assert isinstance(reader, CountMapReader), (
+                    "the real-space navigator should read the per-slice count "
+                    f"map, got {reader!r}")
         finally:
             session.shutdown()
 
-    def test_the_count_fn_returns_that_slices_count_map(self):
-        from spyde.actions.find_vectors_action import _install_render_display
+    def test_the_count_map_reader_returns_that_slices_map(self):
+        from spyde.actions.find_vectors_action import (
+            CountMapReader, _all_nav_plots, _install_result_readers,
+        )
         session, tree = self._session_with_5d()
         try:
             v = _make_5d()
-            _install_render_display(tree, v)
-            count_fn = None
-            for sel in tree.navigator_plot_manager.all_navigation_selectors:
-                for fn in sel.children.values():
-                    if getattr(fn, "__name__", "") == "_count_fn":
-                        count_fn = fn
-            assert count_fn is not None, "no count-map slice function installed"
+            _install_result_readers(tree, v)
+            readers = [tree.reader_override_for(p.plot_state.current_signal)
+                       for p in _all_nav_plots(tree)
+                       if getattr(p, "plot_state", None) is not None]
+            readers = [r for r in readers if isinstance(r, CountMapReader)]
+            assert readers, "no count-map reader pinned on the navigator"
             for t in range(v.n_time):
-                out = count_fn(None, None, np.array([[t]]))
-                np.testing.assert_array_equal(out, v.count_map_at_t(t))
+                np.testing.assert_array_equal(readers[0].read_frame((t,)),
+                                              v.count_map_at_t(t))
         finally:
             session.shutdown()
 
