@@ -507,9 +507,59 @@ class TestGroupKinds:
             plot.enqueue_overlay(node, {"detector": np.ones((32, 32), np.float32)})
             assert _wait(lambda: painted.threads, 10)
             assert set(painted.threads) == {"nav-paint"}, painted.threads
-            assert plot._fv_transform_active
+            assert plot.has_live_transform()
             plot.enqueue_overlay(node, {})
-            assert _wait(lambda: not plot._fv_transform_active, 10)
+            assert _wait(lambda: not plot.has_live_transform(), 10)
+        finally:
+            session.shutdown()
+
+    def test_a_value_may_carry_the_appearance_to_draw_it_with(self):
+        """A slider that changes a marker radius rides the next value: the
+        group is pushed with the new appearance, never rebuilt for it."""
+        session, plot = _open_session(_off_centre_lazy())
+        try:
+            tree = plot.signal_tree
+            node = tree.add_overlay(
+                tree.root, lambda frame: {}, name="sized",
+                groups={"found": ("circles", {"radius": 3.0})})
+            group = plot._overlay_groups[(id(node), "found")]
+            pushed = _ThreadRecorder(group, "set")
+
+            plot.enqueue_overlay(node, {"found": {
+                "data": np.array([[4.0, 5.0]], dtype=np.float32), "radius": 9.0}})
+            assert _wait(lambda: pushed.threads, 10), "the value never drew"
+            assert set(pushed.threads) == {"nav-paint"}, pushed.threads
+            assert plot._overlay_groups[(id(node), "found")] is group, \
+                "the group was rebuilt for an appearance change"
+            assert float(group._data["radius"]) == 9.0
+            assert len(np.asarray(group._data["offsets"])) == 1
+        finally:
+            session.shutdown()
+
+    def test_a_live_transform_holds_the_base_frame_back(self):
+        """A transform group's image IS the frame the plot shows, so the
+        navigator's own paint waits until the group's value is None again."""
+        session, plot = _open_session(_off_centre_lazy())
+        try:
+            tree = plot.signal_tree
+            node = tree.add_overlay(
+                tree.root, lambda frame: {}, name="detector",
+                groups={"response": ("transform", {})})
+            response = np.ones((32, 32), np.float32)
+            plot.enqueue_overlay(node, {"response": response})
+            assert _wait(lambda: plot.has_live_transform(), 10)
+
+            raw = np.full((32, 32), 7.0, np.float32)
+            painted = _ThreadRecorder(plot, "_set_array")
+            plot.enqueue_paint(raw)
+            assert _wait(lambda: plot.current_data is raw, 10)
+            time.sleep(0.3)                       # give a wrong paint time to land
+            assert painted.threads == [], "the raw frame painted over the transform"
+
+            plot.enqueue_overlay(node, {})
+            assert _wait(lambda: not plot.has_live_transform(), 10)
+            plot.enqueue_paint(raw)
+            assert _wait(lambda: painted.threads, 10), "the raw frame never came back"
         finally:
             session.shutdown()
 

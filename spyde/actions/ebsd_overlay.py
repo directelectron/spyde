@@ -26,7 +26,7 @@ _NO_ZONE_AXES = np.zeros((0, 2), np.float32)
 
 
 def ebsd_bands(frame, *, indexer, reflectors, detector, pc, correct, n_bands,
-               show_zone_axes) -> dict:
+               show_zone_axes, linewidth) -> dict:
     """The Kikuchi bands of the best-matching orientation for one pattern.
 
     The pattern is corrected the way the dictionary expects, matched against
@@ -44,7 +44,8 @@ def ebsd_bands(frame, *, indexer, reflectors, detector, pc, correct, n_bands,
     zone_axes = (zone_axis_points(euler, reflectors.brightest(int(n_bands)),
                                   detector, pc)
                  if show_zone_axes else _NO_ZONE_AXES)
-    return {"bands": segments, "zone": zone_axes, "match": (euler, score)}
+    return {"bands": {"data": segments, "linewidths": float(linewidth)},
+            "zone": zone_axes, "match": (euler, score)}
 
 
 def attach_ebsd_band_overlay(signal, indexer, reflectors, tree, *,
@@ -61,8 +62,7 @@ def attach_ebsd_band_overlay(signal, indexer, reflectors, tree, *,
 
     node = tree.add_overlay(
         signal, ebsd_bands, name="ebsd_bands", expensive=True,
-        groups={"bands": ("lines", {"edgecolors": color,
-                                    "linewidths": float(linewidth)}),
+        groups={"bands": ("lines", {"edgecolors": color}),
                 "zone": ("circles", {"radius": 3.0, "edgecolors": ZONE_COLOR,
                                      "facecolors": None, "linewidths": 1.2,
                                      "alpha": 1.0})},
@@ -70,7 +70,8 @@ def attach_ebsd_band_overlay(signal, indexer, reflectors, tree, *,
                 "detector": (int(detector[0]), int(detector[1])),
                 "pc": tuple(float(v) for v in pc), "correct": correct,
                 "n_bands": int(n_bands),
-                "show_zone_axes": bool(show_zone_axes)},
+                "show_zone_axes": bool(show_zone_axes),
+                "linewidth": float(linewidth)},
         on_value=(None if on_match is None
                   else lambda value: _report_match(on_match, value)),
     )
@@ -94,7 +95,6 @@ def set_ebsd_refine_params(tree, node, **params) -> None:
     The projection centre belongs here because it is the one parameter you
     cannot set from first principles: you nudge it until the drawn lines sit on
     the bands."""
-    from spyde.actions.vector_overlay import _restyle_group
     from spyde.drawing.overlays import refresh_overlays_for
 
     static = {}
@@ -105,8 +105,7 @@ def set_ebsd_refine_params(tree, node, **params) -> None:
     if params.get("pc") is not None:
         static["pc"] = tuple(float(v) for v in params["pc"])
     if params.get("linewidth") is not None:
-        _restyle_group(tree, node, "bands",
-                       linewidths=max(0.2, float(params["linewidth"])))
+        static["linewidth"] = max(0.2, float(params["linewidth"]))
     if static:
         tree.replace_overlay_static(node, **static)
     else:

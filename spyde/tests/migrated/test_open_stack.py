@@ -159,8 +159,67 @@ class TestMultiNavIndexOrdering:
 
 class TestFindVectorsPreviewOnStack:
     """The find-vectors preview must reduce a navigation window to a SINGLE 2-D
-    frame, and blur only the two innermost navigation axes — a 5-D stack's time
+    frame, and blur only the two innermost navigation axes: a 5-D stack's time
     axis is a fixed position, exactly as the batch treats it."""
+
+    def test_the_preview_window_is_flat_on_a_stacks_time_axis(self):
+        """A neighbourhood radius is per navigation axis, so the preview on a
+        5-D stack reads (2d+1)^2 frames of one time slice, not (2d+1)^3 across
+        three, and its value is the 4-D answer for that slice."""
+        from dataclasses import replace
+        import hyperspy.api as hs
+        from spyde.actions.find_vectors_action import fv_open
+        from spyde.actions.vector_overlay import find_vectors_preview
+        from spyde.array_cache import drop_reader, reader_for_overlay
+        from spyde.tests.migrated._async import wait_until
+        from spyde.tests.migrated.conftest import (
+            _settle, close_session, make_session,
+        )
+
+        rng = np.random.default_rng(0)
+        data = rng.normal(50, 3, (2, 9, 9, 16, 16)).astype(np.float32)
+        for index in np.ndindex(2, 9, 9):
+            data[index][6:10, 6:10] += 400.0        # one bright disk per pattern
+        signal = hs.signals.Signal2D(data).as_lazy()
+        signal.data = signal.data.rechunk((1, 3, 3, -1, -1))
+        signal.set_signal_type("electron_diffraction")
+
+        session = make_session()
+        try:
+            session._add_signal(signal, source_path=None)
+            _settle(session)
+            plot = next(p for p in session._plots
+                        if not p.is_navigator and p.plot_state is not None)
+            tree = plot.signal_tree
+            fv_open(session, plot, {"method": "dog", "sigma": 1.0,
+                                    "kernel_radius": 3, "threshold": 8.0,
+                                    "min_distance": 3, "subpixel": False})
+            assert wait_until(lambda: getattr(tree, "_fv_preview", None) is not None, 30)
+            node = tree._fv_preview
+            assert node.signal._map_recipe.depth == (0, 3, 3)
+
+            windows = []
+            recipe = node.signal._map_recipe
+
+            def _recording(window, centre, **kwargs):
+                windows.append((window, centre))
+                return recipe.function(window, centre, **kwargs)
+
+            node.signal._map_recipe = replace(recipe, function=_recording)
+            drop_reader(plot, node.signal)
+
+            value = reader_for_overlay(plot, node).read_frame((1, 4, 4))
+            # The navigator may also be drawing this overlay; take the window
+            # built for the position asked for here.
+            window, centre = next(w for w in windows if w[1] == (0, 3, 3))
+            assert window.shape == (1, 7, 7, 16, 16), window.shape
+
+            # The same window without its (single) time axis is the 4-D call.
+            flat = find_vectors_preview(window[0], centre[1:],
+                                        **recipe.static)
+            assert np.array_equal(value["peaks"]["data"], flat["peaks"]["data"])
+        finally:
+            close_session(session)
 
     @staticmethod
     def _window(shape):

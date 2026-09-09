@@ -78,8 +78,10 @@ class FrameRecipe:
     is then returned as it comes, without the allocate-and-cast.
 
     ``source`` is the signal one frame is read from, or None for a function
-    that needs no frame. ``depth`` is a navigation neighbourhood radius: with
-    ``depth > 0`` the function is called as
+    that needs no frame. ``depth`` is a navigation neighbourhood radius: one
+    int for every navigation axis, or a tuple with one radius per axis,
+    outermost first, so a neighbourhood can be flat on an axis it must not
+    cross. With a radius above zero the function is called as
     ``function(window, centre, **iterating_at_index, **static)``, where
     ``window`` stacks the source frames over ``[index - depth, index + depth]``
     clipped to each navigation axis and ``centre`` is the requested position's
@@ -92,7 +94,7 @@ class FrameRecipe:
     output_name: str | None
     output_shape: tuple[int, ...] | None
     output_dtype: np.dtype | None
-    depth: int = 0
+    depth: int | tuple[int, ...] = 0
 
 
 def recipe_for(signal) -> FrameRecipe | None:

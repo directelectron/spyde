@@ -31,9 +31,10 @@ from spyde.tests.migrated.conftest import _settle, close_session, make_session
 
 def _bands_at(plot, node, iy, ix):
     """The overlay node's value at one navigation position, read through the
-    plot's readers exactly as a navigator move reads it."""
+    plot's readers exactly as a navigator move reads it. The band segments
+    come with the line width the Refine tab set, so unwrap them."""
     value = reader_for_overlay(plot, node).read_frame((int(iy), int(ix)))
-    return value["bands"], value["zone"]
+    return value["bands"]["data"], value["zone"]
 
 
 @pytest.fixture(autouse=True)

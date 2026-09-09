@@ -198,18 +198,6 @@ def _add_overlay(tree, parent_signal, function, **kwargs):
     return node
 
 
-def _restyle_group(tree, node, name: str, **style) -> None:
-    """Change one group's appearance. The handle is dropped so the painter
-    rebuilds it from the node's groups when the next value arrives."""
-    kind, current = node.groups[name]
-    merged = {**current, **style}
-    if merged == current:
-        return
-    node.groups[name] = (kind, merged)
-    for plot in list(tree.signal_plots):
-        plot.drop_overlay_groups(node)
-
-
 # ── found vectors on the source or result diffraction pattern ────────────────
 
 def found_vector_offsets(*, rows, pixels: DetectorPixels) -> dict:
@@ -305,12 +293,14 @@ def find_vectors_preview(window, centre=None, *, params: dict, sigma: float,
     else:
         # peaks are [ky_row, kx_col, value] in pixels; a marker is (x, y).
         offsets = np.column_stack([peaks[:, 1], peaks[:, 0]]).astype(np.float32)
-    value = {"peaks": offsets, "transform": None,
-             "threshold": float(params.get("threshold", 0.0))}
+    threshold = float(params.get("threshold", 0.0))
+    value = {"peaks": {"data": offsets, "radius": _preview_marker_radius(params)},
+             "transform": None, "threshold": threshold}
     if response is not None:
         response = np.asarray(response, dtype=np.float32)
-        value["transform"] = (response, _transform_levels(
-            response, str(params.get("method", "")).lower(), value["threshold"]))
+        levels = _transform_levels(
+            response, str(params.get("method", "")).lower(), threshold)
+        value["transform"] = {"data": response, "levels": levels}
     return value
 
 
@@ -361,6 +351,17 @@ def _push_beamstop_overlay(plot, mask) -> None:
         log.debug("[fv-preview] pushing the beam-stop overlay failed: %s", e)
 
 
+def _preview_depth(signal, sigma: float):
+    """The navigation neighbourhood the blur needs, flat on every axis above
+    the two the scan is blurred over, so a stack's time axis is never crossed
+    and the window stays ``(2d+1)`` frames per blurred axis."""
+    radius = int(np.ceil(3 * sigma)) if sigma > 0 else 0
+    navigation_dimension = int(signal.axes_manager.navigation_dimension)
+    if radius == 0 or navigation_dimension <= 2:
+        return radius
+    return (0,) * (navigation_dimension - 2) + (radius, radius)
+
+
 def attach_find_vectors_preview(dp_plot, signal, tree, params: dict,
                                 *, color="#ff3030"):
     """Draw the peaks the detector finds under the crosshair, live, while the
@@ -368,23 +369,63 @@ def attach_find_vectors_preview(dp_plot, signal, tree, params: dict,
 
     ``params`` is the wizard's coerced parameter set. The navigation blur is a
     neighbourhood of radius ``ceil(3 sigma)`` on the recipe, so the preview
-    sees the same frame the batch does."""
-    mask = _beamstop_for(tree, signal, params)
-    _push_beamstop_overlay(dp_plot, mask)
+    sees the same frame the batch does. The beam stop, if one is wanted, lands
+    a moment later: detecting it reads frames, which does not belong on the
+    thread the caret is dispatched on."""
     sigma = float(params.get("sigma", 0.0))
     style = {"radius": _preview_marker_radius(params), "edgecolors": color,
              "facecolors": None, "linewidths": 1.5, "alpha": 1.0}
-    return _add_overlay(
+    node = _add_overlay(
         tree, signal, find_vectors_preview, name="fv_preview",
-        depth=int(np.ceil(3 * sigma)) if sigma > 0 else 0,
+        depth=_preview_depth(signal, sigma),
         expensive=str(params.get("method", "")).lower() == "neural",
         groups={"peaks": ("circles", style),
                 "transform": ("transform", {})},
         static={"params": _detector_params(params), "sigma": sigma,
-                "beamstop_mask": mask,
+                "beamstop_mask": None,
                 "show_transform": bool(params.get("show_transform"))},
         on_value=lambda value: _emit_preview_histogram(dp_plot, value),
     )
+    request_beamstop(tree, node, dp_plot, params)
+    return node
+
+
+def request_beamstop(tree, node, dp_plot, params: dict) -> None:
+    """Put the beam-stop mask the preview excludes on the overlay node, off the
+    caller's thread.
+
+    Detection reads a sample of frames, so it runs on the compute backend's
+    overlay lane and the mask reaches the recipe from the done callback.
+    Turning the stop off needs no scan and applies straight away."""
+    if not params.get("beamstop_auto"):
+        _push_beamstop_overlay(dp_plot, None)
+        if overlay_static(node).get("beamstop_mask") is not None:
+            tree.replace_overlay_static(node, beamstop_mask=None)
+        return
+    session = getattr(tree, "session", None)
+    backend = getattr(session, "compute_backend", None) if session else None
+    signal = node.parent.signal
+    if backend is None:
+        log.debug("[fv-preview] no compute backend for the beam-stop estimate")
+        return
+
+    def _apply(finished) -> None:
+        try:
+            mask = finished.result()
+        except Exception as e:
+            log.debug("[fv-preview] beam-stop detection failed: %s", e)
+            return
+        parent = node.parent
+        if parent is None or parent.children.get(node.name) is not node:
+            return              # the caret closed while the stop was found
+        _push_beamstop_overlay(dp_plot, mask)
+        tree.replace_overlay_static(node, beamstop_mask=mask)
+
+    try:
+        backend.submit_overlay(
+            lambda: _beamstop_for(tree, signal, params)).add_done_callback(_apply)
+    except Exception as e:
+        log.debug("[fv-preview] the beam-stop estimate was not submitted: %s", e)
 
 
 def _emit_preview_histogram(plot, value) -> None:
@@ -393,7 +434,7 @@ def _emit_preview_histogram(plot, value) -> None:
     transform = value.get("transform") if isinstance(value, dict) else None
     if transform is None or not hasattr(plot, "_emit_histogram"):
         return
-    image, (low, high) = transform
+    image, (low, high) = transform["data"], transform["levels"]
     try:
         plot._emit_histogram(image, low, high,
                              threshold=float(value.get("threshold", low)))
@@ -409,15 +450,14 @@ def remove_find_vectors_preview(tree, dp_plot) -> None:
 
 def tune_find_vectors_preview(tree, node, dp_plot, params: dict) -> None:
     """Apply a new parameter set to the live preview and redraw at the current
-    crosshair position."""
-    mask = _beamstop_for(tree, node.parent.signal, params)
-    _push_beamstop_overlay(dp_plot, mask if params.get("beamstop_auto") else None)
+    crosshair position. The circle radius rides the next value, so nothing is
+    rebuilt for it; the beam stop, if it changed, lands from the overlay lane."""
     sigma = float(params.get("sigma", 0.0))
     node.expensive = str(params.get("method", "")).lower() == "neural"
-    _restyle_group(tree, node, "peaks", radius=_preview_marker_radius(params))
     tree.replace_overlay_static(
-        node, params=_detector_params(params), sigma=sigma, beamstop_mask=mask,
+        node, params=_detector_params(params), sigma=sigma,
         show_transform=bool(params.get("show_transform")))
+    request_beamstop(tree, node, dp_plot, params)
 
 
 # ── the matched orientation template ─────────────────────────────────────────
@@ -491,7 +531,11 @@ def strain_selection(*, rows, position, pixels: DetectorPixels, ref_yx,
     On the reference pixel the reference spots are drawn as circles, green for
     the ones driving the fit and grey for the excluded ones, and a double-click
     toggles them. Off it, each selected spot is joined to the nearest measured
-    peak within ``match_radius_px``, which is the local displacement."""
+    peak within ``match_radius_px``, which is the local displacement.
+
+    ``on_reference`` is not a group: it tells the overlay's owner which of the
+    two the value is, which is what makes the double-click a pick on the
+    reference pixel and nothing anywhere else."""
     from spyde.signals.diffraction_vectors import COL_KX, COL_KY
 
     empty = np.zeros((0, 2), np.float32)
@@ -505,12 +549,14 @@ def strain_selection(*, rows, position, pixels: DetectorPixels, ref_yx,
         chosen = ref_spots[selected] if len(ref_spots) else empty
         excluded = ref_spots[~selected] if len(ref_spots) else empty
         return {"selected": pixels.clipped(chosen),
-                "excluded": pixels.clipped(excluded), "arrows": no_arrows}
+                "excluded": pixels.clipped(excluded), "arrows": no_arrows,
+                "on_reference": True}
 
     reference = ref_spots[selected] if len(ref_spots) else empty
     rows = np.asarray(rows)
     if len(reference) == 0 or rows.size == 0:
-        return {"selected": empty, "excluded": empty, "arrows": no_arrows}
+        return {"selected": empty, "excluded": empty, "arrows": no_arrows,
+                "on_reference": False}
     reference_px = pixels.to_pixels(reference)
     measured_px = pixels.to_pixels(rows[:, [COL_KX, COL_KY]])
     tails, across, down = [], [], []
@@ -523,8 +569,9 @@ def strain_selection(*, rows, position, pixels: DetectorPixels, ref_yx,
             across.append(float(measured_px[nearest, 0] - x))
             down.append(float(measured_px[nearest, 1] - y))
     if not tails:
-        return {"selected": empty, "excluded": empty, "arrows": no_arrows}
-    return {"selected": empty, "excluded": empty,
+        return {"selected": empty, "excluded": empty, "arrows": no_arrows,
+                "on_reference": False}
+    return {"selected": empty, "excluded": empty, "on_reference": False,
             "arrows": (np.asarray(tails, np.float32),
                        np.asarray(across, np.float32),
                        np.asarray(down, np.float32))}
@@ -665,12 +712,18 @@ class StrainSelectionOverlay:
     def _on_click(self, event=None) -> None:
         """Toggle the reference spot under the cursor in or out of the fit.
 
+        A spot is picked only while this window's navigator sits on the
+        reference pixel, which is what the last value drawn here says.
+
         anyplotlib's double-click event carries xdata/ydata, which for a
         calibrated diffraction pattern are physical kx, ky, the space the
         reference spots are already stored in, so the hit test needs no
         conversion."""
         spots = self.ref_spots
         if self._removed or event is None or len(spots) == 0:
+            return
+        drawn = self.plot.last_overlay_value(self.node) or {}
+        if not drawn.get("on_reference"):
             return
         try:
             x, y = float(event.xdata), float(event.ydata)
@@ -714,19 +767,24 @@ def vector_orientation_fit(*, rows, pixels: DetectorPixels, lib,
         fit_pattern, project_spots, DEFAULTS, COL_KX, COL_KY, COL_INTENSITY,
     )
 
-    empty = np.zeros((0, 2), np.float32)
     rows = np.asarray(rows)
     if rows.size == 0:
-        return {"measured": empty, "template": empty, "fit": None}
+        return {"measured": None, "template": None, "fit": None}
     measured = rows[:, [COL_KX, COL_KY]].astype(np.float64)
     measured_px = pixels.to_pixels(measured)
     if len(rows) < 4:
-        return {"measured": measured_px, "template": empty, "fit": None}
+        return {"measured": measured_px, "template": None, "fit": None}
 
-    fit = fit_pattern(measured, rows[:, COL_INTENSITY].astype(np.float64),
-                      lib, {**DEFAULTS, **params})
+    try:
+        fit = fit_pattern(measured, rows[:, COL_INTENSITY].astype(np.float64),
+                          lib, {**DEFAULTS, **params})
+    except Exception as e:
+        # A pose that will not converge still has measured vectors to draw,
+        # and the caret's readout has to be told there is no fit.
+        log.debug("the vector-orientation fit failed at this position: %s", e)
+        fit = None
     if fit is None:
-        return {"measured": measured_px, "template": empty, "fit": None}
+        return {"measured": measured_px, "template": None, "fit": None}
     pose = np.zeros(7, np.float64)
     pose[0] = float(fit.theta)
     pose[1:5] = np.asarray(fit.affine, float).reshape(-1)

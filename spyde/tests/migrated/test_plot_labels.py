@@ -57,8 +57,6 @@ def _make_1d_plot(signal):
     plot.needs_auto_level = True
     plot._last_levels = None
     plot._last_extent_key = None
-    plot._fv_transform_active = False
-    plot._fv_paint_token = False
     plot._y_label_override = None
 
     class _PS:

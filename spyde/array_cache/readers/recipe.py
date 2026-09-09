@@ -92,15 +92,25 @@ def _navigation_sizes(signal, count: int) -> tuple[int, ...]:
     return tuple(int(n) for n in reversed(navigation_shape))[:count]
 
 
-def _source_window(recipe: FrameRecipe, indices, parent_signal, parent_frame):
+def navigation_depths(depth, count: int) -> tuple[int, ...]:
+    """One neighbourhood radius per navigation axis, from an int (the same
+    radius everywhere) or a per-axis tuple, outermost first."""
+    if isinstance(depth, (tuple, list)):
+        radii = tuple(int(v) for v in depth)
+        return radii + (0,) * (count - len(radii))
+    return (int(depth),) * count
+
+
+def _source_window(recipe: FrameRecipe, indices, depths, parent_signal,
+                   parent_frame):
     """The stack of source frames over ``[index - depth, index + depth]`` on
     each navigation axis, clipped to the navigation grid, and the requested
     position's index inside that stack."""
     sizes = _navigation_sizes(recipe.source, len(indices))
     spans, centre = [], []
     for axis, position in enumerate(indices):
-        low = max(0, position - recipe.depth)
-        high = min(sizes[axis] - 1, position + recipe.depth)
+        low = max(0, position - depths[axis])
+        high = min(sizes[axis] - 1, position + depths[axis])
         spans.append(range(low, high + 1))
         centre.append(position - low)
     frames = []
@@ -146,10 +156,12 @@ def evaluate(recipe: FrameRecipe, indices, parent_signal, parent_frame):
         argument = np.squeeze(argument)
         per_position[key] = argument[()] if argument.shape == () else argument
 
+    depths = navigation_depths(recipe.depth, len(indices))
     if recipe.source is None:
         result = recipe.function(**per_position, **recipe.static)
-    elif recipe.depth > 0:
-        window, centre = _source_window(recipe, indices, parent_signal, parent_frame)
+    elif any(depths):
+        window, centre = _source_window(recipe, indices, depths, parent_signal,
+                                        parent_frame)
         result = recipe.function(window, centre, **per_position, **recipe.static)
     else:
         frame = _source_frame(recipe, indices, parent_signal, parent_frame)

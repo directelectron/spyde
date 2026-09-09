@@ -19,6 +19,7 @@ from __future__ import annotations
 import time
 
 import numpy as np
+import pytest
 import hyperspy.api as hs
 from spyde.tests.migrated._async import quiesce, why_busy
 from spyde.tests.migrated._async import wait_until
@@ -190,6 +191,56 @@ class TestPreviewBeamstop:
         assert pushed[-1] is None
 
 
+    def test_the_detection_never_runs_on_the_callers_thread(self, monkeypatch):
+        """Detecting the stop reads frames, which is far too slow for the
+        thread the caret is dispatched on. It runs on the compute backend's
+        overlay lane and the mask reaches the recipe afterwards."""
+        import threading
+        import spyde.actions.find_vectors as find_vectors
+        from spyde.actions.find_vectors_action import fv_open
+        from spyde.actions.vector_overlay import tune_find_vectors_preview
+
+        params = {"method": "dog", "sigma": 0.0, "kernel_radius": 3,
+                  "threshold": 8.0, "min_distance": 3, "subpixel": False}
+        session = make_session()
+        try:
+            session._add_signal(self._signal_with_a_bar().as_lazy(),
+                                source_path=None)
+            assert quiesce(session), why_busy(session)
+            plot = _signal_plot(session)
+            tree = plot.signal_tree
+            fv_open(session, plot, dict(params))
+            assert _wait(lambda: getattr(tree, "_fv_preview", None) is not None, 30)
+            node = tree._fv_preview
+            assert overlay_static(node)["beamstop_mask"] is None
+
+            scans = []
+            detect = find_vectors._auto_beamstop_from_signal
+
+            def _slow_detect(signal, navigation_dimension, **kwargs):
+                scans.append(threading.current_thread().name)
+                time.sleep(0.3)
+                return detect(signal, navigation_dimension, **kwargs)
+
+            monkeypatch.setattr(find_vectors, "_auto_beamstop_from_signal",
+                                _slow_detect)
+
+            started = time.monotonic()
+            tune_find_vectors_preview(tree, node, plot,
+                                      dict(params, beamstop_auto=True))
+            elapsed = time.monotonic() - started
+            assert elapsed < 0.05, f"the tune blocked for {elapsed:.3f}s"
+
+            assert _wait(
+                lambda: overlay_static(node)["beamstop_mask"] is not None, 20), \
+                "the beam-stop mask never reached the recipe"
+            assert scans, "the beam stop was never detected"
+            assert all(name.startswith("overlay-eval") for name in scans), scans
+            assert overlay_static(node)["beamstop_mask"][10, 15]      # on the bar
+        finally:
+            close_session(session)
+
+
 class TestPreviewTransformView:
     def test_the_value_carries_the_peaks_and_the_response(self):
         """With the transform view on, one evaluation produces BOTH the peak
@@ -209,8 +260,10 @@ class TestPreviewTransformView:
 
         value = find_vectors_preview(frame, None, params=params, sigma=0.0,
                                      beamstop_mask=None, show_transform=True)
-        assert len(value["peaks"]) >= 2
-        image, (low, high) = value["transform"]
+        assert len(value["peaks"]["data"]) >= 2
+        # The circle radius rides the value, so the slider needs no rebuild.
+        assert value["peaks"]["radius"] == pytest.approx(np.sqrt(2.0) * 0.8)
+        image, (low, high) = value["transform"]["data"], value["transform"]["levels"]
         assert image.shape == (ky, kx)
         assert low == 8.0                          # the display floor is the threshold
         assert high > low
@@ -219,7 +272,7 @@ class TestPreviewTransformView:
         off = find_vectors_preview(frame, None, params=params, sigma=0.0,
                                    beamstop_mask=None, show_transform=False)
         assert off["transform"] is None
-        assert len(off["peaks"]) >= 2
+        assert len(off["peaks"]["data"]) >= 2
 
     def test_the_correlation_ceiling_never_moves_with_the_threshold(self):
         """Moving the threshold in correlation view must NOT move the ceiling:
@@ -239,32 +292,43 @@ class TestPreviewTransformView:
 
     def test_the_painter_applies_the_contrast_window_the_value_carries(self):
         """A transform value with levels reaches the plot as those levels, not
-        as an auto-levelled repaint."""
+        as an auto-levelled repaint, and holds the base frame back while it
+        is showing."""
         from spyde.drawing.plots.plot import Plot
 
         node = type("Node", (), {})()
-        painted = []
+        painted, restored = [], []
 
         class _Plot:
             needs_auto_level = True
-            current_data = None
-
-            def set_transform_active(self, active):
-                self.active = active
+            current_data = np.ones((8, 8), np.float32)
 
             def set_transform_image(self, data, levels=None):
                 painted.append((data.shape, levels))
 
+            def _set_array(self, data, levels=None):
+                restored.append(data.shape)
+
         plot = _Plot()
         plot._overlay_groups = {(id(node), "transform"): None}
+        plot._live_transform_groups = set()
         image = np.zeros((8, 8), np.float32)
-        Plot._push_overlay_group(plot, node, "transform", "transform",
-                                 (image, (0.3, 1.0)))
-        assert painted == [((8, 8), (0.3, 1.0))]
-        assert plot.needs_auto_level is False and plot.active is True
+        key = (id(node), "transform")
 
+        Plot._push_overlay_group(plot, node, "transform", "transform",
+                                 {"data": image, "levels": (0.3, 1.0)})
+        assert painted == [((8, 8), (0.3, 1.0))]
+        assert plot.needs_auto_level is False
+        assert Plot.has_live_transform(plot) and key in plot._live_transform_groups
+
+        # A bare array is still a transform value; it just brings no levels.
         Plot._push_overlay_group(plot, node, "transform", "transform", image)
         assert painted[-1] == ((8, 8), None)
+
+        # Clearing it hands the plot back to the frame the navigator read.
+        Plot._push_overlay_group(plot, node, "transform", "transform", None)
+        assert not Plot.has_live_transform(plot)
+        assert restored == [(8, 8)]
 
 
 class TestPreviewHistogram:
@@ -278,7 +342,8 @@ class TestPreviewHistogram:
 
         plot = _Plot()
         image = np.zeros((4, 4), np.float32)
-        _emit_preview_histogram(plot, {"transform": (image, (0.4, 1.0)),
+        _emit_preview_histogram(plot, {"transform": {"data": image,
+                                                     "levels": (0.4, 1.0)},
                                        "threshold": 0.4})
         assert marked == [(0.4, 1.0, 0.4)]
         _emit_preview_histogram(plot, {"transform": None, "threshold": 0.4})

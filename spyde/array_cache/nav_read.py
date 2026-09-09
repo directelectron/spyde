@@ -383,18 +383,22 @@ def _grow_cache_for_window(plot, signal, parent_signal) -> None:
     """Size ``plot``'s frame cache to hold one navigation window, the same
     growth an integrating region asks for. Without it the window evicts its
     own frames and every move re-reads all of them."""
+    from spyde.array_cache.readers.recipe import navigation_depths
     from spyde.external.hyperspy.map_recipe import recipe_for
 
     recipe = recipe_for(signal)
-    depth = int(getattr(recipe, "depth", 0) or 0)
     cache = getattr(plot, "_array_cache", None)
-    if depth <= 0 or cache is None:
+    if recipe is None or cache is None:
         return
     navigation_dimension = int(signal.axes_manager.navigation_dimension)
+    depths = navigation_depths(recipe.depth, navigation_dimension)
+    if not any(depths):
+        return
     data = parent_signal.data
     frame_shape = data.shape[navigation_dimension:]
     frame_bytes = int(np.prod(frame_shape)) * data.dtype.itemsize
-    cache.ensure_budget_for((2 * depth + 1) ** navigation_dimension, frame_bytes)
+    frames = int(np.prod([2 * radius + 1 for radius in depths]))
+    cache.ensure_budget_for(frames, frame_bytes)
 
 
 def reader_for_overlay(plot, node):

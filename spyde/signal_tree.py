@@ -1209,7 +1209,7 @@ class BaseSignalTree:
     # ── Overlay nodes ──────────────────────────────────────────────────────────
 
     def add_overlay(self, parent_signal, function, *, name: str, groups: dict,
-                    static: dict = None, iterating: dict = None, depth: int = 0,
+                    static: dict = None, iterating: dict = None, depth=0,
                     source: bool = True, source_plot=None,
                     expensive: bool = False, on_value=None) -> SignalNode:
         """Add a child of ``parent_signal`` that is drawn on the windows
@@ -1224,8 +1224,9 @@ class BaseSignalTree:
 
         ``static`` arguments are passed to every call; ``iterating`` values
         are indexed per position. ``depth`` asks for a navigation
-        neighbourhood instead of one frame, and ``source=False`` for a
-        function that reads no frame at all (see
+        neighbourhood instead of one frame: one radius for every navigation
+        axis, or a tuple with one per axis, outermost first. ``source=False``
+        is for a function that reads no frame at all (see
         :class:`~spyde.external.hyperspy.map_recipe.FrameRecipe`).
         ``source_plot`` reads the frame through another window's readers.
         ``expensive`` runs the function off the navigator thread as one
@@ -1246,7 +1247,8 @@ class BaseSignalTree:
             output_name=None,
             output_shape=None,
             output_dtype=None,
-            depth=int(depth),
+            depth=tuple(int(v) for v in depth) if isinstance(depth, (tuple, list))
+                  else int(depth),
         )
         node = SignalNode(
             signal=OverlaySignal(parent_signal, recipe, source_plot=source_plot),

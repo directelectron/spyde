@@ -88,8 +88,8 @@ click ──► toolbar gate (plot_control_toolbar filters)
 
 - **on the tree**: results (`diffraction_vectors`, `orientation_map`,
   `vector_orientation`), wizard controllers (`_om_wizard`, `_vom_wizard`,
-  `_strain_controller`), overlay NODES (`_vector_overlay`, `_fv_preview`, …
-  — children of the displayed node, added with `tree.add_overlay`),
+  `_strain_controller`), overlay NODES (`_vector_overlay`, `_fv_preview`, …),
+  which are children of the displayed node, added with `tree.add_overlay`,
   run generations (`_<key>_run_gen`), batch flags (`_fv_batch_running`).
   `BaseSignalTree.close()` tears all of it down.
 - **on the Session**: `_action_artifacts` (RegionAction selectors/outputs),

@@ -639,7 +639,7 @@ class _OverlayVecs:
 
 class _Evt:
     """A real anyplotlib ``double_click`` Event only ever carries xdata/ydata
-    (the calibrated data-space coordinate) — there is NO img_x/img_y field on
+    (the calibrated data-space coordinate); there is NO img_x/img_y field on
     the Python Event dataclass (see callbacks.py). The hit test works directly
     against the reference spots (already calibrated kx,ky), so tests pass the
     CALIBRATED click position here, not a pixel position."""
@@ -693,6 +693,17 @@ class TestStrainSelectionOverlay:
             match_radius_px=3.0, on_toggle=on_toggle)
         return overlay, plot, events
 
+    def _navigate_to(self, plot, node, iy, ix, on_reference):
+        """Move the navigator to one position until that position's value has
+        reached this plot. Used where the spots fall off the detector, so
+        nothing is drawn to count."""
+        def _ready():
+            refresh_overlays(plot, np.array([[ix, iy]]))
+            value = plot.last_overlay_value(node)
+            return value is not None and value.get("on_reference") is on_reference
+
+        assert wait_until(_ready, 10), "the position was never drawn"
+
     def _draw_at(self, plot, node, iy, ix, group, count):
         """Move the navigator to one position until that position is drawn.
 
@@ -719,7 +730,7 @@ class TestStrainSelectionOverlay:
 
     def test_click_handler_listens_on_double_click(self):
         # A single click is ambiguous with panning on an anyplotlib 2-D panel,
-        # so pick/toggle interactions use "double_click" — the same choice the
+        # so pick/toggle interactions use "double_click", the same choice the
         # Particle Picker example makes.
         session = make_session()
         try:
@@ -757,9 +768,12 @@ class TestStrainSelectionOverlay:
         session = make_session()
         try:
             hits = []
-            overlay, _plot, _events = self._attach(
+            overlay, plot, _events = self._attach(
                 session, on_toggle=lambda: hits.append(1), scale=0.01, offset=-0.64)
-            # The spot at calibrated (5.0, 0.0) — click exactly there, NOT at
+            # At this calibration every spot maps well off the detector, so
+            # nothing is drawn; the hit test still has to find them.
+            self._navigate_to(plot, overlay.node, 0, 0, True)
+            # The spot at calibrated (5.0, 0.0): click exactly there, NOT at
             # its (very different) pixel position.
             overlay._click(_Evt(5.0, 0.0))
             assert hits == [1]
@@ -784,14 +798,39 @@ class TestStrainSelectionOverlay:
         finally:
             close_session(session)
 
+    def test_a_click_off_the_reference_pixel_changes_nothing(self):
+        """Off the reference pixel the overlay draws displacement arrows, not
+        pickable circles, so a double-click there must not toggle a spot."""
+        session = make_session()
+        try:
+            hits = []
+            overlay, plot, _events = self._attach(session,
+                                                  on_toggle=lambda: hits.append(1))
+            overlay.tree.replace_overlay_static(
+                overlay.node, selected=np.ones(3, dtype=bool))
+            self._draw_at(plot, overlay.node, 1, 1, "arrows", 3)
+
+            overlay._click(_Evt(5.0, 0.0))       # right on top of a spot
+            assert hits == []
+            assert overlay.selected.sum() == 3, "a click off the reference pixel toggled"
+
+            # Back on the reference pixel the same click does toggle.
+            self._draw_at(plot, overlay.node, 0, 0, "selected", 3)
+            overlay._click(_Evt(5.0, 0.0))
+            assert hits == [1]
+            assert overlay.selected.sum() == 2
+        finally:
+            close_session(session)
+
     def test_selection_carries_forward_when_reference_moves(self):
         """Marking peaks, then moving the reference crosshair, must KEEP those
         peaks marked at their new positions (matched by nearest-within-
-        match_radius, like the displacement arrows) — not reset to a fresh
+        match_radius, like the displacement arrows), not reset to a fresh
         all-or-nothing selection every move."""
         session = make_session()
         try:
-            overlay, _plot, _events = self._attach(session)
+            overlay, plot, _events = self._attach(session)
+            self._draw_at(plot, overlay.node, 0, 0, "excluded", 3)
             # Mark the spot at (5, 0) and (0, 5); leave (-5, 0) unmarked.
             overlay._click(_Evt(5.0, 0.0))
             overlay._click(_Evt(0.0, 5.0))
@@ -814,10 +853,11 @@ class TestStrainSelectionOverlay:
     def test_selection_carry_forward_drops_peak_outside_match_radius(self):
         """A marked peak with NO successor within match_radius at the new
         reference pixel is dropped (not carried forward to some unrelated
-        spot) — it simply becomes unmarked."""
+        spot): it simply becomes unmarked."""
         session = make_session()
         try:
-            overlay, _plot, _events = self._attach(session)
+            overlay, plot, _events = self._attach(session)
+            self._draw_at(plot, overlay.node, 0, 0, "excluded", 3)
             overlay._click(_Evt(5.0, 0.0))              # mark the (5,0) spot
             assert overlay.selected.sum() == 1
 

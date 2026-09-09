@@ -546,12 +546,12 @@ def _finalize(tree, vecs) -> None:
 
 def _install_render_display(tree, vecs) -> None:
     """Drive the result window's signal plot by rendering vectors frames
-    IN-PROCESS on every navigator move (Qt parity) — ``render_frame`` is an O(1)
-    CSR slice. This REPLACES the navigator's slice function so navigation never
-    touches the lazy ``to_rendered_dask`` root, whose chunks are delivered
-    asynchronously (Future → shared-memory) and can leave the window black on
-    real distributed data. Each navigated position now paints its disks
-    synchronously, exactly like the Qt ``_make_hooked`` update."""
+    IN-PROCESS on every navigator move: ``render_frame`` is an O(1) CSR slice.
+    This REPLACES the navigator's slice function so navigation never touches
+    the lazy ``to_rendered_dask`` root, whose chunks are delivered
+    asynchronously (a future into shared memory) and can leave the window black
+    on real distributed data. Each navigated position paints its disks
+    synchronously instead."""
     from spyde.actions.vector_overlay import _indices_to_iyix, _indices_lead_nav
     H = int(vecs.sig_axes[1].size)
     W = int(vecs.sig_axes[0].size)
@@ -856,15 +856,15 @@ def _refresh_signal_from_navigator(tree) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Staged "wizard" workflow (Qt parity): a live found-peaks PREVIEW on the source
-# DP while you tune the sliders, then Compute → the full-dataset batch. The
+# Staged "wizard" workflow: a live found-peaks PREVIEW on the source pattern
+# while you tune the sliders, then Compute runs the full-dataset batch. The
 # preview overlay lives on the source tree as `_fv_preview`.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def fv_open(session, plot, payload) -> None:
-    """'Tune' step: attach the LIVE found-peaks preview to the source DP so the
-    red circles update as you tune the sliders / move the navigator (Qt parity).
-    Idempotent — replaces any existing preview."""
+    """'Tune' step: attach the LIVE found-peaks preview to the source pattern
+    so the red circles update as you tune the sliders or move the navigator.
+    Idempotent: it replaces any existing preview."""
     src, tree = _src_plot_tree(session, plot)
     if src is None or tree is None:
         emit_error("Find Vectors: no active dataset")
@@ -912,8 +912,8 @@ def fv_open(session, plot, payload) -> None:
             # The live preview supersedes any persistent overlay from an
             # earlier Compute: both drawing at once duplicates every peak.
             replace_tree_overlay(tree, "_vector_overlay", None)
-            # Qt parity: estimate the disk radius from the data (once) so the
-            # wizard's defaults match the pattern instead of a fixed 5.
+            # Estimate the disk radius from the data, once, so the wizard's
+            # defaults match the pattern instead of a fixed 5.
             if not getattr(tree, "_fv_auto_sent", False):
                 tree._fv_auto_sent = True
                 _emit_auto_params(src, tree)
