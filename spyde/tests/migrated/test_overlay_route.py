@@ -15,6 +15,7 @@ import itertools
 import threading
 import time
 
+import dask.array as da
 import numpy as np
 import hyperspy.api as hs
 
@@ -321,6 +322,33 @@ class TestNavigationDepth:
             reader_for_overlay(plot, node).read_frame((4, 4))
             expected = np.asarray(tree.root.data[3:6, 3:6].compute())
             assert np.array_equal(frames[0], expected)
+        finally:
+            session.shutdown()
+
+    def test_an_opaque_parent_is_read_as_its_block(self):
+        """A node the locality gate rejects has its dask block for a
+        footprint, which is slower than a recipe and still a real frame."""
+        session, plot = _open_session(_indexed_lazy())
+        try:
+            tree = plot.signal_tree
+            opaque = tree.add_transformation(
+                tree.root, function=lambda signal: signal.deepcopy(),
+                node_name="Opaque", local=False)
+            assert not tree.resolve_locality(opaque)
+
+            single = tree.add_overlay(opaque, lambda frame: {"doubled": frame * 2.0},
+                                      name="single", groups={})
+            value = reader_for_overlay(plot, single).read_frame((2, 3))
+            expected = np.asarray(opaque.data[2, 3].compute()) * 2.0
+            assert np.array_equal(value["doubled"], expected)
+
+            frames = []
+            window = tree.add_overlay(
+                opaque, lambda w, centre, *, sink: sink.append(np.asarray(w)) or {},
+                name="window", groups={}, static={"sink": frames}, depth=1)
+            reader_for_overlay(plot, window).read_frame((2, 3))
+            assert np.array_equal(
+                frames[0], np.asarray(opaque.data[1:4, 2:5].compute()))
         finally:
             session.shutdown()
 
@@ -671,6 +699,50 @@ class TestReaderOverride:
             tree.set_reader_override(tree.root, _ConstantReader(None))
             _move_navigator(session, tree)
             time.sleep(0.3)
+            assert np.array_equal(plot.current_data, before)
+        finally:
+            session.shutdown()
+
+    def test_an_override_answers_for_data_that_cannot_be_sliced(self):
+        """The progressive case: the node's array is a placeholder, which
+        every ordinary read declines, and the override still has a frame."""
+        session, plot = _open_session(_off_centre_lazy())
+        try:
+            tree = plot.signal_tree
+            frame = np.full((32, 32), 7.0, dtype=np.float32)
+            tree.set_reader_override(tree.root, _ConstantReader(frame))
+            tree.root.data = None          # hyperspy's one-element placeholder
+
+            _move_navigator(session, tree)
+            assert _wait(lambda: np.array_equal(plot.current_data, frame), 10), \
+                plot.current_data
+        finally:
+            session.shutdown()
+
+    def test_no_frame_from_the_override_computes_nothing(self):
+        session, plot = _open_session(_off_centre_lazy())
+        try:
+            tree = plot.signal_tree
+            _move_navigator(session, tree)
+            before = np.asarray(plot.current_data).copy()
+            tree.set_reader_override(tree.root, _ConstantReader(None))
+
+            computed = []
+            original = da.Array.compute
+
+            def counting_compute(self, *args, **kwargs):
+                if threading.current_thread().name == "nav-dispatch":
+                    computed.append(self.shape)
+                return original(self, *args, **kwargs)
+
+            da.Array.compute = counting_compute
+            try:
+                _move_navigator(session, tree)
+                time.sleep(0.3)
+            finally:
+                da.Array.compute = original
+
+            assert computed == [], computed
             assert np.array_equal(plot.current_data, before)
         finally:
             session.shutdown()

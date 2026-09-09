@@ -103,8 +103,13 @@ def _source_window(recipe: FrameRecipe, indices, parent_signal, parent_frame):
         high = min(sizes[axis] - 1, position + recipe.depth)
         spans.append(range(low, high + 1))
         centre.append(position - low)
-    frames = [_source_frame(recipe, point, parent_signal, parent_frame)
-              for point in itertools.product(*spans)]
+    frames = []
+    for point in itertools.product(*spans):
+        frame = _source_frame(recipe, point, parent_signal, parent_frame)
+        if frame is None:
+            raise ValueError(f"no source frame at {point} for the window "
+                             f"around {tuple(indices)}")
+        frames.append(frame)
     window_shape = tuple(len(span) for span in spans)
     window = np.stack(frames).reshape(window_shape + np.shape(frames[0]))
     return window, tuple(centre)

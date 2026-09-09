@@ -369,7 +369,14 @@ class _CachedParentFrames:
         self.data = signal.data
 
     def read_frame(self, indices):
-        return get_local_frame(self.plot, self.signal, self.data, indices)
+        frame = get_local_frame(self.plot, self.signal, self.data, indices)
+        if frame is not None:
+            return frame
+        # The locality gate rejects this parent (a console-made or untagged
+        # node). Its footprint is its dask block, so read the block and keep
+        # the frame: correct and slow beats an overlay that draws nothing.
+        reader = _reader_for(self.plot, self.signal, self.data)
+        return self.plot._array_cache.get_frame(id(self.signal), reader, indices)
 
 
 def _grow_cache_for_window(plot, signal, parent_signal) -> None:

@@ -1045,6 +1045,15 @@ def _prepare_nav_indices(current_signal, indices, integrating: bool, data=None):
     return indices
 
 
+class _NavigationAxesBound:
+    """Passed as ``data`` to :func:`_prepare_nav_indices` to clamp against a
+    signal's navigation axes. It deliberately has no ``shape``, which is what
+    selects that fallback."""
+
+
+_NAVIGATION_AXES = _NavigationAxesBound()
+
+
 def _read_through_override(override, current_signal, indices):
     """The frame a reader pinned on the tree answers with, for a point or an
     integrating region.
@@ -1129,6 +1138,28 @@ def update_from_navigation_selection(
     # get the data from the signal tree based on the current indices
 
     current_signal = child.plot_state.current_signal
+
+    # A node whose frames are not in its own array answers through a reader
+    # pinned on the tree: disks rendered from vectors, a progressive result
+    # that has only the blocks that have landed, one window of an event
+    # stream. That reader IS the read for this node, so it runs before every
+    # guard below: those guards ask whether `.data` can be sliced, and a
+    # placeholder or an unresolved future there is exactly the case an
+    # override exists to serve.
+    _tree = getattr(child, "signal_tree", None)
+    _override = (_tree.reader_override_for(current_signal)
+                 if _tree is not None else None)
+    if _override is not None:
+        # Clamp against the navigation axes, not `.data`: the override reads
+        # the position rather than that array, whose shape may be a
+        # placeholder's and would clamp a real coordinate to zero.
+        result = _read_through_override(
+            _override, current_signal,
+            _prepare_nav_indices(current_signal, indices,
+                                 selector.is_integrating,
+                                 data=_NAVIGATION_AXES))
+        _prof.done("reader override")
+        return result
 
     # A signal whose `.data` is still a pending FUTURE has nothing to slice yet,
     # and that is independent of `_lazy` — so it must be checked here rather
@@ -1237,20 +1268,6 @@ def update_from_navigation_selection(
     # same raw selector indices — see _prepare_nav_indices.
     indices = _prepare_nav_indices(current_signal, indices,
                                    selector.is_integrating, data=data_now)
-
-    # A node whose frames are not in its own array answers through a reader
-    # pinned on the tree: disks rendered from vectors, a progressive result
-    # that has only the blocks that have landed, one window of an event
-    # stream. That reader IS the read for this node, so it comes before every
-    # array path below and before the locality gate, which describes reading
-    # the node's array.
-    _tree = getattr(child, "signal_tree", None)
-    _override = (_tree.reader_override_for(current_signal)
-                 if _tree is not None else None)
-    if _override is not None:
-        result = _read_through_override(_override, current_signal, indices)
-        _prof.done("reader override")
-        return result
 
     if current_signal._lazy:
         if is_future_like(data_now[0]):
