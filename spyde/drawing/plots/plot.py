@@ -622,7 +622,11 @@ class Plot:
         self._overlay_groups[key] = handle
 
     def drop_overlay_groups(self, node) -> None:
-        """Remove every anyplotlib primitive an overlay node drew with."""
+        """Remove every anyplotlib primitive an overlay node drew with, and
+        release the transform view if it held one: that suppresses the
+        navigator's own paint, so it must not outlive the node driving it."""
+        if any(kind == "transform" for kind, _ in node.groups.values()):
+            self.set_transform_active(False)
         for key in [k for k in self._overlay_groups if k[0] == id(node)]:
             handle = self._overlay_groups.pop(key)
             for one in (handle if isinstance(handle, list) else [handle]):
@@ -724,8 +728,15 @@ class Plot:
                 if isinstance(self.current_data, np.ndarray):
                     self._set_array(self.current_data)
             else:
+                # A value may carry its own contrast window: a detector's
+                # response has a meaningful floor and ceiling that auto-levelling
+                # would throw away.
+                image, levels = (value if isinstance(value, tuple)
+                                 else (value, None))
                 self.set_transform_active(True)
-                self.set_transform_image(np.asarray(value))
+                if levels is not None:
+                    self.needs_auto_level = False
+                self.set_transform_image(np.asarray(image), levels=levels)
 
     def _push_overlay_curves(self, key, node, name, value) -> None:
         """Draw a list of (x, y) pairs as 1-D lines, growing or trimming the
@@ -779,9 +790,10 @@ class Plot:
         self._set_array(data, levels=levels)
 
     def set_transform_active(self, active: bool) -> None:
-        """Enter/leave Find-Vectors transform view. While active, the navigator's
-        raw-frame paint to this plot is suppressed (the overlay drives the image
-        via :meth:`set_transform_image`)."""
+        """Enter or leave the transform view. While active, the navigator's
+        raw-frame paint to this plot is suppressed and the overlay's transform
+        group drives the image through :meth:`set_transform_image`. Called from
+        the painter thread, where the transform group is pushed."""
         self._fv_transform_active = bool(active)
         logger.debug("[plot] transform-view lock %s (window %s)",
                      "ACTIVE" if active else "released", self.window_id)
@@ -1017,13 +1029,13 @@ class Plot:
             except Exception as _e:
                 logger.debug("tiledbg in-frame probe failed: %s", _e)
 
-        # Transform-view lock: while the Find-Vectors preview shows the DoG /
-        # correlation image on this signal plot, the navigator's RAW-frame paint
-        # must not overwrite it. The overlay sets `_fv_transform_active` and
-        # paints through `set_transform_image` (which sets `_fv_paint_token` to
-        # bypass this guard); every other paint of a navigated frame is dropped
-        # so the navigator move recomputes the transform (via the overlay's
-        # index hook) instead of flashing the raw pattern back.
+        # Transform-view lock: while an overlay's transform group shows the
+        # detector's response image on this signal plot, the navigator's
+        # RAW-frame paint must not overwrite it. The painter applies the base
+        # frame BEFORE the overlay value, and an expensive overlay's value
+        # lands later still, so without this guard every move flashes the raw
+        # pattern back. `set_transform_image` sets `_fv_paint_token` to get
+        # through; every other paint of a navigated frame is dropped.
         if (getattr(self, "_fv_transform_active", False)
                 and not getattr(self, "_fv_paint_token", False)
                 and dims == 2 and self._is_navigated_frame()):

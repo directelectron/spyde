@@ -72,17 +72,19 @@ class TestOrientationWizard:
                 "library/overlay never became ready"
             wiz = tree._om_wizard
             assert wiz.sim is not None and wiz.cache is not None
-            overlay = wiz.overlay
-            assert overlay._mg is not None          # live template overlay attached
+            from spyde.actions.vector_overlay import overlay_static
+            node = wiz.overlay
+            # The live template overlay is drawn on the source pattern.
+            assert (id(node), "template") in src._overlay_groups
 
             # ── Refine: change gamma + normalize live ────────────────────────
             om_refine(session, src, {"gamma": 0.3, "normalize_templates": True})
-            assert _wait(lambda: abs(overlay.gamma - 0.3) < 1e-9)
-            assert overlay.normalize_templates is True
+            assert _wait(lambda: abs(overlay_static(node)["gamma"] - 0.3) < 1e-9)
+            assert overlay_static(node)["normalize_templates"] is True
 
             # scale override is applied too
             om_refine(session, src, {"gamma": 0.3, "scale_override": 0.014})
-            assert _wait(lambda: overlay.scale_override is not None)
+            assert _wait(lambda: overlay_static(node)["scale_override"] is not None)
 
             # ── Compute Map (reuses the built library) ───────────────────────
             # The IPF window now opens BLANK up front (progressive live fill-in)

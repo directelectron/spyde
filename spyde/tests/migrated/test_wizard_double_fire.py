@@ -49,19 +49,17 @@ class TestFindVectorsPreviewDoubleFire:
         orig = vo.attach_find_vectors_preview
 
         def _tracking(*a, **kw):
-            ov = orig(*a, **kw)
-            ov._test_removed = False
-            orig_remove = ov.remove
-
-            def _rm():
-                ov._test_removed = True
-                return orig_remove()
-
-            ov.remove = _rm
-            returned.append(ov)
-            return ov
+            node = orig(*a, **kw)
+            returned.append(node)
+            return node
 
         monkeypatch.setattr(vo, "attach_find_vectors_preview", _tracking)
+
+        def _still_attached(node):
+            """An overlay node is alive while it is still a child of its
+            parent; removing it is what takes it out of the tree."""
+            parent = node.parent
+            return parent is not None and parent.children.get(node.name) is node
 
         # The exact StrictMode sequence, synchronous, before any worker lands.
         fva.fv_open(session, plot, {})
@@ -70,7 +68,7 @@ class TestFindVectorsPreviewDoubleFire:
         _join_threads("fv-preview")
         assert quiesce(session), why_busy(session)
 
-        alive = [ov for ov in returned if not ov._test_removed]
+        alive = [node for node in returned if _still_attached(node)]
         assert len(alive) == 1, (
             f"expected exactly 1 live preview overlay, got {len(alive)} "
             f"of {len(returned)} attached")
@@ -79,4 +77,4 @@ class TestFindVectorsPreviewDoubleFire:
         # And a final close cleans it up.
         fva.fv_close(session, plot, {})
         assert getattr(tree, "_fv_preview", None) is None
-        assert all(ov._test_removed for ov in returned)
+        assert not any(_still_attached(node) for node in returned)

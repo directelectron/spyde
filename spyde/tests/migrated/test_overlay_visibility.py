@@ -1,11 +1,11 @@
 """
-DP marker overlays hide when their action is deselected.
+Pattern marker overlays hide when their action is deselected.
 
 The found-vectors / orientation-template / vector-OM-refine overlays draw on the
 diffraction pattern only while their toolbar action (caret) is SELECTED. Closing
 the caret hides the overlay (markers cleared, nav moves don't redraw); reopening
-redraws at the current frame. Driven by the `set_overlay` action / the overlays'
-`set_visible`.
+redraws at the current frame. Driven by the `set_overlay` action, which reaches
+`BaseSignalTree.set_overlay_visible`.
 """
 from __future__ import annotations
 
@@ -24,6 +24,14 @@ def _wait(pred, timeout=25.0):
 def _signal_plot(session):
     return next((p for p in session._plots
                  if not p.is_navigator and p.plot_state is not None), None)
+
+
+def _drawn(plot, node, group="found"):
+    """What the plot's marker group is currently showing."""
+    handle = plot._overlay_groups.get((id(node), group))
+    if handle is None:
+        return np.zeros((0, 2))
+    return np.asarray(handle._data["offsets"])
 
 
 def _calibrated_diffraction_4d(nav=(4, 5), sig=(24, 24), scale=0.1):
@@ -56,34 +64,29 @@ class TestOverlayVisibility:
                  "min_distance": 3, "subpixel": True},
             )
             assert _wait(lambda: getattr(src_tree, "_vector_overlay", None) is not None)
-            overlay = src_tree._vector_overlay
+            node = src_tree._vector_overlay
 
             # Seed at a position that has vectors so a visible push is non-empty.
+            from spyde.drawing.overlays import refresh_overlays
             vecs = session.signal_trees[-1].diffraction_vectors
             ys, xs = np.nonzero(vecs.count_map())
             iy, ix = int(ys[0]), int(xs[0])
-            overlay._on_indices(np.array([[ix, iy]]))
-
-            # Spy on what gets pushed to the marker group.
-            pushed = []
-            orig = overlay._mg.set
-            overlay._mg.set = lambda **kw: pushed.append(
-                np.asarray(kw.get("offsets", np.zeros((0, 2)))))
+            refresh_overlays(src_plot, np.array([[ix, iy]]))
+            assert _wait(lambda: len(_drawn(src_plot, node)) > 0)
 
             # Deselect → markers CLEARED.
             session._set_overlay(src_plot, "Find Diffraction Vectors", False)
-            assert overlay._hidden is True
-            assert pushed and pushed[-1].shape[0] == 0
+            assert node.visible is False
+            assert _wait(lambda: len(_drawn(src_plot, node)) == 0)
 
             # While hidden, navigating does NOT redraw.
-            pushed.clear()
-            overlay._on_indices(np.array([[ix, iy]]))
-            assert pushed == []
+            refresh_overlays(src_plot, np.array([[ix, iy]]))
+            assert not _wait(lambda: len(_drawn(src_plot, node)) > 0, 1.0)
 
             # Reselect → redrawn at the current frame (non-empty).
             session._set_overlay(src_plot, "Find Diffraction Vectors", True)
-            assert overlay._hidden is False
-            assert pushed and pushed[-1].shape[0] > 0
+            assert node.visible is True
+            assert _wait(lambda: len(_drawn(src_plot, node)) > 0)
         finally:
             close_session(session)
 

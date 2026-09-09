@@ -1,91 +1,100 @@
-"""Regression: tuning Find-Vectors params (set_params) re-renders the live
-preview peaks even when the navigator hasn't moved. A slider tweak is just
-another reason to recompute the current frame, routed through the SAME async
-latest-wins engine as a navigator move (no bespoke synchronous path).
+"""Tuning Find-Vectors parameters re-renders the live preview peaks even when
+the navigator has not moved.
+
+A slider tweak replaces the overlay node's static arguments and re-runs the
+position the navigator is already on, which is the same path a navigator move
+takes: there is no second, synchronous redraw to keep in step with the first.
 """
-import time
+from __future__ import annotations
 
 import numpy as np
+import hyperspy.api as hs
 
-from spyde.actions.vector_overlay import FindVectorsPreviewOverlay
-from spyde.drawing.live_overlay import LiveOverlayEngine
+from spyde.actions.find_vectors_action import fv_close, fv_open, fv_tune
+from spyde.actions.vector_overlay import overlay_static
+from spyde.drawing.overlays import refresh_overlays
+from spyde.tests.migrated._async import wait_until
+from spyde.tests.migrated.conftest import _settle, close_session, make_session
 
-
-class _FakeMarkerGroup:
-    def __init__(self):
-        self.offsets = []
-
-    def set(self, **kw):
-        if "offsets" in kw:
-            self.offsets.append(np.asarray(kw["offsets"]))
-
-    def remove(self):
-        pass
+PARAMS = {"method": "nxcorr", "sigma": 0.0, "kernel_radius": 3,
+          "threshold": 0.5, "min_distance": 3, "subpixel": False}
 
 
-class _Sig:
-    """One nav pixel with disks close together so the found-peak count is
-    sensitive to min_distance (the disk NXCORR ≈1, so threshold doesn't
-    discriminate clean disks; min_distance does)."""
-    def __init__(self):
-        frame = np.zeros((1, 1, 64, 64), np.float32)
-        yy, xx = np.mgrid[0:64, 0:64]
-        for cy, cx in [(28, 28), (28, 36), (36, 28), (36, 36), (20, 32), (44, 32)]:
-            frame[0, 0] += np.exp(-(((yy - cy) ** 2 + (xx - cx) ** 2) / (2 * 2.5 ** 2)))
-        self.data = frame.astype(np.float32)
+def _signal_plot(session):
+    return next((p for p in session._plots
+                 if not p.is_navigator and p.plot_state is not None), None)
 
 
-def _make_overlay():
-    ov = FindVectorsPreviewOverlay(
-        dp_plot=None, signal=_Sig(), sigma=0.0, kernel_radius=3,
-        threshold=0.5, min_distance=3, subpixel=False,
-    )
-    ov._mg = _FakeMarkerGroup()
-    ov._last_iyix = (0, 0)
-    # The overlay normally runs the navigation path through the engine (thread
-    # mode); set_params must still re-render synchronously regardless.
-    ov._engine = LiveOverlayEngine(ov._offsets_for, ov._render_payload,
-                                   mode="thread", name="fv")
-    return ov
+def _close_disks_4d():
+    """Disks close enough together that the found-peak count is sensitive to
+    min_distance (a clean disk correlates at ~1, so the threshold does not
+    discriminate between them; the minimum separation does)."""
+    frame = np.zeros((64, 64), np.float32)
+    yy, xx = np.mgrid[0:64, 0:64]
+    for cy, cx in [(28, 28), (28, 36), (36, 28), (36, 36), (20, 32), (44, 32)]:
+        frame += np.exp(-(((yy - cy) ** 2 + (xx - cx) ** 2) / (2 * 2.5 ** 2)))
+    data = np.broadcast_to(frame, (2, 2, 64, 64)).copy()
+    signal = hs.signals.Signal2D(data)
+    signal.set_signal_type("electron_diffraction")
+    return signal
 
 
-def _wait_render(ov, n_before, timeout=2.0):
-    t0 = time.time()
-    while time.time() - t0 < timeout and len(ov._mg.offsets) <= n_before:
-        time.sleep(0.01)
-    return len(ov._mg.offsets) > n_before
+def _drawn(plot, node):
+    handle = plot._overlay_groups.get((id(node), "peaks"))
+    if handle is None:
+        return np.zeros((0, 2))
+    return np.asarray(handle._data["offsets"])
 
 
-def test_set_params_rerenders_peaks():
-    ov = _make_overlay()
-    try:
-        n_before = len(ov._mg.offsets)
-        ov.set_params(min_distance=2)             # close peaks resolved → many
-        assert _wait_render(ov, n_before), "set_params did not re-render"
-        n_close = len(ov._mg.offsets[-1])
+class TestPreviewParameters:
+    def test_tuning_min_distance_redraws_the_peaks(self):
+        session = make_session()
+        try:
+            session._add_signal(_close_disks_4d(), source_path=None)
+            _settle(session)
+            plot = _signal_plot(session)
+            tree = plot.signal_tree
 
-        n_mid = len(ov._mg.offsets)
-        ov.set_params(min_distance=30)            # merge → few
-        assert _wait_render(ov, n_mid)
-        n_far = len(ov._mg.offsets[-1])
+            fv_open(session, plot, dict(PARAMS))
+            assert wait_until(lambda: getattr(tree, "_fv_preview", None) is not None, 30)
+            node = tree._fv_preview
+            assert wait_until(lambda: len(_drawn(plot, node)) > 0, 20), \
+                "the preview found no peaks on a disk pattern"
 
-        assert n_close > 0
-        assert n_far < n_close, \
-            f"min_distance change didn't update the peaks ({n_close} → {n_far})"
-    finally:
-        ov._engine.stop()
+            fv_tune(session, plot, dict(PARAMS, min_distance=2))
+            assert wait_until(
+                lambda: overlay_static(node)["params"]["min_distance"] == 2, 20)
+            assert wait_until(lambda: len(_drawn(plot, node)) > 0, 20)
+            close = len(_drawn(plot, node))
 
+            fv_tune(session, plot, dict(PARAMS, min_distance=30))
+            assert wait_until(
+                lambda: overlay_static(node)["params"]["min_distance"] == 30, 20)
+            assert wait_until(lambda: len(_drawn(plot, node)) < close, 20), \
+                f"a min_distance change did not update the peaks (still {close})"
+        finally:
+            close_session(session)
 
-def test_navigation_path_renders_via_engine():
-    """The navigator path (_on_indices) goes through the async engine and still
-    renders the preview peaks."""
-    ov = _make_overlay()
-    try:
-        n_before = len(ov._mg.offsets)
-        ov._on_indices(np.array([[0, 0]]))        # crosshair (cx, cy)
-        t0 = time.time()
-        while time.time() - t0 < 2.0 and len(ov._mg.offsets) <= n_before:
-            time.sleep(0.01)
-        assert len(ov._mg.offsets) > n_before, "navigation did not render peaks"
-    finally:
-        ov._engine.stop()
+    def test_a_navigator_move_redraws_the_peaks(self):
+        session = make_session()
+        try:
+            session._add_signal(_close_disks_4d(), source_path=None)
+            _settle(session)
+            plot = _signal_plot(session)
+            tree = plot.signal_tree
+
+            fv_open(session, plot, dict(PARAMS))
+            assert wait_until(lambda: getattr(tree, "_fv_preview", None) is not None, 30)
+            node = tree._fv_preview
+            fv_close(session, plot, {})
+            assert wait_until(lambda: getattr(tree, "_fv_preview", None) is None, 20)
+            assert wait_until(lambda: len(_drawn(plot, node)) == 0, 20)
+
+            fv_open(session, plot, dict(PARAMS))
+            assert wait_until(lambda: getattr(tree, "_fv_preview", None) is not None, 30)
+            node = tree._fv_preview
+            refresh_overlays(plot, np.array([[1, 1]]))
+            assert wait_until(lambda: len(_drawn(plot, node)) > 0, 20), \
+                "a navigator move did not render the preview peaks"
+        finally:
+            close_session(session)

@@ -398,43 +398,39 @@ class ActionRouterMixin:
         ipc.emit({"type": "action_active", "window_id": src_wid, "name": name, "active": True})
 
     def _set_overlay(self, plot, name: str, visible: bool) -> None:
-        """Show/hide the live DP overlay(s) tied to a toolbar action — the marker
-        overlay is only drawn while its action (caret) is SELECTED. The overlay
-        still tracks the navigator while hidden, so re-selecting redraws the
-        current frame."""
+        """Show/hide the live pattern overlay(s) tied to a toolbar action. A
+        marker overlay is drawn only while its action (caret) is SELECTED;
+        showing it again redraws it at the current navigator position."""
         tree = getattr(plot, "signal_tree", None) if plot is not None else None
         if tree is None or not name:
             return
-        overlays = []
+        nodes = []
         if name == "Find Diffraction Vectors":
-            # Two overlays: the SOURCE-DP one (_vector_overlay) and the one on the
-            # RESULT vectors-image window (_result_vector_overlay). The user clicks
-            # the action on EITHER window, so toggle both.
-            overlays.append(getattr(tree, "_vector_overlay", None))
-            # The result window can carry more than one (a second signal plot via
-            # "Add Selector" gets its own); toggling only the primary left the
-            # others drawn.
-            from spyde.actions.find_vectors_action import _result_overlays
-            overlays.extend(_result_overlays(tree))
+            # The SOURCE pattern's overlay and the one on the RESULT
+            # vectors-image window. The user clicks the action on EITHER
+            # window, so toggle whichever this tree owns.
+            nodes.append(getattr(tree, "_vector_overlay", None))
+            nodes.append(getattr(tree, "_result_vector_overlay", None))
         elif name == "Orientation Mapping":
-            overlays.append(getattr(tree, "_orientation_overlay", None))
+            nodes.append(getattr(tree, "_orientation_overlay", None))
             wiz = getattr(tree, "_om_wizard", None)
             if wiz is not None:
-                overlays.append(getattr(wiz, "overlay", None))
+                nodes.append(getattr(wiz, "overlay", None))
         elif name == "Vector Orientation Mapping":
             wiz = getattr(tree, "_vom_wizard", None)
             if wiz is not None:
-                overlays.append(getattr(wiz, "overlay", None))
+                nodes.append(getattr(wiz, "overlay", None))
         elif name == "EBSD Indexing":
             wiz = getattr(tree, "_ebsd_wizard", None)
             if wiz is not None:
-                overlays.append(getattr(wiz, "overlay", None))
-        for ov in overlays:
-            if ov is not None and hasattr(ov, "set_visible"):
-                try:
-                    ov.set_visible(visible)
-                except Exception as e:
-                    log.debug("toggling overlay visibility failed: %s", e)
+                nodes.append(getattr(wiz, "overlay", None))
+        for node in nodes:
+            if node is None:
+                continue
+            try:
+                tree.set_overlay_visible(node, visible)
+            except Exception as e:
+                log.debug("toggling overlay visibility failed: %s", e)
 
     def _set_action_active(self, window_id: int, name: str, active: bool) -> None:
         """Deselecting an action hides the output window + ROI selector it made

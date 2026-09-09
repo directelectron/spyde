@@ -190,11 +190,8 @@ class EbsdWizard(WizardController):
         if self._closed:
             return
         self._closed = True
-        if self.overlay is not None and hasattr(self.overlay, "remove"):
-            try:
-                self.overlay.remove()
-            except Exception as e:
-                log.debug("removing EBSD band overlay failed: %s", e)
+        from spyde.actions.vector_overlay import remove_overlay_node
+        remove_overlay_node(self.tree, self.overlay)
         self.overlay = None
         self.indexer = None
         if getattr(self.tree, "_ebsd_wizard", None) is self:
@@ -445,7 +442,7 @@ def ebsd_build_dictionary(session, plot, payload) -> None:
             )
             from spyde.actions.ebsd_overlay import attach_ebsd_band_overlay
             wiz.overlay = attach_ebsd_band_overlay(
-                src, root, indexer, reflectors, tree,
+                root, indexer, reflectors, tree,
                 detector=detector, pc=pc, correct=wiz.correct,
                 n_bands=n_bands, show_zone_axes=zone_axes,
                 on_match=lambda e, s: _emit_match(window_id, e, s),
@@ -499,8 +496,9 @@ def ebsd_refine(session, plot, payload) -> None:
         params["pc"] = pc
 
     def _work():
+        from spyde.actions.ebsd_overlay import set_ebsd_refine_params
         try:
-            wiz.overlay.set_refine_params(**params)
+            set_ebsd_refine_params(tree, wiz.overlay, **params)
             wiz.refine = dict(payload)
         except Exception as e:
             log.debug("ebsd_refine failed: %s", e)

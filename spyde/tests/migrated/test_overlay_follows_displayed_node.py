@@ -10,12 +10,11 @@ navigator move instead of the node's recipe on the parent's resident block.
 """
 from __future__ import annotations
 
-import time
-
 import dask.array as da
 import numpy as np
 import hyperspy.api as hs
 
+from spyde.array_cache import reader_for_overlay
 from spyde.tests.migrated.conftest import _settle
 from spyde.tests.migrated.test_center_zero_beam import (
     _off_center_4d, _signal_plot, _wait,
@@ -74,9 +73,19 @@ def _find_vectors(session, src, tree):
     return result_tree
 
 
-def _overlay_offsets(overlay, iy, ix):
-    overlay._on_indices(np.array([[ix, iy]]))
-    return np.asarray(overlay._mg._data["offsets"], dtype=np.float64)
+def _overlay_offsets(plot, node, iy, ix, group="found"):
+    """The overlay node's value at one navigation position, read through the
+    plot's readers exactly as a navigator move reads it."""
+    value = reader_for_overlay(plot, node).read_frame((int(iy), int(ix)))
+    return np.asarray(value[group], dtype=np.float64)
+
+
+def _drawn_offsets(plot, node, group="found"):
+    """What the plot's marker group is currently showing."""
+    handle = plot._overlay_groups.get((id(node), group))
+    if handle is None:
+        return np.zeros((0, 2))
+    return np.asarray(handle._data["offsets"], dtype=np.float64)
 
 
 class TestCentreThenFindVectors:
@@ -84,9 +93,9 @@ class TestCentreThenFindVectors:
         tree = src.signal_tree
         centred = _centre(session, src)
         result_tree = _find_vectors(session, src, tree)
-        overlay = tree._vector_overlay
+        node = tree._vector_overlay
 
-        offsets = _overlay_offsets(overlay, 0, 0)
+        offsets = _overlay_offsets(src, node, 0, 0)
         assert len(offsets) == 1, offsets
         shown = _centre_of_mass(src.current_data)
         assert np.allclose(offsets[0], shown, atol=0.5), (offsets[0], shown)
@@ -95,7 +104,7 @@ class TestCentreThenFindVectors:
 
         provenance = getattr(result_tree, "_commit_provenance", None) or {}
         assert str(provenance.get("source_node", "")).startswith("Centered"), provenance
-        assert overlay.signal is centred
+        assert node.parent.signal is centred
 
     def test_circles_land_on_the_displayed_frame(self):
         from spyde.backend.session import Session
@@ -129,37 +138,47 @@ class TestCentreThenFindVectors:
             root = tree.root
             centred = _centre(session, src)
             _find_vectors(session, src, tree)
-            overlay = tree._vector_overlay
-            assert len(_overlay_offsets(overlay, 0, 0)) == 1
+            node = tree._vector_overlay
+            assert _wait(lambda: len(_drawn_offsets(src, node)) == 1, 10)
 
             show_tree_node(src, tree, root)
             assert _wait(lambda: src.plot_state.current_signal is root, 10)
-            assert len(_overlay_offsets(overlay, 0, 0)) == 0, \
+            assert _wait(lambda: len(_drawn_offsets(src, node)) == 0, 10), \
                 "an overlay for the centred node was drawn over the root"
+            assert tree.overlay_children(root) == []
 
             show_tree_node(src, tree, centred)
             assert _wait(lambda: src.plot_state.current_signal is centred, 10)
-            assert len(_overlay_offsets(overlay, 0, 0)) == 1
+            assert _wait(lambda: len(_drawn_offsets(src, node)) == 1, 10)
         finally:
             session.shutdown()
 
 
 class TestOverlayReadsThroughThePlottingPath:
-    def test_frame_at_matches_the_block_and_uses_the_plots_reader(self):
+    def test_the_found_vectors_node_reads_through_the_plots_recipe_reader(self):
+        """The overlay's own reader is the recipe reader the plot resolves, and
+        its value is the store's rows at that position converted to pixels."""
         from spyde.backend.session import Session
-        from spyde.actions.vector_overlay import frame_at
+        from spyde.actions.vector_overlay import DetectorPixels
+        from spyde.signals.diffraction_vectors import COL_KX, COL_KY
         session = Session(n_workers=1, threads_per_worker=1)
         try:
             session._add_signal(_off_centre_lazy())
             _settle(session)
             src = _signal_plot(session)
-            centred = _centre(session, src)
+            tree = src.signal_tree
+            _centre(session, src)
+            result_tree = _find_vectors(session, src, tree)
+            node = tree._vector_overlay
 
-            frame = frame_at(src, centred, 1, 2)
-            expected = np.asarray(centred.data[1, 2].compute())
-            assert np.array_equal(frame, expected)
-            reader = src._local_transform_readers.get(id(centred))
-            assert reader is not None and type(reader).__name__ == "RecipeReader", reader
+            reader = reader_for_overlay(src, node)
+            assert type(reader).__name__ == "RecipeReader", reader
+            assert src._local_transform_readers.get(id(node.signal)) is reader
+
+            vecs = result_tree.diffraction_vectors
+            pixels = DetectorPixels.from_axes(vecs.sig_axes)
+            expected = pixels.clipped(vecs.slice_at(1, 2)[:, [COL_KX, COL_KY]])
+            assert np.allclose(reader.read_frame((1, 2))["found"], expected)
         finally:
             session.shutdown()
 
@@ -179,10 +198,13 @@ class TestOverlayReadsThroughThePlottingPath:
 
             fv_open(session, src, dict(FIND_VECTORS_PARAMS, method="dog"))
             assert _wait(lambda: getattr(tree, "_fv_preview", None) is not None, 30)
-            preview = tree._fv_preview
-            assert preview.signal is centred
-            preview._on_indices(np.array([[1, 1]]))
-            preview._offsets_for(1, 1)          # warm the chunk
+            node = tree._fv_preview
+            assert node.parent.signal is centred
+            reader = reader_for_overlay(src, node)
+            reader.read_frame((1, 1))           # warm the chunk
+
+            parent_reader = src._local_transform_readers.get(id(centred))
+            assert type(parent_reader).__name__ == "RecipeReader", parent_reader
 
             nav_dim = centred.axes_manager.navigation_dimension
             block_computes = []
@@ -196,7 +218,7 @@ class TestOverlayReadsThroughThePlottingPath:
             da.Array.compute = counting_compute
             try:
                 for iy, ix in [(1, 1), (2, 2), (1, 2), (2, 1), (1, 1)]:
-                    preview._offsets_for(iy, ix)
+                    reader.read_frame((iy, ix))
             finally:
                 da.Array.compute = original
             assert block_computes == [], block_computes

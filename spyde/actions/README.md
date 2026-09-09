@@ -76,7 +76,8 @@ click ──► toolbar gate (plot_control_toolbar filters)
            back via session._dispatch_to_main — NEVER touch plots/figures from
            the worker; generation guard drops superseded runs)
       ──► result (commit.open_result_tree for progressive windows /
-           lifecycle.paint_signal_plots / lifecycle.replace_tree_attr overlays)
+           lifecycle.paint_signal_plots / tree.add_overlay for markers on the
+           displayed node)
       ──► Commit (commit.commit_result_tree: primary map + chip views +
            provenance)
       ──► teardown (Session._forget_window → controller.close() → figure
@@ -87,7 +88,8 @@ click ──► toolbar gate (plot_control_toolbar filters)
 
 - **on the tree**: results (`diffraction_vectors`, `orientation_map`,
   `vector_orientation`), wizard controllers (`_om_wizard`, `_vom_wizard`,
-  `_strain_controller`), overlays (`_vector_overlay`, `_fv_preview`, …),
+  `_strain_controller`), overlay NODES (`_vector_overlay`, `_fv_preview`, …
+  — children of the displayed node, added with `tree.add_overlay`),
   run generations (`_<key>_run_gen`), batch flags (`_fv_batch_running`).
   `BaseSignalTree.close()` tears all of it down.
 - **on the Session**: `_action_artifacts` (RegionAction selectors/outputs),

@@ -106,11 +106,8 @@ class VomWizard(WizardController):
         if self._closed:
             return
         self._closed = True
-        if self.overlay is not None and hasattr(self.overlay, "remove"):
-            try:
-                self.overlay.remove()
-            except Exception as e:
-                log.debug("removing VOM wizard overlay failed: %s", e)
+        from spyde.actions.vector_overlay import remove_overlay_node
+        remove_overlay_node(self.tree, self.overlay)
         self.overlay = None
         if getattr(self.tree, "_vom_wizard", None) is self:
             self.tree._vom_wizard = None
@@ -188,7 +185,7 @@ def vom_generate_library(session, plot, payload) -> None:
             try:
                 from spyde.actions.vector_overlay import attach_vector_orientation_overlay
                 overlay = attach_vector_orientation_overlay(
-                    src, vecs, lib, tree, on_fit=lambda fit: _emit_vom_fit(wid, fit))
+                    vecs, lib, tree, on_fit=lambda fit: _emit_vom_fit(wid, fit))
             except Exception as e:
                 import logging
                 logging.getLogger(__name__).debug("vom overlay attach failed: %s", e)
@@ -282,8 +279,9 @@ def vom_refine(session, plot, payload) -> None:
             setattr(wiz, key, params[key])
 
     def _work():
+        from spyde.actions.vector_overlay import set_vector_orientation_params
         try:
-            wiz.overlay.set_params(**params)
+            set_vector_orientation_params(tree, wiz.overlay, **params)
         except Exception as e:
             import logging
             logging.getLogger(__name__).debug("vom_refine failed: %s", e)

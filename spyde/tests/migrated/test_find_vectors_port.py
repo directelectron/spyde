@@ -122,12 +122,13 @@ class TestFindVectorsPort:
             # (b) A found-vectors overlay is attached to the result window and
             # yields markers at a position that actually has vectors.
             assert _wait(lambda: getattr(vtree, "_result_vector_overlay", None) is not None)
-            ov = vtree._result_vector_overlay
-            offs = ov._offsets_for(iy, ix)
+            from spyde.array_cache import reader_for_overlay
+            node = vtree._result_vector_overlay
+            offs = reader_for_overlay(sp, node).read_frame((iy, ix))["found"]
             assert len(offs) > 0
             # (c) Every marker lands inside the detector — spurious out-of-frame
             # vectors (pixel coords like 24000) are filtered, so no giant/off arcs.
-            W = int(ov.vecs.sig_axes[0].size); H = int(ov.vecs.sig_axes[1].size)
+            W = int(vecs.sig_axes[0].size); H = int(vecs.sig_axes[1].size)
             assert offs[:, 0].max() <= W + 8 and offs[:, 1].max() <= H + 8
             assert offs[:, 0].min() >= -8 and offs[:, 1].min() >= -8
         finally:

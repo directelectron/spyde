@@ -141,21 +141,15 @@ def _start_batch(session, plot, src_tree, p: dict, *, overlay_visible: bool = Tr
         except Exception as e:
             log.debug("resolving default model id failed: %s", e)
 
-    # Drop any live tuning preview — the final overlay replaces it.
-    prev = getattr(src_tree, "_fv_preview", None)
-    if prev is not None:
-        try:
-            prev.remove()
-        except Exception as e:
-            log.debug("dropping find-vectors preview failed: %s", e)
-        src_tree._fv_preview = None
-
-    # Drop the prior run's persistent source-DP overlay SYNCHRONOUSLY. The
-    # replace inside _overlay_on_source only runs at the TAIL of the async
-    # batch, so without this a second Compute leaves run 1's circles on the DP
-    # for the whole run — and a torn attach could stack a second marker group.
-    from spyde.actions.lifecycle import replace_tree_attr
-    replace_tree_attr(src_tree, "_vector_overlay", None)
+    # Drop the live tuning preview (the final overlay replaces it) and the
+    # prior run's persistent source-pattern overlay. The replace inside
+    # _overlay_on_source only runs at the TAIL of the async batch, so without
+    # this a second Compute leaves run 1's circles on the pattern all run.
+    from spyde.actions.vector_overlay import (
+        remove_find_vectors_preview, replace_tree_overlay,
+    )
+    remove_find_vectors_preview(src_tree, plot)
+    replace_tree_overlay(src_tree, "_vector_overlay", None)
 
     # ── Build the result tree up front: a lazy zero placeholder with the
     #    source's axes (so we never reference the raw dataset) + a zero
@@ -192,7 +186,6 @@ def _start_batch(session, plot, src_tree, p: dict, *, overlay_visible: bool = Tr
     )
 
     emit_status("Finding diffraction vectors…")
-    src_dp_plot = plot   # overlay the found vectors on the live DP we ran from
 
     # ── Progressive (live) count map: the compute writes per-chunk vector counts
     #    into a shared-memory buffer as chunks finish; a poller paints them into
@@ -309,8 +302,8 @@ def _start_batch(session, plot, src_tree, p: dict, *, overlay_visible: bool = Tr
                 return
             _finalize(new_tree, vecs)
             log.info("[fv-batch] finalized in %.1fs total", _time.monotonic() - t0)
-            _overlay_on_source(src_tree, src_dp_plot, vecs,
-                               visible=overlay_visible, signal=src)
+            _overlay_on_source(src_tree, vecs, visible=overlay_visible,
+                               signal=src)
         except Exception as e:
             emit_error(f"Find Vectors failed: {e}")
             log.exception("Find Vectors compute failed")
@@ -358,29 +351,26 @@ def _node_name(tree, signal):
     return getattr(node, "name", None)
 
 
-def _overlay_on_source(src_tree, dp_plot, vecs, *, visible: bool = True,
+def _overlay_on_source(src_tree, vecs, *, visible: bool = True,
                        signal=None) -> None:
-    """Overlay the found vectors as live circle markers on the SOURCE diffraction
-    pattern (Qt parity: peaks tracked the navigator). Replaces any prior overlay
-    from an earlier run so re-running Find Vectors doesn't stack markers.
-    ``signal`` is the node the vectors were found on; the overlay draws only
-    while the plot displays it.
+    """Overlay the found vectors as live circle markers on the SOURCE
+    diffraction pattern. Replaces any prior overlay from an earlier run so
+    re-running Find Vectors doesn't stack markers. ``signal`` is the node the
+    vectors were found on; the overlay draws only while a window displays it.
 
-    ``visible=False`` (the wizard path) attaches it hidden: the DP stays clean
-    after Compute, and reopening the Find Vectors caret shows it again via the
+    ``visible=False`` (the wizard path) attaches it hidden: the pattern stays
+    clean after Compute, and reopening the caret shows it again through the
     renderer's ``set_overlay`` toggle."""
-    if dp_plot is None or src_tree is None:
+    if src_tree is None:
         return
-    from spyde.actions.lifecycle import replace_tree_attr
-    from spyde.actions.vector_overlay import attach_vector_overlay
-    ov = replace_tree_attr(src_tree, "_vector_overlay",
-                           lambda: attach_vector_overlay(dp_plot, vecs, src_tree,
-                                                         signal=signal))
-    if ov is not None and not visible:
-        try:
-            ov.set_visible(False)
-        except Exception as e:
-            log.debug("hiding source vector overlay failed: %s", e)
+    from spyde.actions.vector_overlay import (
+        attach_vector_overlay, replace_tree_overlay,
+    )
+    replace_tree_overlay(src_tree, "_vector_overlay", None)
+    node = attach_vector_overlay(vecs, src_tree, signal=signal)
+    src_tree._vector_overlay = node
+    if not visible:
+        src_tree.set_overlay_visible(node, False)
 
 
 def _apply_axes_from_vecs(new_sig, nav_sig, vecs) -> None:
@@ -760,44 +750,16 @@ def _detach_time_slice_repaint(tree) -> None:
 
 def _overlay_on_result(tree, vecs) -> None:
     """Overlay the found vectors as red circle markers on the RESULT window's
-    rendered diffraction pattern, tracking its count-map navigator (Qt parity:
-    the computed-vectors window drew red circles over the rendered disks).
-    Replaces any prior overlay so re-running doesn't stack markers."""
-    from spyde.actions.vector_overlay import attach_vector_overlay
-    for old in _result_overlays(tree):
-        try:
-            old.remove()
-        except Exception as e:
-            log.debug("removing prior vector overlay failed: %s", e)
-    tree._result_vector_overlay = None
+    rendered diffraction pattern, tracking its count-map navigator. Replaces
+    any prior overlay so re-running doesn't stack markers.
 
-    # SIGNAL plots only. A 5-D stack's intermediate real-space navigator used to
-    # land in `signal_plots`, so it got a circle overlay in k-space coordinates
-    # too — and its driving selector is the 1-D time selector, whose one-coord
-    # index blew up the (iy, ix) unpack mid-attach and left a raising hook wired
-    # to that selector for the rest of the session.
-    attached = []
-    for sp in list(getattr(tree, "signal_plots", [])):
-        if getattr(sp, "is_navigator", False):
-            continue
-        try:
-            attached.append(attach_vector_overlay(sp, vecs, tree))
-        except Exception as e:
-            log.debug("result vector overlay attach failed: %s", e)
-    # Every overlay is retained so re-running Find Vectors removes them ALL;
-    # `_result_vector_overlay` stays the primary (first signal plot) for callers
-    # and tests that reach for one.
-    tree._result_vector_overlays = attached
-    tree._result_vector_overlay = attached[0] if attached else None
-
-
-def _result_overlays(tree) -> list:
-    """Every result-window vector overlay attached by a previous run."""
-    out = list(getattr(tree, "_result_vector_overlays", None) or [])
-    primary = getattr(tree, "_result_vector_overlay", None)
-    if primary is not None and primary not in out:
-        out.append(primary)
-    return out
+    One node covers every window the result tree opens, including a signal plot
+    added later by "Add Selector"."""
+    from spyde.actions.vector_overlay import (
+        attach_vector_overlay, replace_tree_overlay,
+    )
+    replace_tree_overlay(tree, "_result_vector_overlay", None)
+    tree._result_vector_overlay = attach_vector_overlay(vecs, tree)
 
 
 def _first_nav_plot(tree):
@@ -927,45 +889,29 @@ def fv_open(session, plot, payload) -> None:
 
     def _work():
         try:
-            from spyde.actions.vector_overlay import attach_find_vectors_preview
+            from spyde.actions.vector_overlay import (
+                attach_find_vectors_preview, remove_overlay_node,
+                replace_tree_overlay,
+            )
             if not is_current(tree, "_fv_run_gen", gen):
                 return                     # superseded by fv_close / newer preview
             if p["method"] == "neural":
                 _ensure_model_local(p)   # a first-use HF model downloads here,
                                          # not inside the preview's frame compute
-            new_prev = attach_find_vectors_preview(
-                src, source, tree, sigma=p["sigma"],
-                kernel_radius=p["kernel_radius"], threshold=p["threshold"],
-                min_distance=p["min_distance"], subpixel=p["subpixel"],
-                method=p["method"], model_id=p.get("model_id") or None,
-                bg_sigma=p["bg_sigma"],
-                spot_radius=p.get("spot_radius") or None,
-                dog_sigma1=p["dog_sigma1"],
-                dog_sigma2=p["dog_sigma2"],
-                beamstop_auto=bool(p.get("beamstop_auto")),
-                show_transform=p["show_transform"],
-            )
-            # Superseded while attaching (fv_close / a newer fv_open bumped
-            # the generation after the check above) → tear down what we just
+            new_prev = attach_find_vectors_preview(src, source, tree, p)
+            # Superseded while attaching (fv_close or a newer fv_open bumped the
+            # generation after the check above): tear down what was just
             # attached instead of installing a stale overlay.
             if not is_current(tree, "_fv_run_gen", gen):
-                try:
-                    new_prev.remove()
-                except Exception as e:
-                    log.debug("removing superseded fv preview failed: %s", e)
+                remove_overlay_node(tree, new_prev)
                 return
             old = getattr(tree, "_fv_preview", None)
             if old is not None and old is not new_prev:
-                try:
-                    old.remove()
-                except Exception as e:
-                    log.debug("dropping prior find-vectors preview failed: %s", e)
+                remove_overlay_node(tree, old)
             tree._fv_preview = new_prev
             # The live preview supersedes any persistent overlay from an
-            # earlier Compute — both drawing at once is exactly the
-            # "duplicated peaks" bug, so drop the old one here.
-            from spyde.actions.lifecycle import replace_tree_attr
-            replace_tree_attr(tree, "_vector_overlay", None)
+            # earlier Compute: both drawing at once duplicates every peak.
+            replace_tree_overlay(tree, "_vector_overlay", None)
             # Qt parity: estimate the disk radius from the data (once) so the
             # wizard's defaults match the pattern instead of a fixed 5.
             if not getattr(tree, "_fv_auto_sent", False):
@@ -1095,13 +1041,14 @@ def fv_tune(session, plot, payload) -> None:
         return
 
     def _work():
+        from spyde.actions.vector_overlay import tune_find_vectors_preview
         try:
-            prev.set_params(**coerced)
-            log.info("[fv-tune] set_params APPLIED thr=%s md=%s kr=%s",
+            tune_find_vectors_preview(tree, prev, src, coerced)
+            log.info("[fv-tune] parameters APPLIED thr=%s md=%s kr=%s",
                      coerced.get("threshold"), coerced.get("min_distance"),
                      coerced.get("kernel_radius"))
         except Exception as e:
-            log.exception("[fv-tune] set_params FAILED: %s", e)
+            log.exception("[fv-tune] applying the parameters FAILED: %s", e)
 
     from spyde.actions.lifecycle import run_on_worker
     run_on_worker(session, _work, name="fv-tune")
@@ -1176,11 +1123,8 @@ def fv_close(session, plot, payload=None) -> None:
     prev = getattr(tree, "_fv_preview", None) if tree is not None else None
     log.debug("[fv-stop] removing preview=%s", prev is not None)
     if prev is not None:
-        try:
-            prev.remove()
-        except Exception as e:
-            log.debug("removing find-vectors preview on stop failed: %s", e)
-        tree._fv_preview = None
+        from spyde.actions.vector_overlay import remove_find_vectors_preview
+        remove_find_vectors_preview(tree, src)
 
 
 def test_hold_release(session, plot, payload=None) -> None:
