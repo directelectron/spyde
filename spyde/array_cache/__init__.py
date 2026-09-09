@@ -30,6 +30,7 @@ from .protocol import FrameReader
 from .region_sum import RegionIntegrator, finalize_sum
 from .nav_read import (
     get_local_frame, is_local_frame_resident, close_all_readers, retain_readers,
+    reader_for_overlay, drop_reader,
 )
 
 __all__ = [
@@ -46,4 +47,6 @@ __all__ = [
     "is_local_frame_resident",
     "close_all_readers",
     "retain_readers",
+    "reader_for_overlay",
+    "drop_reader",
 ]

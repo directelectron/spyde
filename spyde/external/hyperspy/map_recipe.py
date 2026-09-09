@@ -68,18 +68,31 @@ class FrameRecipe:
 
     ``iterating`` values are navigation-shaped numpy arrays, snapshotted BEFORE
     the map call because ``map`` rebinds an eager argument signal to a lazy
-    copy, or lazy signals, which may carry a recipe of their own.
+    copy, or lazy signals, which may carry a recipe of their own, or any object
+    with ``at(*navigation_index)`` returning that position's value.
     ``output_name`` is the dask name of the array this recipe describes; a
     signal whose data was swapped afterwards no longer matches it
-    (:func:`recipe_for`).
+    (:func:`recipe_for`). ``output_name`` is None for a recipe that describes no
+    dask array, and ``output_shape`` is None when the result has no fixed frame
+    shape (a ragged output, or a value that is not a frame at all); the result
+    is then returned as it comes, without the allocate-and-cast.
+
+    ``source`` is the signal one frame is read from, or None for a function
+    that needs no frame. ``depth`` is a navigation neighbourhood radius: with
+    ``depth > 0`` the function is called as
+    ``function(window, centre, **iterating_at_index, **static)``, where
+    ``window`` stacks the source frames over ``[index - depth, index + depth]``
+    clipped to each navigation axis and ``centre`` is the requested position's
+    index inside it.
     """
     function: Callable
     static: Mapping[str, Any]
     iterating: Mapping[str, Any]
     source: Any
-    output_name: str
-    output_shape: tuple[int, ...]
-    output_dtype: np.dtype
+    output_name: str | None
+    output_shape: tuple[int, ...] | None
+    output_dtype: np.dtype | None
+    depth: int = 0
 
 
 def recipe_for(signal) -> FrameRecipe | None:
@@ -87,6 +100,10 @@ def recipe_for(signal) -> FrameRecipe | None:
     recipe = getattr(signal, RECIPE_ATTRIBUTE, None)
     if recipe is None:
         return None
+    if recipe.output_name is None:
+        # A display recipe describes a value, not a dask array, so there is no
+        # output name to match against.
+        return recipe
     data = getattr(signal, "data", None)
     if getattr(data, "name", None) != recipe.output_name:
         return None
@@ -115,14 +132,21 @@ def _split_kwargs(signal, kwargs):
     return iterating, static
 
 
+def _is_ragged(result, ragged) -> bool:
+    """Whether a map output holds one value per position rather than a frame of
+    a fixed shape, from the caller's declaration or the output's own flag."""
+    return bool(ragged) or bool(getattr(result, "ragged", False))
+
+
 def _describable(result, ragged) -> bool:
-    """A new LAZY signal with signal axes is the only output a frame recipe
-    describes. Eager output is already indexable; a ragged or scalar-per-
-    position output has no frame."""
+    """A new LAZY signal is the only output a frame recipe describes. Eager
+    output is already indexable. A ragged output has no signal axes and is
+    recorded with no output shape; anything else needs signal axes to have a
+    frame at all."""
     return (result is not None
             and bool(getattr(result, "_lazy", False))
-            and not ragged
-            and result.axes_manager.signal_dimension > 0
+            and (_is_ragged(result, ragged)
+                 or result.axes_manager.signal_dimension > 0)
             and isinstance(getattr(result.data, "name", None), str))
 
 
@@ -168,11 +192,17 @@ def apply() -> bool:
             return result
         if _describable(result, ragged):
             navigation_dimension = result.axes_manager.navigation_dimension
+            if _is_ragged(result, ragged):
+                output_shape, output_dtype = None, None
+            else:
+                output_shape = tuple(
+                    int(n) for n in result.data.shape[navigation_dimension:])
+                output_dtype = np.dtype(result.data.dtype)
             setattr(result, RECIPE_ATTRIBUTE, FrameRecipe(
                 function=function, static=static, iterating=iterating, source=self,
                 output_name=result.data.name,
-                output_shape=tuple(int(n) for n in result.data.shape[navigation_dimension:]),
-                output_dtype=np.dtype(result.data.dtype),
+                output_shape=output_shape,
+                output_dtype=output_dtype,
             ))
         return result
 

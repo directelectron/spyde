@@ -80,6 +80,12 @@ class _NavPainter:
                 try:
                     plot.current_data = data
                     plot._set_array(data)
+                    # Overlay values for this plot, drawn on top of the base
+                    # frame and still on this one thread, so every push to
+                    # anyplotlib stays serialized behind the frame it belongs
+                    # to. No-op when the plot has no overlays.
+                    if getattr(plot, "_pending_overlay_values", None):
+                        plot._apply_pending_overlays()
                     # Apply any pending MDI-overlay layer frames RIGHT AFTER the base
                     # paint, still on this ONE painter thread — so every layer
                     # set_data → stdout push stays serialized behind the base push
@@ -97,6 +103,10 @@ class _NavPainter:
 
 # One painter for the whole process — the single serial lane nav frames paint on.
 _nav_painter = _NavPainter()
+
+# The payloads that draw nothing, for an overlay group with no value.
+_EMPTY_OFFSETS = np.zeros((0, 2), dtype=np.float32)
+_EMPTY_SEGMENTS = np.zeros((0, 2, 2), dtype=np.float32)
 
 import time as _time
 # Per-frame PAINT profile (the transport/render half of a navigator update): logs
@@ -297,6 +307,14 @@ class Plot:
         # freshly-read layer frames for the painter thread to push.
         self._layers: list = []
         self._pending_layer_frames = None
+        # Overlay children of the displayed node (spyde.drawing.overlays).
+        # _overlay_groups holds one anyplotlib primitive per (node, group
+        # name); _pending_overlay_values stages values for the painter thread;
+        # _overlay_futures holds the one in-flight future of each expensive
+        # node, which is how a superseded evaluation is recognised.
+        self._overlay_groups: Dict = {}
+        self._pending_overlay_values: Dict = {}
+        self._overlay_futures: Dict = {}
 
         # anyplotlib figure + plot objects
         self._fig: apl.Figure | None = None
@@ -536,6 +554,181 @@ class Plot:
         Newest-wins: a frame superseded before it paints is dropped."""
         self.current_data = data
         _nav_painter.submit(self, data)
+
+    def ensure_overlay_group(self, node, name: str, kind: str, style=None) -> None:
+        """Create the anyplotlib primitive an overlay group draws with, once.
+
+        ``kind`` is one of ``circles``, ``lines``, ``arrows``, ``curves``,
+        ``layer`` and ``transform``; ``style`` is the appearance passed to the
+        constructor. A ``layer`` needs its first image before it can be built
+        and a ``transform`` draws through the base image, so both register the
+        group with no handle yet."""
+        key = (id(node), name)
+        if key in self._overlay_groups:
+            return
+        # Marker values are in image pixel coordinates, which is what the
+        # "data" transform means; a layer and a curve take no transform.
+        marker_style = dict(style or {})
+        marker_style.setdefault("transform", "data")
+        group_name = f"overlay:{id(node)}:{name}"
+        handle = None
+        try:
+            if kind == "circles":
+                handle = self._plot2d.add_circles(
+                    _EMPTY_OFFSETS, name=group_name, **marker_style)
+            elif kind == "lines":
+                handle = self._plot2d.add_lines(
+                    _EMPTY_SEGMENTS, name=group_name, **marker_style)
+            elif kind == "arrows":
+                handle = self._plot2d.add_arrows(
+                    _EMPTY_OFFSETS, np.zeros(0, np.float32), np.zeros(0, np.float32),
+                    name=group_name, **marker_style)
+            elif kind == "curves":
+                handle = []
+            elif kind not in ("layer", "transform"):
+                logger.debug("[plot] unknown overlay group kind %r", kind)
+                return
+        except Exception as e:
+            logger.debug("[plot] creating overlay group %s/%s failed: %s",
+                         kind, name, e)
+            return
+        self._overlay_groups[key] = handle
+
+    def drop_overlay_groups(self, node) -> None:
+        """Remove every anyplotlib primitive an overlay node drew with."""
+        for key in [k for k in self._overlay_groups if k[0] == id(node)]:
+            handle = self._overlay_groups.pop(key)
+            for one in (handle if isinstance(handle, list) else [handle]):
+                if one is None:
+                    continue
+                try:
+                    one.remove()
+                except Exception as e:
+                    logger.debug("[plot] removing overlay group %s failed: %s",
+                                 key[1], e)
+        with _nav_painter._lock:
+            self._pending_overlay_values.pop(id(node), None)
+        self._overlay_futures.pop(id(node), None)
+
+    def enqueue_overlay(self, node, value) -> None:
+        """Stage an overlay node's value and wake the painter to draw it.
+
+        ``value`` maps group name to the value that group draws; a missing
+        name clears that group and an empty value clears them all. Newest
+        wins: a value superseded before the painter runs is replaced. The
+        painter is woken with the plot's current base frame so the overlay is
+        pushed right behind it, or applied here when there is no frame yet."""
+        with _nav_painter._lock:
+            self._pending_overlay_values[id(node)] = (node, value)
+        base = self.current_data
+        if isinstance(base, np.ndarray):
+            self.enqueue_paint(base)
+        else:
+            self._apply_pending_overlays()
+
+    def _apply_pending_overlays(self) -> None:
+        """Push every staged overlay value to its groups. Runs on the painter
+        thread. The take-and-clear is atomic against ``enqueue_overlay`` so a
+        value written between the read and the clear is not lost; nothing is
+        pushed while the lock is held."""
+        with _nav_painter._lock:
+            pending = self._pending_overlay_values
+            self._pending_overlay_values = {}
+        for node, value in pending.values():
+            values = value if isinstance(value, dict) else {}
+            for name, (kind, _style) in node.groups.items():
+                try:
+                    self._push_overlay_group(node, name, kind, values.get(name))
+                except Exception as e:
+                    logger.debug("[plot] drawing overlay group %s failed: %s",
+                                 name, e)
+            if node.on_value is not None:
+                try:
+                    node.on_value(value)
+                except Exception as e:
+                    logger.debug("[plot] overlay value callback failed: %s", e)
+
+    def _push_overlay_group(self, node, name: str, kind: str, value) -> None:
+        """Draw one group's value. ``None`` clears the group."""
+        key = (id(node), name)
+        if key not in self._overlay_groups:
+            return
+        handle = self._overlay_groups[key]
+        if kind == "circles":
+            offsets = _EMPTY_OFFSETS if value is None else np.asarray(
+                value, dtype=np.float32).reshape(-1, 2)
+            handle.set(offsets=offsets)
+        elif kind == "lines":
+            segments = _EMPTY_SEGMENTS if value is None else np.asarray(
+                value, dtype=np.float32).reshape(-1, 2, 2)
+            handle.set(segments=segments)
+        elif kind == "arrows":
+            if value is None:
+                handle.set(offsets=_EMPTY_OFFSETS, U=np.zeros(0, np.float32),
+                           V=np.zeros(0, np.float32))
+            else:
+                offsets, u, v = value
+                handle.set(offsets=np.asarray(offsets, dtype=np.float32),
+                           U=np.asarray(u, dtype=np.float32),
+                           V=np.asarray(v, dtype=np.float32))
+        elif kind == "curves":
+            self._push_overlay_curves(key, node, name, value)
+        elif kind == "layer":
+            self._push_overlay_layer(key, node, name, value)
+        elif kind == "transform":
+            if value is None:
+                self.set_transform_active(False)
+                if isinstance(self.current_data, np.ndarray):
+                    self._set_array(self.current_data)
+            else:
+                self.set_transform_active(True)
+                self.set_transform_image(np.asarray(value))
+
+    def _push_overlay_curves(self, key, node, name, value) -> None:
+        """Draw a list of (x, y) pairs as 1-D lines, growing or trimming the
+        line set to the number of pairs given."""
+        lines = self._overlay_groups.get(key) or []
+        pairs = list(value or [])
+        style = dict(node.groups[name][1] or {})
+        while len(lines) < len(pairs):
+            lines.append(self._plot1d.add_line(np.zeros(1), x_axis=np.zeros(1),
+                                               **style))
+        while len(lines) > len(pairs):
+            lines.pop().remove()
+        for line, (x, y) in zip(lines, pairs):
+            line.set_data(np.asarray(y, dtype=float),
+                          x_axis=np.asarray(x, dtype=float))
+        self._overlay_groups[key] = lines
+
+    def _push_overlay_layer(self, key, node, name, value) -> None:
+        """Draw an image layer over the base image, building it on the first
+        image it is given. A cleared layer is hidden, not removed, so the next
+        value goes back to the same handle."""
+        handle = self._overlay_groups.get(key)
+        if value is None:
+            if handle is not None:
+                handle.set(visible=False)
+            return
+        frame = np.asarray(value)
+        if handle is None:
+            style = dict(node.groups[name][1] or {})
+            self._overlay_groups[key] = self._plot2d.add_layer(frame, **style)
+            return
+        handle.set(visible=True)
+        handle.set_data(frame)
+
+    def _clear_overlays_of_other_nodes(self, new_signal) -> None:
+        """Clear every overlay group on this plot that does not belong to
+        ``new_signal``, so an overlay computed on one node is never left drawn
+        over another. The re-slice that follows the switch redraws the rest."""
+        tree = self.signal_tree
+        if tree is None or not self._overlay_groups:
+            return
+        keep = {id(node) for node in tree.overlay_children(new_signal)}
+        drawn = {key[0] for key in self._overlay_groups}
+        for node in tree.walk():
+            if node.overlay and id(node) in drawn and id(node) not in keep:
+                self.enqueue_overlay(node, {})
 
     def set_data(self, data: np.ndarray, levels=None) -> None:
         """Directly push new array data (called from progressive compute poll)."""
@@ -1245,6 +1438,7 @@ class Plot:
             self._array_cache.clear()
         from spyde.array_cache import retain_readers
         retain_readers(self, self._ancestor_signals(signal))
+        self._clear_overlays_of_other_nodes(signal)
         # Rebuild the GPU tile backend for the new node (its logical size / dtype may
         # differ; a stale backend would swap a mismatched frame into the old tiling).
         self._gpu_tile_backend = None

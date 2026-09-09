@@ -27,6 +27,19 @@ from .resolve import resolve_reader
 log = logging.getLogger(__name__)
 
 
+def _reader_override_for(plot, signal):
+    """The reader a signal tree has pinned for ``signal``, or None.
+
+    An override answers for a signal whose frames are not in an array at all:
+    rendered diffraction disks, a progressive result that has only the blocks
+    that have landed, one raw camera frame out of an event stream. It is used
+    whatever the node's locality tag says, because the tag describes reading
+    the node's dask array and the override replaces that read."""
+    tree = getattr(plot, "signal_tree", None)
+    lookup = getattr(tree, "reader_override_for", None)
+    return lookup(signal) if lookup is not None else None
+
+
 def _reader_for(plot, signal, data):
     """Resolve (and cache on the plot, keyed by id(signal)) the best
     FrameReader for this signal's data — reusing it across calls is what
@@ -41,7 +54,13 @@ def _reader_for(plot, signal, data):
     from a recycled fd — i.e. another file's bytes — at worst). BinaryReader's
     ``__del__`` releases the fd once the last in-flight user drops it; the
     explicit close stays in :func:`close_all_readers`, which only runs on node
-    switch / plot close."""
+    switch / plot close.
+
+    A tree-level override wins over every resolved kind, and is not checked
+    against ``data``: it does not read that array."""
+    override = _reader_override_for(plot, signal)
+    if override is not None:
+        return override
     readers = plot._local_transform_readers
     key = id(signal)
     reader = readers.get(key)
@@ -177,10 +196,15 @@ def _resolve_for(plot, signal, data):
     """The reader serving this (signal, data), or None if the signal isn't
     ArrayCache-eligible (an opaque signal-tree node, or no signal_tree).
 
+    A tree-level override answers first, whatever the locality tag says.
+
     An EXISTING reader is itself proof the locality gate already passed — only a
     local-resolved signal ever gets one. That keeps BaseSignalTree.resolve_locality
     (which walks the tree to find the node) off the per-frame path: it runs once
     per view, not once per move."""
+    override = _reader_override_for(plot, signal)
+    if override is not None:
+        return override
     reader = plot._local_transform_readers.get(id(signal))
     if reader is not None and getattr(reader, "data", None) is data:
         return reader
@@ -352,6 +376,57 @@ def retain_readers(plot, signals) -> None:
                 close()
             except Exception:
                 pass
+
+
+def reader_for_overlay(plot, node):
+    """The reader that evaluates an overlay ``node`` at one navigation
+    position, cached on ``plot`` alongside the frame readers.
+
+    The source frame comes from the node's parent through the parent's own
+    reader, so an overlay costs the function and nothing else: the frame is
+    already decoded for the base display. An overlay whose signal names a
+    ``source_plot`` resolves that parent reader on THAT plot, which is how a
+    layer sourced from another window reads through the other window's
+    blocks."""
+    from .readers.recipe import RecipeReader
+
+    signal = node.signal
+    readers = plot._local_transform_readers
+    key = id(signal)
+    reader = readers.get(key)
+    if isinstance(reader, RecipeReader) and reader.signal is signal:
+        return reader
+
+    parent = getattr(node, "parent", None)
+    parent_signal = getattr(parent, "signal", None)
+    parent_reader = None
+    if parent_signal is not None and getattr(parent_signal, "data", None) is not None:
+        source_plot = getattr(signal, "source_plot", None) or plot
+        parent_reader = _reader_for(source_plot, parent_signal, parent_signal.data)
+    reader = RecipeReader(signal, signal.data, parent_signal, parent_reader)
+    readers[key] = reader
+    return reader
+
+
+def drop_reader(plot, signal) -> None:
+    """Forget ``plot``'s reader for ``signal``, and everything decoded through
+    it. Called when a node goes away, its recipe is rebuilt, or the reader
+    answering for it is replaced.
+
+    The frames go whether or not a reader was cached: an override is resolved
+    fresh on every read and never lands in the reader table, but the frames it
+    served are in the frame cache like any other."""
+    key = id(signal)
+    cache = getattr(plot, "_array_cache", None)
+    if cache is not None:
+        cache.drop_key(key)
+    readers = getattr(plot, "_local_transform_readers", None)
+    reader = readers.pop(key, None) if readers else None
+    if reader is None:
+        return
+    block_cache = getattr(plot, "_block_cache", None)
+    if block_cache is not None:
+        block_cache.drop_owner(id(reader))
 
 
 def close_all_readers(plot) -> None:

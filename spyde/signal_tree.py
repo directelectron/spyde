@@ -109,6 +109,10 @@ class BaseSignalTree:
         self.navigator_signals["base"] = navigator
 
         self.signal_plots: list[Plot] = []
+        # id(signal) -> (signal, reader): readers pinned for signals whose
+        # frames do not come from their own array. The signal is kept in the
+        # entry so its id cannot be recycled while the override stands.
+        self._reader_overrides: dict = {}
         self.navigator_plot_manager: "MultiplotManager | None" = None
 
         # Cancellation registry: heavy actions register a stopped_flag (a 1-elem
@@ -1051,7 +1055,12 @@ class BaseSignalTree:
         return [node.signal for node in self.walk()]
 
     def create_plot_states(self, plot: "Plot" = None) -> dict:
-        for signal in self.signals():
+        """A PlotState per node the window can display. An overlay node is
+        drawn on its parent rather than shown on its own, so it gets none."""
+        for node in self.walk():
+            if node.overlay:
+                continue
+            signal = node.signal
             dynamic = signal.axes_manager.navigation_dimension > 0
             plot.add_plot_state(
                 signal=signal,
@@ -1089,6 +1098,16 @@ class BaseSignalTree:
             if current_obj is None:
                 return None
         return current_obj
+
+    @staticmethod
+    def _unique_child_name(parent_node: SignalNode, name: str) -> str:
+        """``name``, or the first ``name_N`` free among the node's children."""
+        if name not in parent_node.children:
+            return name
+        count = 1
+        while f"{name}_{count}" in parent_node.children:
+            count += 1
+        return f"{name}_{count}"
 
     def get_node(self, signal) -> SignalNode | None:
         for node in self.walk():
@@ -1173,12 +1192,7 @@ class BaseSignalTree:
         if chain_reaches(new_signal, parent_signal):
             local = True
 
-        final_name = node_name
-        if final_name in parent_node.children:
-            count = 1
-            while f"{node_name}_{count}" in parent_node.children:
-                count += 1
-            final_name = f"{node_name}_{count}"
+        final_name = self._unique_child_name(parent_node, node_name)
 
         parent_node.children[final_name] = SignalNode(
             signal=new_signal,
@@ -1191,6 +1205,147 @@ class BaseSignalTree:
         )
         self.update_plot_states(new_signal)
         return new_signal
+
+    # ── Overlay nodes ──────────────────────────────────────────────────────────
+
+    def add_overlay(self, parent_signal, function, *, name: str, groups: dict,
+                    static: dict = None, iterating: dict = None, depth: int = 0,
+                    source: bool = True, source_plot=None,
+                    expensive: bool = False, on_value=None) -> SignalNode:
+        """Add a child of ``parent_signal`` that is drawn on the windows
+        showing it, evaluated at the navigator's position.
+
+        ``function`` is called once per position and returns a dict keyed by
+        the names in ``groups``, each mapping to the value that group draws;
+        a missing name clears its group. ``groups`` maps a name to
+        ``(kind, style)``, where the kind is one of ``circles``, ``lines``,
+        ``arrows``, ``curves``, ``layer`` and ``transform``, and every value
+        is in image pixel coordinates.
+
+        ``static`` arguments are passed to every call; ``iterating`` values
+        are indexed per position. ``depth`` asks for a navigation
+        neighbourhood instead of one frame, and ``source=False`` for a
+        function that reads no frame at all (see
+        :class:`~spyde.external.hyperspy.map_recipe.FrameRecipe`).
+        ``source_plot`` reads the frame through another window's readers.
+        ``expensive`` runs the function off the navigator thread as one
+        cancellable future. ``on_value`` receives each drawn value.
+        """
+        from spyde.drawing.overlay_node import OverlaySignal
+        from spyde.external.hyperspy.map_recipe import FrameRecipe
+
+        parent_node = self.get_node(parent_signal)
+        if parent_node is None:
+            raise ValueError("Parent signal not found in the tree.")
+
+        recipe = FrameRecipe(
+            function=function,
+            static=dict(static or {}),
+            iterating=dict(iterating or {}),
+            source=parent_signal if source else None,
+            output_name=None,
+            output_shape=None,
+            output_dtype=None,
+            depth=int(depth),
+        )
+        node = SignalNode(
+            signal=OverlaySignal(parent_signal, recipe, source_plot=source_plot),
+            name=self._unique_child_name(parent_node, name),
+            parent=parent_node,
+            transformation=name,
+            local=True,
+            overlay=True,
+            expensive=bool(expensive),
+            groups={key: (kind, dict(style or {}))
+                    for key, (kind, style) in groups.items()},
+            on_value=on_value,
+        )
+        parent_node.children[node.name] = node
+        for plot in list(self.signal_plots):
+            for group_name, (kind, style) in node.groups.items():
+                plot.ensure_overlay_group(node, group_name, kind, style)
+        return node
+
+    def remove_overlay(self, node: SignalNode) -> None:
+        """Take an overlay node off every plot and out of the tree."""
+        from spyde.array_cache import drop_reader
+
+        for plot in list(self.signal_plots):
+            try:
+                plot.drop_overlay_groups(node)
+                drop_reader(plot, node.signal)
+            except Exception as e:
+                logger.debug("removing overlay %r from a plot failed: %s",
+                             node.name, e)
+        parent = node.parent
+        if parent is not None and parent.children.get(node.name) is node:
+            del parent.children[node.name]
+
+    def overlay_children(self, signal) -> List[SignalNode]:
+        """The overlay nodes drawn on a window showing ``signal``."""
+        node = self.get_node(signal)
+        if node is None:
+            return []
+        return [child for child in node.children.values() if child.overlay]
+
+    def replace_overlay_static(self, node: SignalNode, **static) -> None:
+        """Merge new static arguments into an overlay's recipe and redraw.
+
+        This is how a slider or a selection changes what an overlay draws:
+        the recipe is rebuilt, the readers holding the old one are dropped,
+        and the navigator re-runs its current position."""
+        from dataclasses import replace
+        from spyde.array_cache import drop_reader
+        from spyde.drawing.overlays import refresh_overlays_for
+
+        recipe = node.signal._map_recipe
+        merged = dict(recipe.static)
+        merged.update(static)
+        node.signal._map_recipe = replace(recipe, static=merged)
+        for plot in list(self.signal_plots):
+            drop_reader(plot, node.signal)
+        refresh_overlays_for(self)
+
+    def set_overlay_visible(self, node: SignalNode, visible: bool) -> None:
+        """Show or hide an overlay. A hidden one keeps its groups, draws
+        nothing, and is skipped until it is shown again."""
+        from spyde.drawing.overlays import refresh_overlays_for
+
+        node.visible = bool(visible)
+        if not node.visible:
+            for plot in list(self.signal_plots):
+                plot.enqueue_overlay(node, {})
+            return
+        refresh_overlays_for(self)
+
+    # ── Reader overrides ───────────────────────────────────────────────────────
+
+    def set_reader_override(self, signal, reader) -> None:
+        """Pin the reader that answers frame reads for ``signal``, or clear the
+        pin with ``reader=None``.
+
+        For a node whose frames are not in an array: rendered from vectors,
+        available only for the blocks a progressive compute has finished, cut
+        from an event stream. The reader implements ``read_frame(indices)``,
+        which may return None when there is no frame yet, and ``frame_bytes``;
+        ``sum_points(points, dtype)`` is optional and serves regions."""
+        from spyde.array_cache import drop_reader
+
+        if reader is None:
+            self._reader_overrides.pop(id(signal), None)
+        else:
+            self._reader_overrides[id(signal)] = (signal, reader)
+        # Frames already decoded for this signal came from the reader being
+        # replaced, so they must go for the change to be visible at all.
+        for plot in list(self.signal_plots):
+            drop_reader(plot, signal)
+
+    def reader_override_for(self, signal):
+        """The reader pinned for ``signal``, or None. On the read path, so it
+        answers for a tree built without ``__init__`` too."""
+        overrides = getattr(self, "_reader_overrides", None)
+        entry = overrides.get(id(signal)) if overrides else None
+        return entry[1] if entry is not None and entry[0] is signal else None
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 
@@ -1229,6 +1384,14 @@ class BaseSignalTree:
         # Interactive action state living on the tree: controllers and overlays
         # own windows / navigator hooks — give them a real teardown; results,
         # caches and back-references just drop so nothing leaks past the tree.
+        for node in [n for n in self.walk() if n.overlay]:
+            try:
+                self.remove_overlay(node)
+            except Exception as e:
+                logger.debug("removing overlay %r on tree close failed: %s",
+                             node.name, e)
+        if getattr(self, "_reader_overrides", None):
+            self._reader_overrides.clear()
         ctrl = getattr(self, "_strain_controller", None)
         if ctrl is not None:
             try:

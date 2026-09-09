@@ -525,9 +525,11 @@ class Session(
             return
 
         def node_to_dict(node):
+            # Overlay children are drawn on their parent, not shown as nodes.
             return {
                 "name": node.name, "signal_id": id(node.signal),
-                "children": [node_to_dict(c) for c in node.children.values()],
+                "children": [node_to_dict(c) for c in node.children.values()
+                             if not c.overlay],
             }
 
         # Active node = what the tree's signal plot displays (prefer the plot

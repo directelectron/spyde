@@ -89,7 +89,8 @@ class ArrayCache:
         prof=None,
     ) -> np.ndarray:
         """Return the decoded frame at ``indices``, reading through ``reader``
-        on a miss and caching the result."""
+        on a miss and caching the result. A reader that has no value at this
+        position returns None, which is passed through and not cached."""
         cache_key = (key, tuple(int(v) for v in indices))
         with self._lock:
             frame = self._entries.get(cache_key)
@@ -102,7 +103,10 @@ class ArrayCache:
 
         # Read OUTSIDE the lock (it can be a real decode) — a concurrent miss on
         # the same frame just reads twice and the later insert wins.
-        frame = np.asarray(reader.read_frame(cache_key[1]))
+        frame = reader.read_frame(cache_key[1])
+        if frame is None:
+            return None
+        frame = np.asarray(frame)
         with self._lock:
             prior = self._entries.pop(cache_key, None)
             if prior is not None:

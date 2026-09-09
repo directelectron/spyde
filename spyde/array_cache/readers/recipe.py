@@ -29,6 +29,8 @@ function already has to be pure for hyperspy to run it on worker threads.
 """
 from __future__ import annotations
 
+import itertools
+
 import numpy as np
 
 from spyde.external.hyperspy.map_recipe import FrameRecipe, recipe_for
@@ -47,32 +49,91 @@ def _rooted_at(recipe: FrameRecipe, parent_signal, seen: set) -> bool:
         return False
     seen.add(id(recipe))
     for value in recipe.iterating.values():
-        if isinstance(value, np.ndarray):
+        if isinstance(value, np.ndarray) or _per_position_source(value) is not None:
             continue
         nested = recipe_for(value)
         if nested is None or not _rooted_at(nested, parent_signal, seen):
             return False
+    if recipe.source is None:
+        # The function reads no frame, so there is no chain to root.
+        return True
     if recipe.source is parent_signal:
         return True
     nested = recipe_for(recipe.source)
     return nested is not None and _rooted_at(nested, parent_signal, seen)
 
 
-def evaluate(recipe: FrameRecipe, indices, parent_signal, parent_frame) -> np.ndarray:
-    """One frame of ``recipe`` at ``indices``, reading the chain's root frame
+def _per_position_source(value):
+    """``value``'s ``at(*navigation_index)`` when it has one, else None. A
+    store that answers one position at a time is an iterating argument in its
+    own right; it needs no recipe because it already holds the values."""
+    at = getattr(value, "at", None)
+    return at if callable(at) else None
+
+
+def _missing_parent_frame(indices):
+    raise ValueError("this recipe reads a source frame, but no parent reader "
+                     "was resolved to supply one")
+
+
+def _source_frame(recipe: FrameRecipe, indices, parent_signal, parent_frame):
+    """One frame of ``recipe``'s source at ``indices``."""
+    if recipe.source is parent_signal:
+        return parent_frame(indices)
+    return evaluate(recipe_for(recipe.source), indices, parent_signal, parent_frame)
+
+
+def _navigation_sizes(signal, count: int) -> tuple[int, ...]:
+    """The first ``count`` navigation axis sizes of ``signal``, in data order."""
+    shape = getattr(getattr(signal, "data", None), "shape", None)
+    if shape is not None and len(shape) >= count:
+        return tuple(int(n) for n in shape[:count])
+    navigation_shape = signal.axes_manager.navigation_shape
+    return tuple(int(n) for n in reversed(navigation_shape))[:count]
+
+
+def _source_window(recipe: FrameRecipe, indices, parent_signal, parent_frame):
+    """The stack of source frames over ``[index - depth, index + depth]`` on
+    each navigation axis, clipped to the navigation grid, and the requested
+    position's index inside that stack."""
+    sizes = _navigation_sizes(recipe.source, len(indices))
+    spans, centre = [], []
+    for axis, position in enumerate(indices):
+        low = max(0, position - recipe.depth)
+        high = min(sizes[axis] - 1, position + recipe.depth)
+        spans.append(range(low, high + 1))
+        centre.append(position - low)
+    frames = [_source_frame(recipe, point, parent_signal, parent_frame)
+              for point in itertools.product(*spans)]
+    window_shape = tuple(len(span) for span in spans)
+    window = np.stack(frames).reshape(window_shape + np.shape(frames[0]))
+    return window, tuple(centre)
+
+
+def evaluate(recipe: FrameRecipe, indices, parent_signal, parent_frame):
+    """The value of ``recipe`` at ``indices``, reading the chain's root frame
     with ``parent_frame(indices)``. Mirrors ``process_function_blockwise``
     step for step: per-position arguments are squeezed and a 0-d one becomes a
     scalar; the result is written into a freshly allocated frame of the
     recorded dtype, so a float result lands in an integer frame by the same
-    truncating assignment the block path uses."""
-    source = recipe.source
-    if source is parent_signal:
-        frame = parent_frame(indices)
-    else:
-        frame = evaluate(recipe_for(source), indices, parent_signal, parent_frame)
+    truncating assignment the block path uses.
+
+    The recipe chooses one of three calls: no source frame at all (``source``
+    is None), a navigation neighbourhood (``depth`` above zero, which passes
+    the window and the centre index ahead of the arguments), or one frame.
+    With no recorded ``output_shape`` there is no frame to cast into: a ragged
+    map output comes back as an array of per-position values, and a recipe
+    that describes no dask array at all comes back exactly as the function
+    returned it, None included."""
+    if parent_frame is None:
+        parent_frame = _missing_parent_frame
 
     per_position = {}
     for key, value in recipe.iterating.items():
+        at = _per_position_source(value)
+        if at is not None:
+            per_position[key] = at(*indices)
+            continue
         if isinstance(value, np.ndarray):
             argument = value[indices]
         else:
@@ -80,7 +141,24 @@ def evaluate(recipe: FrameRecipe, indices, parent_signal, parent_frame) -> np.nd
         argument = np.squeeze(argument)
         per_position[key] = argument[()] if argument.shape == () else argument
 
-    result = np.asarray(recipe.function(frame, **per_position, **recipe.static))
+    if recipe.source is None:
+        result = recipe.function(**per_position, **recipe.static)
+    elif recipe.depth > 0:
+        window, centre = _source_window(recipe, indices, parent_signal, parent_frame)
+        result = recipe.function(window, centre, **per_position, **recipe.static)
+    else:
+        frame = _source_frame(recipe, indices, parent_signal, parent_frame)
+        result = recipe.function(frame, **per_position, **recipe.static)
+
+    if recipe.output_shape is None:
+        if recipe.output_name is None:
+            # A display recipe: the value is whatever the function returns,
+            # which for an overlay is a dict of one value per group.
+            return result
+        # A ragged map output is still an array of per-position values, just
+        # one with no frame shape to cast it into.
+        return None if result is None else np.asarray(result)
+    result = np.asarray(result)
     out = np.empty(recipe.output_shape, recipe.output_dtype)
     out[...] = result.reshape(out.shape)
     return out
@@ -104,6 +182,9 @@ class RecipeReader:
 
     @property
     def frame_bytes(self) -> int:
+        if self.data is None:
+            # A display recipe has no array behind it, so nothing to budget.
+            return 0
         frame_shape = self.data.shape[self._nav_ndim:]
         return int(np.prod(frame_shape)) * self.data.dtype.itemsize
 
@@ -112,7 +193,10 @@ class RecipeReader:
         probe = getattr(self._parent_reader, "is_chunk_resident", None)
         return bool(probe(indices)) if probe is not None else False
 
-    def read_frame(self, indices: tuple[int, ...]) -> np.ndarray:
+    def read_frame(self, indices: tuple[int, ...]):
+        """The recipe's value at ``indices``, or None when the function
+        returned None (no value at this position)."""
         point = tuple(int(v) for v in indices[:self._nav_ndim])
-        return evaluate(self.recipe, point, self._parent_signal,
-                        self._parent_reader.read_frame)
+        parent_frame = (self._parent_reader.read_frame
+                        if self._parent_reader is not None else None)
+        return evaluate(self.recipe, point, self._parent_signal, parent_frame)

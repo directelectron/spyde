@@ -1,6 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Callable, Optional
 from hyperspy.signal import BaseSignal
 
 
@@ -21,4 +21,19 @@ class SignalNode:
     # nobody remembered to tag) can't be inspected for locality automatically.
     # See spyde/array_cache/locality.py for the ancestry-walk resolver.
     local: Optional[bool] = None
+    # Overlay node: its signal has no data of its own, it is evaluated at the
+    # navigator position and drawn on the plot showing its parent. It gets no
+    # PlotState and is not part of the workflow tree the renderer shows.
+    overlay: bool = False
+    # The per-position function is slow enough to freeze the navigator, so it
+    # runs as one cancellable future instead of inline on the dispatcher.
+    expensive: bool = False
+    # Drawn while True; a hidden overlay keeps its groups but pushes nothing.
+    visible: bool = True
+    # Group name -> (kind, style): one anyplotlib primitive per entry, created
+    # when the node is added. The function returns a value per group name.
+    groups: dict = field(default_factory=dict)
+    # Called on the painter thread with the whole value dict each time the
+    # overlay is drawn, for a node whose result also feeds a panel or a caret.
+    on_value: Optional[Callable] = None
     _resolved_local: Optional[bool] = field(default=None, repr=False, compare=False)
