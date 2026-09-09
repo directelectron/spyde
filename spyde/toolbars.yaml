@@ -392,6 +392,15 @@ functions:
     navigation: False
     toggle: True
 
+  Segment:
+    description: Paint a few strokes on what you want found and on the background, train a pixel classifier on them, and segment every frame into measured instances. On a 4-D scan, open it on the real-space navigator to segment scan positions.
+    icon: drawing/toolbars/icons/segment.svg
+    function: spyde.actions.segment_action.segment
+    exclude_signal_types: [regions, spyde_diffraction_vectors_image, electron_diffraction]
+    plot_dim: [2]
+    toolbar_side: bottom
+    toggle: True
+
   Fit:
     description: Fit a model to every spectrum. Add components line by line, watch the model curve on the spectrum, then Run to fit the whole scan on the GPU. Commit turns each component's integrated area into a map.
     icon: drawing/toolbars/icons/fit.svg

@@ -342,6 +342,8 @@ class TestCaretDefaults:
 RUNTIME_FIXTURES: dict[str, dict] = {
     "dpc":    {"loader": "_load_test_data_dpc",
                "kwargs": {"nav": 12, "sig": 24}, "payload": {}},
+    "seg":    {"loader": "_load_test_data_particles",
+               "kwargs": {"frames": 4}, "payload": {}},
     "czb":    {"loader": "_load_test_data", "kwargs": {}, "payload": {}},
     "crop":   {"loader": "_load_test_data", "kwargs": {}, "payload": {}},
 }
@@ -505,6 +507,7 @@ class TestWizardRuntimeConformance:
 NO_COMPUTE_ON_OPEN: dict[str, str] = {
     "crop": "opening only draws an ROI; the crop happens on commit",
     "czb":  "opening only draws the search region; the pass is czb_run",
+    "seg":  "opening only arms the brush; training and the run register their own",
 }
 
 

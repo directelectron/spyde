@@ -44,7 +44,7 @@ log = logging.getLogger(__name__)
 def attach_container(tree, store, *, name: str):
     """Attach a ragged result container to *tree* under attribute *name* —
     THE seam between a batch compute finalizing and the tree carrying its
-    result (``tree.diffraction_vectors`` today; ``tree.particles`` next).
+    result (``tree.diffraction_vectors``, ``tree.regions``).
 
     setattr + provenance stamp: a container carrying no ``provenance`` record
     of its own inherits the tree's commit provenance (the dict
@@ -155,34 +155,20 @@ def wait_for_vectors(session, plot, then: Callable[[], None], *, what: str,
     return True
 
 
-def wait_for_particles(session, plot, then: Callable[[], None], *, what: str,
-                       grace: float = 6.0, timeout: float = 600.0,
-                       status_every: float = 5.0) -> bool:
-    """Wait out the segmentation attach gap, then re-dispatch.
+def wait_for_regions(session, plot, then: Callable[[], None], *, what: str,
+                     grace: float = 6.0, timeout: float = 600.0,
+                     status_every: float = 5.0) -> bool:
+    """Wait out a running segmentation, then re-dispatch.
 
-    The particle-tree twin of :func:`wait_for_vectors`, and it exists for the
-    same reason: ``seg_run`` opens its result window EARLY with a placeholder
-    count trace and attaches ``tree.particles`` only when the batch finalizes on
-    a worker thread, so a particle-dependent action (track, export, per-particle
-    DP) can fire in the gap and find ``None`` on a tree that gets it seconds
-    later. Polls on a worker thread and re-dispatches *then* via
-    ``_dispatch_to_main`` once the particles land.
-
-    Unlike the vectors version there is **no ``strict`` switch** — and that is
-    deliberate. ``wait_for_vectors`` needs one because vectors attach to the tree
-    the user clicked, so an any-tree fallback could satisfy the wait from an
-    unrelated tree and re-dispatch forever into a tree-specific gate. Particles
-    live on their OWN tree (plan §0.6: segmentation spawns a new tree rather than
-    decorating the source), so the only sensible question is whether *this* tree
-    has them. There is no ambiguity to resolve, so there is no knob.
-
-    The default *timeout* is longer than the vectors one (600 s vs 300 s):
-    segmenting thousands of frames is the plan's stated target scale, and a run
-    that legitimately takes eight minutes must not be abandoned at five.
+    The regions twin of :func:`wait_for_vectors`: ``seg_run`` labels every
+    field on a worker and attaches ``tree.regions`` only when it finishes, so
+    a region-dependent action can fire while the run is still going. Polls on
+    a worker thread and re-dispatches *then* via ``_dispatch_to_main`` once the
+    regions land. There is no ``strict`` switch — regions live on their own
+    result tree, so the only question is whether *this* tree has them.
 
     Returns True if a wait was started (the caller must return immediately);
-    False when there is no event loop to wait on (bare test stubs) — the caller
-    should emit its own error then.
+    False when there is no event loop to wait on (bare test stubs).
     """
     from de_shell.ipc import emit_error, emit_status
     if getattr(session, "_dispatch_to_main", None) is None:
@@ -197,23 +183,23 @@ def wait_for_particles(session, plot, then: Callable[[], None], *, what: str,
         status_at = 0.0
         while True:
             tree = _tree()
-            if tree is not None and getattr(tree, "particles", None) is not None:
+            if tree is not None and getattr(tree, "regions", None) is not None:
                 session._dispatch_to_main(then)
                 return
             running = seg_batch_running(session)
             if not running and waited >= grace:
-                emit_error(f"{what} needs a segmentation result (no particles).")
+                emit_error(f"{what} needs a segmentation result (no regions).")
                 return
             if running and waited - status_at >= status_every:
-                emit_status("Waiting for particle segmentation to finish…")
+                emit_status("Waiting for the segmentation to finish…")
                 status_at = waited
             if waited >= timeout:
-                emit_error(f"{what} timed out waiting for particles.")
+                emit_error(f"{what} timed out waiting for the segmentation.")
                 return
             reliable_sleep(0.1)
             waited += 0.1
 
-    threading.Thread(target=_wait, daemon=True, name="wait-particles").start()
+    threading.Thread(target=_wait, daemon=True, name="wait-regions").start()
     return True
 
 
