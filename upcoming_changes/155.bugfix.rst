@@ -1,0 +1,6 @@
+Find Vectors and Orientation Mapping now run on the node the window displays,
+so after centring a pattern their overlays land on the centred disks instead of
+the root's; the live preview and the template, EBSD-band and IPF-refine
+overlays read each frame through the same cached path as the pattern itself,
+which on a centred lazy scan is under a millisecond per move instead of a
+whole-block compute.
