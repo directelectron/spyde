@@ -133,10 +133,7 @@ class EbsdBandOverlay(_DPOverlay):
 
     # ── the per-position compute ──────────────────────────────────────────────
     def _frame(self, iy, ix) -> np.ndarray:
-        frame = self.signal.data[iy, ix]
-        if hasattr(frame, "compute"):        # lazy/dask: one small pattern only
-            frame = frame.compute()
-        return np.asarray(frame, dtype=float)
+        return np.asarray(self._frame_at(iy, ix), dtype=float)
 
     def _offsets_for(self, iy, ix):
         from spyde.ebsd.bands import band_lines, zone_axis_points

@@ -18,7 +18,7 @@ import numpy as np
 import hyperspy.api as hs
 
 from de_shell.ipc import emit, emit_status, emit_error
-from spyde.actions.context import src_plot_tree as _src_plot_tree
+from spyde.actions.context import src_plot_tree as _src_plot_tree, current_signal as _current_signal
 from spyde.actions._common import reciprocal_radius as _reciprocal_radius
 
 log = logging.getLogger(__name__)
@@ -49,7 +49,7 @@ def orientation_mapping(ctx, action_name: str = "Orientation Mapping",
         emit_error("Orientation Mapping: no active dataset")
         return None
 
-    src = src_tree.root
+    src = _current_signal(plot) or src_tree.root
     am = src.axes_manager
     if am.signal_dimension != 2 or am.navigation_dimension != 2:
         emit_error("Orientation Mapping needs a 4D-STEM dataset (2-D nav + 2-D signal)")
@@ -334,7 +334,7 @@ def om_generate_library(session, plot, payload) -> None:
                 generate_library_from_phases, build_matching_cache,
             )
             from spyde.actions.vector_overlay import attach_orientation_overlay
-            src_root = tree.root
+            src_root = _current_signal(src) or tree.root
             phases = [Phase.from_cif(p) for p in cif_paths]
             recip_r = _reciprocal_radius(src_root)
             sim = generate_library_from_phases(phases, voltage, resolution,
@@ -438,7 +438,7 @@ def om_run(session, plot, payload) -> None:
     def _work():
         try:
             om = _compute_with_live_ipf(
-                session, tree.root, tree, sim,
+                session, _current_signal(src) or tree.root, tree, sim,
                 dict(n_best=n_best, gamma=gamma, normalize_templates=normalize))
             if om is None:
                 # None also means "cancelled" (tree closed mid-compute) — don't

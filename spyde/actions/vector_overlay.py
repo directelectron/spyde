@@ -87,6 +87,31 @@ def _clip_to_bounds(px, W, H, slack=8.0):
     return px[m]
 
 
+def frame_at(dp_plot, signal, iy, ix, lead=()):
+    """The frame of ``signal`` at navigation position ``lead + (iy, ix)``, read
+    the way the base pattern is read: through the plot's readers and caches
+    (``get_local_frame``). On a mapped node that is the recipe on the parent's
+    resident block, not a compute of the whole dask block (measured 145 ms →
+    1.4 ms per move on a centred lazy scan). Falls back to the plain slice, and
+    a compute for lazy data, when the node is not eligible for that path (no
+    tree, or an opaque node): correct, just slower."""
+    index = tuple(int(v) for v in lead) + (int(iy), int(ix))
+    data = getattr(signal, "data", None)
+    if data is None:
+        return None
+    try:
+        from spyde.array_cache import get_local_frame
+        frame = get_local_frame(dp_plot, signal, data, np.asarray(index))
+        if frame is not None:
+            return frame
+    except Exception as e:
+        log.debug("overlay frame read through the plotting path failed: %s", e)
+    frame = data[index]
+    if hasattr(frame, "compute"):
+        frame = frame.compute()
+    return np.asarray(frame)
+
+
 def _navigator_selectors_for(tree, dp_plot):
     """Navigator selectors that drive ``dp_plot`` (so the overlay tracks the same
     navigation that updates the DP image)."""
@@ -135,6 +160,22 @@ class _DPOverlay:
     # the compute never holds the navigator's serialised update lock.
     _overlay_mode = "sync"
     _engine = None
+    # The tree node this overlay was computed on. When set, the overlay draws
+    # only while the plot displays that node: an overlay for one node drawn
+    # over another is the "circles miss the disks after centring" bug.
+    signal = None
+
+    def _frame_at(self, iy, ix):
+        """This overlay's node's frame at the navigator position, through the
+        plot's readers (see :func:`frame_at`)."""
+        return frame_at(self.dp_plot, self.signal, iy, ix, lead=self._lead_nav)
+
+    def _displayed_elsewhere(self) -> bool:
+        if self.signal is None:
+            return False
+        state = getattr(self.dp_plot, "plot_state", None)
+        current = getattr(state, "current_signal", None)
+        return current is not None and current is not self.signal
 
     def _calibrate(self, sig_axes) -> None:
         self._x_scale = float(sig_axes[0].scale) or 1.0
@@ -250,7 +291,9 @@ class _DPOverlay:
 
     def _render_payload(self, payload) -> None:
         """Render a computed payload (default: a single offsets array)."""
-        if not self._hidden:
+        if self._displayed_elsewhere():
+            self._push(self._empty())
+        elif not self._hidden:
             self._push(payload)
 
     def _on_indices(self, indices):
@@ -261,6 +304,9 @@ class _DPOverlay:
         log.debug("[overlay:%s] nav move -> lead=%s (%s,%s) engine=%s hidden=%s",
                   self.name, self._lead_nav, self._last_iyix[0], self._last_iyix[1],
                   self._engine is not None, self._hidden)
+        if self._displayed_elsewhere():
+            self._push(self._empty())
+            return
         if self._engine is not None and not self._hidden:
             self._engine.request(*self._last_iyix)
 
@@ -278,6 +324,8 @@ class _DPOverlay:
     def set_visible(self, visible: bool) -> None:
         self._hidden = not bool(visible)
         if self._hidden:
+            self._push(self._empty())
+        elif self._displayed_elsewhere():
             self._push(self._empty())
         elif self._engine is not None:
             self._engine.request(*self._last_iyix)      # recompute current frame
@@ -304,9 +352,10 @@ class VectorOverlay(_DPOverlay):
     """A live found-vectors circle overlay bound to a DP plot and its navigator."""
 
     def __init__(self, dp_plot, vecs, *, color="#ff3030", name="found_vectors",
-                 radius_px=None):
+                 radius_px=None, signal=None):
         self.dp_plot = dp_plot
         self.vecs = vecs
+        self.signal = signal
         self.name = name
         self._color = color
         self._mg = None
@@ -334,11 +383,14 @@ class VectorOverlay(_DPOverlay):
 
 
 def attach_vector_overlay(dp_plot, vecs, tree, *, color="#ff3030",
-                          name="found_vectors", radius_px=None) -> VectorOverlay:
+                          name="found_vectors", radius_px=None,
+                          signal=None) -> VectorOverlay:
     """Add a live found-vectors marker overlay to ``dp_plot`` and wire it to the
-    navigator selectors of ``tree``. Returns the :class:`VectorOverlay`."""
+    navigator selectors of ``tree``. ``signal`` is the node the vectors were
+    found on; the overlay draws only while the plot displays it. Returns the
+    :class:`VectorOverlay`."""
     return VectorOverlay(dp_plot, vecs, color=color, name=name,
-                         radius_px=radius_px).attach(tree)
+                         radius_px=radius_px, signal=signal).attach(tree)
 
 
 class StrainSelectionOverlay(_DPOverlay):
@@ -718,10 +770,7 @@ class OrientationOverlay(_DPOverlay):
         self._push(self._offsets_for(iy, ix))
 
     def _frame(self, iy, ix):
-        frame = self.signal.data[iy, ix]
-        if hasattr(frame, "compute"):      # lazy/dask: one small pattern only
-            frame = frame.compute()
-        return np.asarray(frame, dtype=float)
+        return np.asarray(self._frame_at(iy, ix), dtype=float)
 
     def _offsets_for(self, iy, ix) -> np.ndarray:
         from spyde.actions.orientation_compute import best_match_spots
@@ -963,47 +1012,31 @@ class FindVectorsPreviewOverlay(_DPOverlay):
     # ── geometry ──────────────────────────────────────────────────────────────
     def _blurred_frame(self, iy, ix) -> np.ndarray:
         """Nav-space Gaussian blur matching the batch (``sigma`` over the 2-D scan
-        dims, 0 over signal dims). Slice a small nav window of radius ``ceil(3σ)``
-        around (iy,ix), blur it, and return the centre frame.
+        dims, 0 over signal dims): the frames of a nav window of radius
+        ``ceil(3σ)`` around (iy, ix), blurred, centre frame returned.
 
-        For a higher-D navigator (5-D stack), the leading nav axes (``_lead_nav``,
-        e.g. the stack index) are sliced at their FIXED current position first, so
-        the spatial window + blur operate on the selected stack's 2-D scan exactly
-        as for a plain 4-D dataset."""
+        Every frame of the window is read the way the base pattern is read
+        (:func:`frame_at`: the plot's readers and caches), so on a mapped node
+        each is its recipe on the parent's resident block rather than a compute
+        of the whole dask block per move (measured 130 ms → 9 ms per move on a
+        centred lazy scan). For a higher-D navigator the leading nav coordinates
+        (``_lead_nav``, e.g. the stack index) are fixed, as before."""
         data = self.signal.data
-        # Drop the leading (non-spatial) nav axes at their current index, so the
-        # remaining array is (y, x, *signal) — the 4-D-style layout the rest of
-        # this method assumes. ``_lead_nav`` is in data-axis order.
         lead = tuple(int(v) for v in (self._lead_nav or ()))
-        nav_dim = 2 + len(lead)
-        if lead:
-            sig_ndim = data.ndim - nav_dim
-            # Clamp each leading index to its axis (a stale higher-grid position
-            # mustn't IndexError; matches the navigator's own clamp).
-            lead = tuple(min(max(0, v), int(data.shape[i]) - 1)
-                         for i, v in enumerate(lead))
-            data = data[lead]   # fancy/scalar index of the leading axes
-        ny, nx = int(data.shape[0]), int(data.shape[1])
+        # Clamp each leading index to its axis (a stale higher-grid position
+        # mustn't IndexError; matches the navigator's own clamp).
+        lead = tuple(min(max(0, v), int(data.shape[i]) - 1)
+                     for i, v in enumerate(lead))
+        ny, nx = int(data.shape[len(lead)]), int(data.shape[len(lead) + 1])
         r = int(np.ceil(3 * self.sigma)) if self.sigma > 0 else 0
         y0, y1 = max(0, iy - r), min(ny, iy + r + 1)
         x0, x1 = max(0, ix - r), min(nx, ix + r + 1)
-        block = data[y0:y1, x0:x1]
-        if hasattr(block, "compute"):
-            # Compute this tiny window on the LOCAL threaded scheduler, NOT the
-            # distributed cluster. The navigator drives the same lazy signal's
-            # CachedDaskArray and aggressively cancels surrounding-block futures
-            # (cancel_surrounding); a distributed preview slice shares those
-            # block futures, so a navigator move cancels the preview's chunk
-            # mid-read → "get_inds … cancelled for reason: lost dependencies"
-            # and the preview stops updating. The local scheduler reads the slice
-            # independently and is unaffected by the navigator's cancels.
-            try:
-                block = block.compute(scheduler="threads")
-            except Exception:
-                # Fall back to whatever default the array carries (e.g. already
-                # in-RAM numpy via a Future-backed slice) rather than failing.
-                block = np.asarray(block.compute())
-        block = np.asarray(block, dtype=np.float32)
+        block = np.asarray(
+            [[np.asarray(frame_at(self.dp_plot, self.signal, y, x, lead=lead),
+                         dtype=np.float32)
+              for x in range(x0, x1)]
+             for y in range(y0, y1)],
+            dtype=np.float32)
         if r > 0 and self.sigma > 0:
             from scipy.ndimage import gaussian_filter
             sig_tuple = (self.sigma, self.sigma) + (0,) * (block.ndim - 2)
@@ -1102,9 +1135,10 @@ class FindVectorsPreviewOverlay(_DPOverlay):
         """Render the compute payload: the transformed image (if any) THEN the
         markers on top. Runs latest-wins via the engine; safe on a worker thread
         (set_data / marker push are GIL-protected)."""
-        if self._hidden or not isinstance(payload, dict):
-            log.debug("[fv-preview] render SKIPPED (hidden=%s dict=%s)",
-                      self._hidden, isinstance(payload, dict))
+        if self._hidden or not isinstance(payload, dict) or self._displayed_elsewhere():
+            log.debug("[fv-preview] render SKIPPED (hidden=%s dict=%s elsewhere=%s)",
+                      self._hidden, isinstance(payload, dict),
+                      self._displayed_elsewhere())
             return
         response = payload.get("response")
         offsets = payload.get("offsets", np.zeros((0, 2), np.float32))

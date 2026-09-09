@@ -26,7 +26,7 @@ log = logging.getLogger(__name__)
 
 from de_shell.ipc import emit, emit_status, emit_error
 from spyde.backend import test_hold as _hold
-from spyde.actions.context import src_plot_tree as _src_plot_tree
+from spyde.actions.context import src_plot_tree as _src_plot_tree, current_signal as _current_signal
 from spyde.actions.find_vectors import _do_compute_vectors, _copy_nav_axes_to
 
 # Defaults mirror the old Qt CaretGroup sliders, plus the detection method:
@@ -96,7 +96,7 @@ def find_diffraction_vectors(ctx, action_name: str = "Find Diffraction Vectors",
     if src_tree is None or session is None:
         emit_error("Find Vectors: no active dataset")
         return None
-    src = src_tree.root
+    src = _current_signal(plot) or src_tree.root
     am = src.axes_manager
     if am.signal_dimension != 2 or am.navigation_dimension < 2:
         emit_error("Find Vectors needs a 4D-STEM dataset (2-D nav + 2-D signal)")
@@ -127,7 +127,7 @@ def _start_batch(session, plot, src_tree, p: dict, *, overlay_visible: bool = Tr
     thread. Shared by the toolbar one-shot and the staged-wizard ``fv_run``
     (which passes ``overlay_visible=False`` — after Compute the source DP stays
     clean; reopening the caret toggles the overlay back via ``set_overlay``)."""
-    src = src_tree.root
+    src = _current_signal(plot) or src_tree.root
     am = src.axes_manager
 
     # Pin the CONCRETE model id for neural runs ("" = registry default) so the
@@ -187,7 +187,8 @@ def _start_batch(session, plot, src_tree, p: dict, *, overlay_visible: bool = Tr
         signal_type="spyde_diffraction_vectors_image",
         navigator_override=nav_sig, selector_type=CrosshairSelector,
         provenance={"action": "Find Diffraction Vectors",
-                    "source_title": base_title, "params": dict(p)},
+                    "source_title": base_title,
+                    "source_node": _node_name(src_tree, src), "params": dict(p)},
     )
 
     emit_status("Finding diffraction vectors…")
@@ -309,7 +310,7 @@ def _start_batch(session, plot, src_tree, p: dict, *, overlay_visible: bool = Tr
             _finalize(new_tree, vecs)
             log.info("[fv-batch] finalized in %.1fs total", _time.monotonic() - t0)
             _overlay_on_source(src_tree, src_dp_plot, vecs,
-                               visible=overlay_visible)
+                               visible=overlay_visible, signal=src)
         except Exception as e:
             emit_error(f"Find Vectors failed: {e}")
             log.exception("Find Vectors compute failed")
@@ -348,10 +349,22 @@ def _start_batch(session, plot, src_tree, p: dict, *, overlay_visible: bool = Tr
     return None
 
 
-def _overlay_on_source(src_tree, dp_plot, vecs, *, visible: bool = True) -> None:
+def _node_name(tree, signal):
+    """The tree node name of ``signal``, for provenance; None if not a node."""
+    try:
+        node = tree.get_node(signal)
+    except Exception:
+        node = None
+    return getattr(node, "name", None)
+
+
+def _overlay_on_source(src_tree, dp_plot, vecs, *, visible: bool = True,
+                       signal=None) -> None:
     """Overlay the found vectors as live circle markers on the SOURCE diffraction
     pattern (Qt parity: peaks tracked the navigator). Replaces any prior overlay
     from an earlier run so re-running Find Vectors doesn't stack markers.
+    ``signal`` is the node the vectors were found on; the overlay draws only
+    while the plot displays it.
 
     ``visible=False`` (the wizard path) attaches it hidden: the DP stays clean
     after Compute, and reopening the Find Vectors caret shows it again via the
@@ -361,7 +374,8 @@ def _overlay_on_source(src_tree, dp_plot, vecs, *, visible: bool = True) -> None
     from spyde.actions.lifecycle import replace_tree_attr
     from spyde.actions.vector_overlay import attach_vector_overlay
     ov = replace_tree_attr(src_tree, "_vector_overlay",
-                           lambda: attach_vector_overlay(dp_plot, vecs, src_tree))
+                           lambda: attach_vector_overlay(dp_plot, vecs, src_tree,
+                                                         signal=signal))
     if ov is not None and not visible:
         try:
             ov.set_visible(False)
@@ -893,7 +907,8 @@ def fv_open(session, plot, payload) -> None:
     if src is None or tree is None:
         emit_error("Find Vectors: no active dataset")
         return
-    am = tree.root.axes_manager
+    source = _current_signal(src) or tree.root
+    am = source.axes_manager
     if am.signal_dimension != 2 or am.navigation_dimension < 2:
         emit_error("Find Vectors needs a 4D-STEM dataset (2-D nav + 2-D signal)")
         return
@@ -901,7 +916,7 @@ def fv_open(session, plot, payload) -> None:
     log.debug("[fv-preview] ATTACH method=%s thr=%s show_transform=%s beamstop=%s "
               "data.shape=%s lazy=%s", p["method"], p["threshold"],
               p.get("show_transform"), p.get("beamstop_auto"),
-              tuple(tree.root.data.shape), getattr(tree.root, "_lazy", "?"))
+              tuple(source.data.shape), getattr(source, "_lazy", "?"))
 
     # Run/stop generation guard (React StrictMode mounts the wizard twice
     # synchronously: fv_open, fv_close, fv_open — before either worker
@@ -919,7 +934,7 @@ def fv_open(session, plot, payload) -> None:
                 _ensure_model_local(p)   # a first-use HF model downloads here,
                                          # not inside the preview's frame compute
             new_prev = attach_find_vectors_preview(
-                src, tree.root, tree, sigma=p["sigma"],
+                src, source, tree, sigma=p["sigma"],
                 kernel_radius=p["kernel_radius"], threshold=p["threshold"],
                 min_distance=p["min_distance"], subpixel=p["subpixel"],
                 method=p["method"], model_id=p.get("model_id") or None,
@@ -981,7 +996,7 @@ def _emit_auto_params(plot, tree) -> None:
     Qt, which auto-sizes per dataset rather than using a fixed radius."""
     try:
         from spyde.actions.find_vectors import _auto_params
-        root = tree.root
+        root = _current_signal(plot) or tree.root
         nav_dim = root.axes_manager.navigation_dimension
         nav_shape = tuple(root.data.shape[:nav_dim])
         idx = tuple(int(s) // 2 for s in nav_shape)        # centre pattern
@@ -1038,7 +1053,7 @@ def _emit_calibration(plot, tree, p: dict, gen) -> None:
 
     cal = getattr(tree, "_fv_calibration", None)
     if cal is None:
-        root = tree.root
+        root = _current_signal(plot) or tree.root
         sig_shape = root.axes_manager.signal_shape
         if int(sig_shape[0]) * int(sig_shape[1]) > _CAL_MAX_FRAME_PX:
             log.debug("[fv-cal] signal frame too large — keeping defaults")
@@ -1099,7 +1114,8 @@ def fv_run(session, plot, payload) -> None:
     if src is None or tree is None:
         emit_error("Find Vectors: no active dataset")
         return
-    am = tree.root.axes_manager
+    source = _current_signal(src) or tree.root
+    am = source.axes_manager
     if am.signal_dimension != 2 or am.navigation_dimension < 2:
         emit_error("Find Vectors needs a 4D-STEM dataset (2-D nav + 2-D signal)")
         return

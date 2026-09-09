@@ -274,10 +274,8 @@ class RefineIpfController:
         self._recompute()
 
     def _frame(self, iy, ix):
-        f = self.signal.data[iy, ix]
-        if hasattr(f, "compute"):
-            f = f.compute()
-        return np.asarray(f, dtype=float)
+        from spyde.actions.vector_overlay import frame_at
+        return np.asarray(frame_at(self.dp_plot, self.signal, iy, ix), dtype=float)
 
     def _recompute(self):
         from spyde.actions.ipf_refine import match_correlations, rot_mask_from_circles
