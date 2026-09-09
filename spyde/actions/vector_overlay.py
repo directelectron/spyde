@@ -168,7 +168,8 @@ class _DPOverlay:
     def _frame_at(self, iy, ix):
         """This overlay's node's frame at the navigator position, through the
         plot's readers (see :func:`frame_at`)."""
-        return frame_at(self.dp_plot, self.signal, iy, ix, lead=self._lead_nav)
+        return frame_at(getattr(self, "dp_plot", None), self.signal, iy, ix,
+                        lead=self._lead_nav)
 
     def _displayed_elsewhere(self) -> bool:
         if self.signal is None:
@@ -1031,8 +1032,10 @@ class FindVectorsPreviewOverlay(_DPOverlay):
         r = int(np.ceil(3 * self.sigma)) if self.sigma > 0 else 0
         y0, y1 = max(0, iy - r), min(ny, iy + r + 1)
         x0, x1 = max(0, ix - r), min(nx, ix + r + 1)
+        # A preview built without a plot (a bare stub) reads the plain slice.
+        plot = getattr(self, "dp_plot", None)
         block = np.asarray(
-            [[np.asarray(frame_at(self.dp_plot, self.signal, y, x, lead=lead),
+            [[np.asarray(frame_at(plot, self.signal, y, x, lead=lead),
                          dtype=np.float32)
               for x in range(x0, x1)]
              for y in range(y0, y1)],
