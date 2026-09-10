@@ -5,7 +5,8 @@ every overlay of the displayed node is evaluated at the index the base frame
 used, through the same readers, and handed to the painter thread. A cheap one
 runs inline on the dispatcher; an expensive one is one future on the session's
 compute backend, superseded by identity and painted from its done callback.
-Neither path holds a lock or starts a thread.
+Neither path holds a lock or starts a thread: the dispatcher is already serial
+and the painter already keeps only the newest value.
 """
 from __future__ import annotations
 
@@ -124,6 +125,8 @@ def _submit_overlay(plot, tree, node, reader, index) -> None:
     futures[id(node)] = future
 
     def paint_when_done(finished, expected=future):
+        if finished.cancelled():
+            return          # superseded before it ran
         try:
             value = finished.result()
         except Exception as e:
