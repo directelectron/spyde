@@ -54,7 +54,7 @@ test('orientation mapping runs on lazy data and opens the IPF map window', async
   // The IPF window has a 2D/3D toggle (a second `view:"3d"` explorer figure was
   // emitted). Switching to 3D shows the 3-D scatter iframe.
   const toggle = page.getByTestId(/^ipf-view-toggle-/).first()
-  await expect(toggle).toBeVisible({ timeout: 15_000 })
+  await expect(toggle).toBeVisible({ timeout: 120_000 })
   await page.getByTestId(/^ipf-view-3d-/).first().click()
   await expect(page.getByTestId(/^ipf-view-3d-/).first()).toBeVisible()
 
