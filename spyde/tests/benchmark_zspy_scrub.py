@@ -271,6 +271,18 @@ def _silence_messages():
             module.emit = lambda message: None
 
 
+def _blosc_state():
+    """How numcodecs will decode, once the session has applied its patches."""
+    import numcodecs.blosc as blosc
+
+    from spyde.external.numcodecs.blosc_threads import MARKER
+
+    pool = "pool on" if blosc.use_threads else "thread-dependent"
+    serialised = "serialised" if getattr(blosc.decompress, MARKER, False) \
+        else "unserialised"
+    return f"{pool}, {blosc.get_nthreads()} threads, {serialised}"
+
+
 def run(path):
     from spyde.tests.migrated.conftest import close_session, make_session
 
@@ -291,7 +303,7 @@ def run(path):
         print(f"shape          {tuple(int(v) for v in signal.data.shape)} "
               f"{signal.data.dtype}")
         print(f"nav chunks     {chunk_shape}")
-        print(f"blosc threads  {os.environ.get('SPYDE_BLOSC_THREADS', 'unset')}")
+        print(f"blosc          {_blosc_state()}")
         print(f"think time     {THINK_MILLISECONDS:.0f} ms between reads")
         print()
 

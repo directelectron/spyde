@@ -64,6 +64,7 @@ _APPLIED = False
 # time) while still discoverable from one list.
 _PATCH_SUBPACKAGES = (
     "spyde.external.hyperspy",
+    "spyde.external.numcodecs",
     "spyde.external.rosettasciio",
 )
 
