@@ -339,6 +339,9 @@ class Plot:
         self._pending_overlay_values: Dict = {}
         self._overlay_futures: Dict = {}
         self._overlay_values: Dict = {}
+        # The appearance each curve of a curves group was created with, so a
+        # line is rebuilt only when its own appearance changed.
+        self._overlay_curve_styles: Dict = {}
         self._live_transform_groups: set = set()
         # The transform image last pushed, which is what `displayed_data`
         # answers with while a transform group is live.
@@ -632,6 +635,8 @@ class Plot:
         was_live = {k for k in self._live_transform_groups if k[0] == id(node)}
         self._live_transform_groups -= was_live
         self._overlay_values.pop(id(node), None)
+        for key in [k for k in self._overlay_curve_styles if k[0] == id(node)]:
+            self._overlay_curve_styles.pop(key, None)
         for key in [k for k in self._overlay_groups if k[0] == id(node)]:
             handle = self._overlay_groups.pop(key)
             if node.groups.get(key[1], (None, None))[0] == "mask":
@@ -814,20 +819,41 @@ class Plot:
                                    **{**(node.groups[name][1] or {}), **style})
 
     def _push_overlay_curves(self, key, node, name, value) -> None:
-        """Draw a list of (x, y) pairs as 1-D lines, growing or trimming the
-        line set to the number of pairs given."""
-        lines = self._overlay_groups.get(key) or []
-        pairs = list(value or [])
-        style = dict(node.groups[name][1] or {})
-        while len(lines) < len(pairs):
-            lines.append(self._plot1d.add_line(np.zeros(1), x_axis=np.zeros(1),
-                                               **style))
-        while len(lines) > len(pairs):
+        """Draw a list of curves as 1-D lines, growing or trimming the line set
+        to the number given.
+
+        A curve is an ``(x, y)`` pair, or a dict carrying that pair under
+        ``data`` plus the appearance to draw it with. A line's appearance is
+        fixed when it is created, so a curve whose appearance changed is
+        rebuilt; the values themselves are written in place, which is what
+        makes a curve follow a dragged handle."""
+        lines = list(self._overlay_groups.get(key) or [])
+        drawn_with = list(self._overlay_curve_styles.get(key) or [])
+        base = dict(node.groups[name][1] or {})
+        pairs, appearances = [], []
+        for curve in list(value or []):
+            pair, style = _split_overlay_value(curve)
+            pairs.append(pair)
+            appearances.append({**base, **style})
+        while len(lines) > len(appearances):
             lines.pop().remove()
+            drawn_with.pop()
+        for position, look in enumerate(appearances):
+            if position < len(lines) and drawn_with[position] == look:
+                continue
+            if position < len(lines):
+                lines[position].remove()
+            new = self._plot1d.add_line(np.zeros(1), x_axis=np.zeros(1), **look)
+            if position < len(lines):
+                lines[position], drawn_with[position] = new, look
+            else:
+                lines.append(new)
+                drawn_with.append(look)
         for line, (x, y) in zip(lines, pairs):
             line.set_data(np.asarray(y, dtype=float),
                           x_axis=np.asarray(x, dtype=float))
         self._overlay_groups[key] = lines
+        self._overlay_curve_styles[key] = drawn_with
 
     def _push_overlay_layer(self, key, node, name, value, style=None) -> None:
         """Draw an image layer over the base image, building it on the first

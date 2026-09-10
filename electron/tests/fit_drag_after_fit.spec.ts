@@ -7,10 +7,11 @@
  * while a drag is in progress.
  *
  * The suspicion this is built to confirm or kill: `fit_current` REMEMBERS the
- * position, and the caret's navigator listener sends `fit_navigated` on any
- * figure pointer_up it does not recognise as its own. `fit_navigated` recalls
- * a stored fit — so after a fit, every drag could be immediately overwritten
- * by the stored values and the handle would snap straight back.
+ * position, and a redraw of the model's curves reads the row stored there. If
+ * a redraw loaded that row back into the model, every drag after a fit would
+ * be overwritten by the stored values and the handle would snap straight back.
+ * A stored row is loaded only on ARRIVING at a new position, which is why a
+ * drag at the position you are already on survives.
  *
  * Run: npx playwright test tests/fit_drag_after_fit.spec.ts \
  *        --project=electron --reporter=line --retries=0

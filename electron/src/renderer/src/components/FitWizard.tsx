@@ -108,41 +108,11 @@ export function FitWizard({ caretPos, windowId, sendAction, onClose }: Props) {
   // builds a model for. Read from the shared state rather than asked for, so
   // the button appears the moment they are set.
   const elements = state.composition.get(windowId)?.elements ?? []
-  // Read inside the navigator listener, which is registered once — a state
-  // value captured there would be the value at registration forever.
-  const adaptiveRef = React.useRef(adaptive)
-  adaptiveRef.current = adaptive
 
-  // ── navigator coalescer: one `fit_navigated` in flight, latest wins ─────
-  // A drag posts a pointer_move per frame and each one costs a recall, a
-  // preview redraw and a full model re-send. Sending one per frame queues work
-  // faster than it is served, and the queue drains AFTER the drag: measured 29
-  // moves over 486 ms, with the model settling 1159 ms after the last of them.
-  // That is the pause, and the value finally arriving is the snap.
-  //
-  // Skipping intermediate sends loses nothing: `fit_navigated` reads the
-  // CURRENT selector position when the backend handles it, so one send after
-  // the previous finishes always acts on the newest position. `fit_state`
-  // coming back is the completion signal — self-tuning, unlike a fixed
-  // throttle, and there is a timeout so a lost reply cannot wedge the gate.
-  const inFlight = React.useRef(false)
-  const pending = React.useRef(false)
-  const wedgeTimer = React.useRef<ReturnType<typeof setTimeout> | null>(null)
-
-  const sendNavigated = React.useCallback(() => {
-    if (inFlight.current) { pending.current = true; return }
-    inFlight.current = true
-    pending.current = false
-    if (wedgeTimer.current) clearTimeout(wedgeTimer.current)
-    wedgeTimer.current = setTimeout(() => { inFlight.current = false }, 2_000)
-    sendAction('fit_navigated', { adaptive: adaptiveRef.current }, windowId)
-  }, [sendAction, windowId])
-
-  const navDone = React.useCallback(() => {
-    inFlight.current = false
-    if (wedgeTimer.current) { clearTimeout(wedgeTimer.current); wedgeTimer.current = null }
-    if (pending.current) sendNavigated()
-  }, [sendNavigated])
+  // The caret does not follow the navigator: the model's curves are an overlay
+  // child of the spectrum node, so the backend evaluates and draws them at
+  // whatever position the navigator read, and sends the state that comes back
+  // below. Nothing is sent from here per pointer frame.
 
   useWizardLifecycle({
     windowId, sendAction,
@@ -173,15 +143,12 @@ export function FitWizard({ caretPos, windowId, sendAction, onClose }: Props) {
     setFitted(Boolean(d.fitted))
     setPoor(d.poor_count ?? 0)
     if (d.stored_models) setStoredModels(d.stored_models)
-    // Every backend edit ends in a `fit_state`, so this is the completion
-    // signal the navigator coalescer waits on — see sendNavigated.
-    navDone()
-    // TEST SEAM. `fit_navigated` pushes the model overlay (draw_preview) and
-    // THEN emits this state, both down the same ordered stdout protocol — so
-    // the arrival of a fit_state proves this position's overlay has already
-    // landed. That makes this counter the only sound "the curves are now this
-    // position's" signal available to e2e; everything else is a guess about
-    // quiescence, and a stale overlay is perfectly quiescent.
+    // TEST SEAM. The backend draws this position's curves and THEN emits this
+    // state, both down the same ordered stdout protocol — so the arrival of a
+    // fit_state proves this position's curves have already landed. That makes
+    // this counter the only sound "the curves are now this position's" signal
+    // available to e2e; everything else is a guess about quiescence, and a
+    // stale overlay is perfectly quiescent.
     const w = window as unknown as { _spyde_fit_state_seq?: number }
     w._spyde_fit_state_seq = (w._spyde_fit_state_seq ?? 0) + 1
     setCoverage({
@@ -191,37 +158,6 @@ export function FitWizard({ caretPos, windowId, sendAction, onClose }: Props) {
     })
     if (d.status) setStatus(d.status)
   })
-
-  // ── follow the navigator ────────────────────────────────────────────────
-  // The navigator's crosshair lives on a DIFFERENT window, so this listens to
-  // `spyde:figure_event` unfiltered and ignores anything from OUR OWN figures
-  // — `useWizardEvent` filters by window_id, which would drop exactly the
-  // events wanted here.
-  //
-  // The filter is by figId, and it has to be: `spyde:figure_event` carries
-  // `{figId, event}` and NO window_id at all (SpyDEContext's re-broadcast), so
-  // the old `detail.window_id === windowId` test compared undefined and never
-  // fired. Every pointer_up on this window's own plot therefore sent
-  // `fit_navigated` — including the ones from the caret's own drag handles.
-  // Before a fit that was harmless; after one the position is in the store, so
-  // `fit_navigated` RECALLED it and overwrote the drag the instant it landed.
-  // That is "once you fit a spectrum you can't move either component".
-  const ownFigIds = React.useRef<Set<string>>(new Set())
-  ownFigIds.current = new Set(
-    (state.windows.get(windowId)?.figures ?? []).map((f) => f.figId))
-
-  React.useEffect(() => {
-    const on = (e: Event) => {
-      const d = (e as CustomEvent).detail as { figId?: string }
-      if (d.figId && ownFigIds.current.has(d.figId)) return   // our own plot
-      sendNavigated()
-    }
-    window.addEventListener('spyde:figure_event', on)
-    return () => {
-      window.removeEventListener('spyde:figure_event', on)
-      if (wedgeTimer.current) clearTimeout(wedgeTimer.current)
-    }
-  }, [sendNavigated])
 
   const add = (kind: string) => {
     sendAction('fit_add_component', { kind }, windowId)
@@ -364,9 +300,13 @@ export function FitWizard({ caretPos, windowId, sendAction, onClose }: Props) {
               )}
               {/* Refit automatically as the navigator moves. Each position's
                   answer is remembered, so scrubbing back shows what was found
-                  there rather than the last pixel's model. */}
+                  there rather than the last pixel's model. The backend's curves
+                  do the fitting, so the toggle is a setting sent to them. */}
               <Check testid="fit-adaptive" checked={adaptive}
-                onChange={setAdaptive} label="Adaptive" />
+                onChange={(v) => {
+                  setAdaptive(v)
+                  sendAction('fit_tune', { adaptive: v }, windowId)
+                }} label="Adaptive" />
               {/* Coverage, so a skipped position is visible rather than
                   something you discover when a map comes out patchy. */}
               {coverage.total > 0 && (
