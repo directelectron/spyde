@@ -197,10 +197,16 @@ class _WorkerTuningPlugin(_WorkerPluginBase):
        decodes single-threaded on any thread but the main one, and every task
        here runs on a worker thread. The patch turns the pool on and serialises
        access to it; the lock is per process, so each worker decodes one chunk
-       at a time with the whole pool.
+       at a time with its pool, sized as the machine's cores divided among the
+       workers so they do not oversubscribe it together.
     """
 
     name = "spyde-worker-tuning"
+
+    def __init__(self, blosc_threads: "int | None" = None):
+        # The pool size for this worker's blosc, chosen by the cluster so the
+        # workers together do not oversubscribe the machine.
+        self.blosc_threads = blosc_threads
 
     def setup(self, worker=None):
         _neutralize_slow_net_io_counters(force=True)
@@ -213,7 +219,7 @@ class _WorkerTuningPlugin(_WorkerPluginBase):
         _apply_mac_neural_env()
         try:
             from spyde.external.numcodecs.blosc_threads import apply as apply_blosc_threads
-            apply_blosc_threads()
+            apply_blosc_threads(self.blosc_threads)
         except Exception as e:
             logger.debug("worker blosc thread-pool patch failed: %s", e)
 
@@ -334,14 +340,17 @@ class DaskManager:
                 time.monotonic() - t_sched, _elapsed(),
             )
             client = Client(cluster)
+            # Each worker's blosc pool gets an equal share of the cores, so the
+            # workers decoding together stay within the machine.
+            pool_threads = max(1, (os.cpu_count() or 1) // max(1, self._n_workers))
             # Every worker process must stub net_io_counters too (its own
             # SystemMonitor ticks it on the worker event loop) — registered
             # BEFORE workers spawn so the plugin runs at each worker's startup.
             try:
                 try:
-                    client.register_plugin(_WorkerTuningPlugin())
+                    client.register_plugin(_WorkerTuningPlugin(blosc_threads=pool_threads))
                 except AttributeError:   # older distributed
-                    client.register_worker_plugin(_WorkerTuningPlugin())
+                    client.register_worker_plugin(_WorkerTuningPlugin(blosc_threads=pool_threads))
             except Exception as e:
                 logger.warning("[dask] worker tuning plugin failed: %s", e)
             n_gpus = _probe_gpus()
