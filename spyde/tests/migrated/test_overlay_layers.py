@@ -15,6 +15,7 @@ an expensive overlay painting from its future's callback.
 """
 from __future__ import annotations
 
+import threading
 import time
 
 import numpy as np
@@ -87,6 +88,23 @@ def _add_layer(session, tgt, src, timeout=5.0):
     if nodes:
         _wait_for_layer(tgt, nodes[0], timeout)
     return nodes[0] if nodes else None
+
+
+def _region_points(height, width):
+    """The widget (cx, cy) pairs an integrating region of this size reports."""
+    return np.array([[x, y] for y in range(height) for x in range(width)])
+
+
+def _drive_region_to(mm, navpw, target_plot, points):
+    """Run the selector that drives ``target_plot`` over an integrating region
+    covering ``points`` (widget (cx, cy) pairs)."""
+    sel = [s for s in mm.navigation_selectors[navpw] if target_plot in s.children][0]
+    inner = getattr(sel, "selector", sel)
+    inner.get_selected_indices = lambda: np.asarray(points)
+    inner.is_integrating = True
+    inner._run_update(force=True)
+    time.sleep(0.6)
+    return sel
 
 
 def _drive_selector_to(mm, navpw, target_plot, y, x):
@@ -367,8 +385,10 @@ class TestPendingOverlayRace:
         node = _StubNode()
 
         drawn = []
-        monkeypatch.setattr(type(target), "_push_overlay_group",
-                            lambda self, n, name, kind, value: drawn.append(value))
+        monkeypatch.setattr(
+            type(target), "_push_overlay_group",
+            lambda self, n, name, kind, value, base_painted=False:
+                drawn.append(value))
 
         in_critical_section = threading.Event()
         release = threading.Event()
@@ -399,7 +419,7 @@ class TestPendingOverlayRace:
         target._pending_overlay_values = {id(node): (node, old_value)}
         node.on_value = lambda value: drawn.append(value)
 
-        painter = threading.Thread(target=target._apply_pending_overlays)
+        painter = threading.Thread(target=lambda: target.paint_pass(None))
         painter.start()
         assert in_critical_section.wait(2.0), \
             "the painter never entered the critical section"
@@ -423,7 +443,7 @@ class TestPendingOverlayRace:
         # The painter delivered the OLD value it read; the NEW one is still
         # staged, so a second drain delivers it. Nothing is lost.
         monkeypatch.setattr(plot_module._nav_painter, "_lock", real_lock)
-        target._apply_pending_overlays()
+        target.paint_pass(None)
         assert old_value in drawn, "the old value was not delivered"
         assert new_value in drawn, "the NEWER value was lost (lost-update race)"
 
@@ -460,3 +480,91 @@ class TestExpensiveOverlayCallback:
             assert seen, "the expensive overlay's value never arrived"
         finally:
             tree.remove_overlay(node)
+
+
+# ── the tier a layer takes, and the region it integrates ────────────────────────
+
+
+class TestLayerTakesTheSourceTier:
+    """A layer names no tier of its own: it is the source window's frame, so
+    it runs wherever reading that frame would run."""
+
+    def _threads_of(self, monkeypatch):
+        """Record the thread ``layer_frame`` is called on."""
+        threads = []
+        original = ov.layer_frame
+
+        def recording(frame, *, appearance):
+            threads.append(threading.current_thread().name)
+            return original(frame, appearance=appearance)
+
+        monkeypatch.setattr(ov, "layer_frame", recording)
+        return threads
+
+    def test_a_resident_frame_is_read_inline(self, stem_4d_dataset, monkeypatch):
+        """Read on the thread running the navigator update, so the value is
+        staged before the base frame is painted and both reach the figure in
+        one pass."""
+        session = stem_4d_dataset["window"]
+        _prime(session)
+        tgt, src, nav, mm, navpw = _two_signal_windows(session)
+        threads = self._threads_of(monkeypatch)
+        node = _add_layer(session, tgt, src)
+        threads.clear()                       # the drop's own seeding call
+
+        _drive_selector_to(mm, navpw, tgt, 2, 3)
+        assert threads, "the layer never evaluated"
+        assert set(threads) == {threading.current_thread().name}, threads
+        assert node.expensive is None
+
+    def test_a_costly_read_arrives_from_the_overlay_lane(self, stem_4d_dataset,
+                                                         monkeypatch):
+        """A region wide enough to block the navigator goes to the compute
+        backend's lane, exactly as the base frame's own read would."""
+        session = stem_4d_dataset["window"]
+        _prime(session)
+        tgt, src, nav, mm, navpw = _two_signal_windows(session)
+        threads = self._threads_of(monkeypatch)
+        _add_layer(session, tgt, src)
+        threads.clear()                       # the drop's own seeding call
+
+        _drive_region_to(mm, navpw, tgt, _region_points(8, 8))
+        assert quiesce(session), why_busy(session)
+        time.sleep(0.4)
+        assert threads, "the layer never evaluated"
+        assert all(name.startswith("overlay-eval") for name in threads), threads
+
+
+class TestEagerRegionParity:
+    def test_a_region_layer_integrates_what_the_base_integrates(self,
+                                                                stem_4d_dataset):
+        """A layer composites over the base image, so it must integrate the
+        same navigation positions under the same rule: the region reaches the
+        source read whole rather than being reduced to its centre."""
+        from spyde.array_cache import get_local_frame
+        from spyde.drawing.update_functions import _prepare_nav_indices
+
+        session = stem_4d_dataset["window"]
+        _prime(session)
+        tgt, src, nav, mm, navpw = _two_signal_windows(session)
+        node = _add_layer(session, tgt, src)
+
+        points = _region_points(3, 2)
+        _drive_region_to(mm, navpw, tgt, points)
+        assert quiesce(session), why_busy(session)
+        time.sleep(0.4)
+
+        value = tgt.last_overlay_value(node)
+        assert value, "the layer drew nothing for the region"
+        drawn = np.asarray(value[ov.LAYER_GROUP]["data"])
+
+        signal = src.plot_state.current_signal
+        prepared = _prepare_nav_indices(signal, points, integrating=True)
+        expected = get_local_frame(src, signal, signal.data, prepared)
+        assert np.array_equal(drawn, expected), \
+            "the layer's region differs from the base frame's"
+        centre = get_local_frame(src, signal, signal.data,
+                                 _prepare_nav_indices(signal, points,
+                                                      integrating=False))
+        assert not np.array_equal(drawn, centre), \
+            "the fixture cannot tell a region from its centre position"

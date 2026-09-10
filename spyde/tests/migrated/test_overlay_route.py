@@ -185,11 +185,12 @@ class _RampReader(_ConstantReader):
         return np.full(self.shape, float(sum(indices)), dtype=self.dtype)
 
 
-class _SummingReader(_RampReader):
-    """The same, with the block readers' ``sum_points`` fast path."""
+class _RegionReader(_RampReader):
+    """The same, with a region rule of its own: the frames summed rather than
+    averaged, which is what a store that renders counts wants."""
 
-    def sum_points(self, points, accumulate_dtype):
-        total = np.zeros(self.shape, dtype=accumulate_dtype)
+    def region_frame(self, points):
+        total = np.zeros(self.shape, dtype=np.float64)
         for row in np.asarray(points):
             total += self.read_frame(tuple(int(v) for v in row))
         return total
@@ -587,6 +588,103 @@ class TestGroupKinds:
             session.shutdown()
 
 
+class TestTransformOrdering:
+    """A transform group's image IS the frame the window shows, so the raw
+    pattern must never appear on the way in or on the way out."""
+
+    def _painted(self, plot):
+        """Every array pushed to the figure, in order."""
+        pushed = []
+        plot._set_array = lambda data, levels=None: pushed.append(np.asarray(data))
+        return pushed
+
+    def _transform_overlay(self, tree, response):
+        def detector(frame, *, show):
+            return {"response": response if show else None}
+
+        return tree.add_overlay(tree.root, detector, name="detector",
+                                groups={"response": ("transform", {})},
+                                static={"show": True})
+
+    def test_entering_the_transform_view_never_shows_the_raw_frame(self):
+        session, plot = _open_session(_off_centre_lazy())
+        try:
+            tree = plot.signal_tree
+            response = np.ones((32, 32), np.float32)
+            node = self._transform_overlay(tree, response)
+            pushed = self._painted(plot)
+
+            _move_navigator(session, tree)
+            assert _wait(lambda: pushed, 10), "nothing was painted"
+            assert all(np.array_equal(one, response) for one in pushed),                 "the raw pattern was painted under the transform"
+            assert plot.displayed_data is response
+            assert node.visible
+        finally:
+            session.shutdown()
+
+    def test_leaving_it_paints_the_raw_frame_once(self):
+        session, plot = _open_session(_off_centre_lazy())
+        try:
+            tree = plot.signal_tree
+            response = np.ones((32, 32), np.float32)
+            node = self._transform_overlay(tree, response)
+            _move_navigator(session, tree)
+            assert _wait(lambda: plot.has_live_transform(), 10)
+
+            pushed = self._painted(plot)
+            tree.replace_overlay_static(node, show=False)
+            assert _wait(lambda: not plot.has_live_transform(), 10)
+            _settle(session)
+            assert len(pushed) == 1,                 f"the raw frame was painted {len(pushed)} times, not once"
+            assert np.array_equal(pushed[0], plot.current_data)
+            assert plot.displayed_data is plot.current_data
+        finally:
+            session.shutdown()
+
+    def test_dropping_the_node_brings_the_pattern_back(self):
+        """Closing the caret restores the pattern without waiting for a move:
+        the node owned the image on screen, so it stages a repaint as it goes."""
+        session, plot = _open_session(_off_centre_lazy())
+        try:
+            tree = plot.signal_tree
+            node = self._transform_overlay(tree, np.ones((32, 32), np.float32))
+            _move_navigator(session, tree)
+            assert _wait(lambda: plot.has_live_transform(), 10)
+            raw = plot.current_data
+
+            pushed = self._painted(plot)
+            tree.remove_overlay(node)
+            assert _wait(lambda: pushed, 10), "the pattern never came back"
+            assert np.array_equal(pushed[-1], raw)
+            assert not plot.has_live_transform()
+        finally:
+            session.shutdown()
+
+
+class TestOverlaySourceOverride:
+    def test_a_frame_overlay_reads_through_a_pinned_reader(self):
+        """A window whose frames come from a pinned reader has no array to
+        slice, so an overlay ON that node must read the reader's frame rather
+        than the placeholder underneath it."""
+        session, plot = _open_session(_off_centre_lazy())
+        try:
+            tree = plot.signal_tree
+            frame = np.full((32, 32), 7.0, dtype=np.float32)
+            tree.set_reader_override(tree.root, _ConstantReader(frame))
+
+            seen = []
+            node = tree.add_overlay(
+                tree.root, lambda source: seen.append(np.asarray(source)) or {},
+                name="reads", groups={"found": ("circles", {})})
+
+            _move_navigator(session, tree)
+            assert _wait(lambda: seen, 10), "the overlay never evaluated"
+            assert np.array_equal(seen[-1], frame), seen[-1]
+            assert node.visible
+        finally:
+            session.shutdown()
+
+
 class TestWhereTheWorkRuns:
     def test_a_move_evaluates_on_the_dispatcher_and_draws_on_the_painter(self):
         session, plot = _open_session(_off_centre_lazy())
@@ -798,15 +896,17 @@ class TestReaderOverride:
             session.shutdown()
 
     def test_a_region_integrates_through_the_override(self):
+        """Without a rule of its own an override's region is the mean of its
+        frames; with one, the region is whatever that rule returns, used as
+        is."""
         from spyde.drawing.update_functions import _read_through_override
 
-        signal = _off_centre_lazy()
         points = np.array([[0, 0], [1, 1], [2, 2], [3, 3]])
-        expected = np.full((4, 4), 3.0, dtype=np.float32)   # mean of 0, 2, 4, 6
+        mean = _read_through_override(_RampReader((4, 4)), points)
+        assert np.array_equal(mean, np.full((4, 4), 3.0))   # mean of 0, 2, 4, 6
 
-        for override in (_RampReader((4, 4)), _SummingReader((4, 4))):
-            got = _read_through_override(override, signal, points)
-            assert np.array_equal(got, expected), type(override).__name__
+        summed = _read_through_override(_RegionReader((4, 4)), points)
+        assert np.array_equal(summed, np.full((4, 4), 12.0))
 
 
 class TestNodeSwitch:

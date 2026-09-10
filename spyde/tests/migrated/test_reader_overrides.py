@@ -85,6 +85,9 @@ class TestVectorsWindowReader:
             close_session(session)
 
     def test_a_region_reads_the_summed_render(self):
+        """The store owns the rule, so the region IS ``render_region``: each
+        position's disks at their intra-frame maximum, summed across
+        positions, used exactly as it comes back."""
         session = make_session()
         try:
             vecs = _vectors()
@@ -95,8 +98,7 @@ class TestVectorsWindowReader:
             grid = np.array([[ix, iy] for iy in (0, 1) for ix in (0, 1)])
             frame = update_from_navigation_selection(
                 _Pointer(integrating=True), plot, grid)
-            np.testing.assert_allclose(frame, vecs.render_region(0, 2, 0, 2),
-                                       atol=1e-4)
+            np.testing.assert_array_equal(frame, vecs.render_region(0, 2, 0, 2))
         finally:
             close_session(session)
 
@@ -147,6 +149,38 @@ class TestProgressivePreviewReader:
             close_session(session)
 
 
+    def test_a_region_shows_its_centre_position(self):
+        """Integrating over a half-finished result would have to wait for every
+        position in it, so a region shows the one position at its centre, and
+        nothing at all when that position has not landed."""
+        session = make_session()
+        try:
+            tree = self._result_tree(session)
+            _settle(session)
+            plot = tree.signal_plots[0]
+            landed = {(1, 2)}
+
+            def render(index):
+                return (np.full((16, 16), 7.0, np.float32)
+                        if tuple(index) in landed else None)
+
+            preview = attach_signal_preview(session, tree, render=render,
+                                            nav_shape=(4, 5))
+            preview.note_block((slice(1, 2), slice(2, 3)))
+
+            # A region centred on the landed position (widget [ix, iy] pairs).
+            around = np.array([[1, 1], [2, 1], [3, 1]])
+            frame = update_from_navigation_selection(
+                _Pointer(integrating=True), plot, around)
+            assert frame is not None and float(frame.max()) == 7.0
+
+            elsewhere = np.array([[3, 3], [4, 3]])
+            assert update_from_navigation_selection(
+                _Pointer(integrating=True), plot, elsewhere) is None
+        finally:
+            close_session(session)
+
+
 class TestRawFrameToggle:
     def test_toggling_raw_leaves_another_trees_override_alone(self):
         session = make_session()
@@ -167,14 +201,51 @@ class TestRawFrameToggle:
 
             assert install(selector, True) is True
             assert isinstance(
-                movie_tree.reader_override_for(movie_plot.plot_state.current_signal),
+                movie_tree.reader_override_for(
+                    movie_plot.plot_state.current_signal, movie_plot),
                 RawFrameReader)
             assert vectors_tree.reader_override_for(vectors_tree.root) is rendered
 
             assert install(selector, False) is False
             assert movie_tree.reader_override_for(
-                movie_plot.plot_state.current_signal) is None
+                movie_plot.plot_state.current_signal, movie_plot) is None
             assert vectors_tree.reader_override_for(vectors_tree.root) is rendered
+        finally:
+            close_session(session)
+
+    def test_two_windows_on_one_signal_toggle_raw_independently(self):
+        """Raw is a way of looking at a movie, not a property of it. A second
+        window on the same signal keeps showing integrated planes while the
+        first shows raw frames, and turning the first off leaves the second
+        alone."""
+        session = make_session()
+        try:
+            session._add_signal(_lazy_movie(), source_path=None)
+            _settle(session)
+            tree = session.signal_trees[-1]
+            navigator = [p for p in session._plots if p.is_navigator][0]
+            navigator.multiplot_manager.add_navigation_selector_and_signal_plot(
+                navigator.plot_window)
+            _settle(session)
+
+            first, second = tree.signal_plots[0], tree.signal_plots[1]
+            assert first is not second
+            signal = first.plot_state.current_signal
+            selectors = {
+                id(plot): next(
+                    s for s in
+                    tree.navigator_plot_manager.all_navigation_selectors
+                    if plot in s.children)
+                for plot in (first, second)
+            }
+
+            install(selectors[id(first)], True)
+            install(selectors[id(second)], True)
+            install(selectors[id(first)], False)
+
+            assert tree.reader_override_for(signal, first) is None
+            assert isinstance(tree.reader_override_for(signal, second),
+                              RawFrameReader)
         finally:
             close_session(session)
 

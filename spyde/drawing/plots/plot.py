@@ -94,23 +94,12 @@ class _NavPainter:
                 overlay_only.pop(id(plot), None)
                 try:
                     plot.current_data = data
-                    # An overlay's transform group IS the image this plot
-                    # shows, so the base frame is held back while one is live
-                    # and paints again as soon as its value is None.
-                    live = getattr(plot, "has_live_transform", None)
-                    if live is None or not live():
-                        plot._set_array(data)
-                    # Overlay values for this plot, drawn on top of the base
-                    # frame and still on this one thread, so every push to
-                    # anyplotlib stays serialized behind the frame it belongs
-                    # to. No-op when the plot has no overlays.
-                    if getattr(plot, "_pending_overlay_values", None):
-                        plot._apply_pending_overlays()
+                    plot.paint_pass(data)
                 except Exception as e:
                     logger.debug("nav paint failed: %s", e)
             for plot in overlay_only.values():
                 try:
-                    plot._apply_pending_overlays()
+                    plot.paint_pass(None)
                 except Exception as e:
                     logger.debug("overlay paint failed: %s", e)
 
@@ -121,6 +110,11 @@ _nav_painter = _NavPainter()
 # The payloads that draw nothing, for an overlay group with no value.
 _EMPTY_OFFSETS = np.zeros((0, 2), dtype=np.float32)
 _EMPTY_SEGMENTS = np.zeros((0, 2, 2), dtype=np.float32)
+
+# Group kinds that draw an image. They are pushed before the marker kinds so
+# the markers land on the image they were computed against, never on the one
+# this pass is replacing.
+_IMAGE_KINDS = ("transform", "layer", "mask")
 
 
 def _split_overlay_value(value):
@@ -346,6 +340,9 @@ class Plot:
         self._overlay_futures: Dict = {}
         self._overlay_values: Dict = {}
         self._live_transform_groups: set = set()
+        # The transform image last pushed, which is what `displayed_data`
+        # answers with while a transform group is live.
+        self._transform_image: "np.ndarray | None" = None
 
         # anyplotlib figure + plot objects
         self._fig: apl.Figure | None = None
@@ -590,10 +587,10 @@ class Plot:
         """Create the anyplotlib primitive an overlay group draws with, once.
 
         ``kind`` is one of ``circles``, ``lines``, ``arrows``, ``curves``,
-        ``layer`` and ``transform``; ``style`` is the appearance passed to the
-        constructor. A ``layer`` needs its first image before it can be built
-        and a ``transform`` draws through the base image, so both register the
-        group with no handle yet."""
+        ``layer``, ``transform`` and ``mask``; ``style`` is the appearance
+        passed to the constructor. A ``layer`` needs its first image before it
+        can be built, and a ``transform`` and a ``mask`` draw through the base
+        image, so all three register the group with no handle yet."""
         key = (id(node), name)
         if key in self._overlay_groups:
             return
@@ -616,7 +613,7 @@ class Plot:
                     name=group_name, **marker_style)
             elif kind == "curves":
                 handle = []
-            elif kind not in ("layer", "transform"):
+            elif kind not in ("layer", "transform", "mask"):
                 logger.debug("[plot] unknown overlay group kind %r", kind)
                 return
         except Exception as e:
@@ -627,13 +624,18 @@ class Plot:
 
     def drop_overlay_groups(self, node) -> None:
         """Remove every anyplotlib primitive an overlay node drew with, and
-        release any transform hold it had: that suppresses the navigator's own
-        paint, so it must not outlive the node driving it."""
-        self._live_transform_groups -= {k for k in self._live_transform_groups
-                                        if k[0] == id(node)}
+        clear what it drew through the base image.
+
+        A transform group suppresses the navigator's own paint, so dropping one
+        that is live stages a repaint of the raw frame: the pattern comes back
+        as the node goes, without waiting for a navigator move."""
+        was_live = {k for k in self._live_transform_groups if k[0] == id(node)}
+        self._live_transform_groups -= was_live
         self._overlay_values.pop(id(node), None)
         for key in [k for k in self._overlay_groups if k[0] == id(node)]:
             handle = self._overlay_groups.pop(key)
+            if node.groups.get(key[1], (None, None))[0] == "mask":
+                self._set_overlay_mask(None)
             for one in (handle if isinstance(handle, list) else [handle]):
                 if one is None:
                     continue
@@ -645,6 +647,9 @@ class Plot:
         with _nav_painter._lock:
             self._pending_overlay_values.pop(id(node), None)
         self._overlay_futures.pop(id(node), None)
+        if was_live and isinstance(self.current_data, np.ndarray):
+            self._transform_image = None
+            self.enqueue_paint(self.current_data)
 
     def enqueue_overlay(self, node, value) -> None:
         """Stage an overlay node's value for the painter thread.
@@ -669,31 +674,70 @@ class Plot:
         except Exception as e:
             logger.debug("[plot] cancelling an overlay evaluation failed: %s", e)
 
-    def _apply_pending_overlays(self) -> None:
-        """Push every staged overlay value to its groups. Runs on the painter
-        thread. The take-and-clear is atomic against ``enqueue_overlay`` so a
-        value written between the read and the clear is not lost; nothing is
-        pushed while the lock is held."""
+    def paint_pass(self, base) -> None:
+        """One navigator pass on the painter thread: the base frame, then every
+        staged overlay value.
+
+        The base frame is skipped when a transform group will be showing an
+        image once this pass has been applied, so entering or leaving the
+        transform view never flashes the raw pattern. ``base`` is None for a
+        pass woken by an overlay alone."""
         with _nav_painter._lock:
             pending = self._pending_overlay_values
             self._pending_overlay_values = {}
+        painted = False
+        if base is not None and not self._transform_live_after(pending):
+            self._set_array(base)
+            painted = True
+        if pending:
+            self._apply_pending_overlays(pending, base_painted=painted)
+
+    def _transform_live_after(self, pending) -> bool:
+        """Whether a transform group will be showing an image once ``pending``
+        has been drawn. A staged value that is not None makes its group live; a
+        None (or a missing key, or a hidden node) clears it."""
+        live = set(self._live_transform_groups)
         for node, value in pending.values():
-            if not _overlay_attached(node):
-                continue
-            # A hidden node draws nothing, whatever landed for it: an
-            # evaluation submitted before it was hidden still returns a value.
             values = {} if not node.visible else (
                 value if isinstance(value, dict) else {})
-            for name, (kind, style) in node.groups.items():
-                try:
-                    # First value on this plot: the plot may have opened after
-                    # the node was added, and a group is an anyplotlib push, so
-                    # it is created here rather than wherever that happened.
-                    self.ensure_overlay_group(node, name, kind, style)
-                    self._push_overlay_group(node, name, kind, values.get(name))
-                except Exception as e:
-                    logger.debug("[plot] drawing overlay group %s failed: %s",
-                                 name, e)
+            for name, (kind, _style) in node.groups.items():
+                if kind != "transform":
+                    continue
+                key = (id(node), name)
+                if values.get(name) is None:
+                    live.discard(key)
+                else:
+                    live.add(key)
+        return bool(live)
+
+    def _apply_pending_overlays(self, pending, base_painted: bool = False) -> None:
+        """Push staged overlay values to their groups. Runs on the painter
+        thread, images before markers so a marker is never drawn over the image
+        of the previous position."""
+        drawing = [(node, value) for node, value in pending.values()
+                   if _overlay_attached(node)]
+        for images in (True, False):
+            for node, value in drawing:
+                # A hidden node draws nothing, whatever landed for it: an
+                # evaluation submitted before it was hidden still returns a
+                # value.
+                values = {} if not node.visible else (
+                    value if isinstance(value, dict) else {})
+                for name, (kind, style) in node.groups.items():
+                    if (kind in _IMAGE_KINDS) is not images:
+                        continue
+                    try:
+                        # First value on this plot: the plot may have opened
+                        # after the node was added, and a group is an
+                        # anyplotlib push, so it is created here rather than
+                        # wherever that happened.
+                        self.ensure_overlay_group(node, name, kind, style)
+                        self._push_overlay_group(node, name, kind,
+                                                 values.get(name), base_painted)
+                    except Exception as e:
+                        logger.debug("[plot] drawing overlay group %s failed: %s",
+                                     name, e)
+        for node, value in drawing:
             self._overlay_values[id(node)] = value if node.visible else None
             if node.on_value is not None and node.visible:
                 try:
@@ -714,13 +758,17 @@ class Plot:
         paint is held back until the group's value is None again."""
         return bool(self._live_transform_groups)
 
-    def _push_overlay_group(self, node, name: str, kind: str, value) -> None:
+    def _push_overlay_group(self, node, name: str, kind: str, value,
+                            base_painted: bool = False) -> None:
         """Draw one group's value. ``None`` clears the group.
 
         A value is either the array its kind expects, or a dict carrying that
         array under ``data`` plus appearance keys (``radius``, ``linewidths``,
         ``levels``) to apply with it, so a slider that changes an appearance
-        rides the next value instead of rebuilding the group."""
+        rides the next value instead of rebuilding the group.
+
+        ``base_painted`` says whether this pass has already painted the raw
+        frame, so a transform going dark does not paint it a second time."""
         key = (id(node), name)
         if key not in self._overlay_groups:
             return
@@ -750,7 +798,8 @@ class Plot:
         elif kind == "transform":
             if data is None:
                 self._live_transform_groups.discard(key)
-                if isinstance(self.current_data, np.ndarray):
+                self._transform_image = None
+                if not base_painted and isinstance(self.current_data, np.ndarray):
                     self._set_array(self.current_data)
             else:
                 self._live_transform_groups.add(key)
@@ -760,6 +809,9 @@ class Plot:
                 if levels is not None:
                     self.needs_auto_level = False
                 self.set_transform_image(np.asarray(data), levels=levels)
+        elif kind == "mask":
+            self._set_overlay_mask(None if data is None else np.asarray(data),
+                                   **{**(node.groups[name][1] or {}), **style})
 
     def _push_overlay_curves(self, key, node, name, value) -> None:
         """Draw a list of (x, y) pairs as 1-D lines, growing or trimming the
@@ -816,16 +868,32 @@ class Plot:
         """Paint an overlay's transform image as the frame this plot shows.
 
         ``current_data`` keeps the raw frame the navigator read, so clearing
-        the transform group paints the pattern back without re-reading it."""
+        the transform group paints the pattern back without re-reading it, and
+        ``displayed_data`` is this image for as long as it is up."""
+        self._transform_image = data
         self._set_array(data, levels=levels)
 
-    def set_overlay_mask(self, mask: "np.ndarray | None",
-                         color: str = "#ff4444", alpha: float = 0.4) -> None:
+    @property
+    def displayed_data(self):
+        """The image on screen: an overlay's transform image while one is up,
+        otherwise the frame the navigator read.
+
+        Everything that means "what the user is looking at" reads this;
+        everything that means "the frame at the navigator's position" reads
+        ``current_data``."""
+        if self._live_transform_groups and self._transform_image is not None:
+            return self._transform_image
+        return self.current_data
+
+    def _set_overlay_mask(self, mask: "np.ndarray | None",
+                          color: str = "#ff4444", alpha: float = 0.4) -> None:
         """Draw (or clear) a translucent boolean mask over the displayed image.
 
-        Used to show the detected beam-stop region during Find-Vectors. The mask
-        is composited client-side in the anyplotlib iframe — no recompute, no
-        new image push. Pass ``mask=None`` to clear it.
+        The ``mask`` group kind, so it is pushed on the painter thread with
+        every other overlay value; the detected beam-stop region during Find
+        Vectors is the one that uses it. The mask is composited client-side in
+        the anyplotlib iframe — no recompute, no new image push. ``None``
+        clears it.
 
         The mask must match the displayed image's (H, W); if it doesn't (e.g. a
         stale beam-stop from a different signal), the overlay is cleared rather
@@ -852,7 +920,7 @@ class Plot:
             logger.debug("[plot] overlay mask set: %d px (window %s)",
                          int(np.count_nonzero(arr)), self.window_id)
         except Exception as e:
-            logger.debug("[plot] set_overlay_mask failed: %s", e)
+            logger.debug("[plot] drawing the overlay mask failed: %s", e)
 
     def _display_axes(self):
         """The axis objects that calibrate THIS plot's displayed image.

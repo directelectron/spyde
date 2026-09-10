@@ -7,7 +7,9 @@ the node the target displays, added with ``BaseSignalTree.add_overlay``: its
 function is the source frame, its group is one anyplotlib ``Layer``, and its
 appearance rides every value. The navigator drives it like every other overlay,
 so the frame comes from the source window's own readers and blocks, the read
-runs off the navigator thread, and the push runs on the painter thread.
+takes the tier that frame's own read takes, and the push runs on the painter
+thread. An integrating region reaches the source whole, so a layer integrates
+the positions the base image integrates.
 
 The four staged handlers (``overlay_add`` / ``overlay_set`` / ``overlay_remove``
 / ``overlay_query``) share the uniform ``fn(session, plot, payload)`` signature
@@ -190,8 +192,8 @@ def overlay_add(session, plot, payload) -> None:
             "Layers are only supported on non-tiled images.")
         return
 
-    base = getattr(plot, "current_data", None)
-    source_frame = getattr(source, "current_data", None)
+    base = getattr(plot, "displayed_data", None)
+    source_frame = getattr(source, "displayed_data", None)
     if not isinstance(base, np.ndarray) or base.ndim != 2:
         ipc.emit_status("Overlay: target has no 2-D image to layer onto.")
         return
@@ -220,7 +222,11 @@ def overlay_add(session, plot, payload) -> None:
             signal, layer_frame, name=LAYER_GROUP,
             groups={LAYER_GROUP: (LAYER_GROUP, {})},
             static={"appearance": appearance},
-            source=True, source_plot=source, target_plot=plot, expensive=True)
+            source=True, source_plot=source, target_plot=plot,
+            # No tier of its own: a layer is the source window's frame, so it
+            # takes whichever tier reading that frame takes. A resident one
+            # draws in the same pass as the base image.
+            expensive=None, follows_region=True)
     except Exception as e:
         ipc.emit_error(f"overlay_add failed: {e}")
         return

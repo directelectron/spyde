@@ -460,7 +460,8 @@ class BaseSelector:
                 # must not sit at the position of a frame that is no longer shown.
                 try:
                     from spyde.drawing.overlays import refresh_overlays
-                    refresh_overlays(child, indices, settle=settle)
+                    refresh_overlays(child, indices, settle=settle,
+                                     integrating=self.is_integrating)
                 except Exception as e:
                     logger.debug("overlay refresh failed: %s", e)
                 if new_data is None:

@@ -17,10 +17,10 @@ HOW
     the plane stack itself is built from. Same binning, same shape, same cache.
 
     That makes it a reader rather than a slice, so raw mode pins
-    :class:`RawFrameReader` on the tree for the signal the selector's windows
-    display and unpins it again when the mode goes off. Nothing in the
-    navigator read path changes: the read asks the tree which reader answers
-    for the displayed node, and while raw mode is on this one does.
+    :class:`RawFrameReader` on the tree for each of the selector's windows and
+    unpins it again when the mode goes off. Nothing in the navigator read path
+    changes: the read asks the tree which reader answers for the window and the
+    node it displays, and while raw mode is on this one does.
 
 COST
     Bounded and known. The plane readback is ~27 ms and does not depend on the
@@ -123,8 +123,11 @@ def install(selector, on: bool) -> bool:
     """Read one raw camera frame under *selector*'s point, or go back to the
     integrated plane. Returns True when the selector ends up in raw mode.
 
-    Turning raw off releases only a reader this put there, so a window whose
-    frames come from somewhere else entirely keeps answering the way it did.
+    The reader is pinned for the WINDOW, not the signal: two windows can show
+    the same movie, and raw is a way of looking at it rather than a property of
+    it. Turning raw off releases only a reader this put there, so a window
+    whose frames come from somewhere else entirely keeps answering the way it
+    did.
     """
     inner = getattr(selector, "selector", None) or selector
     for child in list(inner.children):
@@ -134,8 +137,9 @@ def install(selector, on: bool) -> bool:
         if tree is None or signal is None:
             continue
         if on:
-            tree.set_reader_override(signal, RawFrameReader(selector, signal))
-        elif isinstance(tree.reader_override_for(signal), RawFrameReader):
-            tree.set_reader_override(signal, None)
+            tree.set_reader_override(signal, RawFrameReader(selector, signal),
+                                     plot=child)
+        elif isinstance(tree.reader_override_for(signal, child), RawFrameReader):
+            tree.set_reader_override(signal, None, plot=child)
     inner.raw_frame = bool(on)
     return bool(on)

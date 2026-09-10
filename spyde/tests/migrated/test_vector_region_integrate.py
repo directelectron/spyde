@@ -4,7 +4,7 @@ The find-vectors result window renders disks on every navigator move through
 :class:`~spyde.actions.find_vectors_action.RenderedVectorsReader`, pinned on the
 result tree. A POINT crosshair prepares one nav index and reads
 ``render_frame``; a REGION selector prepares a grid of nav indices and reads
-``sum_points``, which is the summed ``render_region``. These tests pin the
+``region_frame``, the store's own rule for a rectangle. These tests pin the
 reader's two answers, so dragging or resizing a nav region shows the summed
 diffraction pattern.
 """
@@ -13,7 +13,6 @@ from __future__ import annotations
 import numpy as np
 
 from spyde.actions.find_vectors_action import RenderedVectorsReader
-from spyde.array_cache.region_sum import finalize_sum
 from spyde.signals.diffraction_vectors import (
     COL_INTENSITY, COL_KX, COL_KY, COL_TIME, N_COLS,
     SpyDEDiffractionVectors, _AxisLite,
@@ -46,10 +45,8 @@ def _vecs(nav=(4, 4), sig=64):
 
 def _region(reader, points):
     """What the navigator read shows for an integrating region: the reader's
-    accumulator, finalized the way every region read is."""
-    points = np.asarray(points)
-    return finalize_sum(reader.sum_points(points, np.float64),
-                        len(points), np.float32)
+    own answer for that rectangle, used as it comes back."""
+    return reader.region_frame(np.asarray(points))
 
 
 class TestRenderedVectorsReader:

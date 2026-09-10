@@ -311,6 +311,17 @@ class ProgressiveSignalPreview:
             log.debug("[%s] preview read failed: %s", self.name, e)
             return None
 
+    def region_frame(self, points):
+        """A region shows its centre position, or nothing when that position
+        has not been computed.
+
+        Integrating a region over a half-finished result would have to wait for
+        every position in it; the action's own final display owns real region
+        integration, and the preview shows one position."""
+        index = np.asarray(points).reshape(-1, np.shape(points)[-1])
+        centre = np.mean(index, axis=0).astype(int)
+        return self.read_frame(tuple(int(v) for v in centre))
+
     @property
     def frame_bytes(self) -> int:
         """One frame of the result window, for a caller sizing a cache."""

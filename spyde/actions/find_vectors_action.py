@@ -148,7 +148,7 @@ def _start_batch(session, plot, src_tree, p: dict, *, overlay_visible: bool = Tr
     from spyde.actions.vector_overlay import (
         remove_find_vectors_preview, replace_tree_overlay,
     )
-    remove_find_vectors_preview(src_tree, plot)
+    remove_find_vectors_preview(src_tree)
     replace_tree_overlay(src_tree, "_vector_overlay", None)
 
     # ── Build the result tree up front: a lazy zero placeholder with the
@@ -537,7 +537,6 @@ def _finalize(tree, vecs) -> None:
             log.debug("re-sending toolbar config after find-vectors failed: %s", e)
     _install_result_readers(tree, vecs)
     _overlay_on_result(tree, vecs)
-    _attach_time_slice_repaint(tree, vecs)
 
     total = int(len(vecs.flat_buffer))   # total over ALL slices, not one slice
     emit_status(f"Found {total} diffraction vectors")
@@ -583,21 +582,17 @@ class RenderedVectorsReader:
                       iy, ix, slice_index, e)
             return np.zeros(self.frame_shape, dtype=np.float32)
 
-    def sum_points(self, points, dtype):
-        """The region's rendered frame, scaled by its point count.
-
-        A region read divides the accumulator it is given by the number of
-        points, and a vectors region is a sum rather than a mean, so the sum
-        is scaled up to survive that divide. float64 makes the scale and the
-        divide exact for any frame the store renders."""
+    def region_frame(self, points):
+        """The rectangle the region covers, rendered by the store's own rule:
+        each position's disks at their intra-frame maximum, summed across
+        positions."""
         points = np.asarray(points)
         slice_index = int(points[0][0]) if points.shape[1] > 2 else None
         rows = points[:, -2].astype(np.int64)
         columns = points[:, -1].astype(np.int64)
-        region = self.vecs.render_region(
+        return self.vecs.render_region(
             int(rows.min()), int(rows.max()) + 1,
             int(columns.min()), int(columns.max()) + 1, t=slice_index)
-        return np.asarray(region, dtype=np.float64) * float(len(points))
 
 
 class CountMapReader:
@@ -612,6 +607,7 @@ class CountMapReader:
         self.vecs = vecs
         self.shape = tuple(int(s) for s in vecs.nav_shape)
         self.n_time = int(getattr(vecs, "n_time", 0) or 0)
+        self._last_slice = None
 
     @property
     def frame_bytes(self) -> int:
@@ -623,21 +619,25 @@ class CountMapReader:
     def read_frame(self, indices):
         values = np.atleast_1d(np.asarray(indices)).ravel()
         t = self._slice(values[-1] if values.size else 0)
+        if t != self._last_slice:
+            self._last_slice = t
+            # INFO because it is the only honest handle the e2e has on "the map
+            # followed the time axis".
+            log.info("[fv-5d] count map -> slice %d", t)
         try:
             return np.asarray(self.vecs.count_map_at_t(t), dtype=np.float32)
         except Exception as e:
             log.debug("the count map of slice %s failed to build: %s", t, e)
             return np.zeros(self.shape, dtype=np.float32)
 
-    def sum_points(self, points, dtype):
-        """The count maps of the slices a span covers, summed and scaled by
-        the point count (see :meth:`RenderedVectorsReader.sum_points`)."""
-        points = np.asarray(points)
-        slices = sorted({self._slice(row[-1]) for row in points})
-        total = np.zeros(self.shape, dtype=np.float64)
+    def region_frame(self, points):
+        """The count maps of every slice a span covers, summed: a count map is
+        counts, so integrating a span of time adds them."""
+        slices = sorted({self._slice(row[-1]) for row in np.asarray(points)})
+        total = np.zeros(self.shape, dtype=np.float32)
         for t in slices:
-            total += np.asarray(self.vecs.count_map_at_t(t), dtype=np.float64)
-        return total * float(len(points))
+            total += np.asarray(self.vecs.count_map_at_t(t), dtype=np.float32)
+        return total
 
 
 def _install_result_readers(tree, vecs) -> None:
@@ -663,84 +663,6 @@ def _install_result_readers(tree, vecs) -> None:
                 tree.set_reader_override(signal, CountMapReader(vecs))
                 nav_plot.needs_auto_level = True
     _refresh_signal_from_navigator(tree)
-
-
-def _attach_time_slice_repaint(tree, vecs) -> None:
-    """Repaint the 2-D count map when the TIME axis moves (5-D stacks only).
-
-    The count map a navigator shows belongs to one slice, so it has to follow
-    the time axis wherever that axis is driven from. This rides the navigator
-    ``index_hooks`` the vector overlay follows, and hands the map to the plot's
-    painter thread like every other frame. Idempotent: re-running Find Vectors
-    removes the previous hook first, or a second run would paint twice per move.
-    """
-    from spyde.actions.vector_overlay import (
-        _indices_lead_nav, _navigator_selectors_for,
-    )
-
-    _detach_time_slice_repaint(tree)
-    if getattr(vecs, "n_time", 0) <= 0:
-        return                                   # 4-D: nothing to slice
-    spatial_2d = tuple(int(s) for s in vecs.nav_shape)
-    n_t = int(vecs.n_time)
-    state = {"t": 0}
-
-    def _targets():
-        out = []
-        for nav_plot in _all_nav_plots(tree):
-            cur = getattr(nav_plot, "current_data", None)
-            exp = tuple(cur.shape) if hasattr(cur, "shape") else None
-            if exp is not None and exp == spatial_2d:
-                out.append(nav_plot)
-        return out
-
-    def _on_indices(indices):
-        lead = _indices_lead_nav(indices)
-        if not lead:
-            return
-        t = int(lead[0])
-        if not (0 <= t < n_t) or t == state["t"]:
-            return                               # same slice — nothing to redo
-        state["t"] = t
-        try:
-            cm = np.asarray(vecs.count_map_at_t(t), dtype=np.float32)
-        except Exception as e:
-            log.debug("count_map_at_t(%s) failed: %s", t, e)
-            return
-        n_painted = 0
-        for nav_plot in _targets():
-            try:
-                nav_plot.needs_auto_level = True
-                nav_plot.enqueue_paint(cm)
-                n_painted += 1
-            except Exception as e:
-                log.debug("repainting the count map for t=%s failed: %s", t, e)
-        # INFO because it is the only honest handle the e2e has on "the map
-        # followed the time axis".
-        log.info("[fv-5d] count map -> slice %d (%d plot(s))", t, n_painted)
-
-    hooked = []
-    for sp in list(getattr(tree, "signal_plots", [])):
-        for sel in _navigator_selectors_for(tree, sp):
-            if _on_indices not in sel.index_hooks:
-                sel.index_hooks.append(_on_indices)
-                hooked.append(sel)
-    tree._vectors_time_repaint = (_on_indices, hooked)
-
-
-def _detach_time_slice_repaint(tree) -> None:
-    """Drop a previous run's time-slice hook (see the idempotence note above)."""
-    prev = getattr(tree, "_vectors_time_repaint", None)
-    if not prev:
-        return
-    fn, sels = prev
-    for sel in sels:
-        try:
-            if fn in sel.index_hooks:
-                sel.index_hooks.remove(fn)
-        except Exception as e:
-            log.debug("detaching the time-slice repaint failed: %s", e)
-    tree._vectors_time_repaint = None
 
 
 def _overlay_on_result(tree, vecs) -> None:
@@ -1038,7 +960,7 @@ def fv_tune(session, plot, payload) -> None:
     def _work():
         from spyde.actions.vector_overlay import tune_find_vectors_preview
         try:
-            tune_find_vectors_preview(tree, prev, src, coerced)
+            tune_find_vectors_preview(tree, prev, coerced)
             log.info("[fv-tune] parameters APPLIED thr=%s md=%s kr=%s",
                      coerced.get("threshold"), coerced.get("min_distance"),
                      coerced.get("kernel_radius"))
@@ -1119,7 +1041,7 @@ def fv_close(session, plot, payload=None) -> None:
     log.debug("[fv-stop] removing preview=%s", prev is not None)
     if prev is not None:
         from spyde.actions.vector_overlay import remove_find_vectors_preview
-        remove_find_vectors_preview(tree, src)
+        remove_find_vectors_preview(tree)
 
 
 def test_hold_release(session, plot, payload=None) -> None:

@@ -8,12 +8,15 @@ and the rect/disk virtual-image series.
 """
 from __future__ import annotations
 
+from unittest import mock
+
 import numpy as np
 
 from spyde.signals.diffraction_vectors import (
     SpyDEDiffractionVectors, N_COLS, COL_NAV_X, COL_NAV_Y, COL_KX, COL_KY,
     COL_TIME, COL_INTENSITY,
 )
+from spyde.actions import find_vectors_action as fv_action
 from spyde.tests.migrated.conftest import make_session
 
 
@@ -181,55 +184,54 @@ class TestFiveDResultDisplay:
             "per-slice totals must account for every vector"
         assert (per_slice > 0).all(), "a flat-zero time navigator is the bug"
 
-    def test_moving_time_repaints_the_count_map(self):
-        from spyde.actions.find_vectors_action import _attach_time_slice_repaint
+    def test_the_count_map_follows_the_time_axis(self, caplog):
+        """The reader answering the 2-D navigator's read IS the slice lookup,
+        so moving the time axis reads that slice's map with nothing to keep in
+        step."""
+        from spyde.actions.find_vectors_action import CountMapReader
+
         v = _make_5d()
-        tree, spatial, _timeline, sel = self._tree(v)
-        _attach_time_slice_repaint(tree, v)
-        assert sel.index_hooks, "no hook registered on the navigator selector"
+        reader = CountMapReader(v)
+        with caplog.at_level("INFO"):
+            np.testing.assert_array_equal(reader.read_frame((1,)),
+                                          v.count_map_at_t(1))
+        assert "[fv-5d] count map -> slice 1" in caplog.text
 
-        # A 5-D index is (t, iy, ix); the leading coord is the slice.
-        sel.index_hooks[0](np.array([[1, 0, 0]]))
-        assert spatial.painted, "moving the time axis repainted nothing"
-        np.testing.assert_array_equal(spatial.painted[-1], v.count_map_at_t(1))
+    def test_a_repeat_of_the_same_slice_is_narrated_once(self):
+        """The read fires on every move of the time navigator, not only on a
+        change of slice, so the line that says which slice is showing must
+        not repeat for a position that stayed put."""
+        from spyde.actions.find_vectors_action import CountMapReader
 
-    def test_a_repeat_of_the_same_slice_does_not_repaint(self):
-        """The hook fires on every nav move, not just time changes."""
-        from spyde.actions.find_vectors_action import _attach_time_slice_repaint
         v = _make_5d()
-        tree, spatial, _t, sel = self._tree(v)
-        _attach_time_slice_repaint(tree, v)
-        sel.index_hooks[0](np.array([[1, 0, 0]]))
-        n = len(spatial.painted)
-        sel.index_hooks[0](np.array([[1, 2, 2]]))     # same t, different x/y
-        assert len(spatial.painted) == n
+        reader = CountMapReader(v)
+        lines = []
+        with mock.patch.object(fv_action.log, "info",
+                               lambda msg, *args: lines.append(msg % args)):
+            reader.read_frame((1,))
+            reader.read_frame((1,))
+            reader.read_frame((0,))
+        assert [line for line in lines if "count map" in line] == [
+            "[fv-5d] count map -> slice 1", "[fv-5d] count map -> slice 0"]
 
-    def test_reattaching_does_not_double_paint(self):
-        """Re-running Find Vectors must not leave two hooks painting per move."""
-        from spyde.actions.find_vectors_action import _attach_time_slice_repaint
+    def test_a_span_of_slices_sums_their_counts(self):
+        """A count map is counts, so integrating a span of time adds them
+        rather than averaging them."""
+        from spyde.actions.find_vectors_action import CountMapReader
+
         v = _make_5d()
-        tree, spatial, _t, sel = self._tree(v)
-        _attach_time_slice_repaint(tree, v)
-        _attach_time_slice_repaint(tree, v)
-        assert len(sel.index_hooks) == 1
-        sel.index_hooks[0](np.array([[1, 0, 0]]))
-        assert len(spatial.painted) == 1
+        reader = CountMapReader(v)
+        summed = reader.region_frame(np.array([[0], [1]]))
+        np.testing.assert_allclose(
+            summed, np.asarray(v.count_map_at_t(0)) + np.asarray(v.count_map_at_t(1)))
 
-    def test_a_4d_result_registers_no_hook(self):
-        """4-D has no time axis — nothing to slice, nothing to subscribe to."""
-        from spyde.actions.find_vectors_action import _attach_time_slice_repaint
-        from types import SimpleNamespace
-        flat = np.zeros((4, N_COLS), dtype=np.float32)
-        flat[:, COL_KX] = 4.0
-        flat[:, COL_KY] = 4.0
-        v4 = SpyDEDiffractionVectors.from_arrays(
-            flat_buffer=flat, full_nav_shape=(2, 2), sig_shape=(8, 8),
-            sig_axes=(_Ax(8), _Ax(8)), kernel_radius_px=1.0,
-            kernel_radius_data=1.0)
-        assert v4.n_time == 0
-        tree, _s, _t, sel = self._tree(v4)
-        _attach_time_slice_repaint(tree, v4)
-        assert sel.index_hooks == []
+    def test_an_out_of_range_slice_is_clamped(self):
+        from spyde.actions.find_vectors_action import CountMapReader
+
+        v = _make_5d()
+        reader = CountMapReader(v)
+        np.testing.assert_array_equal(reader.read_frame((99,)),
+                                      v.count_map_at_t(v.n_time - 1))
 
 
 class TestFiveDResultWiringOnARealTree:

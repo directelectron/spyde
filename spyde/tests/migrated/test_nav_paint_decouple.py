@@ -25,6 +25,11 @@ class _RecorderPlot:
         self._paint_delay = paint_delay
         self._lock = threading.Lock()
 
+    def paint_pass(self, data):
+        """What the painter calls: the base frame, then a plot's staged overlay
+        values. This stand-in has none, so it is the frame alone."""
+        self._set_array(data)
+
     def _set_array(self, data):
         if self._paint_delay:
             time.sleep(self._paint_delay)

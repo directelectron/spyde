@@ -156,7 +156,10 @@ def evaluate(recipe: FrameRecipe, indices, parent_signal, parent_frame):
         argument = np.squeeze(argument)
         per_position[key] = argument[()] if argument.shape == () else argument
 
-    depths = navigation_depths(recipe.depth, len(indices))
+    # An array of points is an integrating region, which the source reduces in
+    # one call; there is no single position to take a neighbourhood around.
+    region = isinstance(indices, np.ndarray) and indices.ndim > 1
+    depths = (0,) if region else navigation_depths(recipe.depth, len(indices))
     if recipe.source is None:
         result = recipe.function(**per_position, **recipe.static)
     elif any(depths):
@@ -210,10 +213,17 @@ class RecipeReader:
         probe = getattr(self._parent_reader, "is_chunk_resident", None)
         return bool(probe(indices)) if probe is not None else False
 
-    def read_frame(self, indices: tuple[int, ...]):
+    def read_frame(self, indices):
         """The recipe's value at ``indices``, or None when the function
-        returned None (no value at this position)."""
-        point = tuple(int(v) for v in indices[:self._nav_ndim])
+        returned None (no value at this position).
+
+        An array of points instead of one position is an integrating region,
+        which reaches the source read whole: the source integrates it exactly
+        as it does for a base frame, and the function is applied to the
+        result."""
+        index = np.asarray(indices)
+        point = (index if index.ndim > 1
+                 else tuple(int(v) for v in index[:self._nav_ndim]))
         parent_frame = (self._parent_reader.read_frame
                         if self._parent_reader is not None else None)
         return evaluate(self.recipe, point, self._parent_signal, parent_frame)

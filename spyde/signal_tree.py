@@ -1211,7 +1211,8 @@ class BaseSignalTree:
     def add_overlay(self, parent_signal, function, *, name: str, groups: dict,
                     static: dict = None, iterating: dict = None, depth=0,
                     source: bool = True, source_plot=None, target_plot=None,
-                    expensive: bool = False, on_value=None) -> SignalNode:
+                    expensive: bool = False, follows_region: bool = False,
+                    on_value=None) -> SignalNode:
         """Add a child of ``parent_signal`` that is drawn on the windows
         showing it, evaluated at the navigator's position.
 
@@ -1231,8 +1232,11 @@ class BaseSignalTree:
         ``source_plot`` reads the frame through another window's readers.
         ``target_plot`` draws on that window alone instead of on every window
         showing ``parent_signal``. ``expensive`` runs the function off the
-        navigator thread as one cancellable future. ``on_value`` receives each
-        drawn value.
+        navigator thread as one cancellable future; None leaves that to the
+        tier the source frame's own read would take. ``follows_region`` reads
+        an integrating region's whole point set, so the source integrates what
+        the base frame integrates instead of the overlay following the
+        region's centre. ``on_value`` receives each drawn value.
         """
         from spyde.drawing.overlay_node import OverlaySignal
         from spyde.external.hyperspy.map_recipe import FrameRecipe
@@ -1260,7 +1264,8 @@ class BaseSignalTree:
             transformation=name,
             local=True,
             overlay=True,
-            expensive=bool(expensive),
+            expensive=None if expensive is None else bool(expensive),
+            follows_region=bool(follows_region),
             groups={key: (kind, dict(style or {}))
                     for key, (kind, style) in groups.items()},
             on_value=on_value,
@@ -1330,7 +1335,7 @@ class BaseSignalTree:
 
     # ── Reader overrides ───────────────────────────────────────────────────────
 
-    def set_reader_override(self, signal, reader) -> None:
+    def set_reader_override(self, signal, reader, plot=None) -> None:
         """Pin the reader that answers frame reads for ``signal``, or clear the
         pin with ``reader=None``.
 
@@ -1338,20 +1343,35 @@ class BaseSignalTree:
         available only for the blocks a progressive compute has finished, cut
         from an event stream. The reader implements ``read_frame(indices)``,
         returning None when it has no frame at that position, and may
-        implement ``sum_points(points, dtype)`` to integrate a region in one
-        call. It answers the navigator read directly, so it neither resolves
-        as a frame reader nor fills the frame cache."""
-        if reader is None:
-            self._reader_overrides.pop(id(signal), None)
-        else:
-            self._reader_overrides[id(signal)] = (signal, reader)
+        implement ``region_frame(points)`` to reduce an integrating region
+        under its own rule. It answers the navigator read directly, so it
+        neither resolves as a frame reader nor fills the frame cache.
 
-    def reader_override_for(self, signal):
-        """The reader pinned for ``signal``, or None. On the read path, so it
+        ``plot`` pins the reader for that window alone, which is what a viewing
+        mode wants: two windows on one signal then toggle independently."""
+        key = (id(signal), None if plot is None else id(plot))
+        if reader is None:
+            self._reader_overrides.pop(key, None)
+        else:
+            self._reader_overrides[key] = (signal, plot, reader)
+
+    def reader_override_for(self, signal, plot=None):
+        """The reader pinned for ``signal`` on ``plot``, or for the signal on
+        every window, or None. A window's own pin wins. On the read path, so it
         answers for a tree built without ``__init__`` too."""
         overrides = getattr(self, "_reader_overrides", None)
-        entry = overrides.get(id(signal)) if overrides else None
-        return entry[1] if entry is not None and entry[0] is signal else None
+        if not overrides:
+            return None
+        for key in (((id(signal), id(plot)),) if plot is not None else ()) \
+                + ((id(signal), None),):
+            entry = overrides.get(key)
+            if entry is None:
+                continue
+            pinned_signal, pinned_plot, reader = entry
+            if pinned_signal is signal and (pinned_plot is None
+                                            or pinned_plot is plot):
+                return reader
+        return None
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 

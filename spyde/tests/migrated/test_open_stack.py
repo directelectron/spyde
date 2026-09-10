@@ -147,14 +147,20 @@ class TestMultiNavIndexOrdering:
         clipped = np.clip(swapped[0], 0, bounds)
         assert clipped.tolist() == [0, 169, 525]  # unchanged → no spurious clamp
 
-    def test_overlay_helpers_split_lead_and_spatial(self):
-        from spyde.actions.vector_overlay import _indices_to_iyix, _indices_lead_nav
-        # 4-D scan: [x, y] → spatial only, no lead.
-        assert _indices_to_iyix([[5, 7]]) == (7, 5)
-        assert _indices_lead_nav([[5, 7]]) == ()
-        # 5-D stack: [stack, x, y] → lead=(stack,), spatial=(iy=y, ix=x).
-        assert _indices_to_iyix([[1, 5, 7]]) == (7, 5)
-        assert _indices_lead_nav([[1, 5, 7]]) == (1,)
+    def test_the_prepared_index_splits_lead_and_spatial(self):
+        """Everything that needs "where is the navigator" reads it from the
+        SAME preparation the frame read uses: the spatial pair swapped into
+        data order, any leading stack coordinate left in front of it."""
+        import hyperspy.api as hs
+        from spyde.drawing.update_functions import _prepare_nav_indices
+
+        four_d = hs.signals.Signal2D(np.zeros((16, 16, 4, 4)))
+        prepared = _prepare_nav_indices(four_d, [[5, 7]], integrating=False)
+        assert list(prepared) == [7, 5]
+
+        five_d = hs.signals.Signal2D(np.zeros((4, 16, 16, 4, 4)))
+        prepared = _prepare_nav_indices(five_d, [[1, 5, 7]], integrating=False)
+        assert list(prepared) == [1, 7, 5]
 
 
 class TestFindVectorsPreviewOnStack:

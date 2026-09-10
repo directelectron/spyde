@@ -21,14 +21,17 @@ from spyde.array_cache import reader_for_overlay
 log = logging.getLogger(__name__)
 
 
-def refresh_overlays(plot, indices, settle: bool = False) -> None:
+def refresh_overlays(plot, indices, settle: bool = False,
+                     integrating: bool = False) -> None:
     """Evaluate and draw every visible overlay child of the node ``plot``
     displays, at the selector position ``indices``.
 
     Runs on the navigator dispatcher thread. Costs nothing when the displayed
     node has no overlay children, which is the common case. ``settle`` is the
     resting-position re-fire flag the base read takes; an overlay treats it as
-    an ordinary evaluation.
+    an ordinary evaluation. ``integrating`` is the selector's own mode, which
+    a node declaring ``follows_region`` reads with so its source integrates
+    the same positions the base frame does.
     """
     state = getattr(plot, "plot_state", None)
     signal = getattr(state, "current_signal", None) if state is not None else None
@@ -46,6 +49,9 @@ def refresh_overlays(plot, indices, settle: bool = False) -> None:
     if prepared is None:
         return
     index = tuple(int(v) for v in np.atleast_1d(np.asarray(prepared)).ravel())
+    region = None
+    if integrating:
+        region = _prepare_nav_indices(signal, indices, integrating=True)
 
     for node in children:
         if not node.visible:
@@ -55,14 +61,40 @@ def refresh_overlays(plot, indices, settle: bool = False) -> None:
         target = getattr(node.signal, "target_plot", None)
         if target is not None and target is not plot:
             continue
+        at = region if (node.follows_region and region is not None) else index
         try:
             reader = reader_for_overlay(plot, node)
-            if node.expensive:
-                _submit_overlay(plot, tree, node, reader, index)
+            if _runs_off_the_dispatcher(plot, node, at):
+                _submit_overlay(plot, tree, node, reader, at)
             else:
-                plot.enqueue_overlay(node, reader.read_frame(index))
+                plot.enqueue_overlay(node, reader.read_frame(at))
         except Exception as e:
-            log.debug("overlay %s did not evaluate at %s: %s", node.name, index, e)
+            log.debug("overlay %s did not evaluate at %s: %s", node.name, at, e)
+
+
+def _runs_off_the_dispatcher(plot, node, index) -> bool:
+    """Whether ``node``'s function runs on the overlay lane rather than inline.
+
+    A node that names its own tier is taken at its word. One that leaves it
+    open takes the tier of the frame it reads, so a source frame already
+    decoded is drawn in the same pass as the base and a cold one arrives from
+    the callback."""
+    if node.expensive is not None:
+        return bool(node.expensive)
+
+    from spyde.drawing.update_functions import _classify_nav_read
+
+    source_plot = getattr(node.signal, "source_plot", None) or plot
+    state = getattr(source_plot, "plot_state", None)
+    source = getattr(state, "current_signal", None)
+    data = getattr(source, "data", None)
+    if source is None or data is None:
+        return False
+    navigation_dimension = int(source.axes_manager.navigation_dimension)
+    frame_shape = data.shape[navigation_dimension:]
+    frame_bytes = int(np.prod(frame_shape)) * data.dtype.itemsize
+    return _classify_nav_read(source, index, data, frame_bytes,
+                              child=source_plot) == "expensive"
 
 
 def refresh_overlays_for(tree) -> None:

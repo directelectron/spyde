@@ -286,7 +286,8 @@ test('d) driving the target navigator keeps the layered figure updating', async 
   const { page } = ctx
   // The TARGET is tree B's signal window; test_nav_drag drives signal_trees[-1]
   // (= tree B). So its verdict reflects moves on the target's OWN navigator, which
-  // repaints the base AND (via refresh_plot_layers) the layer. si_grains is 6×6
+  // repaints the base AND, as an overlay child of the node it displays, the
+  // layer. si_grains is 6×6
   // nav; scrub the CORNERS (different grains → the DP genuinely changes). Count
   // this run's verdict lines so a stale line from any earlier drag can't satisfy
   // the poll.

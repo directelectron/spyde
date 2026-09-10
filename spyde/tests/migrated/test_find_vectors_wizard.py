@@ -16,6 +16,7 @@ test_find_vectors_memory for the batch-compute contract).
 """
 from __future__ import annotations
 
+import threading
 import time
 
 import numpy as np
@@ -172,23 +173,40 @@ class TestPreviewBeamstop:
         assert _beamstop_for(tree, signal, {"beamstop_auto": False}) is None
         assert tree._fv_beamstop_raw is raw
 
-    def test_the_mask_is_pushed_to_the_pattern_and_cleared(self):
-        from spyde.actions.vector_overlay import _push_beamstop_overlay
-        pushed = []
+    def test_the_mask_is_drawn_on_nav_paint_and_goes_with_the_node(self):
+        """The stop is a group of the preview node like any other: its value
+        rides every evaluation, it is pushed on the painter thread, and
+        removing the node clears it — nothing keeps a mask alive past the
+        caret that put it there."""
+        from spyde.actions.find_vectors_action import fv_open, fv_close
 
-        class _Plot:
-            def set_overlay_mask(self, mask, color="#ff4444", alpha=0.4):
-                pushed.append(None if mask is None
-                              else int(np.count_nonzero(mask)))
+        session = make_session()
+        try:
+            session._add_signal(self._signal_with_a_bar().as_lazy(),
+                                source_path=None)
+            assert quiesce(session), why_busy(session)
+            plot = _signal_plot(session)
+            tree = plot.signal_tree
 
-        plot = _Plot()
-        mask = np.zeros((64, 64), bool)
-        yy, xx = np.ogrid[:64, :64]
-        mask[(yy - 32) ** 2 + (xx - 32) ** 2 < 36] = True
-        _push_beamstop_overlay(plot, mask)
-        assert pushed[-1] == int(mask.sum())
-        _push_beamstop_overlay(plot, None)
-        assert pushed[-1] is None
+            drawn = []
+            plot._set_overlay_mask = lambda mask, **style: drawn.append(
+                (threading.current_thread().name,
+                 None if mask is None else int(np.count_nonzero(mask))))
+
+            fv_open(session, plot, {"method": "dog", "sigma": 0.0,
+                                    "kernel_radius": 3, "threshold": 8.0,
+                                    "min_distance": 3, "subpixel": False,
+                                    "beamstop_auto": True})
+            assert _wait(lambda: getattr(tree, "_fv_preview", None) is not None, 30)
+            node = tree._fv_preview
+            assert _wait(lambda: any(count for _thread, count in drawn), 30),                 "the beam stop never reached the pattern"
+            assert {thread for thread, _count in drawn} == {"nav-paint"}, drawn
+
+            fv_close(session, plot, {})
+            assert _wait(lambda: drawn[-1][1] is None, 10), drawn
+            assert (id(node), "mask") not in plot._overlay_groups
+        finally:
+            close_session(session)
 
 
     def test_the_detection_never_runs_on_the_callers_thread(self, monkeypatch):
@@ -226,7 +244,7 @@ class TestPreviewBeamstop:
                                 _slow_detect)
 
             started = time.monotonic()
-            tune_find_vectors_preview(tree, node, plot,
+            tune_find_vectors_preview(tree, node,
                                       dict(params, beamstop_auto=True))
             elapsed = time.monotonic() - started
             assert elapsed < 0.05, f"the tune blocked for {elapsed:.3f}s"

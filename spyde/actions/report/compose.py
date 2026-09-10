@@ -254,7 +254,7 @@ def repfig_query_compose(session, plot, payload) -> None:
 
     if cell is not None and src is not None:
         base_shape = _target_base_shape(mgr, cell, target_panel_id)
-        src_frame = getattr(src, "current_data", None)
+        src_frame = getattr(src, "displayed_data", None)
         src_shape = (tuple(src_frame.shape[:2])
                      if isinstance(src_frame, np.ndarray) and src_frame.ndim >= 2
                      else None)

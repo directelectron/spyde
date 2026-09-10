@@ -26,8 +26,14 @@ class SignalNode:
     # PlotState and is not part of the workflow tree the renderer shows.
     overlay: bool = False
     # The per-position function is slow enough to freeze the navigator, so it
-    # runs as one cancellable future instead of inline on the dispatcher.
-    expensive: bool = False
+    # runs as one cancellable future instead of inline on the dispatcher. None
+    # means the source frame decides: the overlay takes whichever tier the base
+    # read of that frame would take.
+    expensive: Optional[bool] = False
+    # An integrating region reaches this node's source read as the whole point
+    # array, so it integrates what the base frame integrates. Off by default:
+    # a marker overlay follows the region's centre position.
+    follows_region: bool = False
     # Drawn while True; a hidden overlay keeps its groups but pushes nothing.
     visible: bool = True
     # Group name -> (kind, style): one anyplotlib primitive per entry, created

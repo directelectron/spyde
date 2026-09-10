@@ -23,59 +23,6 @@ import numpy as np
 log = logging.getLogger(__name__)
 
 
-def _indices_to_iyix(indices):
-    """A navigator crosshair reports ``[[ix, iy]]`` (cx=column=nav-x,
-    cy=row=nav-y). Return ``(iy, ix)``, the SPATIAL pair (last two nav
-    coords). For a higher-D navigator (a 5-D stack: ``[stack, ix, iy]``) the
-    extra leading coords are dropped here; the caller reads them via
-    :func:`_indices_lead_nav`.
-
-    For a navigator hook, which is handed the selector's raw indices rather
-    than the prepared ones the read path builds."""
-    idx = np.asarray(indices)
-    if idx.ndim >= 2:
-        idx = idx[0]
-    # A 1-D navigator reports ONE coord (a movie/stack position), so there is
-    # no spatial pair to unpack.
-    if idx.shape[-1] < 2:
-        return 0, 0
-    ix, iy = int(idx[-2]), int(idx[-1])
-    return iy, ix
-
-
-def _indices_lead_nav(indices):
-    """The LEADING navigation coords (everything before the spatial x,y pair)
-    as a tuple, in data-axis order: ``(stack,)`` for a 5-D stack, ``()`` for a
-    plain 4-D scan."""
-    idx = np.asarray(indices)
-    if idx.ndim >= 2:
-        idx = idx[0]
-    if idx.shape[-1] <= 2:
-        return ()
-    return tuple(int(v) for v in idx[:-2])
-
-
-def _navigator_selectors_for(tree, dp_plot):
-    """Navigator selectors that drive ``dp_plot``, one per composite selector.
-
-    A composite navigator selector exposes its crosshair AND its rectangle, so
-    a hook registered on both fires twice per move."""
-    npm = getattr(tree, "navigator_plot_manager", None)
-    if npm is None:
-        return []
-    out = [sel for sel in npm.all_navigation_selectors
-           if dp_plot in getattr(sel, "active_children", [])]
-    out = out or list(npm.all_navigation_selectors)
-    seen, unique = set(), []
-    for sel in out:
-        key = id(getattr(sel, "parent", sel) or sel)
-        if key in seen:
-            continue
-        seen.add(key)
-        unique.append(sel)
-    return unique
-
-
 def _clip_to_bounds(px, width, height, slack=8.0):
     """Drop marker offsets that fall outside the detector (with a small
     ``slack`` so edge disks still show). Peak finding can emit a few spurious
@@ -272,8 +219,9 @@ def _transform_levels(response, method: str, threshold: float):
 
 def find_vectors_preview(window, centre=None, *, params: dict, sigma: float,
                          beamstop_mask, show_transform: bool) -> dict:
-    """The peaks the detector finds in the frame under the crosshair, and the
-    image it found them in when the transform view is on.
+    """The peaks the detector finds in the frame under the crosshair, the image
+    it found them in when the transform view is on, and the beam stop it
+    excluded.
 
     With a navigation blur the recipe hands over the window and the requested
     position inside it; with no blur it hands over that one frame."""
@@ -295,7 +243,7 @@ def find_vectors_preview(window, centre=None, *, params: dict, sigma: float,
         offsets = np.column_stack([peaks[:, 1], peaks[:, 0]]).astype(np.float32)
     threshold = float(params.get("threshold", 0.0))
     value = {"peaks": {"data": offsets, "radius": _preview_marker_radius(params)},
-             "transform": None, "threshold": threshold}
+             "transform": None, "mask": beamstop_mask, "threshold": threshold}
     if response is not None:
         response = np.asarray(response, dtype=np.float32)
         levels = _transform_levels(
@@ -340,17 +288,6 @@ def _beamstop_for(tree, signal, params: dict):
     return _dilate_mask(raw, dilate) if dilate > 0 else raw
 
 
-def _push_beamstop_overlay(plot, mask) -> None:
-    """Show the beam-stop mask as a translucent overlay on the pattern, or
-    clear it. The renderer composites it, so this is state, not a repaint."""
-    if plot is None or not hasattr(plot, "set_overlay_mask"):
-        return
-    try:
-        plot.set_overlay_mask(mask, color="#ff8a3d", alpha=0.35)
-    except Exception as e:
-        log.debug("[fv-preview] pushing the beam-stop overlay failed: %s", e)
-
-
 def _preview_depth(signal, sigma: float):
     """The navigation neighbourhood the blur needs, flat on every axis above
     the two the scan is blurred over, so a stack's time axis is never crossed
@@ -380,25 +317,27 @@ def attach_find_vectors_preview(dp_plot, signal, tree, params: dict,
         depth=_preview_depth(signal, sigma),
         expensive=str(params.get("method", "")).lower() == "neural",
         groups={"peaks": ("circles", style),
-                "transform": ("transform", {})},
+                "transform": ("transform", {}),
+                "mask": ("mask", {"color": "#ff8a3d", "alpha": 0.35})},
         static={"params": _detector_params(params), "sigma": sigma,
                 "beamstop_mask": None,
                 "show_transform": bool(params.get("show_transform"))},
         on_value=lambda value: _emit_preview_histogram(dp_plot, value),
     )
-    request_beamstop(tree, node, dp_plot, params)
+    request_beamstop(tree, node, params)
     return node
 
 
-def request_beamstop(tree, node, dp_plot, params: dict) -> None:
+def request_beamstop(tree, node, params: dict) -> None:
     """Put the beam-stop mask the preview excludes on the overlay node, off the
     caller's thread.
 
     Detection reads a sample of frames, so it runs on the compute backend's
-    overlay lane and the mask reaches the recipe from the done callback.
-    Turning the stop off needs no scan and applies straight away."""
+    overlay lane and the mask reaches the recipe from the done callback. The
+    preview returns the mask under its own group every move, so the drawing
+    follows the static argument and needs no push of its own. Turning the stop
+    off needs no scan and applies straight away."""
     if not params.get("beamstop_auto"):
-        _push_beamstop_overlay(dp_plot, None)
         if overlay_static(node).get("beamstop_mask") is not None:
             tree.replace_overlay_static(node, beamstop_mask=None)
         return
@@ -418,7 +357,6 @@ def request_beamstop(tree, node, dp_plot, params: dict) -> None:
         parent = node.parent
         if parent is None or parent.children.get(node.name) is not node:
             return              # the caret closed while the stop was found
-        _push_beamstop_overlay(dp_plot, mask)
         tree.replace_overlay_static(node, beamstop_mask=mask)
 
     try:
@@ -442,13 +380,13 @@ def _emit_preview_histogram(plot, value) -> None:
         log.debug("[fv-preview] emitting the transform histogram failed: %s", e)
 
 
-def remove_find_vectors_preview(tree, dp_plot) -> None:
-    """Drop the live preview and the beam-stop overlay it drew."""
+def remove_find_vectors_preview(tree) -> None:
+    """Drop the live preview. Its groups go with the node, the beam-stop mask
+    among them."""
     replace_tree_overlay(tree, "_fv_preview", None)
-    _push_beamstop_overlay(dp_plot, None)
 
 
-def tune_find_vectors_preview(tree, node, dp_plot, params: dict) -> None:
+def tune_find_vectors_preview(tree, node, params: dict) -> None:
     """Apply a new parameter set to the live preview and redraw at the current
     crosshair position. The circle radius rides the next value, so nothing is
     rebuilt for it; the beam stop, if it changed, lands from the overlay lane."""
@@ -457,7 +395,7 @@ def tune_find_vectors_preview(tree, node, dp_plot, params: dict) -> None:
     tree.replace_overlay_static(
         node, params=_detector_params(params), sigma=sigma,
         show_transform=bool(params.get("show_transform")))
-    request_beamstop(tree, node, dp_plot, params)
+    request_beamstop(tree, node, params)
 
 
 # ── the matched orientation template ─────────────────────────────────────────

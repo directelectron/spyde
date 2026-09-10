@@ -1054,7 +1054,7 @@ class _NavigationAxesBound:
 _NAVIGATION_AXES = _NavigationAxesBound()
 
 
-def _read_through_override(override, current_signal, indices):
+def _read_through_override(override, indices):
     """The frame a reader pinned on the tree answers with, for a point or an
     integrating region.
 
@@ -1062,12 +1062,10 @@ def _read_through_override(override, current_signal, indices):
     result whose block has not landed): the caller paints nothing and the
     last frame stays up.
 
-    A region is the same sum-and-round the array cache does, either from the
-    override's own ``sum_points`` or one frame at a time, so an override and
-    an ordinary node integrate to the same numbers."""
-    from spyde.array_cache import finalize_sum
-    from spyde.array_cache.nav_read import _region_accum_dtype
-
+    An override owns its region rule and states it with ``region_frame``: the
+    vectors window sums per-position maxima, a count map sums counts, a
+    progressive result shows the region's centre. One without it gets the mean
+    of its frames, in the frames' own dtype."""
     idx = np.asarray(indices)
     if idx.ndim <= 1:
         point = tuple(int(v) for v in np.atleast_1d(idx))
@@ -1077,30 +1075,19 @@ def _read_through_override(override, current_signal, indices):
     n_points = int(idx.shape[0])
     if n_points == 0:
         return None
-    data_dtype = np.dtype(getattr(getattr(current_signal, "data", None),
-                                  "dtype", np.float64))
-    summer = getattr(override, "sum_points", None)
-    if summer is not None:
-        try:
-            acc = summer(idx, _region_accum_dtype(data_dtype, n_points))
-            if acc is not None:
-                return finalize_sum(acc, n_points, data_dtype)
-        except Exception as e:
-            log.debug("override region sum failed, per-frame fallback: %s", e)
+    reduce_region = getattr(override, "region_frame", None)
+    if reduce_region is not None:
+        frame = reduce_region(idx)
+        return None if frame is None else np.asarray(frame)
 
     total = None
-    source_dtype = None
     for row in idx:
         frame = override.read_frame(tuple(int(v) for v in row))
         if frame is None:
             return None
         frame = np.asarray(frame)
-        if total is None:
-            source_dtype = frame.dtype
-            total = frame.astype(_region_accum_dtype(source_dtype, n_points))
-        else:
-            total += frame
-    return None if total is None else finalize_sum(total, n_points, source_dtype)
+        total = frame.astype(np.float64) if total is None else total + frame
+    return None if total is None else (total / n_points).astype(frame.dtype)
 
 
 def update_from_navigation_selection(
@@ -1147,14 +1134,14 @@ def update_from_navigation_selection(
     # placeholder or an unresolved future there is exactly the case an
     # override exists to serve.
     _tree = getattr(child, "signal_tree", None)
-    _override = (_tree.reader_override_for(current_signal)
+    _override = (_tree.reader_override_for(current_signal, child)
                  if _tree is not None else None)
     if _override is not None:
         # Clamp against the navigation axes, not `.data`: the override reads
         # the position rather than that array, whose shape may be a
         # placeholder's and would clamp a real coordinate to zero.
         result = _read_through_override(
-            _override, current_signal,
+            _override,
             _prepare_nav_indices(current_signal, indices,
                                  selector.is_integrating,
                                  data=_NAVIGATION_AXES))

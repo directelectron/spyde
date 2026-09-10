@@ -384,6 +384,15 @@ class _CachedParentFrames:
 
     def read_frame(self, indices):
         signal, data = self._displayed()
+        # A window whose frames come from a pinned reader has no array to read:
+        # an overlay on the vectors result must see the rendered disks, not the
+        # placeholder underneath them.
+        tree = getattr(self.plot, "signal_tree", None)
+        override = (tree.reader_override_for(signal, self.plot)
+                    if tree is not None else None)
+        if override is not None:
+            from spyde.drawing.update_functions import _read_through_override
+            return _read_through_override(override, indices)
         frame = get_local_frame(self.plot, signal, data, indices)
         if frame is not None:
             return frame
