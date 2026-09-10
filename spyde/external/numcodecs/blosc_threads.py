@@ -109,8 +109,7 @@ def apply(count: int | None = None) -> bool:
     upstream shape changed and it was skipped."""
     if thread_count() is None:
         return False
-    if count is None:
-        count = thread_count()
+    count = thread_count() if count is None else max(1, int(count))
     try:
         import numcodecs.blosc as blosc
     except Exception as e:

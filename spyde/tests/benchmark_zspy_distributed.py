@@ -78,7 +78,9 @@ def _measure(path, patched):
     from spyde.dask_manager import _WorkerTuningPlugin
 
     n_workers, threads, pool = _cluster_shape()
-    env = {} if patched else {"SPYDE_BLOSC_THREADS": "0"}
+    # Set the switch explicitly both ways, so a shell that exports it off
+    # cannot turn the comparison into off against off.
+    env = {"SPYDE_BLOSC_THREADS": str(pool) if patched else "0"}
     cluster = LocalCluster(n_workers=n_workers, threads_per_worker=threads,
                            processes=True, dashboard_address=None, env=env)
     client = Client(cluster)
