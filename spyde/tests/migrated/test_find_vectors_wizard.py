@@ -314,7 +314,7 @@ class TestPreviewTransformView:
         is showing."""
         from spyde.drawing.plots.plot import Plot
 
-        node = type("Node", (), {})()
+        node = type("Node", (), {"groups": {"transform": ("transform", {})}})()
         painted, restored = [], []
 
         class _Plot:
@@ -337,7 +337,7 @@ class TestPreviewTransformView:
                                  {"data": image, "levels": (0.3, 1.0)})
         assert painted == [((8, 8), (0.3, 1.0))]
         assert plot.needs_auto_level is False
-        assert Plot.has_live_transform(plot) and key in plot._live_transform_groups
+        assert key in plot._live_transform_groups
 
         # A bare array is still a transform value; it just brings no levels.
         Plot._push_overlay_group(plot, node, "transform", "transform", image)
@@ -345,7 +345,7 @@ class TestPreviewTransformView:
 
         # Clearing it hands the plot back to the frame the navigator read.
         Plot._push_overlay_group(plot, node, "transform", "transform", None)
-        assert not Plot.has_live_transform(plot)
+        assert not bool(plot._live_transform_groups)
         assert restored == [(8, 8)]
 
 

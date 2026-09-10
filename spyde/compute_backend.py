@@ -103,9 +103,8 @@ class ComputeBackend:
         # threaded mode (which already has _executor) never pays for it. See
         # submit_graph: a nav read must NEVER go to the distributed cluster.
         self._nav_executor: concurrent.futures.ThreadPoolExecutor | None = None
-        # Dedicated LOCAL pool for expensive overlay evaluations, separate
-        # from the nav pool so a slow overlay cannot delay the base frame
-        # queued behind it. Created lazily; see submit_overlay.
+        # Dedicated LOCAL pool for expensive overlay evaluations. See
+        # _overlay_pool for why it is separate from the nav pool.
         self._overlay_executor: concurrent.futures.ThreadPoolExecutor | None = None
 
     def _nav_pool(self) -> concurrent.futures.ThreadPoolExecutor:
@@ -132,15 +131,14 @@ class ComputeBackend:
             pool.shutdown(wait=False, cancel_futures=True)
 
     def _overlay_pool(self) -> concurrent.futures.ThreadPoolExecutor:
-        """The local pool expensive overlay evaluations run on, built on
-        first use, in BOTH modes.
+        """The local pool expensive overlay evaluations run on, built on first
+        use, in BOTH modes.
 
         Local, because an overlay function closes over a plot's readers and
-        cannot be pickled to a cluster. Separate from the nav pool, because
-        that pool has one worker and the base frame queues on it: an overlay
-        that takes a second would hold the displayed pattern behind it. One
-        worker here for the same reason the nav pool has one, so a superseded
-        evaluation the caller has already discarded cannot race a newer one."""
+        cannot be pickled to a cluster. Separate from the nav pool, whose one
+        worker the base frame queues on: an overlay taking a second would hold
+        the displayed pattern behind it. One worker here for the nav pool's own
+        reason, so superseded evaluations cannot land out of order."""
         with self._lock:
             if self._overlay_executor is None:
                 self._overlay_executor = concurrent.futures.ThreadPoolExecutor(

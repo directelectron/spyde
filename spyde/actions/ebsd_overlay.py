@@ -58,10 +58,10 @@ def attach_ebsd_band_overlay(signal, indexer, reflectors, tree, *,
 
     The match is milliseconds but not free, so the node is expensive: it runs
     off the navigator thread and the pattern display never waits for it."""
-    from spyde.drawing.overlays import refresh_overlays_for
+    from spyde.actions.vector_overlay import _add_overlay
 
-    node = tree.add_overlay(
-        signal, ebsd_bands, name="ebsd_bands", expensive=True,
+    return _add_overlay(
+        tree, signal, ebsd_bands, name="ebsd_bands", expensive=True,
         groups={"bands": ("lines", {"edgecolors": color}),
                 "zone": ("circles", {"radius": 3.0, "edgecolors": ZONE_COLOR,
                                      "facecolors": None, "linewidths": 1.2,
@@ -75,8 +75,6 @@ def attach_ebsd_band_overlay(signal, indexer, reflectors, tree, *,
         on_value=(None if on_match is None
                   else lambda value: _report_match(on_match, value)),
     )
-    refresh_overlays_for(tree)
-    return node
 
 
 def _report_match(on_match, value) -> None:

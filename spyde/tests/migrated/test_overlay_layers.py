@@ -362,10 +362,9 @@ class _StubNode:
     def __init__(self):
         self.name = "layer"
         self.visible = True
+        self.attached = True
         self.groups = {}
         self.on_value = None
-        self.parent = self
-        self.children = {"layer": self}
 
 
 class TestPendingOverlayRace:

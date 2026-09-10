@@ -1,4 +1,4 @@
-"""The signal an overlay node holds.
+"""The signal an overlay node holds, and the arguments its recipe takes.
 
 An overlay is a child of the node a window displays whose value at the
 navigator's position is drawn on that window: circles on the diffraction
@@ -36,3 +36,11 @@ class OverlaySignal:
 
     def __repr__(self) -> str:  # pragma: no cover
         return f"OverlaySignal(function={self._map_recipe.function!r})"
+
+
+class NavigationPosition:
+    """The navigation index itself, as a recipe's per-position argument, for a
+    function that has to know where it is."""
+
+    def at(self, *index):
+        return tuple(int(v) for v in index)

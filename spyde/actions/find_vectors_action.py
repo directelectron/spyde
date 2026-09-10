@@ -146,10 +146,10 @@ def _start_batch(session, plot, src_tree, p: dict, *, overlay_visible: bool = Tr
     # _overlay_on_source only runs at the TAIL of the async batch, so without
     # this a second Compute leaves run 1's circles on the pattern all run.
     from spyde.actions.vector_overlay import (
-        remove_find_vectors_preview, replace_tree_overlay,
+        remove_find_vectors_preview, clear_tree_overlay,
     )
     remove_find_vectors_preview(src_tree)
-    replace_tree_overlay(src_tree, "_vector_overlay", None)
+    clear_tree_overlay(src_tree, "_vector_overlay")
 
     # ── Build the result tree up front: a lazy zero placeholder with the
     #    source's axes (so we never reference the raw dataset) + a zero
@@ -364,9 +364,9 @@ def _overlay_on_source(src_tree, vecs, *, visible: bool = True,
     if src_tree is None:
         return
     from spyde.actions.vector_overlay import (
-        attach_vector_overlay, replace_tree_overlay,
+        attach_vector_overlay, clear_tree_overlay,
     )
-    replace_tree_overlay(src_tree, "_vector_overlay", None)
+    clear_tree_overlay(src_tree, "_vector_overlay")
     node = attach_vector_overlay(vecs, src_tree, signal=signal)
     src_tree._vector_overlay = node
     if not visible:
@@ -673,9 +673,9 @@ def _overlay_on_result(tree, vecs) -> None:
     One node covers every window the result tree opens, including a signal plot
     added later by "Add Selector"."""
     from spyde.actions.vector_overlay import (
-        attach_vector_overlay, replace_tree_overlay,
+        attach_vector_overlay, clear_tree_overlay,
     )
-    replace_tree_overlay(tree, "_result_vector_overlay", None)
+    clear_tree_overlay(tree, "_result_vector_overlay")
     tree._result_vector_overlay = attach_vector_overlay(vecs, tree)
 
 
@@ -808,7 +808,7 @@ def fv_open(session, plot, payload) -> None:
         try:
             from spyde.actions.vector_overlay import (
                 attach_find_vectors_preview, remove_overlay_node,
-                replace_tree_overlay,
+                clear_tree_overlay,
             )
             if not is_current(tree, "_fv_run_gen", gen):
                 return                     # superseded by fv_close / newer preview
@@ -828,7 +828,7 @@ def fv_open(session, plot, payload) -> None:
             tree._fv_preview = new_prev
             # The live preview supersedes any persistent overlay from an
             # earlier Compute: both drawing at once duplicates every peak.
-            replace_tree_overlay(tree, "_vector_overlay", None)
+            clear_tree_overlay(tree, "_vector_overlay")
             # Estimate the disk radius from the data, once, so the wizard's
             # defaults match the pattern instead of a fixed 5.
             if not getattr(tree, "_fv_auto_sent", False):

@@ -374,20 +374,18 @@ class _CachedParentFrames:
         self.follow_display = follow_display
 
     def _displayed(self):
-        if not self.follow_display:
+        displayed = (getattr(self.plot.plot_state, "current_signal", None)
+                     if self.follow_display else None)
+        if displayed is None:
             return self.signal, self.data
-        state = getattr(self.plot, "plot_state", None)
-        signal = getattr(state, "current_signal", None)
-        if signal is None:
-            return self.signal, self.data
-        return signal, signal.data
+        return displayed, displayed.data
 
     def read_frame(self, indices):
         signal, data = self._displayed()
         # A window whose frames come from a pinned reader has no array to read:
         # an overlay on the vectors result must see the rendered disks, not the
         # placeholder underneath them.
-        tree = getattr(self.plot, "signal_tree", None)
+        tree = self.plot.signal_tree
         override = (tree.reader_override_for(signal, self.plot)
                     if tree is not None else None)
         if override is not None:
@@ -411,8 +409,7 @@ def _grow_cache_for_window(plot, signal, parent_signal) -> None:
     from spyde.external.hyperspy.map_recipe import recipe_for
 
     recipe = recipe_for(signal)
-    cache = getattr(plot, "_array_cache", None)
-    if recipe is None or cache is None:
+    if recipe is None:
         return
     navigation_dimension = int(signal.axes_manager.navigation_dimension)
     depths = navigation_depths(recipe.depth, navigation_dimension)
@@ -422,7 +419,7 @@ def _grow_cache_for_window(plot, signal, parent_signal) -> None:
     frame_shape = data.shape[navigation_dimension:]
     frame_bytes = int(np.prod(frame_shape)) * data.dtype.itemsize
     frames = int(np.prod([2 * radius + 1 for radius in depths]))
-    cache.ensure_budget_for(frames, frame_bytes)
+    plot._array_cache.ensure_budget_for(frames, frame_bytes)
 
 
 def reader_for_overlay(plot, node):
@@ -439,31 +436,28 @@ def reader_for_overlay(plot, node):
 
     signal = node.signal
     readers = plot._local_transform_readers
-    key = id(signal)
-    reader = readers.get(key)
+    reader = readers.get(id(signal))
     if isinstance(reader, RecipeReader) and reader.signal is signal:
         return reader
 
-    parent = getattr(node, "parent", None)
-    parent_signal = getattr(parent, "signal", None)
+    parent_signal = node.parent.signal if node.parent is not None else None
     # Without a source plot the frame is the node's parent, read on the plot
     # drawing the overlay. With one it is whatever that window displays, which
     # need not be in this tree at all.
-    source_plot = getattr(signal, "source_plot", None)
-    frame_plot = plot if source_plot is None else source_plot
+    source_plot = signal.source_plot
+    frame_plot = source_plot or plot
     frame_signal = parent_signal
     if source_plot is not None:
-        state = getattr(source_plot, "plot_state", None)
-        displayed = getattr(state, "current_signal", None)
+        displayed = getattr(source_plot.plot_state, "current_signal", None)
         if displayed is not None:
             frame_signal = displayed
     parent_frames = None
-    if frame_signal is not None and getattr(frame_signal, "data", None) is not None:
+    if getattr(frame_signal, "data", None) is not None:
         parent_frames = _CachedParentFrames(frame_plot, frame_signal,
                                             follow_display=source_plot is not None)
         _grow_cache_for_window(frame_plot, signal, frame_signal)
     reader = RecipeReader(signal, signal.data, parent_signal, parent_frames)
-    readers[key] = reader
+    readers[id(signal)] = reader
     return reader
 
 
@@ -476,16 +470,10 @@ def drop_reader(plot, signal) -> None:
     fresh on every read and never lands in the reader table, but the frames it
     served are in the frame cache like any other."""
     key = id(signal)
-    cache = getattr(plot, "_array_cache", None)
-    if cache is not None:
-        cache.drop_key(key)
-    readers = getattr(plot, "_local_transform_readers", None)
-    reader = readers.pop(key, None) if readers else None
-    if reader is None:
-        return
-    block_cache = getattr(plot, "_block_cache", None)
-    if block_cache is not None:
-        block_cache.drop_owner(id(reader))
+    plot._array_cache.drop_key(key)
+    reader = plot._local_transform_readers.pop(key, None)
+    if reader is not None:
+        plot._block_cache.drop_owner(id(reader))
 
 
 def close_all_readers(plot) -> None:

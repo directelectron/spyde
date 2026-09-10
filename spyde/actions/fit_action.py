@@ -35,6 +35,7 @@ from spyde.fitting.components import EELS_EDGE_KIND
 from spyde.fitting.store import FitStore
 from spyde.actions.context import src_plot_tree as _src_plot_tree
 from de_shell.actions.wizard import WizardController
+from spyde.drawing.overlay_node import NavigationPosition
 from spyde.drawing.selectors.base_selector import event_handler_fn
 # Imported as a MODULE, not `from ... import emit`. The test fixture patches
 # `ipc.emit` to capture outgoing messages, and a from-import binds the original
@@ -204,14 +205,6 @@ class FitStoreRows:
     def at(self, *index):
         store = getattr(self.tree, "fit_store", None)
         return None if store is None else store.get(tuple(index))
-
-
-class NavigationPosition:
-    """The navigation index itself, as a per-position argument. The curves need
-    it to say where they were drawn and to store an adaptive fit."""
-
-    def at(self, *index):
-        return tuple(int(v) for v in index)
 
 
 def fit_one_spectrum(spec, spectrum, x, max_iter: int = 120):

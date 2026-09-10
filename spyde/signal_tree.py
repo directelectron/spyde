@@ -1253,8 +1253,8 @@ class BaseSignalTree:
             output_name=None,
             output_shape=None,
             output_dtype=None,
-            depth=tuple(int(v) for v in depth) if isinstance(depth, (tuple, list))
-                  else int(depth),
+            depth=(tuple(int(v) for v in depth)
+                   if isinstance(depth, (tuple, list)) else int(depth)),
         )
         node = SignalNode(
             signal=OverlaySignal(parent_signal, recipe, source_plot=source_plot,
@@ -1271,8 +1271,8 @@ class BaseSignalTree:
             on_value=on_value,
         )
         parent_node.children[node.name] = node
-        plots = [target_plot] if target_plot is not None else list(self.signal_plots)
-        for plot in plots:
+        for plot in ([target_plot] if target_plot is not None
+                     else list(self.signal_plots)):
             for group_name, (kind, style) in node.groups.items():
                 plot.ensure_overlay_group(node, group_name, kind, style)
         return node
@@ -1291,9 +1291,8 @@ class BaseSignalTree:
             except Exception as e:
                 logger.debug("removing overlay %r from a plot failed: %s",
                              node.name, e)
-        parent = node.parent
-        if parent is not None and parent.children.get(node.name) is node:
-            del parent.children[node.name]
+        if node.attached:
+            del node.parent.children[node.name]
 
     def overlay_children(self, signal) -> List[SignalNode]:
         """The overlay nodes drawn on a window showing ``signal``."""
@@ -1359,22 +1358,15 @@ class BaseSignalTree:
         """Forget every reader pinned for ``plot``. Called when that window
         closes: a pin is keyed by the window, so one left behind outlives the
         thing it describes."""
-        overrides = getattr(self, "_reader_overrides", None)
-        if not overrides:
-            return
-        for key in [k for k in overrides if k[1] == id(plot)]:
-            del overrides[key]
+        for key in [k for k in self._reader_overrides if k[1] == id(plot)]:
+            del self._reader_overrides[key]
 
     def reader_override_for(self, signal, plot=None):
         """The reader pinned for ``signal`` on ``plot``, or for the signal on
-        every window, or None. A window's own pin wins. On the read path, so it
-        answers for a tree built without ``__init__`` too."""
-        overrides = getattr(self, "_reader_overrides", None)
-        if not overrides:
-            return None
-        for key in (((id(signal), id(plot)),) if plot is not None else ()) \
-                + ((id(signal), None),):
-            entry = overrides.get(key)
+        every window, or None. A window's own pin wins."""
+        pins = [None] if plot is None else [id(plot), None]
+        for pin in pins:
+            entry = self._reader_overrides.get((id(signal), pin))
             if entry is None:
                 continue
             pinned_signal, pinned_plot, reader = entry
@@ -1426,8 +1418,7 @@ class BaseSignalTree:
             except Exception as e:
                 logger.debug("removing overlay %r on tree close failed: %s",
                              node.name, e)
-        if getattr(self, "_reader_overrides", None):
-            self._reader_overrides.clear()
+        self._reader_overrides.clear()
         ctrl = getattr(self, "_strain_controller", None)
         if ctrl is not None:
             try:

@@ -43,3 +43,10 @@ class SignalNode:
     # overlay is drawn, for a node whose result also feeds a panel or a caret.
     on_value: Optional[Callable] = None
     _resolved_local: Optional[bool] = field(default=None, repr=False, compare=False)
+
+    @property
+    def attached(self) -> bool:
+        """True while this node is still a child of its parent. A removed
+        overlay can have a value in flight, and must not draw."""
+        parent = self.parent
+        return parent is not None and parent.children.get(self.name) is self

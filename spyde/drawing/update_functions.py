@@ -1045,13 +1045,9 @@ def _prepare_nav_indices(current_signal, indices, integrating: bool, data=None):
     return indices
 
 
-class _NavigationAxesBound:
-    """Passed as ``data`` to :func:`_prepare_nav_indices` to clamp against a
-    signal's navigation axes. It deliberately has no ``shape``, which is what
-    selects that fallback."""
-
-
-_NAVIGATION_AXES = _NavigationAxesBound()
+# Passed as ``data`` to _prepare_nav_indices to clamp against the signal's
+# navigation axes: it has no ``shape``, which is what selects that fallback.
+_NAVIGATION_AXES = object()
 
 
 def _read_through_override(override, indices):
@@ -1088,8 +1084,6 @@ def _read_through_override(override, indices):
             return None
         frame = np.asarray(frame)
         total = frame.astype(np.float64) if total is None else total + frame
-    if total is None:
-        return None
     mean = total / n_points
     if np.issubdtype(frame.dtype, np.integer):
         mean = np.rint(mean)
@@ -1139,15 +1133,15 @@ def update_from_navigation_selection(
     # guard below: those guards ask whether `.data` can be sliced, and a
     # placeholder or an unresolved future there is exactly the case an
     # override exists to serve.
-    _tree = getattr(child, "signal_tree", None)
-    _override = (_tree.reader_override_for(current_signal, child)
-                 if _tree is not None else None)
-    if _override is not None:
+    tree = getattr(child, "signal_tree", None)
+    override = (tree.reader_override_for(current_signal, child)
+                if tree is not None else None)
+    if override is not None:
         # Clamp against the navigation axes, not `.data`: the override reads
         # the position rather than that array, whose shape may be a
         # placeholder's and would clamp a real coordinate to zero.
         result = _read_through_override(
-            _override,
+            override,
             _prepare_nav_indices(current_signal, indices,
                                  selector.is_integrating,
                                  data=_NAVIGATION_AXES))

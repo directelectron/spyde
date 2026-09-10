@@ -1,14 +1,11 @@
 """Evaluating a plot's overlay children at the navigator's position.
 
-One call from the navigator dispatcher, right after the base frame is enqueued.
-Every overlay of the displayed node is evaluated at the same prepared index the
-base frame used, through the same readers, and handed to the painter thread.
-
-A cheap overlay is evaluated inline on the dispatcher, like the base frame. An
-expensive one is submitted as a single future on the session's compute backend,
-superseded by identity, and painted from its done callback. Neither path holds
-a lock or starts a thread: the dispatcher is already serial, and the painter is
-already newest-wins.
+One call from the navigator dispatcher, right after the base frame is enqueued:
+every overlay of the displayed node is evaluated at the index the base frame
+used, through the same readers, and handed to the painter thread. A cheap one
+runs inline on the dispatcher; an expensive one is one future on the session's
+compute backend, superseded by identity and painted from its done callback.
+Neither path holds a lock or starts a thread.
 """
 from __future__ import annotations
 
@@ -21,21 +18,18 @@ from spyde.array_cache import reader_for_overlay
 log = logging.getLogger(__name__)
 
 
-def refresh_overlays(plot, indices, settle: bool = False,
-                     integrating: bool = False) -> None:
+def refresh_overlays(plot, indices, integrating: bool = False) -> None:
     """Evaluate and draw every visible overlay child of the node ``plot``
     displays, at the selector position ``indices``.
 
     Runs on the navigator dispatcher thread. Costs nothing when the displayed
-    node has no overlay children, which is the common case. ``settle`` is the
-    resting-position re-fire flag the base read takes; an overlay treats it as
-    an ordinary evaluation. ``integrating`` is the selector's own mode, which
-    a node declaring ``follows_region`` reads with so its source integrates
-    the same positions the base frame does.
+    node has no overlay children, which is the common case. A resting-position
+    re-fire is not special: it is one more evaluation. ``integrating`` is the
+    selector's own mode, which a node declaring ``follows_region`` reads with
+    so its source integrates the same positions the base frame does.
     """
-    state = getattr(plot, "plot_state", None)
-    signal = getattr(state, "current_signal", None) if state is not None else None
-    tree = getattr(plot, "signal_tree", None)
+    signal = getattr(plot.plot_state, "current_signal", None)
+    tree = plot.signal_tree
     if signal is None or tree is None:
         return
     children = tree.overlay_children(signal)
@@ -58,7 +52,7 @@ def refresh_overlays(plot, indices, settle: bool = False,
             continue
         # An overlay put on one window (an image layer) draws there only; one
         # that belongs to the node draws on every window showing it.
-        target = getattr(node.signal, "target_plot", None)
+        target = node.signal.target_plot
         if target is not None and target is not plot:
             continue
         at = region if (node.follows_region and region is not None) else index
@@ -84,9 +78,8 @@ def _runs_off_the_dispatcher(plot, node, index) -> bool:
 
     from spyde.drawing.update_functions import _classify_nav_read
 
-    source_plot = getattr(node.signal, "source_plot", None) or plot
-    state = getattr(source_plot, "plot_state", None)
-    source = getattr(state, "current_signal", None)
+    source_plot = node.signal.source_plot or plot
+    source = getattr(source_plot.plot_state, "current_signal", None)
     data = getattr(source, "data", None)
     if source is None or data is None:
         return False
@@ -105,15 +98,11 @@ def refresh_overlays_for(tree) -> None:
     redrawn by re-running the position the navigator is already on.
     """
     manager = getattr(tree, "navigator_plot_manager", None)
-    if manager is None:
-        return
-    for selectors in getattr(manager, "navigation_selectors", {}).values():
-        for selector in selectors:
-            try:
-                selector.delayed_update_data(force=True)
-            except Exception as e:
-                log.debug("re-slicing the navigator to redraw overlays "
-                          "failed: %s", e)
+    for selector in getattr(manager, "all_navigation_selectors", None) or ():
+        try:
+            selector.delayed_update_data(force=True)
+        except Exception as e:
+            log.debug("re-slicing the navigator to redraw overlays failed: %s", e)
 
 
 def _submit_overlay(plot, tree, node, reader, index) -> None:
@@ -124,26 +113,17 @@ def _submit_overlay(plot, tree, node, reader, index) -> None:
     callback finds a newer future in the node's slot. All of the bookkeeping
     happens on the one dispatcher thread, so identity is the whole mechanism.
     """
-    session = getattr(tree, "session", None)
-    backend = getattr(session, "compute_backend", None) if session is not None else None
+    backend = getattr(getattr(tree, "session", None), "compute_backend", None)
     if backend is None:
         log.debug("overlay %s needs a compute backend and there is none", node.name)
         return
 
+    plot.cancel_overlay_future(node)
     futures = plot._overlay_futures
-    previous = futures.get(id(node))
-    if previous is not None:
-        try:
-            previous.cancel()
-        except Exception:
-            pass
-
     future = backend.submit_overlay(lambda: reader.read_frame(index))
     futures[id(node)] = future
 
     def paint_when_done(finished, expected=future):
-        if futures.get(id(node)) is not expected:
-            return
         try:
             value = finished.result()
         except Exception as e:
@@ -152,12 +132,8 @@ def _submit_overlay(plot, tree, node, reader, index) -> None:
                 del futures[id(node)]
             return
         if futures.get(id(node)) is not expected:
-            return
+            return          # superseded while it ran
         del futures[id(node)]
         plot.enqueue_overlay(node, value)
 
-    try:
-        future.add_done_callback(paint_when_done)
-    except Exception as e:
-        log.debug("overlay %s could not be armed: %s", node.name, e)
-        futures.pop(id(node), None)
+    future.add_done_callback(paint_when_done)

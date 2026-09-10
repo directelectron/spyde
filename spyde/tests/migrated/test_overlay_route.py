@@ -508,9 +508,9 @@ class TestGroupKinds:
             plot.enqueue_overlay(node, {"detector": np.ones((32, 32), np.float32)})
             assert _wait(lambda: painted.threads, 10)
             assert set(painted.threads) == {"nav-paint"}, painted.threads
-            assert plot.has_live_transform()
+            assert bool(plot._live_transform_groups)
             plot.enqueue_overlay(node, {})
-            assert _wait(lambda: not plot.has_live_transform(), 10)
+            assert _wait(lambda: not plot._live_transform_groups, 10)
         finally:
             session.shutdown()
 
@@ -548,7 +548,7 @@ class TestGroupKinds:
                 groups={"response": ("transform", {})})
             response = np.ones((32, 32), np.float32)
             plot.enqueue_overlay(node, {"response": response})
-            assert _wait(lambda: plot.has_live_transform(), 10)
+            assert _wait(lambda: bool(plot._live_transform_groups), 10)
 
             raw = np.full((32, 32), 7.0, np.float32)
             painted = _ThreadRecorder(plot, "_set_array")
@@ -558,7 +558,7 @@ class TestGroupKinds:
             assert painted.threads == [], "the raw frame painted over the transform"
 
             plot.enqueue_overlay(node, {})
-            assert _wait(lambda: not plot.has_live_transform(), 10)
+            assert _wait(lambda: not plot._live_transform_groups, 10)
             plot.enqueue_paint(raw)
             assert _wait(lambda: painted.threads, 10), "the raw frame never came back"
         finally:
@@ -629,11 +629,11 @@ class TestTransformOrdering:
             response = np.ones((32, 32), np.float32)
             node = self._transform_overlay(tree, response)
             _move_navigator(session, tree)
-            assert _wait(lambda: plot.has_live_transform(), 10)
+            assert _wait(lambda: bool(plot._live_transform_groups), 10)
 
             pushed = self._painted(plot)
             tree.replace_overlay_static(node, show=False)
-            assert _wait(lambda: not plot.has_live_transform(), 10)
+            assert _wait(lambda: not plot._live_transform_groups, 10)
             _settle(session)
             assert len(pushed) == 1,                 f"the raw frame was painted {len(pushed)} times, not once"
             assert np.array_equal(pushed[0], plot.current_data)
@@ -649,14 +649,14 @@ class TestTransformOrdering:
             tree = plot.signal_tree
             node = self._transform_overlay(tree, np.ones((32, 32), np.float32))
             _move_navigator(session, tree)
-            assert _wait(lambda: plot.has_live_transform(), 10)
+            assert _wait(lambda: bool(plot._live_transform_groups), 10)
             raw = plot.current_data
 
             pushed = self._painted(plot)
             tree.remove_overlay(node)
             assert _wait(lambda: pushed, 10), "the pattern never came back"
             assert np.array_equal(pushed[-1], raw)
-            assert not plot.has_live_transform()
+            assert not plot._live_transform_groups
         finally:
             session.shutdown()
 

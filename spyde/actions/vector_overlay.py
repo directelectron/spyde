@@ -20,19 +20,12 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from spyde.drawing.overlay_node import NavigationPosition
+
 log = logging.getLogger(__name__)
 
-
-def _clip_to_bounds(px, width, height, slack=8.0):
-    """Drop marker offsets that fall outside the detector (with a small
-    ``slack`` so edge disks still show). Peak finding can emit a few spurious
-    peaks far outside the frame whose calibrated coords map to pixel positions
-    like 24000, and a circle there litters the plot with giant arcs."""
-    if px is None or len(px) == 0:
-        return px
-    inside = ((px[:, 0] >= -slack) & (px[:, 0] <= (width - 1) + slack) &
-              (px[:, 1] >= -slack) & (px[:, 1] <= (height - 1) + slack))
-    return px[inside]
+# How far outside the detector a marker may still sit, so an edge disk shows.
+_MARKER_SLACK_PX = 8.0
 
 
 @dataclass(frozen=True)
@@ -72,8 +65,20 @@ class DetectorPixels:
                                ).astype(np.float32)
 
     def clipped(self, xy) -> np.ndarray:
-        """:meth:`to_pixels`, with the offsets off the detector dropped."""
-        return _clip_to_bounds(self.to_pixels(xy), self.width, self.height)
+        """:meth:`to_pixels`, with the offsets off the detector dropped.
+
+        Peak finding can emit a few spurious peaks far outside the frame whose
+        calibrated coordinates map to pixel positions like 24000, and a circle
+        there litters the plot with giant arcs."""
+        pixels = self.to_pixels(xy)
+        if len(pixels) == 0:
+            return pixels
+        inside = (
+            (pixels[:, 0] >= -_MARKER_SLACK_PX)
+            & (pixels[:, 0] <= self.width - 1 + _MARKER_SLACK_PX)
+            & (pixels[:, 1] >= -_MARKER_SLACK_PX)
+            & (pixels[:, 1] <= self.height - 1 + _MARKER_SLACK_PX))
+        return pixels[inside]
 
     def marker_radius(self, radius_px) -> float:
         """A circle radius capped to a small fraction of the detector, so the
@@ -103,14 +108,6 @@ class VectorRows:
         return vectors.at(int(index[-2]), int(index[-1]))
 
 
-class NavigationPosition:
-    """The navigation index itself, as a recipe's per-position argument, for a
-    function that has to know where it is and reads no frame."""
-
-    def at(self, *index):
-        return tuple(int(v) for v in index)
-
-
 def remove_overlay_node(tree, node) -> None:
     """Take an overlay node off ``tree``, tolerating a missing tree or node."""
     if tree is None or node is None:
@@ -122,12 +119,11 @@ def remove_overlay_node(tree, node) -> None:
                   getattr(node, "name", node), e)
 
 
-def replace_tree_overlay(tree, attribute: str, node=None):
-    """Put ``node`` on ``tree.<attribute>``, removing the overlay node that was
-    there, so re-running an action never stacks two sets of markers."""
+def clear_tree_overlay(tree, attribute: str) -> None:
+    """Remove the overlay node held on ``tree.<attribute>`` and forget it, so
+    re-running an action never stacks two sets of markers."""
     remove_overlay_node(tree, getattr(tree, attribute, None))
-    setattr(tree, attribute, node)
-    return node
+    setattr(tree, attribute, None)
 
 
 def overlay_static(node) -> dict:
@@ -341,8 +337,7 @@ def request_beamstop(tree, node, params: dict) -> None:
         if overlay_static(node).get("beamstop_mask") is not None:
             tree.replace_overlay_static(node, beamstop_mask=None)
         return
-    session = getattr(tree, "session", None)
-    backend = getattr(session, "compute_backend", None) if session else None
+    backend = getattr(getattr(tree, "session", None), "compute_backend", None)
     signal = node.parent.signal
     if backend is None:
         log.debug("[fv-preview] no compute backend for the beam-stop estimate")
@@ -354,8 +349,7 @@ def request_beamstop(tree, node, params: dict) -> None:
         except Exception as e:
             log.debug("[fv-preview] beam-stop detection failed: %s", e)
             return
-        parent = node.parent
-        if parent is None or parent.children.get(node.name) is not node:
+        if not node.attached:
             return              # the caret closed while the stop was found
         tree.replace_overlay_static(node, beamstop_mask=mask)
 
@@ -383,7 +377,7 @@ def _emit_preview_histogram(plot, value) -> None:
 def remove_find_vectors_preview(tree) -> None:
     """Drop the live preview. Its groups go with the node, the beam-stop mask
     among them."""
-    replace_tree_overlay(tree, "_fv_preview", None)
+    clear_tree_overlay(tree, "_fv_preview")
 
 
 def tune_find_vectors_preview(tree, node, params: dict) -> None:
@@ -541,8 +535,9 @@ class StrainSelectionOverlay:
         mask = (np.zeros(len(spots), dtype=bool) if selected is None
                 else np.asarray(selected, dtype=bool).reshape(-1))
         circles = {"facecolors": None, "alpha": 1.0, "radius": self.radius_px}
+        displayed = getattr(plot.plot_state, "current_signal", None)
         self.node = _add_overlay(
-            tree, self._displayed_signal(plot, tree), strain_selection,
+            tree, tree.root if displayed is None else displayed, strain_selection,
             name="strain_select", source=False,
             groups={
                 "excluded": ("circles", dict(circles, linewidths=1.3,
@@ -561,12 +556,6 @@ class StrainSelectionOverlay:
                     "match_radius_px": float(match_radius_px)},
         )
         self._wire_double_click(plot)
-
-    @staticmethod
-    def _displayed_signal(plot, tree):
-        state = getattr(plot, "plot_state", None)
-        signal = getattr(state, "current_signal", None) if state else None
-        return signal if signal is not None else tree.root
 
     def _wire_double_click(self, plot) -> None:
         # A single click is ambiguous with panning on a 2-D anyplotlib panel,

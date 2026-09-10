@@ -138,10 +138,10 @@ def _overlay_template_on_source(src_tree, dp_plot, src, sim, gamma) -> None:
         return
     from spyde.actions.orientation_compute import build_matching_cache
     from spyde.actions.vector_overlay import (
-        attach_orientation_overlay, replace_tree_overlay,
+        attach_orientation_overlay, clear_tree_overlay,
     )
 
-    replace_tree_overlay(src_tree, "_orientation_overlay", None)
+    clear_tree_overlay(src_tree, "_orientation_overlay")
     cache = build_matching_cache(src, sim)
     node = attach_orientation_overlay(
         src, sim, cache, src_tree, gamma=gamma,

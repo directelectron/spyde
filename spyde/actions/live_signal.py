@@ -238,11 +238,6 @@ class ProgressiveSignalPreview:
             return None
         return tuple(int(v) for v in np.atleast_1d(np.asarray(prepared)).ravel())
 
-    def _selectors(self):
-        """The tree's navigator selectors."""
-        manager = getattr(self.tree, "navigator_plot_manager", None)
-        return list(getattr(manager, "all_navigation_selectors", []) or [])
-
     def _refresh_parked_position(self, nav_slices: Sequence[slice]) -> bool:
         """Re-fire any selector whose current position sits in *nav_slices*.
 
@@ -251,7 +246,8 @@ class ProgressiveSignalPreview:
         never a direct paint from this callback thread.
         """
         hit = False
-        for selector in self._selectors():
+        manager = getattr(self.tree, "navigator_plot_manager", None)
+        for selector in getattr(manager, "all_navigation_selectors", None) or ():
             try:
                 index = self._navigation_index(selector.current_indices)
             except Exception:
@@ -318,8 +314,8 @@ class ProgressiveSignalPreview:
         Integrating a region over a half-finished result would have to wait for
         every position in it; the action's own final display owns real region
         integration, and the preview shows one position."""
-        index = np.asarray(points).reshape(-1, np.shape(points)[-1])
-        centre = np.mean(index, axis=0).astype(int)
+        grid = np.asarray(points).reshape(-1, np.shape(points)[-1])
+        centre = np.mean(grid, axis=0).astype(int)
         return self.read_frame(tuple(int(v) for v in centre))
 
     @property
