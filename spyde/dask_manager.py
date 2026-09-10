@@ -193,6 +193,11 @@ class _WorkerTuningPlugin(_WorkerPluginBase):
     4. Mac neural env (_apply_mac_neural_env): PYTORCH_ENABLE_MPS_FALLBACK=1 +
        SPYDE_FV_GPU_CONC=1 so MPS ops degrade to CPU and the device is used by
        one forward at a time (crash-avoidance for the SpotUNet batch).
+    5. blosc thread pool (spyde.external.numcodecs.blosc_threads): numcodecs
+       decodes single-threaded on any thread but the main one, and every task
+       here runs on a worker thread. The patch turns the pool on and serialises
+       access to it; the lock is per process, so each worker decodes one chunk
+       at a time with the whole pool.
     """
 
     name = "spyde-worker-tuning"
@@ -206,6 +211,11 @@ class _WorkerTuningPlugin(_WorkerPluginBase):
             logger.debug("worker timer unthrottle failed: %s", e)
         _lower_worker_priority()
         _apply_mac_neural_env()
+        try:
+            from spyde.external.numcodecs.blosc_threads import apply as apply_blosc_threads
+            apply_blosc_threads()
+        except Exception as e:
+            logger.debug("worker blosc thread-pool patch failed: %s", e)
 
     def teardown(self, worker=None):
         pass
