@@ -1,5 +1,5 @@
 /**
- * center_then_find_vectors.spec.ts — an overlay belongs to the node on screen.
+ * center_then_find_vectors.spec.ts: an overlay belongs to the node on screen.
  *
  * Centre the diffraction pattern (a mapped child node), THEN open Find Vectors:
  * the live preview and, after Compute, the found-vectors circles must draw on
@@ -9,7 +9,7 @@
  * disks; the preview also computed a whole dask block per move on lazy data.
  *
  * Real Dask + the lazy 3×3-chunk synthetic scan (the eager si-grains dataset
- * skips every cache and measures nothing — CLAUDE.md, region drag trap 1).
+ * skips every cache and measures nothing, CLAUDE.md, region drag trap 1).
  * The per-move numbers come from the backend's own [NAV-PROFILE] lines
  * (SPYDE_NAV_PROFILE=1). Screenshots land in electron/center_fv_shots/.
  */
@@ -68,10 +68,10 @@ test('centre the pattern, then Find Vectors draws on the centred node', async ()
   await sig.getByTestId('action-btn-Center Zero Beam').click()
   await expect(page.getByTestId('center-zero-beam-wizard')).toBeVisible()
   await page.getByTestId('czb-center').click()
-  await expect(page.getByTestId('status-text'))
-    .toContainText('centered', { timeout: 60_000, ignoreCase: true })
+  // The "Centered" node in the Workflow panel is the completion signal; the
+  // status text is overwritten by the navigator recompute that follows.
   await expect(page.getByTestId(/^tree-node-Centered/).first())
-    .toBeVisible({ timeout: 10_000 })
+    .toBeVisible({ timeout: 90_000 })
   await page.getByTestId('czb-close').click()
   await page.waitForTimeout(500)
   await page.screenshot({ path: `${SHOTS}/02-centred.png` })

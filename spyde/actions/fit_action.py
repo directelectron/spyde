@@ -502,7 +502,9 @@ class FitWizard(WizardController):
         try:
             dispatch(apply)
         except Exception as e:
+            # Without a running loop the delivery still has to land.
             log.debug("dispatching the fit curves failed: %s", e)
+            apply()
 
     # ── the per-position store ────────────────────────────────────────────
     @property

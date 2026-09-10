@@ -1,5 +1,5 @@
 /**
- * fv_heatmap_view.spec.ts — the Find Vectors "Show heatmap" view is an overlay
+ * fv_heatmap_view.spec.ts: the Find Vectors "Show heatmap" view is an overlay
  * group of kind `transform`: while it is on, the painter shows the detector's
  * response image instead of the raw pattern and never flashes the raw frame
  * on a navigator move; turning it off restores the pattern without a move.
