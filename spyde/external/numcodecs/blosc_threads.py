@@ -4,11 +4,18 @@ Patch: blosc decodes with its thread pool on every thread, one caller at a time.
 WHAT
 ----
 Sets ``numcodecs.blosc.use_threads = True`` and ``set_nthreads(N)``, and wraps
-the module-level ``numcodecs.blosc.compress`` and ``numcodecs.blosc.decompress``
-so each call holds one process-wide lock. ``Blosc.encode`` and ``Blosc.decode``
-look those two names up in the module at call time, so every zarr read and
-write in the process goes through the wrappers, including the ones dask's
-workers make.
+the module-level ``numcodecs.blosc.compress``, ``decompress`` and, where the
+installed version has it, ``decompress_partial`` so each call holds one
+process-wide lock. ``Blosc.encode``, ``Blosc.decode`` and
+``Blosc.decode_partial`` look those names up in the module at call time, so
+every zarr read and write in THIS process goes through the wrappers.
+
+This process only. Dask's workers are separate processes, spawned by
+``LocalCluster``, and nothing in them calls ``ensure_heavy_imports``, so they
+never see this patch: they keep numcodecs' default, which off the main thread
+is the single-threaded path that never touches the global pool. They need no
+lock and decode exactly as they did. The batch numbers below were measured on
+dask's threaded scheduler, in this process, which is where the patch applies.
 
 ``SPYDE_BLOSC_THREADS=0`` applies nothing, which is the A/B switch. Unset uses
 :data:`DEFAULT_THREAD_COUNT`; any other number sets that thread count.
@@ -18,8 +25,8 @@ WHY
 ``numcodecs`` decides whether to use blosc's thread pool from the identity of
 the calling thread: with ``use_threads`` left at ``None`` it uses the pool on
 the main thread and decodes single-threaded everywhere else. The navigator
-reads on the ``_NavDispatcher`` thread, the block prefetcher on its own, and
-dask's workers on theirs, so in this application the fast path was never taken.
+reads on the ``_NavDispatcher`` thread and the block prefetcher on its own, so
+in this process the fast path was never taken.
 
 Measured on a real .zspy (blosc zstd level 1 with shuffle, 64 MiB chunks of
 512^2 float32, compressed to about 50 MiB), decoding one chunk off the main
@@ -29,7 +36,7 @@ into a new chunk paid the 172 ms.
 
 blosc's pool is global, so two callers using it at once corrupt each other's
 work. The lock is what makes turning the pool on safe when the dispatcher, the
-prefetcher and dask's workers all decode. It serialises decodes that used to
+prefetcher and the threaded scheduler all decode. It serialises decodes that used to
 overlap, and the batch paths got quicker anyway: over the same square of
 chunks on dask's threaded scheduler with eight threads, the navigator sum went
 615 ms to 486 ms and a Find Vectors DoG batch 1201 ms to 1093 ms. Serialised
@@ -37,7 +44,9 @@ pooled decodes finish more chunks per second than eight concurrent
 single-threaded ones, so nothing had to be traded for the interactive win.
 
 The lock covers the call and nothing else. It is not held across any read of
-the store, and no other lock is taken inside it.
+the store, and no other lock is taken inside it. It is not fair either, so a
+threaded ``.zspy`` save in this process, compressing chunk after chunk, can
+keep a navigator decode waiting for as long as the save runs.
 
 WHEN TO REMOVE
 --------------
@@ -117,6 +126,11 @@ def apply() -> bool:
 
     blosc.compress = _serialised(blosc.compress)
     blosc.decompress = _serialised(blosc.decompress)
+    # Blosc.decode_partial's route to the same pool. zarr 2 calls it only with
+    # partial decompression enabled, which is off by default, and older
+    # numcodecs may not have it at all.
+    if hasattr(blosc, "decompress_partial"):
+        blosc.decompress_partial = _serialised(blosc.decompress_partial)
     blosc.use_threads = True
     blosc.set_nthreads(count)
     log.debug("spyde.external.numcodecs: blosc pool on with %d threads, "

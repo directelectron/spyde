@@ -36,6 +36,15 @@ class TestApply:
         assert blosc_module.use_threads is True
         assert blosc_module.get_nthreads() == blosc_threads.thread_count()
 
+    def test_partial_decompression_is_serialised_too(self, blosc_module):
+        """Blosc.decode_partial's route to the same global pool. Optional,
+        because an older numcodecs may not have it."""
+        blosc_threads.apply()
+        partial = getattr(blosc_module, "decompress_partial", None)
+        if partial is None:
+            pytest.skip("this numcodecs has no decompress_partial")
+        assert getattr(partial, blosc_threads.MARKER, False)
+
     def test_apply_is_idempotent(self, blosc_module):
         blosc_threads.apply()
         wrapped = blosc_module.decompress

@@ -267,56 +267,6 @@ def _next_chunk_position(reader, point, signs, nav_shape):
     return tuple(ahead)
 
 
-BYTE_WARM_VARIABLE = "SPYDE_NAV_BYTE_WARM"
-
-
-def _byte_warm_enabled() -> bool:
-    """Whether to prepay the disk read of the chunk after the prefetch target.
-
-    Off, because on the file this was measured on it made every drag slower.
-    The one read-ahead thread spends 20 to 50 ms reading those bytes instead of
-    decoding the chunk the drag reaches next, and on a fast disk that read is a
-    small part of a crossing anyway: with it the crossings on a 60-step drag
-    cost a median 111 ms against 103 ms without, over chunks nothing had
-    touched, and 79 ms against 52 ms with the file's pages already cached. A
-    slow drag lost hits to it too. It is kept for a machine whose disk is the
-    expensive half, where prepaying may be worth the thread.
-    """
-    return _os.environ.get(BYTE_WARM_VARIABLE, "0") not in ("", "0")
-
-
-def _warm_chunk_bytes(reader, point) -> None:
-    """Read the compressed bytes of the chunk holding ``point`` and throw them
-    away, so the operating system's page cache holds them when that chunk is
-    decoded for real.
-
-    Only for a zarr 2 backing: it is the one that exposes its chunk keys and
-    the store they live in. Any other reader has no such thing and is skipped.
-    """
-    source = getattr(reader, "source", None)
-    store = getattr(source, "chunk_store", None)
-    chunk_key = getattr(source, "_chunk_key", None)
-    grid_shape = getattr(source, "cdata_shape", None)
-    if store is None or chunk_key is None or grid_shape is None:
-        return
-    coordinates = tuple(int(p) // int(c)
-                        for p, c in zip(point, source.chunks))
-    if any(c < 0 or c >= int(grid_shape[axis])
-           for axis, c in enumerate(coordinates)):
-        return
-    # The nav chunk spans every chunk of the signal axes, which is one chunk
-    # under the storage-aligned chunking SpyDE loads with. Reading them all is
-    # exactly the bytes the decode will ask for, so this is bounded by one
-    # block however the signal axes are cut.
-    tails = itertools.product(
-        *(range(int(n)) for n in grid_shape[len(coordinates):]))
-    for tail in tails:
-        try:
-            store[chunk_key(coordinates + tail)]
-        except KeyError:
-            return                  # never written; nothing to warm
-
-
 class _BlockPrefetcher:
     """Warm the nav-CHUNK block a 2-D drag is heading into, off the dispatcher.
 
@@ -334,16 +284,16 @@ class _BlockPrefetcher:
     read-ahead warmed a chunk that was already warm and every crossing decoded on
     the dispatcher.
 
-    With SPYDE_NAV_BYTE_WARM set it then reads the compressed bytes of the chunk
-    after that and drops them, so the disk read is already paid when its turn
-    comes. Off by default because it measured slower on every drag tried; see
-    _byte_warm_enabled.
-
     Latest-target-wins (a newer position replaces the pending one), single daemon
     thread, and every failure is swallowed: this is pure speculation, so being
     wrong must cost nothing but wasted background work. If the drag beats the
     read-ahead to a chunk, the dispatcher waits for that decode rather than
     starting a second one, in BlockCache.get_or_load.
+
+    Reading the compressed bytes of the chunk one further, to prepay its disk
+    read, was tried and removed: the single thread spent 20 to 50 ms in that
+    read instead of decoding the chunk the drag reached next, and every drag
+    measured slower for it.
 
     Distinct from _MoviePrefetcher, which warms the OS page cache for 1-D time
     scrubs; this warms the DECODED-block cache for 2-D nav. Both are latest-wins.
@@ -351,7 +301,7 @@ class _BlockPrefetcher:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._target = None         # (plot, signal, data, point, signs)
+        self._target = None         # (plot, signal, data, point)
         self._pending = False
         self._wake = threading.Event()
         self._thread = None
@@ -382,7 +332,7 @@ class _BlockPrefetcher:
         except Exception:
             return
         with self._lock:
-            self._target = (plot, signal, data, ahead, signs)
+            self._target = (plot, signal, data, ahead)
             self._pending = True
             if self._thread is None:
                 self._thread = threading.Thread(
@@ -401,22 +351,15 @@ class _BlockPrefetcher:
                 target = self._target
             if target is None:
                 continue
-            plot, signal, data, point, signs = target
+            plot, signal, data, point = target
             try:
                 from spyde.array_cache import (
                     get_local_frame, is_local_frame_resident,
                 )
-                if not is_local_frame_resident(plot, signal, data,
-                                               np.asarray(point)):
-                    get_local_frame(plot, signal, data, np.asarray(point))
-                if self._wake.is_set() or not _byte_warm_enabled():
-                    continue        # a newer target arrived, or the byte warm is off
-                reader = plot._local_transform_readers.get(id(signal))
-                further = (_next_chunk_position(reader, point, signs,
-                                                data.shape[:len(point)])
-                           if reader is not None else None)
-                if further is not None and further != point:
-                    _warm_chunk_bytes(reader, further)
+                if is_local_frame_resident(plot, signal, data,
+                                           np.asarray(point)):
+                    continue                    # already warm
+                get_local_frame(plot, signal, data, np.asarray(point))
             except Exception as e:
                 log.debug("nav block prefetch at %s failed: %s", point, e)
 

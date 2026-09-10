@@ -40,6 +40,12 @@ Reads go through ``get_local_frame``, and each read primes the block prefetcher
 exactly as ``_direct_read_frame`` does, so the read-ahead under test is the one
 the app runs.
 
+Opening through the Session builds the navigator. A ``.zspy`` that stores its
+own (hyperspy writes one) is read from the file and costs nothing; one that
+does not is summed over the whole dataset and cached as ``.spyde-nav.npz``
+beside the file, so on such a file the first run carries that and later runs do
+not. The file this was written against stores its own navigator.
+
 It also times the two batch computations that share the decoder with the
 navigator: the navigator sum over a square of chunks, and a Find Vectors DoG
 batch over the same square, both on dask's threaded scheduler with eight
