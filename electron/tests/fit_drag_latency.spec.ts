@@ -6,7 +6,7 @@
  *
  * Every pointer frame of a drag posts a `pointer_move`. The model's curves are
  * an overlay child of the spectrum, so the backend evaluates them at the
- * position it just read and the painter drops any superseded value — the caret
+ * position it just read and the painter drops any superseded value, so the caret
  * sends nothing per frame. If a drag ever queues work faster than it is served
  * the queue drains after the drag: a pause, then a snap.
  *

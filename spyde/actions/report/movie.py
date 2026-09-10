@@ -1354,7 +1354,7 @@ def movie_drop_window(session, plot, payload) -> None:
     if src is None:
         ipc.emit_error("Movie drop: source window not found.")
         return
-    data = getattr(src, "current_data", None)
+    data = getattr(src, "displayed_data", None)
     ndim = np.asarray(data).ndim if isinstance(data, np.ndarray) else 0
     if ndim == 1:
         movie_add_text_overlay(session, plot, payload)
@@ -1389,7 +1389,7 @@ def movie_add_overlay_image(session, plot, payload) -> None:
     if src is None:
         ipc.emit_error("Add overlay image: source window not found.")
         return
-    frame = getattr(src, "current_data", None)
+    frame = getattr(src, "displayed_data", None)
     if not isinstance(frame, np.ndarray) or frame.ndim != 2:
         ipc.emit_error("Add overlay image: source is not a 2-D image.")
         return

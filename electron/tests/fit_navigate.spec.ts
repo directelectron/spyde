@@ -127,7 +127,7 @@ test('the overlaid model follows the navigator after a scan fit', async () => {
       //
       // The backend draws this position's curves and THEN emits its state down
       // the same ordered protocol, so a new fit_state is proof the caret is now
-      // showing THIS position — the same signal fit_quality's sweep uses.
+      // showing THIS position: the same signal fit_quality's sweep uses.
       //
       // Bounded, not fatal: the painter drops a value superseded before it is
       // drawn, so a move posted while another is pending can legitimately

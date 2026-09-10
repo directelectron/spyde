@@ -217,7 +217,7 @@ class NavigationPosition:
 def fit_one_spectrum(spec, spectrum, x, max_iter: int = 120):
     """Fit ONE spectrum with the batched engine.
 
-    Returns ``(values, chi squared, status)`` — the packed parameters, how well
+    Returns ``(values, chi squared, status)``: the packed parameters, how well
     they fit, and the line the caret shows beside them. The same engine and the
     same model a whole-scan run uses; only the data is one row.
 
@@ -474,20 +474,35 @@ class FitWizard(WizardController):
     def _drew(self, value) -> None:
         """One delivery of the curves, on the painter thread.
 
-        Adopts the position they were drawn at and the spectrum they were drawn
-        against, loads a recalled fit into the model so the caret's numbers and
-        its drag handles show it, and sends the state the caret renders from.
+        The position and the spectrum are this controller's own record of where
+        the drawing is, so they are rebound here. Writing the MODEL and sending
+        the state are handed to the main thread instead: the model is edited
+        there by every handler and read on the navigator's thread by the curves
+        themselves, and a message must be emitted from there too. Marshalling
+        keeps a recall from landing in the middle of a drag, and keeps
+        deliveries in the order they arrived.
         """
+        self.position = value.get("position")
+        self.spectrum = value.get("spectrum")
+        recalled, status = value.get("recall"), value.get("status")
+
+        def apply() -> None:
+            try:
+                if recalled is not None:
+                    self.spec.set_flat_values(recalled)
+                    self.update_widgets()
+                self.emit_state(status)
+            except Exception as e:
+                log.debug("delivering the fit curves failed: %s", e)
+
+        dispatch = getattr(self.session, "_dispatch_to_main", None)
+        if dispatch is None:
+            apply()
+            return
         try:
-            recalled = value.get("recall")
-            self.position = value.get("position")
-            self.spectrum = value.get("spectrum")
-            if recalled is not None:
-                self.spec.set_flat_values(recalled)
-                self.update_widgets()
-            self.emit_state(value.get("status"))
+            dispatch(apply)
         except Exception as e:
-            log.debug("delivering the fit curves failed: %s", e)
+            log.debug("dispatching the fit curves failed: %s", e)
 
     # ── the per-position store ────────────────────────────────────────────
     @property
@@ -1661,12 +1676,12 @@ def fit_set_param(session, plot, payload) -> None:
         log.debug("fit_set_param %s failed: %s", p, e)
         return
     wiz.update_widgets()      # MOVE, do not rebuild — see update_widgets
-    wiz.redraw()              # ...and AFTER the handles — see _on_widget_drag
+    wiz.redraw()              # ...and AFTER the handles, see _on_widget_drag
     wiz.emit_state()
 
 
 def fit_tune(session, plot, payload=None) -> None:
-    """Debounced redraw — the caret's live edit path, and where the adaptive
+    """Debounced redraw: the caret's live edit path, and where the adaptive
     toggle lands. Turning adaptive on refits an unfitted position as the
     navigator arrives on it."""
     wiz, _tree = _wizard(session, plot)

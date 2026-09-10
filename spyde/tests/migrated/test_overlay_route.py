@@ -908,6 +908,18 @@ class TestReaderOverride:
         summed = _read_through_override(_RegionReader((4, 4)), points)
         assert np.array_equal(summed, np.full((4, 4), 12.0))
 
+    def test_an_integer_region_rounds_back_to_its_dtype(self):
+        """The dtype parity rule of the base read: an integer source integrates
+        to a ROUNDED integer frame, not a truncated one."""
+        from spyde.drawing.update_functions import _read_through_override
+
+        # Values 1 and 2 over two points: the mean is 1.5, which truncates to
+        # 1 and rounds to 2 (numpy rounds a half to even).
+        counts = _RampReader((4, 4), dtype=np.uint16)
+        got = _read_through_override(counts, np.array([[0, 1], [1, 1]]))
+        assert got.dtype == np.uint16
+        assert np.array_equal(got, np.full((4, 4), 2, dtype=np.uint16)), got[0, 0]
+
 
 class TestNodeSwitch:
     def test_switching_to_a_sibling_clears_the_overlay(self):

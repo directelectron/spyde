@@ -1065,7 +1065,8 @@ def _read_through_override(override, indices):
     An override owns its region rule and states it with ``region_frame``: the
     vectors window sums per-position maxima, a count map sums counts, a
     progressive result shows the region's centre. One without it gets the mean
-    of its frames, in the frames' own dtype."""
+    of its frames, rounded back to the frames' own dtype so an integer source
+    integrates to the same numbers the base read gives it."""
     idx = np.asarray(indices)
     if idx.ndim <= 1:
         point = tuple(int(v) for v in np.atleast_1d(idx))
@@ -1087,7 +1088,12 @@ def _read_through_override(override, indices):
             return None
         frame = np.asarray(frame)
         total = frame.astype(np.float64) if total is None else total + frame
-    return None if total is None else (total / n_points).astype(frame.dtype)
+    if total is None:
+        return None
+    mean = total / n_points
+    if np.issubdtype(frame.dtype, np.integer):
+        mean = np.rint(mean)
+    return mean.astype(frame.dtype)
 
 
 def update_from_navigation_selection(

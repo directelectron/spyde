@@ -1355,6 +1355,16 @@ class BaseSignalTree:
         else:
             self._reader_overrides[key] = (signal, plot, reader)
 
+    def drop_reader_overrides(self, plot) -> None:
+        """Forget every reader pinned for ``plot``. Called when that window
+        closes: a pin is keyed by the window, so one left behind outlives the
+        thing it describes."""
+        overrides = getattr(self, "_reader_overrides", None)
+        if not overrides:
+            return
+        for key in [k for k in overrides if k[1] == id(plot)]:
+            del overrides[key]
+
     def reader_override_for(self, signal, plot=None):
         """The reader pinned for ``signal`` on ``plot``, or for the signal on
         every window, or None. A window's own pin wins. On the read path, so it

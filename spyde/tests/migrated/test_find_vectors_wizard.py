@@ -176,7 +176,7 @@ class TestPreviewBeamstop:
     def test_the_mask_is_drawn_on_nav_paint_and_goes_with_the_node(self):
         """The stop is a group of the preview node like any other: its value
         rides every evaluation, it is pushed on the painter thread, and
-        removing the node clears it — nothing keeps a mask alive past the
+        removing the node clears it, so nothing keeps a mask alive past the
         caret that put it there."""
         from spyde.actions.find_vectors_action import fv_open, fv_close
 

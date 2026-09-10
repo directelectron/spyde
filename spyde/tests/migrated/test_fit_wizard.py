@@ -1373,7 +1373,7 @@ class TestFitsWhatIsOnScreen:
         """Driven through the navigator selector, the way a drag does it.
 
         The caret's position IS the index the frame read prepared, and its
-        spectrum is the frame that read produced — not a second reading of the
+        spectrum is the frame that read produced, not a second reading of the
         selector that could resolve the position differently. That is what
         makes the store's key and the display agree by construction."""
         from spyde.drawing.update_functions import _prepare_nav_indices
@@ -1450,9 +1450,17 @@ def _navigate(wiz, index, spectrum=None):
         spectrum = np.asarray(wiz.signal.data, float)[index]
     row = wiz.store.get(index) if wiz.store is not None else None
     arrived = index != wiz.position
-    wiz._drew({"components": [], "position": index, "spectrum": spectrum,
-               "recall": row if (row is not None and arrived) else None,
-               "status": None})
+    _deliver(wiz, {"components": [], "position": index, "spectrum": spectrum,
+                   "recall": row if (row is not None and arrived) else None,
+                   "status": None})
+
+
+def _deliver(wiz, value):
+    """Hand a value to the caret and wait for what it marshals to the main
+    thread, which is where the model write and the state message happen."""
+    from spyde.tests.migrated._async import drain_loop
+    wiz._drew(value)
+    drain_loop(wiz.session)
 
 
 class TestPerPositionMemory:
@@ -1475,7 +1483,7 @@ class TestPerPositionMemory:
             wiz.spectrum, np.asarray(wiz.signal.data, float)[2, 3])
 
     def test_no_position_means_nothing_is_stored(self, window, fitted):
-        """Before the curves have been drawn anywhere there is no position —
+        """Before the curves have been drawn anywhere there is no position,
         and `remember` then stores nothing rather than inventing a key that
         would collide with every other position that also had none."""
         session, plot, tree, _ = fitted
@@ -1564,11 +1572,102 @@ class TestPerPositionMemory:
         assert tree._fit_wizard.recall() is True
 
 
+class _QueueingSession:
+    """A session whose ``_dispatch_to_main`` queues instead of running, and
+    records the thread each hand-off came from."""
+
+    def __init__(self, real):
+        self._real = real
+        self.queued = []
+        self.dispatched_from = []
+
+    def _dispatch_to_main(self, fn):
+        self.dispatched_from.append(threading.current_thread().name)
+        self.queued.append(fn)
+
+    def drain(self):
+        while self.queued:
+            self.queued.pop(0)()
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+class TestTheDeliveryIsMarshalled:
+    """A value callback runs on the painter thread, which may not write the
+    model or send a message.
+
+    The model is edited by every handler on the main thread and read by the
+    curves on the navigator's, so a third writer is a race however small; and
+    a message must leave from the main thread. `_drew` rebinds its own record
+    of the position and hands the rest over.
+    """
+
+    def _wizard(self, session, plot, tree):
+        fit_open(session, plot, {})
+        fit_add_component(session, plot, {"kind": "Offset"})
+        wiz = tree._fit_wizard
+        wiz.session = _QueueingSession(session)
+        return wiz
+
+    def _delivery(self, wiz, index, recall):
+        return {"components": [], "position": tuple(index),
+                "spectrum": np.asarray(wiz.signal.data, float)[tuple(index)],
+                "recall": recall, "status": None}
+
+    def test_the_model_write_and_the_state_leave_the_painter(self, window,
+                                                             fitted):
+        session, plot, tree, _ = fitted
+        wiz = self._wizard(session, plot, tree)
+        before = wiz.spec["Offset"]["offset"].value
+
+        emitted_on = []
+        real_emit = wiz.emit_state
+        wiz.emit_state = lambda status=None: (
+            emitted_on.append(threading.current_thread().name),
+            real_emit(status))
+
+        delivery = self._delivery(wiz, (1, 2), [42.0])
+        painter = threading.Thread(target=lambda: wiz._drew(delivery),
+                                   name="nav-paint")
+        painter.start()
+        painter.join(5.0)
+
+        # The painter recorded where the drawing is and handed the rest over.
+        assert wiz.position == (1, 2)
+        assert wiz.spec["Offset"]["offset"].value == before, \
+            "the model was written from the painter thread"
+        assert emitted_on == [], "the state was emitted from the painter thread"
+        assert wiz.session.dispatched_from == ["nav-paint"]
+
+        wiz.session.drain()
+        assert wiz.spec["Offset"]["offset"].value == pytest.approx(42.0)
+        assert emitted_on == [threading.current_thread().name]
+
+    def test_deliveries_apply_in_the_order_they_were_handed_over(self, window,
+                                                                 fitted):
+        """Dispatch order is the whole ordering guarantee: a value landing
+        while a drag is in flight is applied after the edit that preceded it,
+        never on top of a half-written model."""
+        session, plot, tree, _ = fitted
+        wiz = self._wizard(session, plot, tree)
+
+        wiz._drew(self._delivery(wiz, (0, 0), [11.0]))
+        wiz._on_widget_drag("Offset", "anchor:0", {"x": 25.0, "y": 33.0})
+        dragged = wiz.spec["Offset"]["offset"].value
+        wiz._drew(self._delivery(wiz, (1, 1), [22.0]))
+
+        assert wiz.spec["Offset"]["offset"].value == dragged, \
+            "a queued delivery wrote the model before the drag it followed"
+        wiz.session.drain()
+        assert wiz.spec["Offset"]["offset"].value == pytest.approx(22.0)
+
+
 class TestTheStoreIndexesOneWay:
     """A position becomes a row in exactly one place.
 
     `FitStore._key` answers "which position is this" and `flat_index` answers
-    "which row of a whole-scan result is it" — and they were derived
+    "which row of a whole-scan result is it", and they were derived
     separately, one reading the indices as given and the other reversing them.
     On a square scan both look right and every position quietly shows its
     transpose's fit.
@@ -1638,7 +1737,7 @@ class TestAdaptiveFit:
 
         value = _draw_curves(wiz, (0, 0), adaptive=True)
         np.testing.assert_allclose(value["recall"], [42.0])
-        wiz._drew(value)
+        _deliver(wiz, value)
         assert wiz.spec["Offset"]["offset"].value == pytest.approx(42.0)
 
     def test_adaptive_off_leaves_the_model_alone(self, window, fitted):
@@ -1648,7 +1747,7 @@ class TestAdaptiveFit:
         wiz = tree._fit_wizard
         before = wiz.spec["Offset"]["offset"].value
         value = _draw_curves(wiz, (3, 3), adaptive=False)
-        wiz._drew(value)
+        _deliver(wiz, value)
         assert wiz.spec["Offset"]["offset"].value == before
         assert tree.fit_store.is_set((3, 3)) is False
         # The model as it stands is still what is drawn against the spectrum.
@@ -1685,16 +1784,16 @@ class TestAdaptiveFit:
 
         fit_action.fit_one_spectrum = counting
         try:
-            wiz._drew(_draw_curves(wiz, (0, 0), adaptive=True))
+            _deliver(wiz, _draw_curves(wiz, (0, 0), adaptive=True))
             assert len(fits) == 1
-            wiz._drew(_draw_curves(wiz, (0, 0), adaptive=True))
+            _deliver(wiz, _draw_curves(wiz, (0, 0), adaptive=True))
             assert len(fits) == 1, "the position was fitted a second time"
         finally:
             fit_action.fit_one_spectrum = real
 
     def test_every_delivery_sends_the_state(self, window, fitted):
         """The caret rebuilds itself from `fit_state`, so a delivery that drew
-        nothing must still say so — a silent one leaves the numbers showing the
+        nothing must still say so: a silent one leaves the numbers showing the
         previous position's answers."""
         session, plot, tree, _ = fitted
         fit_open(session, plot, {})
@@ -1702,19 +1801,19 @@ class TestAdaptiveFit:
 
         # 1. no components at all
         n = len(_messages_of(window, "fit_state"))
-        wiz._drew(_draw_curves(wiz, (3, 3)))
+        _deliver(wiz, _draw_curves(wiz, (3, 3)))
         assert len(_messages_of(window, "fit_state")) > n, "no model: silent"
 
         # 2. a model, but nothing stored here
         fit_add_component(session, plot, {"kind": "Offset"})
         n = len(_messages_of(window, "fit_state"))
-        wiz._drew(_draw_curves(wiz, (3, 3)))
+        _deliver(wiz, _draw_curves(wiz, (3, 3)))
         assert len(_messages_of(window, "fit_state")) > n, "nothing stored: silent"
 
         # 3. a stored fit to show
         tree.fit_store.put((0, 0), wiz.spec.flat_values(), chisq=1.0)
         n = len(_messages_of(window, "fit_state"))
-        wiz._drew(_draw_curves(wiz, (0, 0)))
+        _deliver(wiz, _draw_curves(wiz, (0, 0)))
         assert len(_messages_of(window, "fit_state")) > n, "a stored fit: silent"
 
     def test_drawing_with_no_model_draws_no_curves(self, window, fitted):

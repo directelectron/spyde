@@ -144,7 +144,7 @@ export function FitWizard({ caretPos, windowId, sendAction, onClose }: Props) {
     setPoor(d.poor_count ?? 0)
     if (d.stored_models) setStoredModels(d.stored_models)
     // TEST SEAM. The backend draws this position's curves and THEN emits this
-    // state, both down the same ordered stdout protocol — so the arrival of a
+    // state, both down the same ordered stdout protocol, so the arrival of a
     // fit_state proves this position's curves have already landed. That makes
     // this counter the only sound "the curves are now this position's" signal
     // available to e2e; everything else is a guess about quiescence, and a

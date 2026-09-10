@@ -249,6 +249,27 @@ class TestRawFrameToggle:
         finally:
             close_session(session)
 
+    def test_closing_a_window_takes_its_pin_with_it(self):
+        """A pin is keyed by the window, so one left behind outlives the thing
+        it describes and would answer for a plot object nobody holds."""
+        session = make_session()
+        try:
+            session._add_signal(_lazy_movie(), source_path=None)
+            _settle(session)
+            tree = session.signal_trees[-1]
+            plot = tree.signal_plots[0]
+            signal = plot.plot_state.current_signal
+            selector = next(
+                s for s in tree.navigator_plot_manager.all_navigation_selectors
+                if plot in s.children)
+
+            install(selector, True)
+            assert tree.reader_override_for(signal, plot) is not None
+            plot.close()
+            assert tree._reader_overrides == {}
+        finally:
+            close_session(session)
+
     def test_raw_mode_on_a_signal_that_cannot_serve_it_reads_nothing(self):
         """The reader answers None rather than raising when the signal is not an
         event stream, so the navigator keeps the last frame."""

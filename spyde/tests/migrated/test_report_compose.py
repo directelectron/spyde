@@ -898,7 +898,10 @@ class TestLayeredAddToReport:
         # so _snapshot_plot serializes the layer without a real second window.
         class _StubSource:
             def __init__(self, frame):
+                # What a window shows: a real Plot answers with the transform
+                # image while one is up, else the frame it read.
                 self.current_data = frame
+                self.displayed_data = frame
                 self.view_label = "Overlay Src"
                 self.is_navigator = False
                 self.signal_tree = sig_plot.signal_tree

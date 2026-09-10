@@ -918,7 +918,7 @@ class Plot:
         The ``mask`` group kind, so it is pushed on the painter thread with
         every other overlay value; the detected beam-stop region during Find
         Vectors is the one that uses it. The mask is composited client-side in
-        the anyplotlib iframe — no recompute, no new image push. ``None``
+        the anyplotlib iframe, with no recompute and no new image push. ``None``
         clears it.
 
         The mask must match the displayed image's (H, W); if it doesn't (e.g. a
@@ -1733,6 +1733,15 @@ class Plot:
             close_all_readers(self)
         except Exception as e:
             logger.debug("closing frame readers on plot close failed: %s", e)
+        # A reader pinned for THIS window only (a viewing mode such as CSB raw)
+        # goes with it, or the tree keeps an entry keyed by a plot nobody holds.
+        tree = self.signal_tree
+        if tree is not None:
+            try:
+                tree.drop_reader_overrides(self)
+            except Exception as e:
+                logger.debug("dropping this window's reader overrides on plot "
+                             "close failed: %s", e)
         # Drop any MDI overlay layers ON this plot (their anyplotlib handles) AND
         # any layers on OTHER plots that source FROM this one — so closing either a
         # target or a source leaves no dangling handle / stale composited image.
