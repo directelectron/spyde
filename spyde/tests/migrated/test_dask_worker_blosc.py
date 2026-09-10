@@ -14,7 +14,9 @@ def unpatched(monkeypatch):
     import numcodecs.blosc as blosc
     from spyde.external.numcodecs import blosc_threads
 
-    saved = {name: getattr(blosc, name) for name in ("compress", "decompress")}
+    saved = {name: getattr(blosc, name)
+             for name in ("compress", "decompress", "decompress_partial")
+             if hasattr(blosc, name)}
     originals = {name: getattr(fn, "__wrapped__", fn) for name, fn in saved.items()}
     for name, fn in originals.items():
         monkeypatch.setattr(blosc, name, fn)
