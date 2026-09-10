@@ -239,6 +239,84 @@ class _MoviePrefetcher:
 _movie_prefetcher = _MoviePrefetcher()
 
 
+def _step_signs(previous_point, point):
+    """Direction of travel per navigation axis: -1, 0 or +1."""
+    return tuple(int(np.sign(int(point[k]) - int(previous_point[k])))
+                 for k in range(len(point)))
+
+
+def _next_chunk_position(reader, point, signs, nav_shape):
+    """The first position past the chunk boundary ``point`` is travelling
+    towards, per axis, or None when the reader has no chunks.
+
+    An axis that is not moving keeps its position, so a drag straight along x
+    aims at the next chunk along x and stays in the same row of chunks.
+    """
+    span = getattr(reader, "chunk_span", None)
+    span = span(point) if span is not None else None
+    if span is None:
+        return None
+    ahead = []
+    for axis, (start, stop) in enumerate(span):
+        position = int(point[axis])
+        if signs[axis] > 0:
+            position = stop
+        elif signs[axis] < 0:
+            position = start - 1
+        ahead.append(int(np.clip(position, 0, int(nav_shape[axis]) - 1)))
+    return tuple(ahead)
+
+
+BYTE_WARM_VARIABLE = "SPYDE_NAV_BYTE_WARM"
+
+
+def _byte_warm_enabled() -> bool:
+    """Whether to prepay the disk read of the chunk after the prefetch target.
+
+    Off, because on the file this was measured on it made every drag slower.
+    The one read-ahead thread spends 20 to 50 ms reading those bytes instead of
+    decoding the chunk the drag reaches next, and on a fast disk that read is a
+    small part of a crossing anyway: with it the crossings on a 60-step drag
+    cost a median 111 ms against 103 ms without, over chunks nothing had
+    touched, and 79 ms against 52 ms with the file's pages already cached. A
+    slow drag lost hits to it too. It is kept for a machine whose disk is the
+    expensive half, where prepaying may be worth the thread.
+    """
+    return _os.environ.get(BYTE_WARM_VARIABLE, "0") not in ("", "0")
+
+
+def _warm_chunk_bytes(reader, point) -> None:
+    """Read the compressed bytes of the chunk holding ``point`` and throw them
+    away, so the operating system's page cache holds them when that chunk is
+    decoded for real.
+
+    Only for a zarr 2 backing: it is the one that exposes its chunk keys and
+    the store they live in. Any other reader has no such thing and is skipped.
+    """
+    source = getattr(reader, "source", None)
+    store = getattr(source, "chunk_store", None)
+    chunk_key = getattr(source, "_chunk_key", None)
+    grid_shape = getattr(source, "cdata_shape", None)
+    if store is None or chunk_key is None or grid_shape is None:
+        return
+    coordinates = tuple(int(p) // int(c)
+                        for p, c in zip(point, source.chunks))
+    if any(c < 0 or c >= int(grid_shape[axis])
+           for axis, c in enumerate(coordinates)):
+        return
+    # The nav chunk spans every chunk of the signal axes, which is one chunk
+    # under the storage-aligned chunking SpyDE loads with. Reading them all is
+    # exactly the bytes the decode will ask for, so this is bounded by one
+    # block however the signal axes are cut.
+    tails = itertools.product(
+        *(range(int(n)) for n in grid_shape[len(coordinates):]))
+    for tail in tails:
+        try:
+            store[chunk_key(coordinates + tail)]
+        except KeyError:
+            return                  # never written; nothing to warm
+
+
 class _BlockPrefetcher:
     """Warm the nav-CHUNK block a 2-D drag is heading into, off the dispatcher.
 
@@ -248,11 +326,24 @@ class _BlockPrefetcher:
     are the only remaining stalls, and they are predictable: a drag has velocity,
     so the chunk it is about to enter can be decoded before it is asked for.
 
-    Extrapolates the last step one ROI-length ahead, and decodes that block through
-    the SAME reader — so the result lands in the plot's BlockCache and the
-    dispatcher's next read is a hit. Latest-target-wins (a newer position replaces
-    the pending one), single daemon thread, and every failure is swallowed: this is
-    pure speculation, so being wrong must cost nothing but wasted background work.
+    Aims at the first position past the chunk boundary it is travelling towards,
+    and decodes that block through the SAME reader, so the result lands in the
+    plot's BlockCache and the dispatcher's next read is a hit. Aiming a fixed
+    number of positions ahead instead misses: a drag of one position per step is
+    still inside its own chunk two positions later, so on a real .zspy the
+    read-ahead warmed a chunk that was already warm and every crossing decoded on
+    the dispatcher.
+
+    With SPYDE_NAV_BYTE_WARM set it then reads the compressed bytes of the chunk
+    after that and drops them, so the disk read is already paid when its turn
+    comes. Off by default because it measured slower on every drag tried; see
+    _byte_warm_enabled.
+
+    Latest-target-wins (a newer position replaces the pending one), single daemon
+    thread, and every failure is swallowed: this is pure speculation, so being
+    wrong must cost nothing but wasted background work. If the drag beats the
+    read-ahead to a chunk, the dispatcher waits for that decode rather than
+    starting a second one, in BlockCache.get_or_load.
 
     Distinct from _MoviePrefetcher, which warms the OS page cache for 1-D time
     scrubs; this warms the DECODED-block cache for 2-D nav. Both are latest-wins.
@@ -260,30 +351,38 @@ class _BlockPrefetcher:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._target = None         # (plot, signal, data, point)
+        self._target = None         # (plot, signal, data, point, signs)
         self._pending = False
         self._wake = threading.Event()
         self._thread = None
 
     def prime(self, plot, signal, data, prev_point, point, reach: int) -> None:
-        """Queue a speculative decode of the block ``reach`` positions along the
-        travel direction. No-op without a previous point (no velocity yet)."""
+        """Queue a speculative decode of the chunk the drag is heading into.
+
+        ``reach`` is the fallback lookahead in positions, used only when the
+        reader has no chunks to aim at. No-op without a previous point (no
+        velocity yet)."""
         if plot is None or prev_point is None or point is None:
             return
         try:
             if len(prev_point) != len(point) or len(point) < 2:
                 return              # 2-D nav only; 1-D is _MoviePrefetcher's job
-            delta = [int(point[k]) - int(prev_point[k]) for k in range(len(point))]
-            if not any(delta):
+            signs = _step_signs(prev_point, point)
+            if not any(signs):
                 return              # not moving — nothing to guess
             nav_shape = data.shape[:len(point)]
-            ahead = tuple(
-                int(np.clip(int(point[k]) + delta[k] * reach, 0, nav_shape[k] - 1))
-                for k in range(len(point)))
+            reader = plot._local_transform_readers.get(id(signal))
+            ahead = (_next_chunk_position(reader, point, signs, nav_shape)
+                     if reader is not None else None)
+            if ahead is None:
+                ahead = tuple(
+                    int(np.clip(int(point[k]) + signs[k] * reach,
+                                0, nav_shape[k] - 1))
+                    for k in range(len(point)))
         except Exception:
             return
         with self._lock:
-            self._target = (plot, signal, data, ahead)
+            self._target = (plot, signal, data, ahead, signs)
             self._pending = True
             if self._thread is None:
                 self._thread = threading.Thread(
@@ -302,14 +401,22 @@ class _BlockPrefetcher:
                 target = self._target
             if target is None:
                 continue
-            plot, signal, data, point = target
+            plot, signal, data, point, signs = target
             try:
                 from spyde.array_cache import (
                     get_local_frame, is_local_frame_resident,
                 )
-                if is_local_frame_resident(plot, signal, data, np.asarray(point)):
-                    continue                    # already warm
-                get_local_frame(plot, signal, data, np.asarray(point))
+                if not is_local_frame_resident(plot, signal, data,
+                                               np.asarray(point)):
+                    get_local_frame(plot, signal, data, np.asarray(point))
+                if self._wake.is_set() or not _byte_warm_enabled():
+                    continue        # a newer target arrived, or the byte warm is off
+                reader = plot._local_transform_readers.get(id(signal))
+                further = (_next_chunk_position(reader, point, signs,
+                                                data.shape[:len(point)])
+                           if reader is not None else None)
+                if further is not None and further != point:
+                    _warm_chunk_bytes(reader, further)
             except Exception as e:
                 log.debug("nav block prefetch at %s failed: %s", point, e)
 
@@ -639,8 +746,10 @@ def _direct_read_frame(current_signal, selector, indices, prof, child=None):
                            else tuple(int(v) for v in np.atleast_1d(idx)))
                     prev = getattr(child, "_prefetch_prev_point", None)
                     child._prefetch_prev_point = cur
-                    # Reach one region-extent ahead so the block is decoded before
-                    # the ROI's leading edge arrives; a point gets a short lookahead.
+                    # A reader with chunks is aimed at its next chunk boundary
+                    # and ignores this. It is the lookahead for a reader without
+                    # one: a region-extent ahead so the block is there before the
+                    # ROI's leading edge arrives, a short step for a point.
                     reach = int(np.ptp(idx[:, 0])) + 1 if is_region else 2
                     _block_prefetcher.prime(child, current_signal, data,
                                             prev, cur, max(2, reach))

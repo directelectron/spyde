@@ -219,6 +219,32 @@ class SourceArrayReader:
         else:
             self._memo = (key, block)
 
+    def _load_block(self, key, nav_slices):
+        """The decoded block for ``key``, reading it from the store on a miss.
+
+        Through the cache's ``get_or_load``, so the prefetcher and the
+        dispatcher chasing the same chunk decode it once between them instead
+        of twice at the same time."""
+        if self._block_cache is None:
+            block = self._cached_block(key)
+            if block is None:
+                block = np.asarray(self.source[tuple(nav_slices)])
+                self._store_block(key, block)
+            return block
+        return self._block_cache.get_or_load(
+            id(self), key, lambda: np.asarray(self.source[tuple(nav_slices)]))
+
+    def chunk_span(self, point):
+        """``(start, stop)`` of the storage chunk holding ``point``, one pair
+        per navigation axis, or None when this reader reads frame at a time.
+
+        The read-ahead uses it to aim at the first position past the boundary
+        it is travelling towards."""
+        located = self._locate(tuple(int(v) for v in point[:self._nav_ndim]))
+        if located is None:
+            return None
+        return tuple((int(s.start), int(s.stop)) for s in located[1])
+
     def is_chunk_resident(self, indices) -> bool:
         """Is the decoded storage chunk holding ``indices`` already cached —
         i.e. would read_frame be a ~0 ms numpy slice? Side-effect-free; feeds
@@ -267,10 +293,7 @@ class SourceArrayReader:
 
         acc = None
         for key, (nav_slices, pts) in groups.items():
-            block = self._cached_block(key)
-            if block is None:
-                block = np.asarray(self.source[tuple(nav_slices)])
-                self._store_block(key, block)
+            block = self._load_block(key, nav_slices)
             part = _sum_block_points(block, nav_slices, pts, self._nav_ndim,
                                      out_dtype)
             acc = part if acc is None else acc + part
@@ -285,10 +308,7 @@ class SourceArrayReader:
             frame = np.asarray(self.source[point])
         else:
             key, nav_slices = located
-            block = self._cached_block(key)
-            if block is None:
-                block = np.asarray(self.source[tuple(nav_slices)])
-                self._store_block(key, block)
+            block = self._load_block(key, nav_slices)
             local = tuple(point[ax] - nav_slices[ax].start
                           for ax in range(self._nav_ndim))
             frame = block[local]

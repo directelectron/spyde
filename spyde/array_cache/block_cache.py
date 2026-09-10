@@ -33,8 +33,15 @@ warms frames from a compute-backend worker thread while the ``_NavDispatcher``
 reads on its own thread, so the bookkeeping IS locked. The lock covers ONLY the
 dict bookkeeping, NEVER the decode — holding a lock across a compute is the
 retired ``_cache_lock_ctx`` mistake that wedged the navigator (Live-Display
-Section 2). Two threads may both miss and both decode the same block; that is
-harmless, last insert wins.
+Section 2).
+
+Two threads asking for the SAME block go through :meth:`BlockCache.get_or_load`,
+where the second waits on the first's result instead of decoding it again. That
+wait is bounded by one decode and is only ever taken for a block the waiter
+needs, which is what makes it safe on the dispatcher: the prefetcher and the
+dispatcher chase the same chunk constantly, and without it a drag that outran
+its read-ahead paid the decode twice, in parallel, over one thread pool.
+Different blocks never wait on each other.
 
 Cached blocks are SHARED and must be treated as READ-ONLY — readers slice a
 frame out and copy it, never mutate the block.
@@ -43,6 +50,7 @@ from __future__ import annotations
 
 import threading
 from collections import OrderedDict
+from concurrent.futures import Future
 from typing import Any
 
 import numpy as np
@@ -76,6 +84,10 @@ class BlockCache:
         self._budget_bytes = int(budget_bytes)
         self._full_budget_bytes = int(budget_bytes)
         self._lock = threading.Lock()   # bookkeeping only — never held across a decode
+        # Blocks being decoded right now, keyed the same way as _entries. A
+        # second caller for one of these waits on its future rather than
+        # decoding it a second time.
+        self._loading: "dict[tuple[Any, Any], Future]" = {}
 
     # -- lookup ------------------------------------------------------------
 
@@ -99,6 +111,43 @@ class BlockCache:
             self._entries[key] = block
             self._nbytes += nbytes
             self._evict_over_budget()
+
+    def get_or_load(self, owner_key: Any, block_index: Any, load) -> np.ndarray:
+        """Return the decoded block, decoding it with ``load()`` on a miss.
+
+        Exactly one caller per key runs ``load``; the others wait for its
+        result. The wait is bounded by that one decode, and a caller only ever
+        waits for a block it asked for, so the dispatcher waiting here is
+        waiting for its own frame.
+
+        ``load`` runs with no lock held: holding one across a decode is what
+        wedged the navigator before (see the module docstring).
+        """
+        key = (owner_key, block_index)
+        with self._lock:
+            block = self._entries.get(key)
+            if block is not None:
+                self._entries.move_to_end(key)
+                return block
+            pending = self._loading.get(key)
+            mine = pending is None
+            if mine:
+                pending = self._loading[key] = Future()
+        if not mine:
+            return pending.result()
+
+        try:
+            block = load()
+        except BaseException as error:
+            with self._lock:
+                self._loading.pop(key, None)
+            pending.set_exception(error)
+            raise
+        self.put(owner_key, block_index, block)
+        with self._lock:
+            self._loading.pop(key, None)
+        pending.set_result(block)
+        return block
 
     def contains(self, owner_key: Any, block_index: Any) -> bool:
         """Side-effect-free residency probe — does NOT LRU-touch, so it is safe

@@ -1,5 +1,5 @@
 """
-spyde.external.numcodecs — patches to numcodecs, the codec layer zarr reads
+spyde.external.numcodecs: patches to numcodecs, the codec layer zarr reads
 compressed chunks through.
 
 Each module here documents WHAT / WHY / WHEN-TO-REMOVE and exposes an idempotent,
