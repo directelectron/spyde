@@ -10,12 +10,11 @@ process-wide lock. ``Blosc.encode``, ``Blosc.decode`` and
 ``Blosc.decode_partial`` look those names up in the module at call time, so
 every zarr read and write in THIS process goes through the wrappers.
 
-This process only. Dask's workers are separate processes, spawned by
-``LocalCluster``, and nothing in them calls ``ensure_heavy_imports``, so they
-never see this patch: they keep numcodecs' default, which off the main thread
-is the single-threaded path that never touches the global pool. They need no
-lock and decode exactly as they did. The batch numbers below were measured on
-dask's threaded scheduler, in this process, which is where the patch applies.
+Applied twice: by ``ensure_heavy_imports`` in the backend process, and by the
+worker plugin (``dask_manager._WorkerTuningPlugin.setup``) in every dask worker
+process, which is a separate spawned process with its own pool and its own
+lock. Every task in a worker runs on a worker thread, so without the plugin a
+worker decodes single-threaded and the batch's parallelism is dask's alone.
 
 ``SPYDE_BLOSC_THREADS=0`` applies nothing, which is the A/B switch. Unset uses
 :data:`DEFAULT_THREAD_COUNT`; any other number sets that thread count.
