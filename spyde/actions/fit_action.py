@@ -35,6 +35,7 @@ from spyde.fitting.components import EELS_EDGE_KIND
 from spyde.fitting.store import FitStore
 from spyde.actions.context import src_plot_tree as _src_plot_tree
 from de_shell.actions.wizard import WizardController
+from spyde.drawing.overlay_node import NavigationPosition
 from spyde.drawing.selectors.base_selector import event_handler_fn
 # Imported as a MODULE, not `from ... import emit`. The test fixture patches
 # `ipc.emit` to capture outgoing messages, and a from-import binds the original
@@ -168,14 +169,112 @@ _ANCHORS = {
 }
 
 
-def evaluate_component(comp, xs) -> np.ndarray:
-    """A component's own curve at *xs*, through the torch components."""
+def model_curve(spec, values, xs) -> np.ndarray:
+    """A model's curve at *xs* for the packed parameter vector *values*.
+
+    Through :func:`spyde.fitting.components.evaluate`, the one evaluator the
+    fit itself uses, so what is drawn and what is fitted can never be two
+    different functions.
+    """
     import torch
     from spyde.fitting import components as tcomp
-    vals = np.array([[p.value for p in comp.scalar_parameters]])
-    return tcomp.component_for(comp)(
-        torch.as_tensor(np.asarray(xs, float)),
-        torch.as_tensor(vals)).numpy()[0]
+    return tcomp.evaluate(
+        spec, torch.as_tensor(np.asarray(xs, float)),
+        torch.as_tensor(np.asarray(values, float).reshape(1, -1))).numpy()[0]
+
+
+def component_curve(cspec, xs) -> np.ndarray:
+    """One component's own curve at *xs*, at the values it currently holds."""
+    from spyde.fitting import ModelSpec
+    return model_curve(ModelSpec(components=[cspec]),
+                       [p.value for p in cspec.scalar_parameters], xs)
+
+
+class FitStoreRows:
+    """The parameters stored at one navigation position, as the curves node's
+    per-position argument.
+
+    Holds the TREE rather than the store: changing the component list rebuilds
+    the store, because the packed parameter width changes with it, and the
+    rows must come from whichever store the tree holds now.
+    """
+
+    def __init__(self, tree):
+        self.tree = tree
+
+    def at(self, *index):
+        store = getattr(self.tree, "fit_store", None)
+        return None if store is None else store.get(tuple(index))
+
+
+def fit_one_spectrum(spec, spectrum, x, max_iter: int = 120):
+    """Fit ONE spectrum with the batched engine.
+
+    Returns ``(values, chi squared, status)``: the packed parameters, how well
+    they fit, and the line the caret shows beside them. The same engine and the
+    same model a whole-scan run uses; only the data is one row.
+
+    Raises whatever the engine raises: a caller on the navigator's thread logs
+    and draws nothing, a caller on a button reports it.
+    """
+    from spyde.fitting.engine import fit_batched
+
+    result = fit_batched(spec, np.asarray(spectrum, float)[None, :], x,
+                         device="cpu", max_iter=int(max_iter))
+    converged = "converged" if bool(result.converged[0]) else "did not converge"
+    return (result.values[0], float(result.chisq[0]),
+            f"This spectrum {converged} (chi2 {result.chisq[0]:.3g}).")
+
+
+def model_curves(spectrum, *, values, position, caret, x, colors, adaptive,
+                 max_iter) -> dict:
+    """The model's curves over the spectrum at one navigation position.
+
+    One line per active component in its own colour, then the dashed sum. The
+    model and the store are reached through ``caret`` because both are replaced
+    when the component list changes, and the drawing must never be a model
+    older than the one being fitted.
+
+    ``values`` is the row stored for this position, or None when nothing has
+    been fitted here. A position with a stored fit shows that fit as the
+    navigator arrives on it; with adaptive fitting on, an unfitted position is
+    fitted now and the answer stored, which is the only thing this writes.
+    Otherwise the model as it stands is drawn against the new spectrum.
+    """
+    spec = caret.spec
+    spectrum = np.asarray(spectrum, float).squeeze()
+    status = None
+    # A repeat of the position the caret is already on is a redraw of an edit,
+    # so the model wins; arriving somewhere new is what recalls a stored fit.
+    arrived = position != caret.position
+    if values is not None and arrived:
+        drawn = np.asarray(values, float)
+    elif values is None and adaptive and len(spec.active_components):
+        drawn, chisq, status = fit_one_spectrum(spec, spectrum, x, max_iter)
+        store = getattr(caret.tree, "fit_store", None)
+        if store is not None:
+            store.put(position, drawn, chisq=chisq)
+    else:
+        drawn = spec.flat_values()
+
+    from spyde.fitting import ModelSpec
+    curves, start = [], 0
+    for number, component in enumerate(spec.active_components):
+        width = len(component.scalar_parameters)
+        curves.append({
+            "data": (x, model_curve(ModelSpec(components=[component]),
+                                    drawn[start:start + width], x)),
+            "color": colors[number % len(colors)], "label": component.name,
+            "linewidth": 1.6,
+        })
+        start += width
+    if curves:
+        curves.append({"data": (x, model_curve(spec, drawn, x)),
+                       "color": "#cdd6f4", "label": "model",
+                       "linewidth": 1.8, "linestyle": "dashed"})
+    return {"components": curves, "position": position, "spectrum": spectrum,
+            "recall": drawn if (values is not None and arrived) else None,
+            "status": status}
 
 
 def _clip_to_bounds(param, value: float, span: float = 50.0) -> float:
@@ -200,7 +299,7 @@ def _solve_anchors(comp, kind: str, xs, ys) -> bool:
         # higher coefficients are its SHAPE and are left to the fit — a single
         # handle cannot determine order+1 coefficients, and pretending it can
         # would make the curve lurch.
-        y_now = float(evaluate_component(comp, [xs[0]])[0])
+        y_now = float(component_curve(comp, [xs[0]])[0])
         comp["a0"].value = float(comp["a0"].value) + float(ys[0]) - y_now
         return True
 
@@ -273,9 +372,16 @@ class FitWizard(WizardController):
         # fitted. `_ensure_store` (re)builds it whenever the component list
         # changes, because the packed width changes with it.
         self._ensure_store()
-        # One overlay line per component, plus the dashed sum.
-        self._comp_lines: dict = {}
-        self._sum_line = None
+        # The curves: an overlay child of the spectrum node, evaluated at the
+        # navigator's position through the readers the spectrum is read with.
+        self._curves = None
+        # Refit an unfitted position as the navigator arrives on it.
+        self.adaptive = False
+        # Where the curves were last drawn, and what they were drawn against.
+        # Both come from the overlay's own value, so the caret and the drawing
+        # cannot disagree about which spectrum is being fitted.
+        self.position = None
+        self.spectrum = None
         # component name -> {"point": widget, "range": widget, "info": ...}
         self._widgets: dict = {}
         # anyplotlib registers callbacks WEAKLY — a handler this object does
@@ -309,52 +415,89 @@ class FitWizard(WizardController):
     def axis(self) -> np.ndarray:
         return np.asarray(self.signal.axes_manager.signal_axes[0].axis, float)
 
-    # ── where the navigator is, and what was fitted there ─────────────────
-    def current_indices(self):
-        """The navigator's position, as a tuple, or None.
+    # -- the curves, and where they were drawn ----------------------------
+    def attach_curves(self) -> None:
+        """Draw the model on the spectrum, at the navigator's position.
 
-        Read from the SELECTOR, not the plot: ``current_indices`` lives on the
-        navigation selector. Looking for it on the Plot (as this first did)
-        always returned None, which is what made "Fit spectrum" silently fit
-        the navigation mean.
-
-        …and from the selector's LIVE geometry, not its ``current_indices``
-        snapshot. That attribute is written by ``_run_update`` on the
-        ``_NavDispatcher`` THREAD, while this runs on the asyncio main thread —
-        and the renderer sends ``fit_navigated`` off the same pointer event that
-        started the navigator update, so a handler can easily arrive before the
-        dispatcher has committed the new position. It then recalls the PREVIOUS
-        pixel's fit, and nothing re-fires to correct it: the caret sits on a
-        stale model until the next navigator move. ``get_selected_indices`` is
-        the same pure geometry call ``_run_update`` itself makes (the snapshot is
-        just its last result), so reading it here is the same number, only never
-        behind.
-
-        Which selector wins is unchanged — still the first with a committed
-        position — so this cannot resurrect the fit-the-navigation-mean bug
-        above; only the VALUE is made current.
+        The curves are an overlay child of the node the window displays, so
+        they are evaluated where every other display of that position is
+        evaluated and pushed on the painter thread behind the spectrum they
+        lie over. Nothing here follows the navigator itself.
         """
-        npm = getattr(self.tree, "navigator_plot_manager", None)
-        if npm is None:
-            return None
-        for sels in (getattr(npm, "navigation_selectors", {}) or {}).values():
-            for sel in sels:
-                idx = getattr(sel, "current_indices", None)
-                if idx is None:
-                    continue
-                try:
-                    live = sel.get_selected_indices()
-                    if live is not None:
-                        idx = live
-                except Exception as e:
-                    log.debug("live navigator indices unavailable (%s); "
-                              "using the dispatcher's snapshot", e)
-                try:
-                    flat = np.atleast_1d(np.asarray(idx)).ravel()
-                    return tuple(int(v) for v in flat)
-                except Exception as e:
-                    log.debug("reading navigator indices failed: %s", e)
-        return None
+        if self._curves is not None:
+            return
+        try:
+            self._curves = self.tree.add_overlay(
+                self.plot.plot_state.current_signal, model_curves, name="fit",
+                groups={"components": ("curves", {})},
+                static={"caret": self, "x": self.axis(),
+                        "colors": self._COMP_COLORS, "adaptive": False,
+                        "max_iter": 120},
+                iterating={"values": FitStoreRows(self.tree),
+                           "position": NavigationPosition()},
+                source=True, expensive=False, on_value=self._drew,
+            )
+        except Exception as e:
+            log.debug("attaching the fit curves failed: %s", e)
+
+    def redraw(self) -> None:
+        """Re-evaluate the curves at the navigator's position.
+
+        The model is read through this controller, so an edit is redrawn by
+        re-running the position rather than by pushing new lines: there is one
+        place that turns a model into curves, and it is the overlay's function.
+        """
+        if self._curves is None:
+            return
+        from spyde.drawing.overlays import refresh_overlays_for
+        refresh_overlays_for(self.tree)
+
+    def set_adaptive(self, adaptive: bool) -> None:
+        """Refit an unfitted position as the navigator arrives on it, or stop.
+
+        An adaptive move runs a fit, which is far too slow for the navigator
+        thread, so the node moves to the compute backend's overlay lane.
+        """
+        self.adaptive = bool(adaptive)
+        if self._curves is None:
+            return
+        self._curves.expensive = self.adaptive
+        self.tree.replace_overlay_static(self._curves, adaptive=self.adaptive)
+
+    def _drew(self, value) -> None:
+        """One delivery of the curves, on the painter thread.
+
+        The position and the spectrum are this controller's own record of where
+        the drawing is, so they are rebound here. Writing the MODEL and sending
+        the state are handed to the main thread instead: the model is edited
+        there by every handler and read on the navigator's thread by the curves
+        themselves, and a message must be emitted from there too. Marshalling
+        keeps a recall from landing in the middle of a drag, and keeps
+        deliveries in the order they arrived.
+        """
+        self.position = value.get("position")
+        self.spectrum = value.get("spectrum")
+        recalled, status = value.get("recall"), value.get("status")
+
+        def apply() -> None:
+            try:
+                if recalled is not None:
+                    self.spec.set_flat_values(recalled)
+                    self.update_widgets()
+                self.emit_state(status)
+            except Exception as e:
+                log.debug("delivering the fit curves failed: %s", e)
+
+        dispatch = getattr(self.session, "_dispatch_to_main", None)
+        if dispatch is None:
+            apply()
+            return
+        try:
+            dispatch(apply)
+        except Exception as e:
+            # Without a running loop the delivery still has to land.
+            log.debug("dispatching the fit curves failed: %s", e)
+            apply()
 
     # ── the per-position store ────────────────────────────────────────────
     @property
@@ -384,10 +527,10 @@ class FitWizard(WizardController):
         return store
 
     def remember(self, values, chisq: float | None = None) -> None:
-        """Store the fitted parameters for the CURRENT navigator position."""
+        """Store the fitted parameters for the position the curves are on."""
         store = self.store
         if store is not None:
-            store.put(self.current_indices(), values, chisq=chisq)
+            store.put(self.position, values, chisq=chisq)
 
     def record_run(self, result, nav_shape=None) -> int:
         """Record a whole-scan fit. Returns how many positions landed.
@@ -425,7 +568,7 @@ class FitWizard(WizardController):
     def recall(self) -> bool:
         """Load this position's stored fit into the model. True if there was one."""
         store = self.store
-        stored = store.get(self.current_indices()) if store is not None else None
+        stored = store.get(self.position) if store is not None else None
         if stored is None or len(stored) != len(self.spec.parameter_names()):
             return False
         self.spec.set_flat_values(stored)
@@ -442,160 +585,10 @@ class FitWizard(WizardController):
         if store is not None:
             store.clear()
 
-    def current_spectrum(self) -> np.ndarray:
-        """The spectrum ON SCREEN — what the preview and "Fit spectrum" fit.
-
-        ``plot.current_data`` is the authority: it is literally the array the
-        plot is displaying, already resolved through whatever navigator,
-        region-integration or derived-view path produced it.
-
-        Reconstructing it instead from ``signal.data`` and a navigator index was
-        wrong in a way that LOOKED like it worked. The index was not where this
-        expected, so it silently fell through to the mean over navigation — the
-        fit then converged happily against a spectrum nobody was looking at, and
-        the drawn model came out about half the height of the data with a
-        "converged" status next to it.
-        """
-        n = len(self.axis())
-        data = getattr(self.plot, "current_data", None)
-        if isinstance(data, np.ndarray):
-            arr = np.asarray(data, float).squeeze()
-            if arr.ndim == 1 and arr.size == n:
-                return arr
-
-        # No painted data yet (the caret can open before the first frame
-        # lands). The nav mean is a defensible stand-in for a PREVIEW, and the
-        # log line says so, because a fit against it is not what was asked for.
-        raw = np.asarray(self.signal.data, float)
-        if raw.ndim > 1:
-            log.debug("no painted spectrum yet — falling back to the "
-                      "navigation mean")
-            return raw.reshape(-1, raw.shape[-1]).mean(0)
-        return raw
-
-    # ── live preview: ONE LINE PER COMPONENT + a sum line ─────────────────
-    # Follows anyplotlib's interactive-fitting example. Two things there that
-    # this got wrong at first, and that matter more than they look:
-    #
-    #   * lines are updated with ``Line1D.set_data`` IN PLACE. Removing and
-    #     re-adding a line every drag frame is heavy AND does not repaint
-    #     during the drag — the curve simply did not follow the handle.
-    #   * a widget's drag event carries the widget on ``event.source``:
-    #     ``event.source.x``, not ``event.x``. Reading ``event.x`` gives None,
-    #     so every drag silently did nothing at all.
-    #
-    # Per-component lines rather than one summed curve, also from the example:
-    # with several overlapping peaks a single sum tells you the total is wrong
-    # but not WHICH component to grab.
+    # One colour per component, in the order they were added, so a curve
+    # can be told from its neighbour when several peaks overlap.
     _COMP_COLORS = ("#f5a97f", "#a6da95", "#c6a0f6", "#eed49f", "#8bd5ca",
                     "#f0c6c6")
-
-    def rebuild_lines(self) -> None:
-        """One overlay line per active component, plus the sum. Called when
-        the component LIST changes."""
-        p1 = getattr(self.plot, "_plot1d", None)
-        if p1 is None:
-            return
-        self.clear_preview()
-        x = self.axis()
-        blank = np.zeros(len(x), np.float32)
-        for i, comp in enumerate(self.spec.active_components):
-            try:
-                self._comp_lines[comp.name] = p1.add_line(
-                    blank.copy(), x_axis=x, label=comp.name, linewidth=1.6,
-                    color=self._COMP_COLORS[i % len(self._COMP_COLORS)])
-            except Exception as e:
-                log.debug("adding a line for %s failed: %s", comp.name, e)
-        if len(self.spec):
-            try:
-                self._sum_line = p1.add_line(
-                    blank.copy(), x_axis=x, label="model", color="#cdd6f4",
-                    linewidth=1.8, linestyle="dashed")
-            except Exception as e:
-                log.debug("adding the sum line failed: %s", e)
-        self.refresh_lines()
-
-    def refresh_lines(self) -> None:
-        """Re-evaluate every line and push the result ONCE.
-
-        The arithmetic here is nothing — 0.37 ms for two components over 1024
-        channels, measured. The cost is the transport: ``Line1D.set_data``
-        recomputes the axis range and pushes the WHOLE plot state, so calling it
-        per line meant N+1 full state pushes per pointer frame, and that is what
-        made dragging lag. The lines are written together and pushed once
-        instead, which is one push per frame no matter how many components the
-        model has.
-
-        This reaches into anyplotlib's line entries because there is no public
-        batched update; the public per-line path is kept as the fallback, so a
-        change upstream costs speed rather than correctness.
-        """
-        if not self._comp_lines and self._sum_line is None:
-            return
-        try:
-            import torch
-            from spyde.fitting import components as tcomp
-            xt = torch.as_tensor(self.axis())
-            updates, total = [], None
-            for comp in self.spec.active_components:
-                vals = torch.as_tensor(
-                    np.array([[p.value for p in comp.scalar_parameters]]))
-                y = tcomp.component_for(comp)(xt, vals).numpy()[0]
-                total = y if total is None else total + y
-                line = self._comp_lines.get(comp.name)
-                if line is not None:
-                    updates.append((line, y))
-            if self._sum_line is not None and total is not None:
-                updates.append((self._sum_line, total))
-        except Exception as e:
-            log.debug("evaluating the model lines failed: %s", e)
-            return
-        self._push_lines(updates)
-
-    def _push_lines(self, updates) -> None:
-        """Write several lines' data and push the plot once."""
-        p1 = getattr(self.plot, "_plot1d", None)
-        if p1 is None or not updates:
-            return
-        try:
-            for line, y in updates:
-                line._entry()["data"] = np.asarray(y, float)
-            p1._recompute_data_range()
-            p1._push()
-        except Exception as e:
-            log.debug("batched line push unavailable (%s); falling back to "
-                      "one push per line", e)
-            for line, y in updates:
-                try:
-                    line.set_data(np.asarray(y, np.float32))
-                except Exception as e2:
-                    log.debug("set_data fallback failed: %s", e2)
-
-    def draw_preview(self) -> None:
-        """Refresh in place; rebuild only when the line set is out of date."""
-        if list(self._comp_lines) != [c.name for c in self.spec.active_components]:
-            self.rebuild_lines()
-        else:
-            self.refresh_lines()
-
-    def clear_preview(self) -> None:
-        """Remove every overlay line.
-
-        ``remove_line`` takes an id or a ``Line1D`` HANDLE, not a label —
-        passing the label raises a KeyError that used to be swallowed here, so
-        redraws stacked lines until the legend filled up.
-        """
-        p1 = getattr(self.plot, "_plot1d", None)
-        if p1 is not None:
-            for line in list(self._comp_lines.values()) + [self._sum_line]:
-                if line is None:
-                    continue
-                try:
-                    p1.remove_line(line)
-                except Exception as e:
-                    log.debug("removing a model line failed: %s", e)
-        self._comp_lines.clear()
-        self._sum_line = None
 
     # ── on-plot drag handles (#57) ────────────────────────────────────────
     def sync_widgets(self) -> None:
@@ -663,7 +656,7 @@ class FitWizard(WizardController):
 
     def _eval_at(self, comp, xs) -> np.ndarray:
         """The component's own curve at *xs* — how the anchors stay ON it."""
-        return evaluate_component(comp, xs)
+        return component_curve(comp, xs)
 
     def _wire(self, widget, name: str, role: str) -> None:
         """Register the drag handlers, MOVE and UP separately.
@@ -705,7 +698,7 @@ class FitWizard(WizardController):
         what keeps the handles glued on.
 
         **Call this BEFORE the redraw, never after.** A widget ``set`` is a
-        TARGETED push on the event channel; ``refresh_lines`` ends in a FULL
+        TARGETED push on the event channel; redrawing the curves ends in a FULL
         panel push that serialises every widget's geometry. Redrawing first
         means that push carries the OLD handle positions and the new ones go
         out targeted-only — invisible to anything reading panel state, and one
@@ -837,15 +830,15 @@ class FitWizard(WizardController):
             # to the caret, and doing THAT at pointer rate is what made the
             # curve lag behind the cursor.
             #
-            # HANDLES FIRST, then the lines. `refresh_lines` ends in a FULL
-            # panel push, which serialises every widget's current geometry;
+            # HANDLES FIRST, then the curves. The redraw ends in a FULL panel
+            # push, which serialises every widget's current geometry;
             # `update_widgets` only issues TARGETED per-widget pushes. Doing
-            # the lines first meant the frame's full push carried the OLD
+            # the curves first meant the frame's full push carried the OLD
             # partner position and the new one went out on the targeted
             # channel alone — invisible to anything reading panel state, and
             # one push per moved handle instead of none.
             self.update_widgets(skip=role)
-            self.refresh_lines()
+            self.redraw()
             if not live:
                 self.emit_state()
         except Exception as e:
@@ -866,7 +859,7 @@ class FitWizard(WizardController):
         try:
             x = self.axis()
             peaks = {c.name: float(np.max(np.abs(np.nan_to_num(
-                evaluate_component(c, x), nan=0.0, posinf=0.0, neginf=0.0))))
+                component_curve(c, x), nan=0.0, posinf=0.0, neginf=0.0))))
                 for c in self.spec.active_components}
         except Exception as e:
             log.debug("computing component contributions failed: %s", e)
@@ -903,7 +896,7 @@ class FitWizard(WizardController):
             "fitted_count": done,
             "nav_total": total,
             "position_fitted": bool(self.store is not None and
-                                    self.store.is_set(self.current_indices())),
+                                    self.store.is_set(self.position)),
             # How many positions fit worse than their neighbours. The honest
             # headline for a scan fit: "99% converged" can still hide a patch
             # where the model fell over.
@@ -928,7 +921,9 @@ class FitWizard(WizardController):
         if self._closed:
             return
         self._closed = True
-        self.clear_preview()
+        if self._curves is not None:
+            self.tree.remove_overlay(self._curves)
+            self._curves = None
         self.clear_widgets()
         # The live maps window belongs to the CARET, so it closes with it —
         # it is a preview of the model as it currently stands, and one left
@@ -1458,7 +1453,7 @@ def fit_open(session, plot, payload=None) -> None:
     gen = wiz.guard()
     tree._fit_wizard = wiz
     _send_catalogue(session, wiz, src, gen)
-    wiz.draw_preview()
+    wiz.attach_curves()
     wiz.sync_widgets()
     wiz.show_maps()          # flat now, filled in as positions are fitted
     wiz.emit_state("Add a component to begin." if not len(wiz.spec)
@@ -1551,8 +1546,8 @@ def fit_add_component(session, plot, payload) -> None:
     # Put it on THIS spectrum, or the component arrives five orders of
     # magnitude below the data and looks like it does nothing. A background
     # needs its shape solved through the data, not just its amplitude scaled.
-    spectrum = wiz.current_spectrum()
-    if not seed_background(cspec, x, spectrum):
+    spectrum = wiz.spectrum
+    if spectrum is not None and not seed_background(cspec, x, spectrum):
         scale_to_data(cspec, x, spectrum)
     # Two of a kind must not start in the same place (degenerate, unfittable)
     # and no peak may wander off the data.
@@ -1568,7 +1563,7 @@ def fit_add_component(session, plot, payload) -> None:
     wiz.spec.append(cspec)
     wiz.result = None                       # the old fit no longer describes it
     wiz._ensure_store(force=True)   # the packed width changed with the model
-    wiz.draw_preview()
+    wiz.redraw()
     wiz.sync_widgets()
     wiz.show_maps()          # one more (or one fewer) map to fill in
     wiz.emit_state(f"Added {cspec.name}.")
@@ -1636,7 +1631,7 @@ def fit_from_composition(session, plot, payload) -> None:
     wiz.spec = spec
     wiz.result = None
     wiz._ensure_store(force=True)   # the packed width changed with the model
-    wiz.draw_preview()
+    wiz.redraw()
     wiz.sync_widgets()
     wiz.show_maps()          # one more (or one fewer) map to fill in
     dropped = info.get("dropped") or []
@@ -1654,8 +1649,7 @@ def fit_remove_component(session, plot, payload) -> None:
     wiz.spec.components = [c for c in wiz.spec.components if c.name != name]
     wiz.result = None
     wiz._ensure_store(force=True)   # the packed width changed with the model
-    wiz.clear_preview()
-    wiz.draw_preview()
+    wiz.redraw()
     wiz.sync_widgets()
     wiz.show_maps()          # one more (or one fewer) map to fill in
     wiz.emit_state(f"Removed {name}.")
@@ -1677,15 +1671,22 @@ def fit_set_param(session, plot, payload) -> None:
         log.debug("fit_set_param %s failed: %s", p, e)
         return
     wiz.update_widgets()      # MOVE, do not rebuild — see update_widgets
-    wiz.draw_preview()        # ...and BEFORE the redraw — see _on_widget_drag
+    wiz.redraw()              # ...and AFTER the handles, see _on_widget_drag
     wiz.emit_state()
 
 
 def fit_tune(session, plot, payload=None) -> None:
-    """Debounced redraw — the caret's live edit path."""
+    """Debounced redraw: the caret's live edit path, and where the adaptive
+    toggle lands. Turning adaptive on refits an unfitted position as the
+    navigator arrives on it."""
     wiz, _tree = _wizard(session, plot)
-    if wiz is not None:
-        wiz.draw_preview()
+    if wiz is None:
+        return
+    adaptive = (payload or {}).get("adaptive")
+    if adaptive is not None and bool(adaptive) != wiz.adaptive:
+        wiz.set_adaptive(bool(adaptive))
+        return                        # setting it redraws
+    wiz.redraw()
 
 
 def fit_current(session, plot, payload=None) -> None:
@@ -1716,67 +1717,28 @@ def fit_current(session, plot, payload=None) -> None:
                        f"implementation yet")
         return
 
-    from spyde.fitting.engine import fit_batched
+    if wiz.spectrum is None:
+        ipc.emit_error("Fit: no spectrum on screen yet")
+        return
     try:
-        res = fit_batched(wiz.spec, wiz.current_spectrum()[None, :], wiz.axis(),
-                          device="cpu", max_iter=int((payload or {}).get(
-                              "max_iter", 120)))
+        values, chisq, status = fit_one_spectrum(
+            wiz.spec, wiz.spectrum, wiz.axis(),
+            max_iter=int((payload or {}).get("max_iter", 120)))
         # Write the fitted values back into the MODEL so the caret, the handles
         # and the next fit all start from them. This is the difference between
         # a preview and a step in the workflow.
-        wiz.spec.set_flat_values(res.values[0])
+        wiz.spec.set_flat_values(values)
     except Exception as e:
         ipc.emit_error(f"Fit: fitting this spectrum failed ({e})")
         return
 
     wiz.result = None          # a single-spectrum fit is NOT a scan result
-    wiz.remember(res.values[0], chisq=float(res.chisq[0]))
+    wiz.remember(values, chisq=chisq)
     wiz.update_widgets()      # handles first, then the push — see _on_widget_drag
-    wiz.draw_preview()
+    wiz.redraw()
     wiz.show_maps()           # one more position filled in
-    ok = "converged" if bool(res.converged[0]) else "did not converge"
-    wiz.emit_state(f"This spectrum {ok} (chi2 {res.chisq[0]:.3g}). "
+    wiz.emit_state(f"{status} "
                    f"{wiz.store.coverage()[0]} position(s) fitted.")
-
-
-def fit_navigated(session, plot, payload=None) -> None:
-    """The navigator moved — show this position's fit.
-
-    Two behaviours, in order:
-
-    1. If this position has been fitted before, RECALL it. Scrubbing back to a
-       pixel should show what was found there, not whatever the last pixel left
-       in the model.
-    2. Otherwise, if adaptive fitting is on, fit this spectrum now — seeded
-       from the model as it stands, which after step 1 is a neighbouring
-       position's answer and therefore a good starting point (the same reason
-       seeded propagation works for the whole scan, #54).
-
-    With adaptive off and nothing stored, only the preview is redrawn: the
-    model stays put and the user sees it against the new spectrum.
-
-    EVERY path here ends in an ``emit_state``. The caret coalesces navigator
-    moves by keeping ONE of these in flight and waiting for the state to come
-    back, so a branch that returned silently would stall the next move until a
-    2-second wedge timer expired — the pause-and-snap this coalescer exists to
-    remove, reintroduced by the back door.
-    """
-    wiz, _tree = _wizard(session, plot)
-    if wiz is None:
-        return                  # the caret is gone; nothing is listening
-    if not len(wiz.spec):
-        wiz.emit_state()
-        return
-    if wiz.recall():
-        wiz.update_widgets()  # handles first, then the push — see _on_widget_drag
-        wiz.draw_preview()
-        wiz.emit_state("Recalled this position's fit.")
-        return
-    if bool((payload or {}).get("adaptive")):
-        fit_current(session, plot, payload)     # emits its own state
-        return
-    wiz.draw_preview()          # same model, new spectrum underneath
-    wiz.emit_state()
 
 
 def fit_run(session, plot, payload=None) -> None:
@@ -1853,21 +1815,19 @@ def fit_run(session, plot, payload=None) -> None:
             wiz.record_run(result, nav_shape)
         except Exception as e:
             log.debug("recording the run into the fit store failed: %s", e)
-        # Show the fit at the CURRENT position, so the preview reflects the
-        # result rather than the pre-run guess. `current_indices` lives on the
-        # navigation SELECTOR, not the plot — reading it off the plot always
-        # gave None, so this silently showed position 0's parameters.
+        # Show the fit at the position the curves are on, so the model
+        # reflects the result rather than the pre-run guess. The store turns
+        # the position into a row, which is the only place that conversion
+        # happens: a scan result and a single position cannot then disagree
+        # about which spectrum is which.
         try:
-            idx = wiz.current_indices()
-            flat = 0
-            if idx is not None and nav_shape:
-                flat = int(np.ravel_multi_index(
-                    tuple(int(i) for i in reversed(idx)), nav_shape))
-            spec.set_flat_values(result.values[flat])
+            row = (wiz.store.flat_index(wiz.position)
+                   if wiz.store is not None else None)
+            spec.set_flat_values(result.values[0 if row is None else row])
         except Exception as e:
-            log.debug("seeding the post-fit preview failed: %s", e)
+            log.debug("seeding the post-fit model failed: %s", e)
         wiz.update_widgets()  # the curves moved; the handles go with them
-        wiz.draw_preview()    # ...and the full push must come AFTER them
+        wiz.redraw()          # ...and the full push must come AFTER them
         # Show the maps NOW, not only on Commit. "Fit all spectra" produced a
         # result you could not look at: the only way to see where the fit
         # succeeded was to scrub the navigator one pixel at a time.
@@ -1934,7 +1894,7 @@ def fit_load_model(session, plot, payload=None) -> None:
     wiz.recall()
     wiz.sync_widgets()
     wiz.update_widgets()
-    wiz.draw_preview()
+    wiz.redraw()
     wiz.show_maps()
     done, total = store.coverage()
     wiz.emit_state(f"Restored '{name}' — {done}/{total} positions already fitted.")
@@ -1992,7 +1952,7 @@ def fit_refit_poor(session, plot, payload=None) -> None:
         rescued = int(getattr(res, "polish_improved", 0) or 0)
         wiz.recall()
         wiz.update_widgets()  # handles first, then the push — see _on_widget_drag
-        wiz.draw_preview()
+        wiz.redraw()
         try:
             wiz.show_maps()
         except Exception as e:

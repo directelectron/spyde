@@ -147,53 +147,119 @@ class TestMultiNavIndexOrdering:
         clipped = np.clip(swapped[0], 0, bounds)
         assert clipped.tolist() == [0, 169, 525]  # unchanged → no spurious clamp
 
-    def test_overlay_helpers_split_lead_and_spatial(self):
-        from spyde.actions.vector_overlay import _indices_to_iyix, _indices_lead_nav
-        # 4-D scan: [x, y] → spatial only, no lead.
-        assert _indices_to_iyix([[5, 7]]) == (7, 5)
-        assert _indices_lead_nav([[5, 7]]) == ()
-        # 5-D stack: [stack, x, y] → lead=(stack,), spatial=(iy=y, ix=x).
-        assert _indices_to_iyix([[1, 5, 7]]) == (7, 5)
-        assert _indices_lead_nav([[1, 5, 7]]) == (1,)
+    def test_the_prepared_index_splits_lead_and_spatial(self):
+        """Everything that needs "where is the navigator" reads it from the
+        SAME preparation the frame read uses: the spatial pair swapped into
+        data order, any leading stack coordinate left in front of it."""
+        import hyperspy.api as hs
+        from spyde.drawing.update_functions import _prepare_nav_indices
+
+        four_d = hs.signals.Signal2D(np.zeros((16, 16, 4, 4)))
+        prepared = _prepare_nav_indices(four_d, [[5, 7]], integrating=False)
+        assert list(prepared) == [7, 5]
+
+        five_d = hs.signals.Signal2D(np.zeros((4, 16, 16, 4, 4)))
+        prepared = _prepare_nav_indices(five_d, [[1, 5, 7]], integrating=False)
+        assert list(prepared) == [1, 7, 5]
 
 
 class TestFindVectorsPreviewOnStack:
-    """The find-vectors preview must slice a SINGLE 2-D frame from a 5-D stack
-    (regression: it sliced 2 nav axes assuming 4-D → returned a 3-D 'frame' →
-    'index 2 is out of bounds for axis 0 with size 0')."""
+    """The find-vectors preview must reduce a navigation window to a SINGLE 2-D
+    frame, and blur only the two innermost navigation axes: a 5-D stack's time
+    axis is a fixed position, exactly as the batch treats it."""
 
-    def _stub(self, data, lead, sigma=0.0):
-        from spyde.actions.vector_overlay import FindVectorsPreviewOverlay
+    def test_the_preview_window_is_flat_on_a_stacks_time_axis(self):
+        """A neighbourhood radius is per navigation axis, so the preview on a
+        5-D stack reads (2d+1)^2 frames of one time slice, not (2d+1)^3 across
+        three, and its value is the 4-D answer for that slice."""
+        from dataclasses import replace
+        import hyperspy.api as hs
+        from spyde.actions.find_vectors_action import fv_open
+        from spyde.actions.vector_overlay import find_vectors_preview
+        from spyde.array_cache import drop_reader, reader_for_overlay
+        from spyde.tests.migrated._async import wait_until
+        from spyde.tests.migrated.conftest import (
+            _settle, close_session, make_session,
+        )
 
-        class _Sig:
-            pass
+        rng = np.random.default_rng(0)
+        data = rng.normal(50, 3, (2, 9, 9, 16, 16)).astype(np.float32)
+        for index in np.ndindex(2, 9, 9):
+            data[index][6:10, 6:10] += 400.0        # one bright disk per pattern
+        signal = hs.signals.Signal2D(data).as_lazy()
+        signal.data = signal.data.rechunk((1, 3, 3, -1, -1))
+        signal.set_signal_type("electron_diffraction")
 
-        s = _Sig()
-        s.data = data
-        stub = FindVectorsPreviewOverlay.__new__(FindVectorsPreviewOverlay)
-        stub.signal = s
-        stub.sigma = sigma
-        stub._lead_nav = lead
-        return stub
+        session = make_session()
+        try:
+            session._add_signal(signal, source_path=None)
+            _settle(session)
+            plot = next(p for p in session._plots
+                        if not p.is_navigator and p.plot_state is not None)
+            tree = plot.signal_tree
+            fv_open(session, plot, {"method": "dog", "sigma": 1.0,
+                                    "kernel_radius": 3, "threshold": 8.0,
+                                    "min_distance": 3, "subpixel": False})
+            assert wait_until(lambda: getattr(tree, "_fv_preview", None) is not None, 30)
+            node = tree._fv_preview
+            assert node.signal._map_recipe.depth == (0, 3, 3)
 
-    def test_blurred_frame_returns_single_2d_frame_from_5d(self):
-        from spyde.actions.vector_overlay import FindVectorsPreviewOverlay
-        # (stack, y, x, ky, kx); unique marker per (stack, y, x).
-        data = np.zeros((2, 6, 8, 4, 4), dtype=np.float32)
-        for st in range(2):
-            for y in range(6):
-                for x in range(8):
-                    data[st, y, x, 0, 0] = st * 1000 + y * 10 + x
-        stub = self._stub(data, lead=(1,))
-        frame = FindVectorsPreviewOverlay._blurred_frame(stub, iy=4, ix=5)
-        assert frame.shape == (4, 4)             # a single DP, not a 3-D block
-        assert float(frame[0, 0]) == 1 * 1000 + 4 * 10 + 5  # the (1,4,5) frame
+            windows = []
+            recipe = node.signal._map_recipe
 
-    def test_blurred_frame_still_works_for_4d(self):
-        from spyde.actions.vector_overlay import FindVectorsPreviewOverlay
-        data = np.zeros((6, 8, 4, 4), dtype=np.float32)
-        data[4, 5, 0, 0] = 42.0
-        stub = self._stub(data, lead=())
-        frame = FindVectorsPreviewOverlay._blurred_frame(stub, iy=4, ix=5)
+            def _recording(window, centre, **kwargs):
+                windows.append((window, centre))
+                return recipe.function(window, centre, **kwargs)
+
+            node.signal._map_recipe = replace(recipe, function=_recording)
+            drop_reader(plot, node.signal)
+
+            value = reader_for_overlay(plot, node).read_frame((1, 4, 4))
+            # The navigator may also be drawing this overlay; take the window
+            # built for the position asked for here.
+            window, centre = next(w for w in windows if w[1] == (0, 3, 3))
+            assert window.shape == (1, 7, 7, 16, 16), window.shape
+
+            # The same window without its (single) time axis is the 4-D call.
+            flat = find_vectors_preview(window[0], centre[1:],
+                                        **recipe.static)
+            assert np.array_equal(value["peaks"]["data"], flat["peaks"]["data"])
+        finally:
+            close_session(session)
+
+    @staticmethod
+    def _window(shape):
+        """A window with a value unique to each navigation position."""
+        window = np.zeros(shape, dtype=np.float32)
+        for index in np.ndindex(*shape[:-2]):
+            window[index][0, 0] = float(np.ravel_multi_index(index, shape[:-2]) + 1)
+        return window
+
+    def test_a_five_dimensional_window_reduces_to_one_frame(self):
+        from spyde.actions.vector_overlay import _blurred_centre_frame
+        window = self._window((3, 3, 3, 4, 4))     # (t, y, x, ky, kx)
+        frame = _blurred_centre_frame(window, (1, 1, 1), sigma=0.0)
+        assert frame.shape == (4, 4)               # a single pattern, not a block
+        assert np.array_equal(frame, window[1, 1, 1])
+
+    def test_a_four_dimensional_window_reduces_to_one_frame(self):
+        from spyde.actions.vector_overlay import _blurred_centre_frame
+        window = self._window((3, 3, 4, 4))
+        frame = _blurred_centre_frame(window, (2, 0), sigma=0.0)
         assert frame.shape == (4, 4)
-        assert float(frame[0, 0]) == 42.0
+        assert np.array_equal(frame, window[2, 0])
+
+    def test_no_window_at_all_is_the_frame_itself(self):
+        from spyde.actions.vector_overlay import _blurred_centre_frame
+        frame = np.arange(16, dtype=np.float32).reshape(4, 4)
+        assert np.array_equal(_blurred_centre_frame(frame, None, sigma=0.0), frame)
+
+    def test_the_blur_never_crosses_the_time_axis(self):
+        """Blurring across time would mix time steps, which the batch's
+        ``(sigma, sigma, 0, 0)`` never does."""
+        from scipy.ndimage import gaussian_filter
+        from spyde.actions.vector_overlay import _blurred_centre_frame
+        window = self._window((3, 3, 3, 4, 4))
+        frame = _blurred_centre_frame(window, (1, 1, 1), sigma=1.0)
+        expected = gaussian_filter(window[1], sigma=(1.0, 1.0, 0.0, 0.0))[1, 1]
+        assert np.allclose(frame, expected)

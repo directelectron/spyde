@@ -43,8 +43,7 @@ def _make_plot(sig_shape, units="nm", scale=0.5, is_navigator=False):
     plot.needs_auto_level = True
     plot._last_levels = None
     plot._last_extent_key = None
-    plot._fv_transform_active = False
-    plot._fv_paint_token = False
+    plot._overlay_groups = {}
 
     data = np.zeros((2,) + sig_shape, dtype=np.float32)
     s = hs.signals.Signal2D(data)

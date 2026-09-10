@@ -16,12 +16,16 @@ test_find_vectors_memory for the batch-compute contract).
 """
 from __future__ import annotations
 
+import threading
 import time
 
 import numpy as np
+import pytest
 import hyperspy.api as hs
 from spyde.tests.migrated._async import quiesce, why_busy
 from spyde.tests.migrated._async import wait_until
+from spyde.actions.vector_overlay import overlay_static
+from spyde.array_cache import reader_for_overlay
 from spyde.tests.migrated.conftest import make_session, close_session
 
 
@@ -71,11 +75,12 @@ class TestFindVectorsWizard:
             assert _wait(lambda: getattr(tree, "_fv_preview", None) is not None), \
                 "live preview overlay never attached"
             prev = tree._fv_preview
-            assert prev._mg is not None              # circle marker group exists
+            assert (id(prev), "peaks") in src._overlay_groups   # circles exist
 
-            # The centred disk produces at least one peak at the current crosshair.
-            # _offsets_for is now the engine's compute → returns {offsets, response}.
-            assert _wait(lambda: len(prev._offsets_for(0, 0)["offsets"]) >= 1), \
+            # The centred disk produces at least one peak at the current
+            # crosshair, read the way a navigator move reads the overlay.
+            reader = reader_for_overlay(src, prev)
+            assert _wait(lambda: len(reader.read_frame((0, 0))["peaks"]) >= 1), \
                 "preview found no peaks on a disk pattern"
 
             # ── Tune: change params live (no new window) ─────────────────────
@@ -84,8 +89,9 @@ class TestFindVectorsWizard:
                 "sigma": 1.0, "kernel_radius": 7, "threshold": 0.3,
                 "min_distance": 4, "subpixel": False,
             })
-            assert _wait(lambda: prev.kernel_radius == 7 and prev.subpixel is False)
-            assert abs(prev.threshold - 0.3) < 1e-9
+            assert _wait(lambda: overlay_static(prev)["params"]["kernel_radius"] == 7
+                         and overlay_static(prev)["params"]["subpixel"] is False)
+            assert abs(overlay_static(prev)["params"]["threshold"] - 0.3) < 1e-9
             assert len(session.signal_trees) == before_trees   # tune never computes
 
             # ── Compute: full-dataset batch → a new vectors window ───────────
@@ -124,164 +130,239 @@ class TestFindVectorsWizard:
 
             fv_close(session, src, {})
             assert _wait(lambda: getattr(tree, "_fv_preview", None) is None)
-            assert prev._mg is None                  # marker group removed
+            assert (id(prev), "peaks") not in src._overlay_groups   # circles gone
         finally:
             close_session(session)
 
 
-class TestPreviewBeamstopToggle:
-    def test_set_params_beamstop_auto_toggles_mask(self):
-        """Toggling 'Mask beam stop' applies/clears the mask on the live preview.
-        Detection is ASYNC (a ~400-frame scan runs on a bg thread so it never
-        blocks the live re-render), so we wait for the scan to land."""
-        import time
-        from spyde.actions.vector_overlay import FindVectorsPreviewOverlay
+class TestPreviewBeamstop:
+    """The beam stop the preview excludes is a static argument of the overlay
+    node: detected once from a sample of frames, cached on the tree, and
+    dilated on demand without re-detecting."""
 
-        # a synthetic signal whose scan-mean has a dark beam-stop bar
-        ny, nx, ky, kx = 6, 6, 32, 32
-        f = np.full((ky, kx), 1000.0, np.float32)
-        f[:24, 14:18] = 1.0                       # dark bar in every pattern
-        data = np.broadcast_to(f, (ny, nx, ky, kx)).copy()
-        sig = hs.signals.Signal2D(data)
+    class _Tree:
+        """Only the attribute the detection caches itself on."""
 
-        ov = FindVectorsPreviewOverlay.__new__(FindVectorsPreviewOverlay)
-        ov.signal = sig
-        ov.sigma = 0.0; ov.kernel_radius = 5; ov.threshold = 0.4
-        ov.min_distance = 3; ov.subpixel = True; ov.method = "dog"
-        ov.dog_sigma1 = 0.8; ov.dog_sigma2 = 2.0
-        ov.beamstop_mask = None
-        ov._last_iyix = (3, 3)
-        ov.show_transform = False
-        ov._hidden = False
-        ov._beamstop_wanted = False
-        ov._beamstop_scanning = False
-        ov._engine = None        # set_params skips the async re-render request
+    def _signal_with_a_bar(self, ny=6, nx=6, ky=32, kx=32):
+        frame = np.full((ky, kx), 1000.0, np.float32)
+        frame[:24, 14:18] = 1.0                   # a dark bar in every pattern
+        return hs.signals.Signal2D(
+            np.broadcast_to(frame, (ny, nx, ky, kx)).copy())
 
-        # toggle ON → async scan kicked off; wait for it to apply the mask
-        ov.set_params(beamstop_auto=True)
-        t0 = time.time()
-        while time.time() - t0 < 5.0 and ov.beamstop_mask is None:
-            time.sleep(0.02)
-        assert ov.beamstop_mask is not None, "beam-stop scan never applied a mask"
-        assert ov.beamstop_mask[10, 15]           # on the bar
+    def test_the_mask_is_detected_once_and_dilated_on_demand(self):
+        from spyde.actions.vector_overlay import _beamstop_for
+        signal, tree = self._signal_with_a_bar(), self._Tree()
 
-        # toggle OFF → mask cleared (synchronous)
-        ov.set_params(beamstop_auto=False)
-        assert ov.beamstop_mask is None
+        assert _beamstop_for(tree, signal, {"beamstop_auto": False}) is None
+        assert not hasattr(tree, "_fv_beamstop_raw"), "detection ran while off"
 
-        # toggle ON again → cached, applied without a re-scan
-        ov.set_params(beamstop_auto=True)
-        assert ov.beamstop_mask is not None
+        mask = _beamstop_for(tree, signal, {"beamstop_auto": True,
+                                            "beamstop_dilate": 5})
+        assert mask is not None, "the beam stop was never detected"
+        assert mask[10, 15]                        # on the bar
+        raw = tree._fv_beamstop_raw
+        assert raw is not None and int(mask.sum()) >= int(raw.sum())
 
-    def test_mask_overlay_pushed_to_plot(self):
-        """The detected beam-stop mask is drawn as a translucent overlay on the
-        DP plot (set_overlay_mask), re-pushed cheaply on dilation change, and
-        CLEARED when the stop is toggled off — all without re-detecting (the
-        static stop is cached as `_beamstop_raw`)."""
-        from spyde.actions.vector_overlay import FindVectorsPreviewOverlay
+        # A bigger dilation grows the mask from the SAME cached detection.
+        wider = _beamstop_for(tree, signal, {"beamstop_auto": True,
+                                             "beamstop_dilate": 12})
+        assert int(wider.sum()) > int(mask.sum())
+        assert tree._fv_beamstop_raw is raw, "the beam stop was detected twice"
 
-        calls = []                       # captured (mask px or None) per push
-        class _DP:
-            def set_overlay_mask(self, mask, color="#ff4444", alpha=0.4):
-                calls.append(None if mask is None else int(np.count_nonzero(mask)))
+        # Toggling off clears it without dropping the cache.
+        assert _beamstop_for(tree, signal, {"beamstop_auto": False}) is None
+        assert tree._fv_beamstop_raw is raw
 
-        ov = FindVectorsPreviewOverlay.__new__(FindVectorsPreviewOverlay)
-        ov.dp_plot = _DP()
-        ov.beamstop_mask = None
-        ov.beamstop_dilate = 5
-        ov._beamstop_wanted = True
-        raw = np.zeros((64, 64), bool)
-        yy, xx = np.ogrid[:64, :64]
-        raw[(yy - 32) ** 2 + (xx - 32) ** 2 < 36] = True   # disk, undilated
-        ov._beamstop_raw = raw
+    def test_the_mask_is_drawn_on_nav_paint_and_goes_with_the_node(self):
+        """The stop is a group of the preview node like any other: its value
+        rides every evaluation, it is pushed on the painter thread, and
+        removing the node clears it, so nothing keeps a mask alive past the
+        caret that put it there."""
+        from spyde.actions.find_vectors_action import fv_open, fv_close
 
-        ov._apply_dilation()
-        assert calls[-1] is not None and calls[-1] >= int(raw.sum())
-        px5 = calls[-1]
+        session = make_session()
+        try:
+            session._add_signal(self._signal_with_a_bar().as_lazy(),
+                                source_path=None)
+            assert quiesce(session), why_busy(session)
+            plot = _signal_plot(session)
+            tree = plot.signal_tree
 
-        # bigger dilation → bigger overlay, NO re-scan (raw is reused)
-        ov.beamstop_dilate = 12
-        ov._apply_dilation()
-        assert calls[-1] > px5
+            drawn = []
+            plot._set_overlay_mask = lambda mask, **style: drawn.append(
+                (threading.current_thread().name,
+                 None if mask is None else int(np.count_nonzero(mask))))
 
-        # toggle off → overlay cleared
-        ov._beamstop_wanted = False
-        ov.beamstop_mask = None
-        ov._push_mask_overlay()
-        assert calls[-1] is None
+            fv_open(session, plot, {"method": "dog", "sigma": 0.0,
+                                    "kernel_radius": 3, "threshold": 8.0,
+                                    "min_distance": 3, "subpixel": False,
+                                    "beamstop_auto": True})
+            assert _wait(lambda: getattr(tree, "_fv_preview", None) is not None, 30)
+            node = tree._fv_preview
+            assert _wait(lambda: any(count for _thread, count in drawn), 30),                 "the beam stop never reached the pattern"
+            assert {thread for thread, _count in drawn} == {"nav-paint"}, drawn
 
-    def test_show_transform_compute_and_render(self):
-        """With show_transform on, the engine compute returns BOTH peaks and the
-        response, and _render_payload pushes the response image to the DP plot
-        (via the Plot's set_data so it persists) plus the markers."""
-        from spyde.actions.vector_overlay import FindVectorsPreviewOverlay
+            fv_close(session, plot, {})
+            assert _wait(lambda: drawn[-1][1] is None, 10), drawn
+            assert (id(node), "mask") not in plot._overlay_groups
+        finally:
+            close_session(session)
 
-        ny, nx, ky, kx = 4, 4, 32, 32
+
+    def test_the_detection_never_runs_on_the_callers_thread(self, monkeypatch):
+        """Detecting the stop reads frames, which is far too slow for the
+        thread the caret is dispatched on. It runs on the compute backend's
+        overlay lane and the mask reaches the recipe afterwards."""
+        import threading
+        import spyde.actions.find_vectors as find_vectors
+        from spyde.actions.find_vectors_action import fv_open
+        from spyde.actions.vector_overlay import tune_find_vectors_preview
+
+        params = {"method": "dog", "sigma": 0.0, "kernel_radius": 3,
+                  "threshold": 8.0, "min_distance": 3, "subpixel": False}
+        session = make_session()
+        try:
+            session._add_signal(self._signal_with_a_bar().as_lazy(),
+                                source_path=None)
+            assert quiesce(session), why_busy(session)
+            plot = _signal_plot(session)
+            tree = plot.signal_tree
+            fv_open(session, plot, dict(params))
+            assert _wait(lambda: getattr(tree, "_fv_preview", None) is not None, 30)
+            node = tree._fv_preview
+            assert overlay_static(node)["beamstop_mask"] is None
+
+            scans = []
+            detect = find_vectors._auto_beamstop_from_signal
+
+            def _slow_detect(signal, navigation_dimension, **kwargs):
+                scans.append(threading.current_thread().name)
+                time.sleep(0.3)
+                return detect(signal, navigation_dimension, **kwargs)
+
+            monkeypatch.setattr(find_vectors, "_auto_beamstop_from_signal",
+                                _slow_detect)
+
+            started = time.monotonic()
+            tune_find_vectors_preview(tree, node,
+                                      dict(params, beamstop_auto=True))
+            elapsed = time.monotonic() - started
+            assert elapsed < 0.05, f"the tune blocked for {elapsed:.3f}s"
+
+            assert _wait(
+                lambda: overlay_static(node)["beamstop_mask"] is not None, 20), \
+                "the beam-stop mask never reached the recipe"
+            assert scans, "the beam stop was never detected"
+            assert all(name.startswith("overlay-eval") for name in scans), scans
+            assert overlay_static(node)["beamstop_mask"][10, 15]      # on the bar
+        finally:
+            close_session(session)
+
+
+class TestPreviewTransformView:
+    def test_the_value_carries_the_peaks_and_the_response(self):
+        """With the transform view on, one evaluation produces BOTH the peak
+        markers and the image the detector found them in, with the contrast
+        window the response needs."""
+        from spyde.actions.vector_overlay import find_vectors_preview
+
+        ky, kx = 32, 32
         rng = np.random.default_rng(0)
         yy, xx = np.mgrid[0:ky, 0:kx]
-        base = rng.normal(50, 3, (ky, kx)).astype(np.float32)
-        for c in ((10, 10), (22, 22)):
-            base += 300 * np.exp(-((yy - c[0]) ** 2 + (xx - c[1]) ** 2) / (2 * 1.3 ** 2))
-        data = np.broadcast_to(base, (ny, nx, ky, kx)).copy()
-        sig = hs.signals.Signal2D(data)
+        frame = rng.normal(50, 3, (ky, kx)).astype(np.float32)
+        for cy, cx in ((10, 10), (22, 22)):
+            frame += 300 * np.exp(-((yy - cy) ** 2 + (xx - cx) ** 2) / (2 * 1.3 ** 2))
+        params = {"method": "dog", "kernel_radius": 5, "threshold": 8.0,
+                  "min_distance": 3, "subpixel": True,
+                  "dog_sigma1": 0.8, "dog_sigma2": 2.0}
 
-        pushed = []
+        value = find_vectors_preview(frame, None, params=params, sigma=0.0,
+                                     beamstop_mask=None, show_transform=True)
+        assert len(value["peaks"]["data"]) >= 2
+        # The circle radius rides the value, so the slider needs no rebuild.
+        assert value["peaks"]["radius"] == pytest.approx(np.sqrt(2.0) * 0.8)
+        image, (low, high) = value["transform"]["data"], value["transform"]["levels"]
+        assert image.shape == (ky, kx)
+        assert low == 8.0                          # the display floor is the threshold
+        assert high > low
+
+        # With the view off there is no response to pay for.
+        off = find_vectors_preview(frame, None, params=params, sigma=0.0,
+                                   beamstop_mask=None, show_transform=False)
+        assert off["transform"] is None
+        assert len(off["peaks"]["data"]) >= 2
+
+    def test_the_correlation_ceiling_never_moves_with_the_threshold(self):
+        """Moving the threshold in correlation view must NOT move the ceiling:
+        tying the two together blew the window open and washed the image to
+        white. An NXCORR score has a fixed ceiling of 1.0; only the floor
+        moves."""
+        from spyde.actions.vector_overlay import _transform_levels
+
+        response = np.linspace(-1, 0.64, 32 * 32).reshape(32, 32).astype(np.float32)
+        for threshold in (0.5, 0.6, 0.7, 0.9):
+            low, high = _transform_levels(response, "nxcorr", threshold)
+            assert high == 1.0, f"the correlation ceiling moved to {high}"
+            assert abs(low - threshold) < 1e-6
+        # A DoG SNR has no fixed scale, so its ceiling comes from the response.
+        low, high = _transform_levels(response, "dog", 0.5)
+        assert high == float(np.percentile(response, 99.0))
+
+    def test_the_painter_applies_the_contrast_window_the_value_carries(self):
+        """A transform value with levels reaches the plot as those levels, not
+        as an auto-levelled repaint, and holds the base frame back while it
+        is showing."""
+        from spyde.drawing.plots.plot import Plot
+
+        node = type("Node", (), {"groups": {"transform": ("transform", {})}})()
+        painted, restored = [], []
+
+        class _Plot:
+            needs_auto_level = True
+            current_data = np.ones((8, 8), np.float32)
+
+            def set_transform_image(self, data, levels=None):
+                painted.append((data.shape, levels))
+
+            def _set_array(self, data, levels=None):
+                restored.append(data.shape)
+
+        plot = _Plot()
+        plot._overlay_groups = {(id(node), "transform"): None}
+        plot._live_transform_groups = set()
+        image = np.zeros((8, 8), np.float32)
+        key = (id(node), "transform")
+
+        Plot._push_overlay_group(plot, node, "transform", "transform",
+                                 {"data": image, "levels": (0.3, 1.0)})
+        assert painted == [((8, 8), (0.3, 1.0))]
+        assert plot.needs_auto_level is False
+        assert key in plot._live_transform_groups
+
+        # A bare array is still a transform value; it just brings no levels.
+        Plot._push_overlay_group(plot, node, "transform", "transform", image)
+        assert painted[-1] == ((8, 8), None)
+
+        # Clearing it hands the plot back to the frame the navigator read.
+        Plot._push_overlay_group(plot, node, "transform", "transform", None)
+        assert not bool(plot._live_transform_groups)
+        assert restored == [(8, 8)]
+
+
+class TestPreviewHistogram:
+    def test_the_threshold_is_marked_on_the_histogram(self):
+        from spyde.actions.vector_overlay import _emit_preview_histogram
         marked = []
-        hist = []
-        class _DP:                       # Plot-level transform paint (new contract)
-            needs_auto_level = False
-            def set_transform_image(self, arr, levels=None): pushed.append((arr, levels))
-            def _emit_histogram(self, arr, lo, hi, threshold=None): hist.append((lo, hi, threshold))
-        class _MG:
-            def set(self, **kw): marked.append(kw.get("offsets"))
 
-        ov = FindVectorsPreviewOverlay.__new__(FindVectorsPreviewOverlay)
-        ov.signal = sig; ov.dp_plot = _DP(); ov._mg = _MG()
-        ov.sigma = 0.0; ov.kernel_radius = 5; ov.threshold = 8.0
-        ov.min_distance = 3; ov.subpixel = True; ov.method = "dog"
-        ov.dog_sigma1 = 0.8; ov.dog_sigma2 = 2.0; ov.beamstop_mask = None
-        ov.show_transform = True; ov._hidden = False
-        ov._last_iyix = (2, 2)
+        class _Plot:
+            def _emit_histogram(self, image, low, high, threshold=None):
+                marked.append((low, high, threshold))
 
-        # 1) compute returns a payload with peaks AND a response (no side-effect)
-        payload = ov._offsets_for(2, 2)
-        assert isinstance(payload, dict)
-        assert payload["response"] is not None
-        assert payload["response"].shape == (ky, kx)
-        assert len(payload["offsets"]) >= 2
-        assert not pushed, "compute must not paint (render does)"
-
-        # 2) render pushes the response image to the DP and the markers, with the
-        #    display floor (clim-min) snapped to the detector threshold and a
-        #    histogram threshold marker emitted.
-        ov._render_payload(payload)
-        assert pushed and pushed[-1][0].shape == (ky, kx)
-        assert pushed[-1][1][0] == 8.0          # clim-min == threshold
-        assert hist and hist[-1][2] == 8.0       # histogram threshold marker
-        assert marked and len(marked[-1]) >= 2
-
-    def test_nxcorr_transform_clim_ceiling_is_fixed(self):
-        """Moving the threshold in correlation view must NOT move the clim ceiling
-        (the earlier flash: hi was tied to threshold, so nudging it washed the
-        image to white). NXCORR ceiling is a fixed 1.0; only the floor moves."""
-        from spyde.actions.vector_overlay import FindVectorsPreviewOverlay
-        pushed = []
-        class _DP:
-            needs_auto_level = False
-            def set_transform_image(self, arr, levels=None): pushed.append(levels)
-            def _emit_histogram(self, *a, **k): pass
-        class _MG:
-            def set(self, **kw): pass
-
-        ov = FindVectorsPreviewOverlay.__new__(FindVectorsPreviewOverlay)
-        ov.dp_plot = _DP(); ov._mg = _MG(); ov.method = "nxcorr"
-        ov.show_transform = True; ov._hidden = False
-
-        resp = np.linspace(-1, 0.64, 32 * 32).reshape(32, 32).astype(np.float32)
-        for thr in (0.5, 0.6, 0.7, 0.9):
-            ov.threshold = thr
-            ov._render_payload({"offsets": np.zeros((0, 2), np.float32),
-                                "response": resp})
-            lo, hi = pushed[-1]
-            assert hi == 1.0, f"NXCORR clim ceiling moved to {hi} (flash)"
-            assert abs(lo - thr) < 1e-6, f"clim floor != threshold ({lo} vs {thr})"
+        plot = _Plot()
+        image = np.zeros((4, 4), np.float32)
+        _emit_preview_histogram(plot, {"transform": {"data": image,
+                                                     "levels": (0.4, 1.0)},
+                                       "threshold": 0.4})
+        assert marked == [(0.4, 1.0, 0.4)]
+        _emit_preview_histogram(plot, {"transform": None, "threshold": 0.4})
+        assert len(marked) == 1

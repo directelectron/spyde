@@ -1,0 +1,9 @@
+Every display that follows the navigator (the Find Vectors preview and its found
+vectors, the orientation template, the EBSD bands, the refine panels, the strain
+selection, image layers from another window, the fit's curves, the vectors
+window, the progressive result preview, the CSB raw frame) is now a node of the
+signal tree read through the same cached path as the pattern itself and drawn by
+the one painter thread. After centring a pattern, Find Vectors and Orientation
+Mapping run on the node the window shows, so their overlays land on the centred
+disks instead of the root's; on a centred lazy scan a preview move costs under a
+millisecond instead of a whole-block compute.

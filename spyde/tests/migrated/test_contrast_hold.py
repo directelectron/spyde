@@ -33,6 +33,7 @@ def _bare_plot(nav_dim: int):
     p.is_navigator = False
     p.needs_auto_level = True
     p._last_levels = None
+    p._overlay_groups = {}
     p.plot_state = _PS(nav_dim)        # nav_dim>0 → navigated (DP); 0 → output
     clims: list[tuple[float, float]] = []
 

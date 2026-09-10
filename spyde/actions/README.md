@@ -76,7 +76,8 @@ click ──► toolbar gate (plot_control_toolbar filters)
            back via session._dispatch_to_main — NEVER touch plots/figures from
            the worker; generation guard drops superseded runs)
       ──► result (commit.open_result_tree for progressive windows /
-           lifecycle.paint_signal_plots / lifecycle.replace_tree_attr overlays)
+           lifecycle.paint_signal_plots / tree.add_overlay for markers on the
+           displayed node)
       ──► Commit (commit.commit_result_tree: primary map + chip views +
            provenance)
       ──► teardown (Session._forget_window → controller.close() → figure
@@ -87,9 +88,13 @@ click ──► toolbar gate (plot_control_toolbar filters)
 
 - **on the tree**: results (`diffraction_vectors`, `orientation_map`,
   `vector_orientation`), wizard controllers (`_om_wizard`, `_vom_wizard`,
-  `_strain_controller`), overlays (`_vector_overlay`, `_fv_preview`, …),
-  run generations (`_<key>_run_gen`), batch flags (`_fv_batch_running`).
-  `BaseSignalTree.close()` tears all of it down.
+  `_strain_controller`), overlay NODES (`_vector_overlay`, `_fv_preview`, …),
+  which are children of the displayed node, added with `tree.add_overlay`,
+  reader overrides (`set_reader_override`: the reader answering for a node
+  whose frames are not in its own array — a vectors window's rendered disks, a
+  progressive result's landed blocks, a raw camera frame cut from an event
+  stream), run generations (`_<key>_run_gen`), batch flags
+  (`_fv_batch_running`). `BaseSignalTree.close()` tears all of it down.
 - **on the Session**: `_action_artifacts` (RegionAction selectors/outputs),
   `_window_controllers` (bare-figure window controllers), `signal_trees`.
 - **on the Plot**: `_vi_items` (VI chips).
@@ -114,12 +119,13 @@ an `open_result_tree` window that is a navigator **and** a signal plot only
 half-fills — the navigator fills block by block while the signal plot sits on
 its placeholder. `attach_signal_preview(session, tree, render=…,
 nav_shape=…)` drives the signal plot from the same per-block results: each
-landing block paints one deterministic sample position, and the
-navigator→signal slice function is swapped for one that renders any
-already-computed position on demand (an un-computed one returns `None`, so
-the last good frame stays up). Feed it `preview.note_block(nav_slices)` from
-the compute's per-chunk callback and `preview.close()` when the batch
-finalizes — close never clobbers a final display installed in the meantime.
+landing block paints one deterministic sample position, and the preview is
+pinned on the tree (`set_reader_override`) as the reader the signal plot reads
+through, rendering any already-computed position on demand (an un-computed one
+returns `None`, so the last good frame stays up). Feed it
+`preview.note_block(nav_slices)` from the compute's per-chunk callback and
+`preview.close()` when the batch finalizes — close never unpins a final
+display pinned in the meantime.
 Returns `None` on a window with no navigator (the Orientation / EBSD IPF map
 is a single 2-D plot); that is a documented no-op, not an error.
 
@@ -132,6 +138,14 @@ is a single 2-D plot); that is a documented no-op, not an error.
    `messages` (see `test_template_actions.py`); a gating test via
    `get_toolbar_actions_for_plot` on a fake plot (see
    `test_vector_vvi_action.py::TestVectorVVIGating`).
+
+**Per-frame display comes free for a `map`-based transform.** A node whose
+method is a hyperspy `map` underneath (`center_direct_beam`, azimuthal
+integration, per-pattern filters) is displayed one frame at a time from its
+parent's frame — the recorded map recipe — without computing the dask block,
+and is tagged local by construction. `is_local_per_frame` remains the switch
+for a per-frame transform that is NOT a `map` (rebin, crop). See
+`spyde/array_cache/readers/recipe.py`.
 
 **Wizard**:
 1. Subclass `WizardController` (set `key`), write the staged handlers

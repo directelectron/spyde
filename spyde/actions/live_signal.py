@@ -14,12 +14,12 @@ results the navigator fill uses:
 
   (a) **live during the fill** — each completed block paints ONE sample position's
       frame, so the signal plot visibly updates alongside the navigator;
-  (b) **computed regions are readable immediately** — the navigator→signal slice
-      function is swapped for one that renders any ALREADY-computed position on
-      demand, so dragging over a filled region shows that position's real frame
-      without waiting for the batch. An un-computed position returns ``None``, so
-      the last good frame stays up (no flash) exactly like the expensive-tier nav
-      read (CLAUDE.md Live-Display §3).
+  (b) **computed regions are readable immediately**: a reader pinned on the
+      result tree renders any ALREADY-computed position on demand, so dragging
+      over a filled region shows that position's real frame without waiting for
+      the batch. An un-computed position returns ``None``, so the last good
+      frame stays up (no flash) exactly like the expensive-tier nav read
+      (CLAUDE.md Live-Display §3).
 
 The action supplies only ``render(index) -> ndarray | None``; readiness tracking,
 sampling, throttling, the thread marshal and the handover to the final display
@@ -35,8 +35,8 @@ THREADING CONTRACT (CLAUDE.md): the feeds (:meth:`note_block`,
 :meth:`note_ready_mask`) run on whatever thread the compute's per-chunk callback
 uses — a Dask done-callback thread or a poller. ``render`` runs there too, so it
 must be cheap and must never touch a ``Plot``; the paint is marshalled onto the
-asyncio main thread via ``session._dispatch_to_main``. The slice function runs on
-the ``_NavDispatcher`` thread like every other navigator read.
+asyncio main thread via ``session._dispatch_to_main``. The reader runs on the
+``_NavDispatcher`` thread like every other navigator read.
 """
 from __future__ import annotations
 
@@ -84,12 +84,15 @@ def _block_sample_index(nav_slices: Sequence[slice]) -> tuple[int, ...]:
 class ProgressiveSignalPreview:
     """Live signal-plot preview for one progressively-filled result tree.
 
+    It is the reader the result tree's signal plots read through while the
+    batch runs: ``read_frame`` answers a computed position and returns None for
+    one the batch has not reached.
+
     Build it with :func:`attach_signal_preview` (which no-ops on a window that
     has no navigator, e.g. the IPF-only Orientation result). Feed it blocks as
     the compute produces them and :meth:`close` it when the batch finalizes —
-    ``close`` never clobbers a final display the action installed in the
-    meantime (it restores a slice function only while that function is still
-    ours).
+    ``close`` never clobbers a final display the action pinned in the meantime
+    (it unpins only while the pinned reader is still this one).
     """
 
     def __init__(self, session, tree, *, render: Callable[[tuple], Any],
@@ -112,12 +115,6 @@ class ProgressiveSignalPreview:
         self._last_user = 0.0
         self._last_log = 0.0
         self._last_serve_log = 0.0
-        self._installed: list[tuple[Any, Any, Any]] = []
-        # ONE bound method, kept for the lifetime of the preview: `self._slice_fn`
-        # builds a fresh bound object on every attribute access, so the identity
-        # checks that install/close rely on ("is this slice function still ours?")
-        # would never match.
-        self.slice_fn = self._slice_fn
         #: counters the tests (and the log lines) assert on
         self.blocks_seen = 0
         #: (a) auto-sample paints driven by a landing block
@@ -226,27 +223,20 @@ class ProgressiveSignalPreview:
         except Exception as e:
             log.debug("[%s] dispatching preview paint failed: %s", self.name, e)
 
-    # ── (b) the navigator→signal slice function ──────────────────────────────
+    # ── (b) the on-demand read ───────────────────────────────────────────────
 
-    @staticmethod
-    def _resolve_index(indices) -> tuple[int, ...] | None:
-        """A navigator's reported indices → a full nav index tuple.
+    def _navigation_index(self, indices):
+        """A selector's reported indices as a full navigation index tuple, the
+        same preparation the base read makes: the spatial pair in data order,
+        a crosshair's point cloud reduced to one point, and a region reduced to
+        its centre (the action's own final display owns real region
+        integration; the preview shows one position)."""
+        from spyde.drawing.update_functions import _prepare_nav_indices
 
-        A crosshair reports ``[[ix, iy]]``; a region selector reports a grid of
-        such rows, which collapses to its CENTRE position (the action's own
-        final display owns real region integration — the preview only ever shows
-        one position). A 5-D stack's leading coords ride in front.
-        """
-        from spyde.actions.vector_overlay import _indices_lead_nav, _indices_to_iyix
-        arr = np.asarray(indices)
-        if arr.ndim == 2 and arr.shape[0] > 1 and arr.shape[1] >= 2:
-            ix = int(np.median(arr[:, -2]))
-            iy = int(np.median(arr[:, -1]))
-            lead = tuple(int(v) for v in arr[0][:-2])
-        else:
-            iy, ix = _indices_to_iyix(indices)
-            lead = _indices_lead_nav(indices)
-        return tuple(lead) + (iy, ix)
+        prepared = _prepare_nav_indices(self.tree.root, indices, integrating=False)
+        if prepared is None:
+            return None
+        return tuple(int(v) for v in np.atleast_1d(np.asarray(prepared)).ravel())
 
     def _refresh_parked_position(self, nav_slices: Sequence[slice]) -> bool:
         """Re-fire any selector whose current position sits in *nav_slices*.
@@ -256,9 +246,10 @@ class ProgressiveSignalPreview:
         never a direct paint from this callback thread.
         """
         hit = False
-        for sel, _child, _prev in list(self._installed):
+        manager = getattr(self.tree, "navigator_plot_manager", None)
+        for selector in getattr(manager, "all_navigation_selectors", None) or ():
             try:
-                index = self._resolve_index(sel.current_indices)
+                index = self._navigation_index(selector.current_indices)
             except Exception:
                 continue
             if index is None or len(index) != len(nav_slices):
@@ -272,25 +263,25 @@ class ProgressiveSignalPreview:
                 continue
             hit = True
             try:
-                sel.delayed_update_data(force=True)
+                selector.delayed_update_data(force=True)
             except Exception as e:
                 log.debug("[%s] re-firing parked selector failed: %s", self.name, e)
         return hit
 
-    def _slice_fn(self, selector, child, indices):
+    def read_frame(self, indices):
         """Render an already-computed position on demand.
 
         Runs on the ``_NavDispatcher`` thread. Returns ``None`` for a position
-        the batch has not reached yet, which ``BaseSelector._run_update`` treats
-        as "nothing to paint" — the last good frame stays up.
+        the batch has not reached yet, which the navigator read treats as
+        nothing to paint, so the last good frame stays up.
         """
         now = time.monotonic()
         self._last_user = now
         if self._closed:
             return None
         try:
-            index = self._resolve_index(indices)
-            if index is None or not self.is_ready(index):
+            index = tuple(int(v) for v in np.atleast_1d(np.asarray(indices)).ravel())
+            if not self.is_ready(index):
                 self.reads_declined += 1
                 return None
             frame = self.render(index)
@@ -313,48 +304,48 @@ class ProgressiveSignalPreview:
                          self.frames_served, self.reads_declined)
             return frame
         except Exception as e:
-            log.debug("[%s] preview slice failed: %s", self.name, e)
+            log.debug("[%s] preview read failed: %s", self.name, e)
             return None
 
-    def install(self) -> bool:
-        """Swap the preview in as the navigator→signal update function.
+    def region_frame(self, points):
+        """A region shows its centre position, or nothing when that position
+        has not been computed.
 
-        Returns True when at least one navigator→signal link was captured (i.e.
-        this really is a navigator + signal window).
-        """
-        sig_plots = set(getattr(self.tree, "signal_plots", []) or [])
-        npm = getattr(self.tree, "navigator_plot_manager", None)
-        if not sig_plots or npm is None:
-            return False
-        for sel in getattr(npm, "all_navigation_selectors", []) or []:
-            for child in list(getattr(sel, "children", {}).keys()):
-                if child not in sig_plots:
-                    continue
-                self._installed.append((sel, child, sel.children[child]))
-                sel.children[child] = self.slice_fn
-                child.needs_auto_level = True
-        return bool(self._installed)
+        Integrating a region over a half-finished result would have to wait for
+        every position in it; the action's own final display owns real region
+        integration, and the preview shows one position."""
+        grid = np.asarray(points).reshape(-1, np.shape(points)[-1])
+        centre = np.mean(grid, axis=0).astype(int)
+        return self.read_frame(tuple(int(v) for v in centre))
+
+    @property
+    def frame_bytes(self) -> int:
+        """One frame of the result window, for a caller sizing a cache."""
+        data = getattr(self.tree.root, "data", None)
+        shape = tuple(getattr(data, "shape", ()) or ())
+        if len(shape) <= len(self.nav_shape):
+            return 0
+        return int(np.prod(shape[len(self.nav_shape):])) * data.dtype.itemsize
 
     # ── teardown ─────────────────────────────────────────────────────────────
 
     def close(self) -> None:
         """Stop previewing and hand the signal plot back.
 
-        A slice function is restored ONLY while it is still ours: the action's
-        finalize (Find Vectors' ``_install_render_display``) runs before this and
-        installs the real render display — restoring the placeholder slice over
-        the top of it would paint the finished window black.
+        The reader is unpinned ONLY while it is still ours: the action's
+        finalize runs first and pins the real display, and unpinning that would
+        paint the finished window black.
         """
         if self._closed:
             return
         self._closed = True
-        for sel, child, prev in self._installed:
-            try:
-                if sel.children.get(child) is self.slice_fn:
-                    sel.children[child] = prev
-            except Exception as e:
-                log.debug("[%s] restoring slice fn failed: %s", self.name, e)
-        self._installed = []
+        signal = getattr(self.tree, "root", None)
+        try:
+            if (signal is not None
+                    and self.tree.reader_override_for(signal) is self):
+                self.tree.set_reader_override(signal, None)
+        except Exception as e:
+            log.debug("[%s] releasing the preview reader failed: %s", self.name, e)
         if getattr(self.tree, "_live_signal_preview", None) is self:
             self.tree._live_signal_preview = None
 
@@ -365,7 +356,8 @@ class ProgressiveSignalPreview:
 def attach_signal_preview(session, tree, *, render: Callable[[tuple], Any],
                           nav_shape: Sequence[int], name: str = "live-signal",
                           **kwargs) -> ProgressiveSignalPreview | None:
-    """Attach a :class:`ProgressiveSignalPreview` to *tree* and install it.
+    """Attach a :class:`ProgressiveSignalPreview` to *tree* and pin it as the
+    reader the tree's signal plots read through.
 
     Returns the preview, or ``None`` when *tree* is not a navigator + signal
     window — the Orientation / EBSD IPF result windows are a single 2-D plot
@@ -375,13 +367,17 @@ def attach_signal_preview(session, tree, *, render: Callable[[tuple], Any],
     per-run state lives on the tree, so ``BaseSignalTree.close()`` tears it down).
     """
     try:
+        if (not getattr(tree, "signal_plots", None)
+                or getattr(tree, "navigator_plot_manager", None) is None):
+            log.debug("[%s] no navigator to signal link on this tree; "
+                      "live signal preview skipped", name)
+            return None
         preview = ProgressiveSignalPreview(session, tree, render=render,
                                            nav_shape=nav_shape, name=name,
                                            **kwargs)
-        if not preview.install():
-            log.debug("[%s] no navigator→signal link on this tree; "
-                      "live signal preview skipped", name)
-            return None
+        tree.set_reader_override(tree.root, preview)
+        for plot in list(tree.signal_plots):
+            plot.needs_auto_level = True
     except Exception as e:
         log.debug("attaching live signal preview failed: %s", e)
         return None

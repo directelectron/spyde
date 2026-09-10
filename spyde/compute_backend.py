@@ -103,6 +103,9 @@ class ComputeBackend:
         # threaded mode (which already has _executor) never pays for it. See
         # submit_graph: a nav read must NEVER go to the distributed cluster.
         self._nav_executor: concurrent.futures.ThreadPoolExecutor | None = None
+        # Dedicated LOCAL pool for expensive overlay evaluations. See
+        # _overlay_pool for why it is separate from the nav pool.
+        self._overlay_executor: concurrent.futures.ThreadPoolExecutor | None = None
 
     def _nav_pool(self) -> concurrent.futures.ThreadPoolExecutor:
         """The local pool interactive nav reads run on, built on first use.
@@ -124,6 +127,32 @@ class ComputeBackend:
         """Release the local nav-read pool (Session.shutdown)."""
         with self._lock:
             pool, self._nav_executor = self._nav_executor, None
+        if pool is not None:
+            pool.shutdown(wait=False, cancel_futures=True)
+
+    def _overlay_pool(self) -> concurrent.futures.ThreadPoolExecutor:
+        """The local pool expensive overlay evaluations run on, built on first
+        use, in BOTH modes.
+
+        Local, because an overlay function closes over a plot's readers and
+        cannot be pickled to a cluster. Separate from the nav pool, whose one
+        worker the base frame queues on: an overlay taking a second would hold
+        the displayed pattern behind it. One worker here for the nav pool's own
+        reason, so superseded evaluations cannot land out of order."""
+        with self._lock:
+            if self._overlay_executor is None:
+                self._overlay_executor = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=1, thread_name_prefix="overlay-eval")
+            return self._overlay_executor
+
+    def submit_overlay(self, fn) -> concurrent.futures.Future:
+        """Run ``fn`` (a no-arg callable) on the overlay lane."""
+        return self._overlay_pool().submit(fn)
+
+    def shutdown_overlay_pool(self) -> None:
+        """Release the local overlay lane (Session.shutdown)."""
+        with self._lock:
+            pool, self._overlay_executor = self._overlay_executor, None
         if pool is not None:
             pool.shutdown(wait=False, cancel_futures=True)
 

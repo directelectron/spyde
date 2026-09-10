@@ -229,8 +229,14 @@ class StrainController(WizardController):
     def _on_ref_selector(self, indices) -> None:
         """The DEDICATED reference crosshair moved → adopt its position as the
         new reference pixel (Region mode) and re-fit."""
-        from spyde.actions.vector_overlay import _indices_to_iyix
-        iy, ix = _indices_to_iyix(indices)
+        from spyde.drawing.update_functions import _prepare_nav_indices
+        signal = getattr(self.src_tree, "root", None)
+        prepared = _prepare_nav_indices(signal, indices, integrating=False)
+        position = tuple(int(v) for v in
+                         np.atleast_1d(np.asarray(prepared)).ravel())
+        if len(position) < 2:
+            return
+        iy, ix = position[-2], position[-1]
         log.debug("[strain-ref] reference crosshair moved -> (%d,%d) (was %s)",
                   iy, ix, self.ref_yx)
         if (iy, ix) == self.ref_yx:

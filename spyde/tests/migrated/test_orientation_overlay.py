@@ -15,6 +15,7 @@ from __future__ import annotations
 import numpy as np
 import hyperspy.api as hs
 
+from spyde.array_cache import reader_for_overlay
 from spyde.tests.migrated.conftest import _settle, close_session, make_session
 
 
@@ -62,18 +63,20 @@ class TestOrientationOverlay:
             )
             assert om is not None
 
-            overlay = getattr(src_tree, "_orientation_overlay", None)
-            assert overlay is not None, "orientation overlay never attached"
-            assert overlay._mg is not None
+            node = getattr(src_tree, "_orientation_overlay", None)
+            assert node is not None, "orientation overlay never attached"
+            assert (id(node), "template") in src_plot._overlay_groups
 
-            # The hook is registered on a navigator selector (real-drag path).
-            sels = [s for s in src_tree.navigator_plot_manager.all_navigation_selectors
-                    if overlay._on_indices in s.index_hooks]
-            assert sels, "overlay hook not registered on any navigator selector"
+            # It is a child of the node the window displays, which is what makes
+            # a navigator move find it.
+            displayed = src_plot.plot_state.current_signal
+            assert node in src_tree.overlay_children(displayed)
 
-            # Push a concrete nav position through the hook and inspect offsets.
-            overlay._on_indices(np.array([[1, 1]]))
-            offsets = np.asarray(overlay._mg._data["offsets"], dtype=np.float64)
+            # Read a concrete nav position through the plot's readers, the way
+            # the navigator refresh reads it, and inspect the offsets.
+            reader = reader_for_overlay(src_plot, node)
+            offsets = np.asarray(reader.read_frame((1, 1))["template"],
+                                 dtype=np.float64)
             # There should be at least a few simulated spots, and every one must
             # land inside the 32x32 detector (pixel coords), not off-frame.
             assert len(offsets) > 0, "no template spots produced"
@@ -84,8 +87,8 @@ class TestOrientationOverlay:
             # Moving to two more positions both yield a valid (finite,
             # in-frame) push.
             for (iy, ix) in [(0, 0), (2, 3)]:
-                overlay._on_indices(np.array([[ix, iy]]))
-                off = np.asarray(overlay._mg._data["offsets"], dtype=np.float64)
+                off = np.asarray(reader.read_frame((iy, ix))["template"],
+                                 dtype=np.float64)
                 assert np.isfinite(off).all()
                 if len(off):
                     assert off.min() >= -0.5 and off.max() <= 32.5
@@ -115,6 +118,62 @@ class TestOrientationOverlay:
             otree = session.signal_trees[-1]
             assert getattr(otree, "orientation_map", None) is om
             assert getattr(src_tree, "_orientation_overlay", None) is not None
+        finally:
+            close_session(session)
+
+    def test_the_template_node_reads_a_centred_lazy_node_through_the_recipe(self):
+        """Centre a lazy scan, then attach the template overlay to the centred
+        node: both the overlay and the frame it matches must come through the
+        plot's recipe readers, not a compute of the centred node's block."""
+        import dask.array as da
+        from spyde.actions.orientation_compute import build_matching_cache
+        from spyde.actions.vector_overlay import attach_orientation_overlay
+        from spyde.actions.center_zero_beam import czb_run
+        from spyde.actions.orientation_compute import generate_library_from_phases
+        from spyde.array_cache import reader_for_overlay
+        from spyde.tests.migrated._async import wait_until
+
+        session = make_session()
+        try:
+            lazy = _centered_diffraction_4d(nav=(4, 4)).as_lazy()
+            lazy.data = lazy.data.rechunk((2, 2, -1, -1))
+            session._add_signal(lazy)
+            _settle(session)
+            plot = _signal_plot(session)
+            tree = plot.signal_tree
+
+            before = plot.plot_state.current_signal
+            czb_run(session, plot, {"method": "center_of_mass"})
+            assert wait_until(
+                lambda: plot.plot_state.current_signal is not before, 30)
+            centred = plot.plot_state.current_signal
+
+            sim = generate_library_from_phases([_make_phase()], 200.0, 10.0,
+                                               1e-4, 1.0)
+            node = attach_orientation_overlay(
+                centred, sim, build_matching_cache(centred, sim), tree)
+
+            reader = reader_for_overlay(plot, node)
+            assert type(reader).__name__ == "RecipeReader", reader
+            block_computes = []
+            original = da.Array.compute
+
+            def counting_compute(self, *args, **kwargs):
+                if int(np.prod(self.shape[:2])) > 1:
+                    block_computes.append(self.shape)
+                return original(self, *args, **kwargs)
+
+            reader.read_frame((1, 1))               # warm the parent's block
+            parent = plot._local_transform_readers.get(id(centred))
+            assert type(parent).__name__ == "RecipeReader", parent
+
+            da.Array.compute = counting_compute
+            try:
+                spots = reader.read_frame((1, 1))["template"]
+            finally:
+                da.Array.compute = original
+            assert block_computes == [], block_computes
+            assert np.isfinite(spots).all()
         finally:
             close_session(session)
 

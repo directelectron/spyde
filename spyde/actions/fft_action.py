@@ -26,7 +26,7 @@ class FFTAction(RegionAction):
 
     def reduce(self, signal, selector, indices, **params):
         # Source image is whatever the parent plot currently displays.
-        img = getattr(self.plot, "current_data", None)
+        img = getattr(self.plot, "displayed_data", None)
         if not isinstance(img, np.ndarray) or img.ndim != 2:
             return None
 

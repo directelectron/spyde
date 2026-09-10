@@ -525,9 +525,11 @@ class Session(
             return
 
         def node_to_dict(node):
+            # Overlay children are drawn on their parent, not shown as nodes.
             return {
                 "name": node.name, "signal_id": id(node.signal),
-                "children": [node_to_dict(c) for c in node.children.values()],
+                "children": [node_to_dict(c) for c in node.children.values()
+                             if not c.overlay],
             }
 
         # Active node = what the tree's signal plot displays (prefer the plot
@@ -695,8 +697,9 @@ class Session(
         if backend is not None:
             try:
                 backend.shutdown_nav_pool()
+                backend.shutdown_overlay_pool()
             except Exception as e:
-                log.debug("compute-backend nav pool shutdown failed: %s", e)
+                log.debug("compute-backend pool shutdown failed: %s", e)
         self.dask_manager.shutdown()
         for tmpdir in self._example_temp_paths:
             try:

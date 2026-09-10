@@ -137,6 +137,18 @@ class FitStore:
             return None
         return key
 
+    def flat_index(self, indices):
+        """The row of a whole-scan values array that holds this position's fit,
+        or None.
+
+        The one place a navigation position becomes a row number, so a
+        whole-scan result and a single position cannot disagree about which
+        spectrum is which. It is :meth:`_key` in C order, which is exactly how
+        :meth:`put_all` lays a scan out."""
+        key = self._key(indices)
+        return None if key is None else int(
+            np.ravel_multi_index(key, self.nav_shape))
+
     # ── one position ──────────────────────────────────────────────────────
     def put(self, indices, values, chisq: float | None = None,
             std=None) -> bool:

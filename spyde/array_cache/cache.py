@@ -8,11 +8,11 @@ eviction is per-FRAME, not per-CHUNK — a reader kind may have no chunk
 concept at all (the binary/pread reader reads exactly one frame per call).
 
 Almost always touched from the serial _NavDispatcher thread (Live-Display §2),
-but NOT exclusively: spyde/actions/overlay.py's off-thread source warm
-(``_warm_source_chunk``) populates this same cache from a compute-backend
-worker thread so the next dispatcher read finds the frame resident. So the
-bookkeeping IS locked — an OrderedDict's ``move_to_end``/``popitem`` and the
-running ``_nbytes`` total are not safe to interleave across threads. The lock
+but NOT exclusively: an expensive overlay reads through this same cache on the
+compute backend's overlay lane, so a frame it decodes is resident for the next
+dispatcher read. So the bookkeeping IS locked — an OrderedDict's
+``move_to_end``/``popitem`` and the running ``_nbytes`` total are not safe to
+interleave across threads. The lock
 covers ONLY the dict bookkeeping, NEVER the reader call: holding a lock across
 a compute is exactly the retired ``_cache_lock_ctx`` mistake that wedged the
 navigator (Live-Display §2). Two threads may therefore both miss and both

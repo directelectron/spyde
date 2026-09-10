@@ -199,7 +199,7 @@ class BackgroundWizard(WizardController):
                 # UPDATE IN PLACE. Removing and re-adding the line every drag
                 # frame is heavy AND does not repaint during the drag — the
                 # curve simply does not follow the band. Same lesson as the fit
-                # preview's `rebuild_lines` vs `refresh_lines`.
+                # preview's model curves.
                 self._line.set_data(y)
         except Exception as e:
             log.debug("drawing the background preview failed: %s", e)

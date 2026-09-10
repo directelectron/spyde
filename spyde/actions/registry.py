@@ -32,7 +32,6 @@ _SPYDE_STAGED_HANDLERS: dict[str, str] = {
     "fit_commit":           "spyde.actions.fit_action.fit_commit",
     "fit_from_composition": "spyde.actions.fit_action.fit_from_composition",
     "fit_current":          "spyde.actions.fit_action.fit_current",
-    "fit_navigated":        "spyde.actions.fit_action.fit_navigated",
     "fit_refit_poor":       "spyde.actions.fit_action.fit_refit_poor",
     "fit_save_model":       "spyde.actions.fit_action.fit_save_model",
     "fit_load_model":       "spyde.actions.fit_action.fit_load_model",

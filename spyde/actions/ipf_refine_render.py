@@ -222,18 +222,30 @@ def emit_refine_window(session, fig, fig_id: str, html: str, *, title: str = "IP
     return int(wid)
 
 
+def refine_correlations(frame, *, sim, cache, gamma, normalize, rot_mask):
+    """The per-template correlation of one pattern against the whole library,
+    restricted to the templates the mask circles keep."""
+    from spyde.actions.ipf_refine import match_correlations
+
+    return match_correlations(np.asarray(frame, dtype=float), sim, cache,
+                              gamma=float(gamma),
+                              normalize_templates=bool(normalize),
+                              rot_mask=rot_mask)
+
+
 class RefineIpfController:
-    """Drives the live per-phase IPF correlation heatmaps during refine: on every
-    navigator move (and gamma/normalize change) it re-matches the current pattern
-    and recolours each phase's triangle; a double-click on a panel adds/removes a
-    mask circle that LIMITS which orientations the match considers (``rot_mask``).
+    """Drives the live per-phase IPF correlation heatmaps during refine.
+
+    The correlation is an overlay node on the displayed pattern, so it is
+    re-matched at every navigator position and its value recolours each phase's
+    triangle. A double-click on a panel adds or removes a mask circle that
+    LIMITS which orientations the match considers, which is the node's
+    ``rot_mask`` static argument.
     """
 
-    def __init__(self, dp_plot, signal, sim, cache, infos, panels, *,
+    def __init__(self, signal, sim, cache, infos, panels, *,
                  gamma: float = 1.0, normalize: bool = False):
-        import threading
         from spyde.actions.orientation_compute import template_tables
-        self.dp_plot = dp_plot
         self.signal = signal
         self.sim = sim
         self.cache = cache
@@ -243,74 +255,68 @@ class RefineIpfController:
         self.normalize = bool(normalize)
         self.n_templates = int(template_tables(sim)[0].shape[0])
         self.circles = {info["phase_index"]: [] for info in infos}   # per-phase masks
-        self._last_iyix = (0, 0)
-        self._lock = threading.Lock()
-        self._selectors: list = []
+        self.tree = None
+        self.node = None
 
     def attach(self, tree):
-        from spyde.actions.vector_overlay import (
-            _navigator_selectors_for, _indices_to_iyix,
+        from spyde.actions.vector_overlay import _add_overlay
+
+        self.tree = tree
+        self.node = _add_overlay(
+            tree, self.signal, refine_correlations, name="ipf_refine", groups={},
+            static={"sim": self.sim, "cache": self.cache, "gamma": self.gamma,
+                    "normalize": self.normalize, "rot_mask": None},
+            on_value=self.draw,
         )
-        self._to_iyix = _indices_to_iyix
-        self._selectors = _navigator_selectors_for(tree, self.dp_plot)
-        for sel in self._selectors:
-            sel.index_hooks.append(self._on_indices)
-            if sel.current_indices is not None:
-                self._last_iyix = _indices_to_iyix(sel.current_indices)
         for panel in self.panels:
             self._wire_double_click(panel)
-        self._recompute()                       # seed the heatmaps
         return self
 
-    def _on_indices(self, indices):
-        self._last_iyix = self._to_iyix(indices)
-        self._recompute()
+    def draw(self, value) -> None:
+        """Recolour every phase panel from one position's correlation. Runs on
+        the painter thread, with the value the node evaluated to."""
+        if not self.panels or value is None:
+            return
+        corr, best = value
+        try:
+            update_panels(self.panels, corr, self.circles,
+                          best_xy_for(self.infos, int(best[0])))
+        except Exception as e:
+            log.debug("repainting the refine triangles failed: %s", e)
 
     def set_refine_params(self, *, gamma=None, normalize=None) -> None:
         if gamma is not None:
             self.gamma = float(gamma)
         if normalize is not None:
             self.normalize = bool(normalize)
-        self._recompute()
-
-    def _frame(self, iy, ix):
-        f = self.signal.data[iy, ix]
-        if hasattr(f, "compute"):
-            f = f.compute()
-        return np.asarray(f, dtype=float)
-
-    def _recompute(self):
-        from spyde.actions.ipf_refine import match_correlations, rot_mask_from_circles
-        if not self.panels:
-            return
-        with self._lock:
-            try:
-                iy, ix = self._last_iyix
-                mask = rot_mask_from_circles(self.infos, self.circles, self.n_templates)
-                corr, best = match_correlations(
-                    self._frame(iy, ix), self.sim, self.cache,
-                    gamma=self.gamma, normalize_templates=self.normalize, rot_mask=mask)
-                update_panels(self.panels, corr, self.circles,
-                              best_xy_for(self.infos, int(best[0])))
-            except Exception as e:
-                log.debug("refine ipf recompute failed: %s", e)
+        self._replace_static(gamma=self.gamma, normalize=self.normalize)
 
     def toggle_circle(self, phase_index: int, x: float, y: float) -> None:
         """Double-click action: remove the mask circle the click lands in, else
-        add a new one centred there (radius ≈ 9 % of the triangle extent), then
-        re-match with the updated region restriction."""
+        add a new one centred there (radius about 9 % of the triangle extent),
+        then re-match with the updated region restriction."""
         info = next((i for i in self.infos if i["phase_index"] == phase_index), None)
         if info is None:
             return
-        circs = self.circles[phase_index]
-        for k, (cx, cy, cr) in enumerate(circs):
+        circles = self.circles[phase_index]
+        for k, (cx, cy, cr) in enumerate(circles):
             if (x - cx) ** 2 + (y - cy) ** 2 <= cr * cr:
-                circs.pop(k)
-                self._recompute()
-                return
-        circs.append((float(x), float(y),
-                      0.09 * float((info["maxs"] - info["mins"]).mean())))
-        self._recompute()
+                circles.pop(k)
+                break
+        else:
+            circles.append((float(x), float(y),
+                            0.09 * float((info["maxs"] - info["mins"]).mean())))
+        self._replace_static(rot_mask=self._rot_mask())
+
+    def _rot_mask(self):
+        from spyde.actions.ipf_refine import rot_mask_from_circles
+
+        return rot_mask_from_circles(self.infos, self.circles, self.n_templates)
+
+    def _replace_static(self, **static) -> None:
+        if self.tree is None or self.node is None:
+            return
+        self.tree.replace_overlay_static(self.node, **static)
 
     def _wire_double_click(self, panel):
         pidx = panel["info"]["phase_index"]
@@ -329,12 +335,13 @@ class RefineIpfController:
             log.debug("wiring refine panel double-click failed: %s", e)
 
     def close(self):
-        """WindowController protocol — Session._forget_window calls this when
-        the refine window goes away (✕, wizard replaced, tree close)."""
+        """WindowController protocol: Session._forget_window calls this when
+        the refine window goes away (the close box, a replaced wizard, a tree
+        close)."""
         self.remove()
 
     def remove(self):
-        for sel in self._selectors:
-            if self._on_indices in sel.index_hooks:
-                sel.index_hooks.remove(self._on_indices)
-        self._selectors = []
+        from spyde.actions.vector_overlay import remove_overlay_node
+
+        remove_overlay_node(self.tree, self.node)
+        self.node = None

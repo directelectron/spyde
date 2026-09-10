@@ -252,11 +252,18 @@ class TestRefineController:
         infos = ipf_refine.build_phase_ipf(sim)
         _fig, _fid, _html, panels = build_refine_figure(infos)
 
-        ctrl = RefineIpfController(None, s, sim, cache, infos, panels,
+        ctrl = RefineIpfController(s, sim, cache, infos, panels,
                                    gamma=0.6, normalize=False)
-        ctrl._last_iyix = (1, 1)
-        ctrl._recompute()                                # live paint — no error
         assert ctrl.circles == {0: []}
+
+        # The per-position function is what a navigator move evaluates; the
+        # controller paints the panels from its value.
+        from spyde.actions.ipf_refine_render import refine_correlations
+        value = refine_correlations(np.asarray(s.data[1, 1], float), sim=sim,
+                                    cache=cache, gamma=0.6, normalize=False,
+                                    rot_mask=None)
+        assert len(value[0]) == ctrl.n_templates
+        ctrl.draw(value)                                 # live paint, no error
 
         info = infos[0]
         cx = float(info["mins"][0] + 0.4 * (info["maxs"][0] - info["mins"][0]))

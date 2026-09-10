@@ -741,7 +741,7 @@ def report_paste_cell(session, plot, payload) -> None:
     A markdown cell is inserted verbatim (fresh id). A figure cell gets FRESH ids
     for its cell / panels / layers, and each layer's SignalRef is resolved like
     ``report_open`` does: all-resolvable → rebuilt LIVE (re-snapshotted from the
-    resolved plots' current_data); otherwise an OFFLINE cell whose baked fallback
+    resolved plots' displayed images); otherwise an OFFLINE cell whose baked fallback
     is the provided ``png`` data URL."""
     from spyde.actions.report.handlers import _ensure_open, _insert_cell
     mgr = _ensure_open(session)
@@ -811,7 +811,7 @@ def report_paste_cell(session, plot, payload) -> None:
             src_plot = layer.source.resolve(session) if layer.source else None
             arr = None
             if src_plot is not None:
-                frame = getattr(src_plot, "current_data", None)
+                frame = getattr(src_plot, "displayed_data", None)
                 if isinstance(frame, np.ndarray) and frame.dtype != object:
                     arr = np.array(frame, copy=True)
             if arr is None:

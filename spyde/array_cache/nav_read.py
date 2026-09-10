@@ -21,6 +21,7 @@ import logging
 
 import numpy as np
 
+from .readers.eager import EagerReader
 from .resolve import resolve_reader
 
 log = logging.getLogger(__name__)
@@ -59,8 +60,15 @@ def _reader_for(plot, signal, data):
         # are recycled, so drop it explicitly at the one place we KNOW the data
         # changed rather than relying on the new reader landing at a new address.
         _invalidate_integrator(plot)
-    reader = _try_per_frame_reader(plot, signal, data) or resolve_reader(
-        signal, data, block_cache=getattr(plot, "_block_cache", None))
+    if isinstance(data, np.ndarray):
+        # Already in RAM (a bundled synthetic root, an eager example): a frame
+        # is an index. Reached as the PARENT of a derived view.
+        reader = EagerReader(data, signal.axes_manager.navigation_dimension)
+    else:
+        reader = (_try_per_frame_reader(plot, signal, data)
+                  or _try_recipe_reader(plot, signal, data)
+                  or resolve_reader(signal, data,
+                                    block_cache=getattr(plot, "_block_cache", None)))
     if reader is not None:
         readers[key] = reader
     return reader
@@ -130,6 +138,38 @@ def _try_per_frame_reader(plot, signal, data):
                                       parent_signal)
     except Exception as e:
         log.debug("per-frame reader resolve failed, using the dask view: %s", e)
+        return None
+
+
+def _try_recipe_reader(plot, signal, data):
+    """A RecipeReader for a node made by a hyperspy ``map`` whose recorded
+    recipe is rooted at the node's tree parent, or None.
+
+    The general form of the per-frame idea above: the recipe IS the function
+    hyperspy runs per position inside every block, so applying it to the
+    parent's frame yields the block's frame, bit for bit (measured 2196 ms ->
+    0.55 ms per chunk crossing on a centred 5-D .zspy). See readers/recipe.py.
+
+    Lives here for the same reason as the per-frame reader: it needs the tree
+    to find the parent, and the parent's reader must come through
+    :func:`_reader_for` so it shares the plot's block cache."""
+    tree = getattr(plot, "signal_tree", None)
+    if tree is None:
+        return None
+    try:
+        from .readers.recipe import RecipeReader, chain_reaches
+
+        node = tree.get_node(signal)
+        parent = getattr(node, "parent", None) if node is not None else None
+        parent_signal = getattr(parent, "signal", None)
+        if parent_signal is None or not chain_reaches(signal, parent_signal):
+            return None
+        parent_reader = _reader_for(plot, parent_signal, parent_signal.data)
+        if parent_reader is None:
+            return None
+        return RecipeReader(signal, data, parent_signal, parent_reader)
+    except Exception as e:
+        log.debug("recipe reader resolve failed, using the dask view: %s", e)
         return None
 
 
@@ -284,22 +324,161 @@ def _get_local_region(plot, signal, data, idx, prof=None):
     return acc
 
 
-def close_all_readers(plot) -> None:
-    """Close every cached reader on ``plot`` (releasing e.g. BinaryReader's
-    open file descriptor) before dropping them — called on node switch and
-    on Plot.close(), mirroring where _array_cache.clear() is already called."""
+def retain_readers(plot, signals) -> None:
+    """Keep the readers, and their decoded blocks, for ``signals``; close and
+    drop every other reader on ``plot`` (releasing e.g. BinaryReader's open
+    file descriptor).
+
+    Called on a node switch with the new node's ancestor chain, the node itself
+    up to the tree root. A mapped or rebinned node reads through its parent's
+    frames, and the root's decoded chunks are the expensive part (a 134 MB zarr
+    chunk is ~110 ms), so they survive the switch. The region running sum
+    belonged to the old node and is dropped."""
     _invalidate_integrator(plot)
     readers = getattr(plot, "_local_transform_readers", None)
     if not readers:
         return
-    for reader in readers.values():
+    keep = {id(signal) for signal in signals}
+    block_cache = getattr(plot, "_block_cache", None)
+    for key in list(readers):
+        if key in keep:
+            continue
+        reader = readers.pop(key)
+        if block_cache is not None:
+            block_cache.drop_owner(id(reader))
         close = getattr(reader, "close", None)
         if close is not None:
             try:
                 close()
             except Exception:
                 pass
-    readers.clear()
+
+
+class _CachedParentFrames:
+    """An overlay's source frames, read through the plot's frame cache.
+
+    A navigation window re-reads most of the frames it read at the previous
+    position, so it has to go through the cache the base frame uses rather
+    than straight at the reader: a memmap reader keeps nothing, and a 7x7
+    window would be 49 disk reads on every move instead of the 7 that
+    actually moved.
+
+    ``follow_display`` re-resolves the signal on every read, for frames that
+    come from another window: that window can switch to another node while the
+    overlay is drawn, and the overlay follows what it shows."""
+
+    def __init__(self, plot, signal, follow_display: bool = False):
+        self.plot = plot
+        self.signal = signal
+        self.data = signal.data
+        self.follow_display = follow_display
+
+    def _displayed(self):
+        displayed = (getattr(self.plot.plot_state, "current_signal", None)
+                     if self.follow_display else None)
+        if displayed is None:
+            return self.signal, self.data
+        return displayed, displayed.data
+
+    def read_frame(self, indices):
+        signal, data = self._displayed()
+        # A window whose frames come from a pinned reader has no array to read:
+        # an overlay on the vectors result must see the rendered disks, not the
+        # placeholder underneath them.
+        tree = self.plot.signal_tree
+        override = (tree.reader_override_for(signal, self.plot)
+                    if tree is not None else None)
+        if override is not None:
+            from spyde.drawing.update_functions import _read_through_override
+            return _read_through_override(override, indices)
+        frame = get_local_frame(self.plot, signal, data, indices)
+        if frame is not None:
+            return frame
+        # The locality gate rejects this parent (a console-made or untagged
+        # node). Its footprint is its dask block, so read the block and keep
+        # the frame: correct and slow beats an overlay that draws nothing.
+        reader = _reader_for(self.plot, signal, data)
+        return self.plot._array_cache.get_frame(id(signal), reader, indices)
+
+
+def _grow_cache_for_window(plot, signal, parent_signal) -> None:
+    """Size ``plot``'s frame cache to hold one navigation window, the same
+    growth an integrating region asks for. Without it the window evicts its
+    own frames and every move re-reads all of them."""
+    from spyde.array_cache.readers.recipe import navigation_depths
+    from spyde.external.hyperspy.map_recipe import recipe_for
+
+    recipe = recipe_for(signal)
+    if recipe is None:
+        return
+    navigation_dimension = int(signal.axes_manager.navigation_dimension)
+    depths = navigation_depths(recipe.depth, navigation_dimension)
+    if not any(depths):
+        return
+    data = parent_signal.data
+    frame_shape = data.shape[navigation_dimension:]
+    frame_bytes = int(np.prod(frame_shape)) * data.dtype.itemsize
+    frames = int(np.prod([2 * radius + 1 for radius in depths]))
+    plot._array_cache.ensure_budget_for(frames, frame_bytes)
+
+
+def reader_for_overlay(plot, node):
+    """The reader that evaluates an overlay ``node`` at one navigation
+    position, cached on ``plot`` alongside the frame readers.
+
+    The source frame comes from the node's parent through the frame cache, so
+    an overlay costs the function and nothing else: the frame is already
+    decoded for the base display. An overlay whose signal names a
+    ``source_plot`` reads THAT plot's displayed signal through THAT plot's
+    readers, which is how a layer sourced from another window reads through
+    the other window's blocks."""
+    from .readers.recipe import RecipeReader
+
+    signal = node.signal
+    readers = plot._local_transform_readers
+    reader = readers.get(id(signal))
+    if isinstance(reader, RecipeReader) and reader.signal is signal:
+        return reader
+
+    parent_signal = node.parent.signal if node.parent is not None else None
+    # Without a source plot the frame is the node's parent, read on the plot
+    # drawing the overlay. With one it is whatever that window displays, which
+    # need not be in this tree at all.
+    source_plot = signal.source_plot
+    frame_plot = source_plot or plot
+    frame_signal = parent_signal
+    if source_plot is not None:
+        displayed = getattr(source_plot.plot_state, "current_signal", None)
+        if displayed is not None:
+            frame_signal = displayed
+    parent_frames = None
+    if getattr(frame_signal, "data", None) is not None:
+        parent_frames = _CachedParentFrames(frame_plot, frame_signal,
+                                            follow_display=source_plot is not None)
+        _grow_cache_for_window(frame_plot, signal, frame_signal)
+    reader = RecipeReader(signal, signal.data, parent_signal, parent_frames)
+    readers[id(signal)] = reader
+    return reader
+
+
+def drop_reader(plot, signal) -> None:
+    """Forget ``plot``'s reader for ``signal``, and everything decoded through
+    it. Called when a node goes away, its recipe is rebuilt, or the reader
+    answering for it is replaced.
+
+    The frames go whether or not a reader was cached: an override is resolved
+    fresh on every read and never lands in the reader table, but the frames it
+    served are in the frame cache like any other."""
+    key = id(signal)
+    plot._array_cache.drop_key(key)
+    reader = plot._local_transform_readers.pop(key, None)
+    if reader is not None:
+        plot._block_cache.drop_owner(id(reader))
+
+
+def close_all_readers(plot) -> None:
+    """Close every cached reader on ``plot`` — called on Plot.close()."""
+    retain_readers(plot, ())
 
 
 def is_local_frame_resident(plot, signal, data, indices) -> bool:

@@ -104,18 +104,22 @@ class TestVectorOrientationOM:
             # ── Generate also activates the live refine overlay ─────────────
             assert _wait(lambda: vtree._vom_wizard.overlay is not None), \
                 "live refine overlay never attached"
-            ov = vtree._vom_wizard.overlay
+            node = vtree._vom_wizard.overlay
             # Two marker groups: measured (red) + fitted template (green).
-            assert ov._mg_meas is not None and ov._mg_tmpl is not None
-            # At a position with ≥4 vectors: measured points drawn, template
-            # fit too.
+            assert set(node.groups) == {"measured", "template"}
+            assert (id(node), "measured") in vplot._overlay_groups
+            assert (id(node), "template") in vplot._overlay_groups
+            # At a position with at least 4 vectors: measured points drawn,
+            # template fit too.
+            from spyde.array_cache import reader_for_overlay
             vecs = vtree.diffraction_vectors
             cm = vecs.count_map()
             ys, xs = np.nonzero(cm >= 4)
             if len(ys):
-                meas, tmpl = ov._offsets_for(int(ys[0]), int(xs[0]))
-                assert meas.shape[0] >= 4
-                assert tmpl.shape[1] == 2     # a fitted template was produced
+                value = reader_for_overlay(vplot, node).read_frame(
+                    (int(ys[0]), int(xs[0])))
+                assert value["measured"].shape[0] >= 4
+                assert value["template"].shape[1] == 2   # a fitted template
 
             # Generate now ALSO fits the whole field and opens the live IPF
             # heatmap window (Qt parity — the orientation map appears while you

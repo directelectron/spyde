@@ -1,45 +1,28 @@
-"""
-overlay.py — MDI live image layering (Report Builder Phase 2, Part 2).
+"""MDI live image layering: another window's image drawn over this one.
 
-A user can drop a signal-window pill onto ANOTHER open signal window to draw its
-image as a translucent, colormapped LAYER over the target's base image (per-layer
-colormap + alpha + clim + visibility). The layers are anyplotlib ``Layer``s
-(``plot2d.add_layer``), composited client-side with the SAME zoom/pan transform as
-the base — and they track the base image LIVE: when the target's displayed frame
-changes because the navigator moved, each visible layer re-reads its OWN source at
-the same navigation indices and refreshes.
+A user drops a signal window's pill onto another open signal window to draw its
+image as a translucent, colormapped layer over the target's base image, with a
+per-layer colormap, alpha, clim and visibility. A layer is an overlay child of
+the node the target displays, added with ``BaseSignalTree.add_overlay``: its
+function is the source frame, its group is one anyplotlib ``Layer``, and its
+appearance rides every value. The navigator drives it like every other overlay,
+so the frame comes from the source window's own readers and blocks, the read
+takes the tier that frame's own read takes, and the push runs on the painter
+thread. An integrating region reaches the source whole, so a layer integrates
+the positions the base image integrates.
 
-The four staged handlers (``overlay_add`` / ``overlay_set`` / ``overlay_remove`` /
-``overlay_query``) share the uniform ``fn(session, plot, payload)`` signature and
-are registered in :data:`spyde.actions.registry.STAGED_HANDLERS`. ``plot`` is the
-TARGET plot (resolved from ``payload["window_id"]``); ``source_window_id`` names the
-plot supplying the layer image.
+The four staged handlers (``overlay_add`` / ``overlay_set`` / ``overlay_remove``
+/ ``overlay_query``) share the uniform ``fn(session, plot, payload)`` signature
+and are registered in :data:`spyde.actions.registry.STAGED_HANDLERS`. ``plot`` is
+the TARGET plot (resolved from ``payload["window_id"]``); ``source_window_id``
+names the plot supplying the layer image.
 
-Live-nav contract (the sensitive part — see CLAUDE.md "Live-Display Core Patterns"
-and "Thread Safety"):
-
-* The nav READ for a layer runs on the SAME serial ``_NavDispatcher`` thread as the
-  base read (``refresh_plot_layers`` is called from ``_run_update`` right after the
-  base frame is enqueued). It uses the cheap SYNCHRONOUS cached read only — if the
-  base move was routed to the async/expensive tier the layer refresh is skipped, and
-  the selector's settle re-fire (which runs the cheap path for the resting position)
-  catches the layers up. No new threads, no locks.
-* The layer PUSH (``Layer.set_data`` → ``_push`` → stdout) is DECOUPLED onto the
-  same newest-wins painter thread that paints the base frame (``_NavPainter``): the
-  dispatcher stashes the freshly-read layer frames on the target plot and the painter
-  applies them right after ``_set_array``, so stdout writes stay serialized and a slow
-  push never blocks reading the next slider position.
-* The non-layered path is ZERO-COST: ``refresh_plot_layers`` returns immediately when
-  ``plot._layers`` is empty (the common case).
-
-Layers refuse TILE mode (a tiled plot streams detail tiles of a single image and
-cannot composite independent layers) — ``overlay_add`` emits a status and no-ops.
+Layers refuse TILE mode: a tiled plot streams detail tiles of a single image and
+cannot composite independent layers.
 """
 from __future__ import annotations
 
 import logging
-import threading
-from dataclasses import dataclass, field
 
 import numpy as np
 
@@ -47,490 +30,135 @@ from de_shell import ipc
 
 log = logging.getLogger(__name__)
 
-# Guards the take-and-clear of a plot's ``_pending_layer_frames`` slot so the
-# dispatcher thread's write (``_enqueue_layer_push``) and the painter thread's
-# read-then-clear (``_apply_pending_layer_frames``) can't interleave and drop the
-# newest frames (the settle re-fire's frames leaving the overlay stale at rest).
-# Mirrors ``_NavPainter._lock`` — a tiny lock around a pointer swap ONLY; it is
-# NEVER held across a ``set_data`` / stdout push. One lock for the whole process
-# (the slot lives per-plot but the two threads racing it are the shared dispatcher
-# + painter). See CLAUDE.md "Thread Safety" / Live-Display §2.
-_PENDING_LOCK = threading.Lock()
+#: The one group a layer overlay draws with.
+LAYER_GROUP = "layer"
 
 # A small palette cycled across the layers added to one plot so a 2nd/3rd overlay
 # is visually distinct from the base (which is usually gray/viridis).
 _LAYER_CMAP_CYCLE = ["magma", "cividis", "plasma", "inferno", "cool", "spring"]
 
 
-@dataclass
-class PlotLayer:
-    """One live overlay layer on a target :class:`~spyde.drawing.plots.plot.Plot`.
+def layer_frame(frame, *, appearance: dict) -> dict:
+    """The source window's frame, drawn as an image layer with ``appearance``.
 
-    Holds the layer id (the anyplotlib ``Layer.id``), a reference to the SOURCE
-    plot supplying the image, the appearance (cmap/alpha/clim/visible), and the
-    anyplotlib ``Layer`` handle. ``source_plot`` is a weak-ish direct ref; if the
-    source's tree closes the layer is dropped by :func:`drop_layers_for_source`."""
-    layer_id: str
-    source_plot: object
-    cmap: str = "magma"
-    alpha: float = 0.5
-    clim: "list | None" = None
-    visible: bool = True
-    handle: object = None                       # anyplotlib Layer
-    title: str = ""
-    # Set True by a drop path (source/target teardown) BEFORE the layer is removed
-    # from its plot's list, so a concurrent ``refresh_plot_layers`` on the dispatcher
-    # thread sees it and skips dereferencing a source that's being torn down (avoids
-    # reading/painting a half-removed layer). A plain attribute set — the dispatcher
-    # only ever READS it, so no lock is needed for the flag itself.
-    dead: bool = False
-
-    def to_state(self) -> dict:
-        clim = None
-        if self.clim is not None and self.clim[0] is not None and self.clim[1] is not None:
-            clim = [float(self.clim[0]), float(self.clim[1])]
-        return {
-            "id": self.layer_id,
-            "title": self.title,
-            "cmap": self.cmap,
-            "alpha": float(self.alpha),
-            "clim": clim,
-            "visible": bool(self.visible),
-        }
+    Anything that is not a 2-D image cannot composite over the base, so it
+    clears the layer rather than pushing a frame anyplotlib would reject.
+    """
+    frame = np.asarray(frame)
+    if frame.ndim != 2 or frame.dtype == object:
+        return {}
+    return {LAYER_GROUP: {"data": frame, **appearance}}
 
 
-# ── frame reading (cheap synchronous tier only) ───────────────────────────────
-
-# Off-thread warm futures, keyed by (id(plot), id(layer-or-None)), so a cold miss
-# warms its needed source nav-chunk exactly once per (plot,layer) at a time
-# (newest-wins: a newer warm for the same key replaces the pending one). Touched
-# from the dispatcher thread only. The warm itself runs on the ComputeBackend pool.
-_LAYER_WARM_FUTURES: "dict[tuple, object]" = {}
+# ── the layers of a plot ──────────────────────────────────────────────────────
 
 
-def _source_read_is_cheap(current_signal, idx, source_plot) -> bool:
-    """Is a SINGLE-POINT lazy read of ``current_signal`` at ``idx`` genuinely cheap to
-    run synchronously on the dispatcher RIGHT NOW (not a blocking cold decode)? True
-    when:
-
-      * the source has a hyperspy ``CachedDaskArray`` — one block read is ~ms even on
-        a cold miss (it is EXACTLY what the base navigator dispatcher does, and the
-        classifier already flags a huge cold frame 'expensive' upstream), AND we do
-        NOT warm/mutate that cache off-thread (which would race the dispatcher — see
-        CLAUDE.md §2/§4); a small cold read is served inline safely, OR
-      * a locality-tagged (ArrayCache-eligible) DERIVED view (rebin/crop/.zspy — NO
-        CachedDaskArray) whose decoded frame is ALREADY resident in the source
-        plot's ArrayCache (a ~0 ms numpy slice). A cold derived miss re-decodes the
-        WHOLE source nav-chunk (~9–160 ms) on every move — that is the read finding
-        #2 must NOT run inline.
-
-    Region reads and any probe failure → False (skip inline; warm off-thread). Reuses
-    the existing update_functions probes — no duplicated chunk-index logic."""
-    try:
-        if np.asarray(idx).ndim > 1:
-            return False                     # region — handled by the classifier tier
-    except Exception:
-        return False
-    # A CachedDaskArray source's single-block read is cheap + dispatcher-safe (the
-    # base navigator does the same); don't gate it (and never warm it off-thread).
-    if getattr(current_signal, "cached_dask_array", None) is not None:
-        return True
-    # Derived view (no CachedDaskArray): cheap ONLY if the decoded frame is resident.
-    try:
-        from spyde.array_cache import is_local_frame_resident
-        data = getattr(current_signal, "data", None)
-        if data is not None:
-            return is_local_frame_resident(source_plot, current_signal, data, idx)
-    except Exception as e:
-        log.debug("overlay array-cache residency probe failed: %s", e)
-    return False
-
-
-def _warm_source_chunk(source_plot, layer, current_signal, idx) -> None:
-    """A cold single-point miss on a lazy source: warm the needed source nav-chunk
-    OFF the dispatcher thread (fire-and-forget on the ComputeBackend pool) so the
-    NEXT move / the settle re-fire finds it resident and paints synchronously — the
-    overlay converges to fresh frames when the user stops moving, without ever
-    blocking the dispatcher on a cold decode.
-
-    Reached ONLY for a DERIVED-view source (no CachedDaskArray) — a CachedDaskArray
-    source reads cheaply inline and is never warmed here (warming its cache off-thread
-    would race the dispatcher; see CLAUDE.md §2/§4). Newest-wins per
-    ``(id(plot), id(layer))``: a superseded warm's future is cancelled before a newer
-    one is scheduled. The warm decodes via the SAME path the resident read PROBES —
-    the source plot's ArrayCache (populates what ``is_local_frame_resident`` checks),
-    else a direct one-frame ``.compute`` (page-cache warm) when not ArrayCache-eligible."""
-    try:
-        session = _session_of(source_plot)
-        if session is None:
-            return
-        backend = getattr(session, "compute_backend", None)
-        if backend is None or not hasattr(backend, "submit"):
-            return
-        key = (id(source_plot), id(layer))
-        prev = _LAYER_WARM_FUTURES.get(key)
-        if prev is not None:
-            try:
-                prev.cancel()
-            except Exception:
-                pass
-
-        data = getattr(current_signal, "data", None)
-        idx_copy = np.array(idx)
-
-        def _warm():
-            try:
-                from spyde.array_cache import get_local_frame
-                if data is not None:
-                    frame = get_local_frame(source_plot, current_signal, data, idx_copy)
-                    if frame is None:
-                        # Not ArrayCache-eligible (e.g. opaque node) — fall back to
-                        # a plain page-cache warm, same as before.
-                        point = tuple(int(v) for v in np.atleast_1d(idx_copy))
-                        data[point].compute(scheduler="synchronous")
-            except Exception as e:
-                log.debug("overlay off-thread chunk warm failed: %s", e)
-
-        _LAYER_WARM_FUTURES[key] = backend.submit(_warm)
-    except Exception as e:
-        log.debug("overlay warm submit failed: %s", e)
-
-
-def _session_of(plot):
-    """Best-effort resolve the owning Session from a plot (via its signal tree)."""
-    for attr in ("session",):
-        s = getattr(plot, attr, None)
-        if s is not None:
-            return s
+def layer_nodes(plot) -> list:
+    """The layer overlays drawn on ``plot``, oldest first."""
     tree = getattr(plot, "signal_tree", None)
-    return getattr(tree, "session", None) if tree is not None else None
+    state = getattr(plot, "plot_state", None)
+    signal = getattr(state, "current_signal", None) if state is not None else None
+    if tree is None or signal is None:
+        return []
+    return [node for node in tree.overlay_children(signal)
+            if LAYER_GROUP in node.groups
+            and getattr(node.signal, "target_plot", None) is plot]
 
 
-def _read_source_frame(source_plot, indices, integrating=False, layer=None):
-    """Read the SOURCE plot's frame at the SAME navigation ``indices`` the target
-    is showing, CHEAPLY + SYNCHRONOUSLY on the caller's (dispatcher) thread. Returns
-    a numpy array, or None to skip this refresh (source not paintable, or the read
-    would be expensive — the settle re-fire will catch it up).
-
-    ``indices`` is the RAW selector index array (same object handed to the base
-    ``update_from_navigation_selection``); this re-runs the identical transpose /
-    mean-reduce / clamp / dtype logic against the source's own signal, so a layer on
-    a same-tree source always resolves the same nav position as the base.
-    ``integrating`` mirrors the driving selector's mode so a REGION read integrates
-    the same nav points the base frame does (a crosshair reduces to one point).
-
-    A synchronous read is done inline ONLY when it is genuinely cheap for the SOURCE:
-    numpy-backed data, a CachedDaskArray with the needed block resident, or a resident
-    ArrayCache frame on the source plot. A COLD single-point
-    miss on a lazy source (a derived rebin/crop view has no CachedDaskArray → a real
-    ~9–160 ms blocking decode) is NOT run on the dispatcher: it returns None and warms
-    the needed chunk OFF-thread (keyed per (plot, ``layer``), newest-wins), so the next
-    move / the selector's settle re-fire finds it resident and paints. Same for a
-    large-region / cold-huge read (classified 'expensive'). This keeps the dispatcher
-    non-blocking while the overlay still CONVERGES to fresh frames at rest."""
-    try:
-        ps = getattr(source_plot, "plot_state", None)
-        if ps is None:
-            return None
-        current_signal = ps.current_signal
-    except Exception:
-        return None
-
-    try:
-        from spyde.drawing.update_functions import (
-            NavProfile, _classify_nav_read, _direct_read_frame,
-            _prepare_nav_indices,
-        )
-    except Exception as e:
-        log.debug("overlay layer read imports failed: %s", e)
-        return None
-
-    try:
-        idx = _prepare_nav_indices(current_signal, indices, integrating=integrating)
-    except Exception as e:
-        log.debug("overlay layer index prep failed: %s", e)
-        return None
-    if idx is None:
-        return None
-
-    prof = NavProfile(getattr(source_plot, "window_id", "LAYER"), idx)
-
-    try:
-        if getattr(current_signal, "_lazy", False):
-            data = getattr(current_signal, "data", None)
-            if data is None or not hasattr(data, "compute") or not hasattr(data, "chunks"):
-                return None
-            # Skip the loading placeholder (Future-bearing data).
-            try:
-                from distributed import Future
-                if isinstance(data[0], Future):
-                    return None
-            except Exception:
-                # Distributed may not be installed, and indexing a placeholder
-                # array can fail; neither is a reason to stop reading.
-                log.debug(
-                    "Could not test the signal for a loading placeholder.",
-                    exc_info=True,
-                )
-            nav_dim = current_signal.axes_manager.navigation_dimension
-            frame_shape = data.shape[nav_dim:]
-            frame_bytes = int(np.prod(frame_shape)) * data.dtype.itemsize
-            # Expensive reads (large region / cold huge frame) are NOT done inline
-            # for a layer — skip; the settle re-fire runs the cheap path.
-            if _classify_nav_read(current_signal, idx, data, frame_bytes,
-                                  child=source_plot) == "expensive":
-                return None
-            # A single-point read is run inline only when genuinely cheap for the
-            # SOURCE (CachedDaskArray one-block read, or a resident derived-view
-            # chunk). A cold DERIVED miss would do a real blocking ~9–160 ms decode on
-            # the dispatcher every move — instead skip + warm the chunk off-thread so
-            # the settle re-fire / next move finds it resident and paints (finding #2).
-            is_region = np.asarray(idx).ndim > 1
-            if not is_region and not _source_read_is_cheap(current_signal, idx, source_plot):
-                _warm_source_chunk(source_plot, layer, current_signal, idx)
-                return None
-            frame = _direct_read_frame(current_signal, None, idx, prof, child=source_plot)
-            if frame is None:
-                # Fall back to the synchronous cached read (base signal path).
-                cached_arr = getattr(current_signal, "cached_dask_array", None)
-                if cached_arr is not None:
-                    try:
-                        cached_arr._client = None
-                    except Exception:
-                        # Failing here does not break the read, it makes it slow:
-                        # the cache keeps its client and every frame goes the
-                        # distributed way round. Debug rather than warning
-                        # because this sits on the per-frame path.
-                        log.debug(
-                            "Could not pin the frame cache to a synchronous read; "
-                            "this navigator will use the slower distributed path.",
-                            exc_info=True,
-                        )
-                frame = np.asarray(
-                    current_signal._get_cache_dask_chunk(idx, get_result=True))
-                src_dtype = getattr(current_signal.data, "dtype", None)
-                if (src_dtype is not None and np.issubdtype(src_dtype, np.integer)
-                        and np.issubdtype(frame.dtype, np.floating)):
-                    frame = frame.astype(src_dtype, copy=False)
-            return np.asarray(frame)
-        # Eager (in-RAM) slice — one nav point, or a region mean. Mirrors the base
-        # eager read in ``update_from_navigation_selection`` VERBATIM: a single point
-        # is the native-dtype frame; an integrating region is the UN-rounded float
-        # mean (``data[sl].mean(axis=0)``). The base does NOT round the eager region
-        # mean, so the layer must not either — else the layer diverges from the base
-        # frame it composites over (finding: overlay eager value divergence).
-        idx_arr = np.asarray(idx)
-        data = current_signal.data
-        if idx_arr.ndim <= 1:
-            point = tuple(int(v) for v in np.atleast_1d(idx_arr))
-            return np.asarray(data[point])
-        sl = tuple(idx_arr[:, k].astype(int) for k in range(idx_arr.shape[1]))
-        return np.asarray(data[sl]).mean(axis=0)
-    except Exception as e:
-        log.debug("overlay layer frame read failed: %s", e)
-        return None
+def layer_appearance(node) -> dict:
+    """A layer's colormap, alpha and clim, the record its dock row shows and
+    its next value carries."""
+    return dict(node.signal._map_recipe.static.get("appearance") or {})
 
 
-# ── the post-paint hook (dispatcher-thread read → painter-thread push) ────────
+def layer_source_plot(node):
+    """The plot whose image a layer draws."""
+    return getattr(node.signal, "source_plot", None)
 
 
-def refresh_plot_layers(target_plot, indices, integrating=False) -> None:
-    """Post-paint hook: refresh every VISIBLE layer of ``target_plot`` from its own
-    source at ``indices``. Called from ``BaseSelector._run_update`` right after the
-    base frame is enqueued, on the serial ``_NavDispatcher`` thread. ``integrating``
-    mirrors the driving selector's mode (region vs crosshair).
+def _layer_state(node) -> dict:
+    appearance = layer_appearance(node)
+    clim = appearance.get("clim")
+    if clim is not None:
+        clim = [float(clim[0]), float(clim[1])]
+    return {
+        "id": node.name,
+        "title": _source_title(layer_source_plot(node)),
+        "cmap": str(appearance.get("cmap", "magma")),
+        "alpha": float(appearance.get("alpha", 0.5)),
+        "clim": clim,
+        "visible": bool(node.visible),
+    }
 
-    ZERO-COST when the plot has no layers (the common case). For each visible layer
-    it does a cheap SYNCHRONOUS read of the source frame HERE (dispatcher thread),
-    then hands the frames to the plot's painter thread to push (``set_data``) — so
-    the stdout pushes stay serialized and off the dispatcher, mirroring the base
-    frame's read/paint split (Live-Display §2/§3, Thread-Safety)."""
-    layers = getattr(target_plot, "_layers", None)
-    if not layers:
+
+def _emit_layers_state(target_plot) -> None:
+    """Emit the authoritative ``layers_state`` for one target plot. The
+    renderer's Plot-Control "Layers" section is written against this shape."""
+    window_id = getattr(target_plot, "window_id", None)
+    if window_id is None:
         return
-    frames: "list[tuple[object, np.ndarray]]" = []
-    base = getattr(target_plot, "current_data", None)
-    base_shape = base.shape[:2] if isinstance(base, np.ndarray) and base.ndim >= 2 else None
-    for layer in list(layers):
-        # A drop path (source/target teardown) sets `dead` BEFORE removing the layer
-        # from the list; skip it so we never dereference a source being torn down on
-        # the main thread while we read on the dispatcher thread (finding: source
-        # teardown race).
-        if getattr(layer, "dead", False):
-            continue
-        if not layer.visible or layer.handle is None:
-            continue
-        src = layer.source_plot
-        if src is None:
-            continue
-        frame = _read_source_frame(src, indices, integrating=integrating, layer=layer)
-        if frame is None:
-            continue
-        # Re-check dead AFTER the (possibly slow) read — the source may have been
-        # dropped meanwhile; don't queue a set_data for a torn-down layer.
-        if getattr(layer, "dead", False) or layer.handle is None:
-            continue
-        frame = np.asarray(frame)
-        # Only 2-D scalar frames can layer (matches the base image); an RGB / 1-D
-        # source can't overlay a 2-D image.
-        if frame.ndim != 2:
-            continue
-        # Guard a source whose frame shape drifted from the base (e.g. a node
-        # switch on the source): a mismatch would raise in add/set_data.
-        if base_shape is not None and frame.shape != base_shape:
-            continue
-        frames.append((layer, layer.handle, frame))
-    if frames:
-        _enqueue_layer_push(target_plot, frames)
+    ipc.emit({
+        "type": "layers_state",
+        "window_id": int(window_id),
+        "layers": [_layer_state(node) for node in layer_nodes(target_plot)],
+    })
 
 
-def _enqueue_layer_push(target_plot, frames) -> None:
-    """Stash freshly-read layer frames on the plot and wake the painter to apply
-    them (``Layer.set_data``) after the base ``_set_array`` — keeping every stdout
-    push serialized on the one painter thread. Newest-wins: a later refresh replaces
-    the pending frames before the painter runs (mirrors the base paint decouple).
+def _find_layer(target_plot, layer_id):
+    for node in layer_nodes(target_plot):
+        if node.name == layer_id:
+            return node
+    return None
 
-    The set of the ``_pending_layer_frames`` slot is done UNDER ``_PENDING_LOCK`` so
-    it is atomic against the painter's take-and-clear — otherwise a write landing
-    between the painter's read and clear is silently dropped (finding: lost-update
-    race; the settle re-fire's fresh frames were the ones being lost, leaving the
-    overlay stale at rest). The lock guards ONLY the pointer swap, never a set_data."""
+
+def _source_title(source_plot) -> str:
+    if source_plot is None:
+        return "Layer"
     try:
-        with _PENDING_LOCK:
-            target_plot._pending_layer_frames = frames
-        # Re-submit the plot's CURRENT base frame to the painter so it wakes and
-        # drains _pending_layer_frames (the painter applies base then layers). If
-        # there's no base frame yet, push the layers directly (rare).
-        base = getattr(target_plot, "current_data", None)
-        if isinstance(base, np.ndarray):
-            target_plot.enqueue_paint(base)
-        else:
-            _apply_pending_layer_frames(target_plot)
+        signal = source_plot.plot_state.current_signal
+        title = str(signal.metadata.get_item("General.title", default="") or "")
+        if title:
+            return title
     except Exception as e:
-        log.debug("enqueue layer push failed: %s", e)
-
-
-def _apply_pending_layer_frames(target_plot) -> None:
-    """Apply (and clear) any pending layer frames on ``target_plot`` by calling each
-    layer handle's ``set_data``. Called on the PAINTER thread from ``_NavPainter``
-    right after ``_set_array`` (so pushes stay serialized), and as a direct fallback
-    when there's no base frame. Safe to call with nothing pending.
-
-    The take-and-clear is ATOMIC under ``_PENDING_LOCK`` (mirrors ``_NavPainter``'s
-    newest-wins swap): read the slot and null it in one critical section so a
-    concurrent ``_enqueue_layer_push`` write can't slip in between and be dropped.
-    The lock is RELEASED before any ``set_data`` — the push itself is never held under
-    it (Thread-Safety: never hold a lock across a compute / stdout write)."""
-    with _PENDING_LOCK:
-        frames = getattr(target_plot, "_pending_layer_frames", None)
-        target_plot._pending_layer_frames = None
-    if not frames:
-        return
-    for entry in frames:
-        # Entries are always (layer, handle, frame) — see _enqueue_layer_push's caller.
-        layer, handle, frame = entry
-        # Skip a layer torn down between read and paint (source-teardown race).
-        if layer is not None and getattr(layer, "dead", False):
-            continue
-        try:
-            handle.set_data(frame)
-        except Exception as e:
-            log.debug("layer set_data failed: %s", e)
+        log.debug("reading a layer source's title failed: %s", e)
+    return str(getattr(source_plot, "view_label", None) or "Layer")
 
 
 # ── teardown ──────────────────────────────────────────────────────────────────
 
 
 def drop_all_layers(target_plot) -> None:
-    """Remove every layer from ``target_plot`` (called on plot close). Drops the
-    anyplotlib handles and clears the list so no dangling refs remain."""
-    layers = getattr(target_plot, "_layers", None)
-    if not layers:
+    """Remove every layer drawn on ``target_plot``. Called when it closes, and
+    when its image shape changes so nothing can composite over it any more."""
+    tree = getattr(target_plot, "signal_tree", None)
+    if tree is None:
         return
-    p2 = getattr(target_plot, "_plot2d", None)
-    for layer in list(layers):
-        # Mark dead FIRST so a concurrent dispatcher-thread refresh/paint skips this
-        # layer instead of dereferencing its (about-to-close) source (finding: source
-        # teardown race). A plain attribute set — dispatcher only reads it.
-        layer.dead = True
+    for node in layer_nodes(target_plot):
         try:
-            if layer.handle is not None:
-                layer.handle.remove()
-            elif p2 is not None:
-                p2.remove_layer(layer.layer_id)
+            tree.remove_overlay(node)
         except Exception as e:
-            log.debug("dropping layer on close failed: %s", e)
-    target_plot._layers = []
-    with _PENDING_LOCK:
-        target_plot._pending_layer_frames = None
+            log.debug("dropping layer %r failed: %s", node.name, e)
 
 
 def drop_layers_for_source(session, source_plot) -> None:
-    """Drop every layer (on ANY target plot) whose source is ``source_plot`` — called
-    when the source's window/tree is closing so no target keeps a dangling source ref
-    or a stale composited image. Re-emits ``layers_state`` for each affected target."""
+    """Remove every layer (on ANY target plot) reading from ``source_plot``, so
+    closing the source leaves no target compositing an image nobody updates.
+    Re-emits ``layers_state`` for each affected target."""
     if session is None:
         return
     for target in list(getattr(session, "_plots", []) or []):
-        layers = getattr(target, "_layers", None)
-        if not layers:
-            continue
-        keep = []
+        tree = getattr(target, "signal_tree", None)
         removed = False
-        for layer in layers:
-            if layer.source_plot is source_plot:
-                # Mark dead BEFORE removing the anyplotlib handle so a concurrent
-                # dispatcher-thread refresh sees it and skips reading a source that's
-                # tearing down / painting a half-removed layer (finding: source
-                # teardown race).
-                layer.dead = True
-                try:
-                    if layer.handle is not None:
-                        layer.handle.remove()
-                except Exception as e:
-                    log.debug("removing source-closed layer failed: %s", e)
+        for node in layer_nodes(target):
+            if layer_source_plot(node) is not source_plot or tree is None:
+                continue
+            try:
+                tree.remove_overlay(node)
                 removed = True
-            else:
-                keep.append(layer)
+            except Exception as e:
+                log.debug("dropping a source-closed layer failed: %s", e)
         if removed:
-            target._layers = keep
             _emit_layers_state(target)
-
-
-# ── layers_state emission ──────────────────────────────────────────────────────
-
-
-def _emit_layers_state(target_plot) -> None:
-    """Emit the authoritative ``layers_state`` for one target plot. The renderer's
-    Plot-Control "Layers" section is written against this EXACT shape."""
-    wid = getattr(target_plot, "window_id", None)
-    if wid is None:
-        return
-    layers = getattr(target_plot, "_layers", None) or []
-    ipc.emit({
-        "type": "layers_state",
-        "window_id": int(wid),
-        "layers": [ly.to_state() for ly in layers],
-    })
-
-
-def _find_layer(target_plot, layer_id):
-    for ly in getattr(target_plot, "_layers", None) or []:
-        if ly.layer_id == layer_id:
-            return ly
-    return None
-
-
-def _source_title(source_plot) -> str:
-    try:
-        sig = source_plot.plot_state.current_signal
-        t = str(sig.metadata.get_item("General.title", default="") or "")
-        if t:
-            return t
-    except Exception:
-        pass
-    lbl = getattr(source_plot, "view_label", None)
-    return str(lbl or "Layer")
 
 
 # ── handlers ───────────────────────────────────────────────────────────────────
@@ -539,13 +167,14 @@ def _source_title(source_plot) -> str:
 def overlay_add(session, plot, payload) -> None:
     """Add ``source_window_id``'s current image as a live layer over the target
     ``window_id`` plot. Validates: identical signal-frame ``(H, W)``; refuses a
-    tiled target; refuses source IS target. Seeds the layer with the source's CURRENT
-    frame and emits ``layers_state``."""
+    tiled target; refuses source IS target. Seeds the layer with the source's
+    CURRENT frame and emits ``layers_state``."""
     if plot is None:
         ipc.emit_error("overlay_add: target window not found.")
         return
-    src_wid = payload.get("source_window_id")
-    source = session._plot_by_window_id(int(src_wid)) if src_wid is not None else None
+    source_window_id = payload.get("source_window_id")
+    source = (session._plot_by_window_id(int(source_window_id))
+              if source_window_id is not None else None)
     if source is None:
         ipc.emit_error("overlay_add: source window not found.")
         return
@@ -553,48 +182,57 @@ def overlay_add(session, plot, payload) -> None:
         ipc.emit_status("Cannot layer a window onto itself.")
         return
 
-    p2 = getattr(plot, "_plot2d", None)
-    if p2 is None:
+    plot2d = getattr(plot, "_plot2d", None)
+    if plot2d is None:
         ipc.emit_status("Overlay: target is not an image plot.")
         return
-    # Refuse tile mode — a tiled plot cannot composite independent layers.
-    if getattr(p2, "_tile_on", False):
+    if getattr(plot2d, "_tile_on", False):
         ipc.emit_status(
             "Overlay unavailable: the target image is in tile mode (large frame). "
             "Layers are only supported on non-tiled images.")
         return
 
-    base = getattr(plot, "current_data", None)
-    src_frame = getattr(source, "current_data", None)
+    base = getattr(plot, "displayed_data", None)
+    source_frame = getattr(source, "displayed_data", None)
     if not isinstance(base, np.ndarray) or base.ndim != 2:
         ipc.emit_status("Overlay: target has no 2-D image to layer onto.")
         return
-    if not isinstance(src_frame, np.ndarray) or src_frame.ndim != 2:
+    if not isinstance(source_frame, np.ndarray) or source_frame.ndim != 2:
         ipc.emit_status("Overlay: source has no 2-D image to layer.")
         return
-    if src_frame.shape != base.shape:
+    if source_frame.shape != base.shape:
         ipc.emit_status(
             f"Overlay refused: frame shapes differ "
-            f"({src_frame.shape} vs {base.shape}).")
+            f"({source_frame.shape} vs {base.shape}).")
         return
 
-    if not hasattr(plot, "_layers") or plot._layers is None:
-        plot._layers = []
-    cmap = _LAYER_CMAP_CYCLE[len(plot._layers) % len(_LAYER_CMAP_CYCLE)]
-    try:
-        handle = p2.add_layer(np.asarray(src_frame), cmap=cmap, alpha=0.5)
-    except RuntimeError as e:
-        # add_layer raises in tile mode (already guarded) — belt & suspenders.
-        ipc.emit_status(f"Overlay unavailable: {e}")
+    tree = getattr(plot, "signal_tree", None)
+    signal = getattr(getattr(plot, "plot_state", None), "current_signal", None)
+    if tree is None or signal is None:
+        ipc.emit_status("Overlay: the target window has no signal to draw on.")
         return
+
+    appearance = {
+        "cmap": _LAYER_CMAP_CYCLE[len(layer_nodes(plot)) % len(_LAYER_CMAP_CYCLE)],
+        "alpha": 0.5,
+        "clim": None,
+    }
+    try:
+        node = tree.add_overlay(
+            signal, layer_frame, name=LAYER_GROUP,
+            groups={LAYER_GROUP: (LAYER_GROUP, {})},
+            static={"appearance": appearance},
+            source=True, source_plot=source, target_plot=plot,
+            # No tier of its own: a layer is the source window's frame, so it
+            # takes whichever tier reading that frame takes. A resident one
+            # draws in the same pass as the base image.
+            expensive=None, follows_region=True)
     except Exception as e:
         ipc.emit_error(f"overlay_add failed: {e}")
         return
-
-    layer = PlotLayer(
-        layer_id=handle.id, source_plot=source, cmap=cmap, alpha=0.5,
-        clim=None, visible=True, handle=handle, title=_source_title(source))
-    plot._layers.append(layer)
+    # Draw the source's current frame now: the layer must appear on the drop,
+    # not on the next navigator move.
+    plot.enqueue_overlay(node, layer_frame(source_frame, appearance=appearance))
     _emit_layers_state(plot)
 
 
@@ -602,38 +240,30 @@ def overlay_set(session, plot, payload) -> None:
     """Update a layer's appearance (any subset of cmap / alpha / clim / visible)."""
     if plot is None:
         return
-    layer = _find_layer(plot, payload.get("layer_id"))
-    if layer is None or layer.handle is None:
+    node = _find_layer(plot, payload.get("layer_id"))
+    if node is None:
         return
-    kw = {}
-    if "cmap" in payload and payload["cmap"]:
-        layer.cmap = str(payload["cmap"])
-        kw["cmap"] = layer.cmap
-    if "alpha" in payload and payload["alpha"] is not None:
+    tree = plot.signal_tree
+    appearance = layer_appearance(node)
+    if payload.get("cmap"):
+        appearance["cmap"] = str(payload["cmap"])
+    if payload.get("alpha") is not None:
         try:
-            layer.alpha = float(payload["alpha"])
-            kw["alpha"] = layer.alpha
+            appearance["alpha"] = float(payload["alpha"])
         except (TypeError, ValueError):
             pass
-    if "visible" in payload and payload["visible"] is not None:
-        layer.visible = bool(payload["visible"])
-        kw["visible"] = layer.visible
     if "clim" in payload:
         clim = payload["clim"]
         if clim is None:
-            layer.clim = None
-            kw["clim"] = None
+            appearance["clim"] = None
         else:
             try:
-                layer.clim = [float(clim[0]), float(clim[1])]
-                kw["clim"] = (layer.clim[0], layer.clim[1])
+                appearance["clim"] = [float(clim[0]), float(clim[1])]
             except (TypeError, ValueError, IndexError):
                 pass
-    if kw:
-        try:
-            layer.handle.set(**kw)
-        except Exception as e:
-            log.debug("overlay_set layer.set failed: %s", e)
+    tree.replace_overlay_static(node, appearance=appearance)
+    if payload.get("visible") is not None:
+        tree.set_overlay_visible(node, bool(payload["visible"]))
     _emit_layers_state(plot)
 
 
@@ -641,17 +271,10 @@ def overlay_remove(session, plot, payload) -> None:
     """Remove one layer from the target plot."""
     if plot is None:
         return
-    layer = _find_layer(plot, payload.get("layer_id"))
-    if layer is None:
+    node = _find_layer(plot, payload.get("layer_id"))
+    if node is None:
         return
-    # Mark dead before removal so an in-flight dispatcher refresh/paint skips it.
-    layer.dead = True
-    try:
-        if layer.handle is not None:
-            layer.handle.remove()
-    except Exception as e:
-        log.debug("overlay_remove failed: %s", e)
-    plot._layers = [ly for ly in (plot._layers or []) if ly is not layer]
+    plot.signal_tree.remove_overlay(node)
     _emit_layers_state(plot)
 
 

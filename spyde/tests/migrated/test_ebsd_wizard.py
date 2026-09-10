@@ -21,8 +21,20 @@ torch = pytest.importorskip("torch")
 from spyde.actions.ebsd_action import (
     DEFAULTS, EbsdWizard, ebsd_build_dictionary, ebsd_refine, ebsd_run,
 )
+from dataclasses import replace
+
+from spyde.actions.vector_overlay import overlay_static
+from spyde.array_cache import reader_for_overlay
 from spyde.data import ebsd_patterns, ground_truth
 from spyde.tests.migrated.conftest import _settle, close_session, make_session
+
+
+def _bands_at(plot, node, iy, ix):
+    """The overlay node's value at one navigation position, read through the
+    plot's readers exactly as a navigator move reads it. The band segments
+    come with the line width the Refine tab set, so unwrap them."""
+    value = reader_for_overlay(plot, node).read_frame((int(iy), int(ix)))
+    return value["bands"]["data"], value["zone"]
 
 
 @pytest.fixture(autouse=True)
@@ -45,6 +57,14 @@ def _cpu_device(monkeypatch):
     """
     if not os.environ.get("SPYDE_EBSD_DEVICE"):
         monkeypatch.setenv("SPYDE_EBSD_DEVICE", "cpu")
+
+
+def _drawn(plot, node, group):
+    """What the plot's marker group is currently showing."""
+    handle = plot._overlay_groups.get((id(node), group))
+    if handle is None:
+        return np.zeros((0, 2, 2))
+    return np.asarray(handle._data.get("segments", handle._data.get("offsets")))
 
 
 def _wait(pred, timeout=120.0, interval=0.05):
@@ -168,16 +188,19 @@ class TestBuildDictionary:
 
 class TestBandOverlay:
     def test_draws_line_segments_and_streams_the_match(self, ebsd_session):
-        _s, _p, _t, wiz = _build(ebsd_session)
-        ov = wiz.overlay
-        assert ov is not None, "no band overlay attached"
-        segs, za = ov._offsets_for(2, 3)
+        _s, plot, _t, wiz = _build(ebsd_session)
+        node = wiz.overlay
+        assert node is not None, "no band overlay attached"
+        assert node.expensive, "the band match must not run on the navigator thread"
+        segs, za = _bands_at(plot, node, 2, 3)
         assert segs.ndim == 3 and segs.shape[1:] == (2, 2), \
             "not the (N,2,2) shape anyplotlib add_lines needs"
         assert len(segs) > 0, "the matched orientation drew no bands"
         assert len(za) == 0, "zone axes are off by default"
 
-        # The draw call above also streams the match to the caret.
+        # Attaching the overlay drew it, which streams the match to the caret.
+        assert _wait(lambda: any(m.get("type") == "ebsd_match"
+                                 for m in ebsd_session["messages"]))
         hits = [m for m in ebsd_session["messages"] if m.get("type") == "ebsd_match"]
         assert hits and hits[-1]["ok"]
         assert 0.0 <= hits[-1]["score"] <= 1.0
@@ -186,30 +209,66 @@ class TestBandOverlay:
     def test_a_different_position_gives_different_bands(self, ebsd_session):
         """The two grains have genuinely different orientations, so an overlay
         that ignored the navigator would be caught here."""
-        _s, _p, _t, wiz = _build(ebsd_session)
+        _s, plot, tree, wiz = _build(ebsd_session)
         mask = np.asarray(ebsd_session["truth"]["grain2_mask"], bool)
         ys, xs = np.nonzero(mask)
         ys2, xs2 = np.nonzero(~mask)
-        a, _ = wiz.overlay._offsets_for(int(ys[0]), int(xs[0]))
-        b, _ = wiz.overlay._offsets_for(int(ys2[0]), int(xs2[0]))
+        a, _ = _bands_at(plot, wiz.overlay, int(ys[0]), int(xs[0]))
+        b, _ = _bands_at(plot, wiz.overlay, int(ys2[0]), int(xs2[0]))
         assert a.shape != b.shape or not np.allclose(a, b)
 
-        # Hiding clears both marker groups: set_visible(False) pushes a bare
-        # array, not the (segments, points) tuple the overlay normally
-        # renders — it has to survive that.
-        wiz.overlay.set_visible(False)
-        assert wiz.overlay._hidden
-        wiz.overlay.set_visible(True)
-        assert not wiz.overlay._hidden
+        # Hiding clears both marker groups and stops the node being evaluated.
+        tree.set_overlay_visible(wiz.overlay, False)
+        assert wiz.overlay.visible is False
+        assert _wait(lambda: len(_drawn(plot, wiz.overlay, "bands")) == 0)
+        tree.set_overlay_visible(wiz.overlay, True)
+        assert wiz.overlay.visible is True
+
+
+    def test_the_band_match_runs_on_the_overlay_lane(self, ebsd_session):
+        """An EBSD match is milliseconds but not free, so it must leave the
+        navigator thread: the value arrives from the compute backend's overlay
+        lane and is drawn on the painter."""
+        import threading
+
+        from spyde.array_cache import drop_reader
+        from spyde.drawing.overlays import refresh_overlays
+
+        _s, plot, _t, wiz = _build(ebsd_session)
+        node = wiz.overlay
+        assert node.expensive
+
+        evaluated, drawn = [], []
+        function = node.signal._map_recipe.function
+
+        def _recording(*args, **kwargs):
+            evaluated.append(threading.current_thread().name)
+            return function(*args, **kwargs)
+
+        node.signal._map_recipe = replace(node.signal._map_recipe,
+                                          function=_recording)
+        drop_reader(plot, node.signal)      # the cached reader holds the old one
+        handle = plot._overlay_groups[(id(node), "bands")]
+        push = handle.set
+
+        def _record_push(**kw):
+            drawn.append(threading.current_thread().name)
+            return push(**kw)
+
+        handle.set = _record_push
+        refresh_overlays(plot, np.array([[3, 2]]))
+        assert _wait(lambda: evaluated and drawn, timeout=20)
+        assert all(name.startswith("overlay-eval") for name in evaluated), evaluated
+        assert all(name == "nav-paint" for name in drawn), drawn
 
 
 class TestRefineStage:
     def test_band_count_and_zone_axes_apply_live(self, ebsd_session):
         session, plot, _t, wiz = _build(ebsd_session)
         ebsd_refine(session, plot, {"n_bands": 3, "show_zone_axes": True})
-        assert _wait(lambda: wiz.overlay.n_bands == 3
-                     and wiz.overlay.show_zone_axes)
-        segs, za = wiz.overlay._offsets_for(2, 3)
+        assert _wait(lambda: overlay_static(wiz.overlay)["n_bands"] == 3
+                     and overlay_static(wiz.overlay)["show_zone_axes"])
+        segs, za = _bands_at(plot, wiz.overlay, 2, 3)
         assert len(segs) <= 3
         assert za.ndim == 2 and za.shape[1] == 2
 
@@ -217,10 +276,10 @@ class TestRefineStage:
         """The PC is the one parameter you can only set by looking — nudging it
         has to redraw, or the Refine tab does nothing."""
         session, plot, _t, wiz = _build(ebsd_session)
-        before, _ = wiz.overlay._offsets_for(2, 3)
+        before, _ = _bands_at(plot, wiz.overlay, 2, 3)
         ebsd_refine(session, plot, {"pc_x": 0.62})
-        assert _wait(lambda: abs(wiz.overlay.pc[0] - 0.62) < 1e-9)
-        after, _ = wiz.overlay._offsets_for(2, 3)
+        assert _wait(lambda: abs(overlay_static(wiz.overlay)["pc"][0] - 0.62) < 1e-9)
+        after, _ = _bands_at(plot, wiz.overlay, 2, 3)
         assert before.shape != after.shape or not np.allclose(before, after)
         assert abs(wiz.pc[0] - 0.62) < 1e-9
 
@@ -488,6 +547,6 @@ class TestWiring:
         which resolves it by ACTION NAME — a name mismatch silently no-ops."""
         session, plot, _t, wiz = _build(ebsd_session)
         session._set_overlay(plot, "EBSD Indexing", False)
-        assert wiz.overlay._hidden
+        assert wiz.overlay.visible is False
         session._set_overlay(plot, "EBSD Indexing", True)
-        assert not wiz.overlay._hidden
+        assert wiz.overlay.visible is True

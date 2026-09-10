@@ -4,11 +4,11 @@
  * Reported as "a pause and then a snap": drag the navigator and the fit sits
  * still, then jumps to the final position when you let go.
  *
- * Every pointer frame of a drag posts a `pointer_move`, and the Fit caret
- * sends a `fit_navigated` for each one — each of which recalls, redraws the
- * preview and re-sends the whole model. If those arrive faster than they are
- * served they queue, and the queue drains after the drag: a pause, then a
- * snap.
+ * Every pointer frame of a drag posts a `pointer_move`. The model's curves are
+ * an overlay child of the spectrum, so the backend evaluates them at the
+ * position it just read and the painter drops any superseded value, so the caret
+ * sends nothing per frame. If a drag ever queues work faster than it is served
+ * the queue drains after the drag: a pause, then a snap.
  *
  * This drives a real stream of moves and measures how long AFTER the last one
  * the drawn model settles. A caret that keeps up settles almost immediately;

@@ -435,41 +435,37 @@ class BaseSelector:
                 # _submit_async_nav_read; harmless for the synchronous path.
                 child._pending_settle = settle
                 new_data = fn(self, child, indices)
+                if new_data is not None:
+                    # A CHEAP synchronous frame is painting now — supersede any
+                    # in-flight EXPENSIVE async read so a late-landing stale async
+                    # result can't clobber this newer frame (its callback no-ops once
+                    # _nav_future is cleared). Covers expensive→cheap transitions
+                    # (a big region dragged small, or moving off a derived node).
+                    nf = getattr(child, "_nav_future", None)
+                    if nf is not None:
+                        try:
+                            nf.cancel()
+                        except Exception:
+                            pass
+                        child._nav_future = None
+                    # Paint OFF the dispatcher thread (newest-wins painter) so this
+                    # transport doesn't block reading the NEXT slider position — the
+                    # slider stays live and the display lags a frame behind + catches up
+                    # (instead of the slider "catching" at slow frames). A frame
+                    # superseded before it paints is dropped. See Plot.enqueue_paint /
+                    # _NavPainter.
+                    child.enqueue_paint(new_data)
+                # Overlay children of the displayed node follow this position too,
+                # including when the base read went async or declined: an overlay
+                # must not sit at the position of a frame that is no longer shown.
+                try:
+                    from spyde.drawing.overlays import refresh_overlays
+                    refresh_overlays(child, indices,
+                                     integrating=self.is_integrating)
+                except Exception as e:
+                    logger.debug("overlay refresh failed: %s", e)
                 if new_data is None:
                     continue
-                # A CHEAP synchronous frame is painting now — supersede any
-                # in-flight EXPENSIVE async read so a late-landing stale async
-                # result can't clobber this newer frame (its callback no-ops once
-                # _nav_future is cleared). Covers expensive→cheap transitions
-                # (a big region dragged small, or moving off a derived node).
-                nf = getattr(child, "_nav_future", None)
-                if nf is not None:
-                    try:
-                        nf.cancel()
-                    except Exception:
-                        pass
-                    child._nav_future = None
-                # Paint OFF the dispatcher thread (newest-wins painter) so this
-                # transport doesn't block reading the NEXT slider position — the
-                # slider stays live and the display lags a frame behind + catches up
-                # (instead of the slider "catching" at slow frames). A frame
-                # superseded before it paints is dropped. See Plot.enqueue_paint /
-                # _NavPainter.
-                child.enqueue_paint(new_data)
-                # MDI live overlay layers: after the base frame is enqueued, refresh
-                # each visible layer from ITS source at the SAME nav indices — a
-                # cheap SYNCHRONOUS read HERE (on the serial dispatcher thread), then
-                # a painter-thread push (mirrors the base read/paint split). ZERO-COST
-                # when the plot has no layers (the common case). Expensive-tier layer
-                # reads are skipped and caught up by the settle re-fire. See
-                # spyde.actions.overlay.refresh_plot_layers.
-                if getattr(child, "_layers", None):
-                    try:
-                        from spyde.actions.overlay import refresh_plot_layers
-                        refresh_plot_layers(child, indices,
-                                            integrating=bool(self.is_integrating))
-                    except Exception as e:
-                        logger.debug("layer refresh failed: %s", e)
                 if update_contrast:
                     child.needs_auto_level = True
                 # Chain to a downstream navigator (5-D: time → spatial → DP). The

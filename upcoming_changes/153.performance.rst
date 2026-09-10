@@ -1,0 +1,5 @@
+Displaying a node made by a hyperspy ``map`` (a centred pattern, an azimuthal
+integration, a per-pattern filter) went from about 2.2 s to 0.55 ms for the
+first frame in every chunk, by evaluating the mapped function on the parent's
+one frame instead of computing the whole dask block; switching between tree
+nodes now also keeps the root's decoded chunks instead of re-decoding them.

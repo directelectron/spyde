@@ -4,11 +4,15 @@ the −g=g, center-robust deformation-gradient fit and the per-pixel field.
 """
 from __future__ import annotations
 
+import hyperspy.api as hs
 import numpy as np
 
 from spyde.actions.strain_mapping import (
     fit_pattern_strain, compute_strain_field, principal_strain, StrainField,
 )
+from spyde.drawing.overlays import refresh_overlays
+from spyde.tests.migrated._async import wait_until
+from spyde.tests.migrated.conftest import _settle, close_session, make_session
 
 # A small multi-ring reference lattice (square, 1st + 2nd ring; non-collinear).
 G_REF = np.array([[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0], [0.0, -1.0],
@@ -605,142 +609,264 @@ class _Plot2D:
 
 
 class _OverlayVecs:
-    """vecs with sig_axes + kxy_at_nav for the selection overlay."""
+    """A vectors store stub for the selection overlay: the reference spots at
+    the reference pixel, shifted peaks everywhere else, as ``(N, 6)`` rows."""
+
     def __init__(self, ref_spots, frame_peaks, *, scale=1.0, offset=0.0):
         self.sig_axes = [_Axis(scale=scale, offset=offset),
                          _Axis(scale=scale, offset=offset)]
         self.kernel_radius_px = 4.0
         self.nav_shape = (3, 3)
-        self._ref = np.asarray(ref_spots, float)
-        self._frame = np.asarray(frame_peaks, float)
-    def kxy_at_nav(self, iy, ix, lead=()):
-        return self._ref if (iy, ix) == (0, 0) else self._frame
+        self.full_nav_shape = (3, 3)
+        self._ref = self._rows(ref_spots)
+        self._frame = self._rows(frame_peaks)
+
+    @staticmethod
+    def _rows(xy):
+        from spyde.signals.diffraction_vectors import COL_KX, COL_KY
+        xy = np.asarray(xy, float).reshape(-1, 2)
+        rows = np.zeros((len(xy), 6), float)
+        rows[:, COL_KX] = xy[:, 0]
+        rows[:, COL_KY] = xy[:, 1]
+        return rows
+
+    def slice_at(self, *index):
+        return self._ref if tuple(index) == (0, 0) else self._frame
+
+    def at(self, iy, ix):
+        return self.slice_at(iy, ix)
 
 
 class _Evt:
     """A real anyplotlib ``double_click`` Event only ever carries xdata/ydata
-    (the calibrated data-space coordinate) — there is NO img_x/img_y field on
-    the Python Event dataclass (see callbacks.py). _on_click hit-tests
-    directly against self.ref_spots (already calibrated kx,ky), so tests pass
-    the CALIBRATED click position here, not a pixel position."""
+    (the calibrated data-space coordinate); there is NO img_x/img_y field on
+    the Python Event dataclass (see callbacks.py). The hit test works directly
+    against the reference spots (already calibrated kx,ky), so tests pass the
+    CALIBRATED click position here, not a pixel position."""
     def __init__(self, xdata, ydata):
         self.xdata, self.ydata = xdata, ydata
 
 
+def _selection_signal(nav=(3, 3), sig=(64, 64), scale=1.0, offset=0.0):
+    signal = hs.signals.Signal2D(np.zeros(nav + sig, dtype=np.float32))
+    signal.set_signal_type("electron_diffraction")
+    for axis in signal.axes_manager.signal_axes:
+        axis.scale, axis.offset = scale, offset
+    return signal
+
+
 class TestStrainSelectionOverlay:
-    """The interactive reference-spot selection + displacement overlay
+    """The interactive reference-spot selection and displacement overlay
     (green/grey circles on the reference pixel; arrows off it)."""
 
-    def _overlay(self, on_toggle=None, *, scale=1.0, offset=0.0):
-        from spyde.actions.vector_overlay import StrainSelectionOverlay
-        ref = np.array([[0.0, 0.0], [5.0, 0.0], [0.0, 5.0], [-5.0, 0.0]])  # incl. zero beam
-        frame = ref + np.array([0.4, -0.3])                               # shifted peaks
-        vecs = _OverlayVecs(ref, frame, scale=scale, offset=offset)
-        dp = type("DP", (), {"_plot2d": _Plot2D()})()
-        ov = StrainSelectionOverlay(dp, vecs, ref_yx=(0, 0),
-                                    ref_spots=ref[1:],   # zero beam already excluded by ctrl
-                                    match_radius_px=3.0, on_toggle=on_toggle)
-        # attach without a tree → no navigator selectors, but groups + handler wire up.
-        ov.attach(tree=type("T", (), {"navigator_plot_manager": None})())
-        return ov, dp._plot2d
+    REFERENCE = np.array([[0.0, 0.0], [5.0, 0.0], [0.0, 5.0], [-5.0, 0.0]])
+    SHIFT = np.array([0.4, -0.3])
+
+    @staticmethod
+    def _drawn(plot, node, group):
+        handle = plot._overlay_groups.get((id(node), group))
+        assert handle is not None, "the %s group was never created" % group
+        return handle._data
+
+    def _attach(self, session, on_toggle=None, *, scale=1.0, offset=0.0):
+        """A real tree and plot with the selection overlay on it, plus the
+        event names the plot registered the click under."""
+        from spyde.actions.vector_overlay import attach_strain_selection_overlay
+        session._add_signal(_selection_signal(scale=scale, offset=offset),
+                            source_path=None)
+        _settle(session)
+        plot = next(p for p in session._plots
+                    if not p.is_navigator and p.plot_state is not None)
+        events = []
+        register = plot._plot2d.add_event_handler
+
+        def _record(fn, *names):
+            events.extend(names)
+            return register(fn, *names)
+
+        plot._plot2d.add_event_handler = _record
+        vecs = _OverlayVecs(self.REFERENCE, self.REFERENCE + self.SHIFT,
+                            scale=scale, offset=offset)
+        overlay = attach_strain_selection_overlay(
+            plot, vecs, plot.signal_tree, ref_yx=(0, 0),
+            ref_spots=self.REFERENCE[1:],   # the zero beam is excluded upstream
+            match_radius_px=3.0, on_toggle=on_toggle)
+        return overlay, plot, events
+
+    def _navigate_to(self, plot, node, iy, ix, on_reference):
+        """Move the navigator to one position until that position's value has
+        reached this plot. Used where the spots fall off the detector, so
+        nothing is drawn to count."""
+        def _ready():
+            refresh_overlays(plot, np.array([[ix, iy]]))
+            value = plot.last_overlay_value(node)
+            return value is not None and value.get("on_reference") is on_reference
+
+        assert wait_until(_ready, 10), "the position was never drawn"
+
+    def _draw_at(self, plot, node, iy, ix, group, count):
+        """Move the navigator to one position until that position is drawn.
+
+        Adding the overlay draws it at wherever the navigator already is, on
+        the navigator's own thread, so one fire can be overtaken by it."""
+        def _ready():
+            refresh_overlays(plot, np.array([[ix, iy]]))
+            handle = plot._overlay_groups.get((id(node), group))
+            return handle is not None and len(handle._data["offsets"]) == count
+
+        assert wait_until(_ready, 10), f"{group} never showed {count} markers"
 
     def test_reference_pixel_starts_with_nothing_selected(self):
-        ov, p2d = self._overlay()
-        # Fresh reference pixel: NOTHING marked yet (the user picks) — all 3
-        # spots show as excluded (grey), none selected (green).
-        assert len(p2d.groups["strain_selected"].kw["offsets"]) == 0
-        assert len(p2d.groups["strain_excluded"].kw["offsets"]) == 3
-        assert ov.selected.sum() == 0
+        session = make_session()
+        try:
+            overlay, plot, _events = self._attach(session)
+            # A fresh reference pixel: NOTHING marked yet (the user picks), so
+            # all three spots show as excluded (grey) and none as selected.
+            self._draw_at(plot, overlay.node, 0, 0, "excluded", 3)
+            assert len(self._drawn(plot, overlay.node, "selected")["offsets"]) == 0
+            assert overlay.selected.sum() == 0
+        finally:
+            close_session(session)
 
     def test_click_handler_listens_on_double_click(self):
         # A single click is ambiguous with panning on an anyplotlib 2-D panel,
-        # so pick/toggle interactions use "double_click" — same as the
-        # anyplotlib Particle Picker example (add_event_handler(fn, "double_click")).
-        ov, p2d = self._overlay()
-        assert "double_click" in p2d.handler_events
+        # so pick/toggle interactions use "double_click", the same choice the
+        # Particle Picker example makes.
+        session = make_session()
+        try:
+            _overlay, _plot, events = self._attach(session)
+            assert "double_click" in events
+        finally:
+            close_session(session)
 
     def test_click_toggles_selection_and_fires_callback(self):
-        hits = []
-        ov, p2d = self._overlay(on_toggle=lambda: hits.append(1))
-        assert ov.selected.sum() == 0           # nothing selected initially
-        # Double-click at the CALIBRATED position of the spot at (5,0) → mark it.
-        p2d.handler(_Evt(5.0, 0.0))
-        assert hits == [1]
-        assert ov.selected.sum() == 1
-        assert len(p2d.groups["strain_selected"].kw["offsets"]) == 1
-        assert len(p2d.groups["strain_excluded"].kw["offsets"]) == 2
-        assert len(ov.selected_reference()) == 1
-        # Click it again → back OFF.
-        p2d.handler(_Evt(5.0, 0.0))
-        assert ov.selected.sum() == 0
+        session = make_session()
+        try:
+            hits = []
+            overlay, plot, _events = self._attach(session,
+                                                  on_toggle=lambda: hits.append(1))
+            self._draw_at(plot, overlay.node, 0, 0, "excluded", 3)
+            assert overlay.selected.sum() == 0           # nothing selected yet
+            # Double-click at the CALIBRATED position of the spot at (5,0).
+            overlay._click(_Evt(5.0, 0.0))
+            assert hits == [1]
+            assert overlay.selected.sum() == 1
+            self._draw_at(plot, overlay.node, 0, 0, "selected", 1)
+            assert len(self._drawn(plot, overlay.node, "excluded")["offsets"]) == 2
+            assert len(overlay.selected_reference()) == 1
+            # Click it again to turn it back off.
+            overlay._click(_Evt(5.0, 0.0))
+            assert overlay.selected.sum() == 0
+        finally:
+            close_session(session)
 
     def test_click_hit_test_is_scale_independent(self):
-        # A trivial scale=1/offset=0 axis makes calibrated units == pixel
-        # units by coincidence — the real bug this guards against (comparing
-        # a calibrated click position against pixel-space markers) was
-        # invisible under exactly that coincidence. Use a realistic
-        # calibration (e.g. 0.01 Å⁻¹/px, offset -0.64, like a real diffraction
-        # pattern's kx/ky axes) so the hit-test must genuinely work in
-        # calibrated space, not just line up by luck.
-        hits = []
-        ov, p2d = self._overlay(on_toggle=lambda: hits.append(1),
-                                scale=0.01, offset=-0.64)
-        # The spot at calibrated (5.0, 0.0) — click exactly there, NOT at its
-        # (very different) pixel position.
-        p2d.handler(_Evt(5.0, 0.0))
-        assert hits == [1]
-        assert ov.selected.sum() == 1
+        # A trivial scale=1/offset=0 axis makes calibrated units equal pixel
+        # units by coincidence, and the bug this guards against (comparing a
+        # calibrated click against pixel-space markers) is invisible under
+        # exactly that coincidence. Use a realistic calibration instead.
+        session = make_session()
+        try:
+            hits = []
+            overlay, plot, _events = self._attach(
+                session, on_toggle=lambda: hits.append(1), scale=0.01, offset=-0.64)
+            # At this calibration every spot maps well off the detector, so
+            # nothing is drawn; the hit test still has to find them.
+            self._navigate_to(plot, overlay.node, 0, 0, True)
+            # The spot at calibrated (5.0, 0.0): click exactly there, NOT at
+            # its (very different) pixel position.
+            overlay._click(_Evt(5.0, 0.0))
+            assert hits == [1]
+            assert overlay.selected.sum() == 1
+        finally:
+            close_session(session)
 
     def test_off_reference_draws_displacement_arrows(self):
-        ov, p2d = self._overlay()
-        ov.selected[:] = True                  # mark all 3 spots to drive arrows
-        ov._last_iyix = (1, 1)                 # move off the reference pixel
-        ov._redraw()
-        arrows = p2d.groups["strain_displacement"].kw
-        # 3 selected spots each match a shifted frame peak within radius → 3 arrows.
-        assert len(arrows["offsets"]) == 3
-        assert np.allclose(arrows["U"], 0.4, atol=1e-5)
-        assert np.allclose(arrows["V"], -0.3, atol=1e-5)
-        # And the circle groups are cleared off-reference.
-        assert len(p2d.groups["strain_selected"].kw["offsets"]) == 0
+        session = make_session()
+        try:
+            overlay, plot, _events = self._attach(session)
+            overlay.tree.replace_overlay_static(
+                overlay.node, selected=np.ones(3, dtype=bool))
+            # Off the reference pixel: three selected spots each match a
+            # shifted frame peak within the radius, so three arrows.
+            self._draw_at(plot, overlay.node, 1, 1, "arrows", 3)
+            arrows = self._drawn(plot, overlay.node, "arrows")
+            assert np.allclose(arrows["U"], 0.4, atol=1e-5)
+            assert np.allclose(arrows["V"], -0.3, atol=1e-5)
+            # And the circle groups are cleared off-reference.
+            assert len(self._drawn(plot, overlay.node, "selected")["offsets"]) == 0
+        finally:
+            close_session(session)
+
+    def test_a_click_off_the_reference_pixel_changes_nothing(self):
+        """Off the reference pixel the overlay draws displacement arrows, not
+        pickable circles, so a double-click there must not toggle a spot."""
+        session = make_session()
+        try:
+            hits = []
+            overlay, plot, _events = self._attach(session,
+                                                  on_toggle=lambda: hits.append(1))
+            overlay.tree.replace_overlay_static(
+                overlay.node, selected=np.ones(3, dtype=bool))
+            self._draw_at(plot, overlay.node, 1, 1, "arrows", 3)
+
+            overlay._click(_Evt(5.0, 0.0))       # right on top of a spot
+            assert hits == []
+            assert overlay.selected.sum() == 3, "a click off the reference pixel toggled"
+
+            # Back on the reference pixel the same click does toggle.
+            self._draw_at(plot, overlay.node, 0, 0, "selected", 3)
+            overlay._click(_Evt(5.0, 0.0))
+            assert hits == [1]
+            assert overlay.selected.sum() == 2
+        finally:
+            close_session(session)
 
     def test_selection_carries_forward_when_reference_moves(self):
         """Marking peaks, then moving the reference crosshair, must KEEP those
         peaks marked at their new positions (matched by nearest-within-
-        match_radius, like the displacement arrows) — not reset to a fresh
+        match_radius, like the displacement arrows), not reset to a fresh
         all-or-nothing selection every move."""
-        ov, p2d = self._overlay()
-        # Mark the spot at (5, 0) and (0, 5); leave (-5, 0) unmarked.
-        p2d.handler(_Evt(5.0, 0.0))
-        p2d.handler(_Evt(0.0, 5.0))
-        assert ov.selected.sum() == 2
+        session = make_session()
+        try:
+            overlay, plot, _events = self._attach(session)
+            self._draw_at(plot, overlay.node, 0, 0, "excluded", 3)
+            # Mark the spot at (5, 0) and (0, 5); leave (-5, 0) unmarked.
+            overlay._click(_Evt(5.0, 0.0))
+            overlay._click(_Evt(0.0, 5.0))
+            assert overlay.selected.sum() == 2
 
-        # New reference pixel: the same 3 spots, each shifted by a small amount
-        # (a real strain gradient would nudge them slightly) — well within the
-        # 3.0 px match_radius used by _overlay().
-        new_ref = np.array([[5.2, 0.1], [0.1, 5.2], [-4.9, -0.1]])
-        ov.set_reference((1, 1), new_ref)
+            # A new reference pixel: the same three spots, each nudged a little
+            # (a real strain gradient would), well inside the 3.0 px radius.
+            new_reference = np.array([[5.2, 0.1], [0.1, 5.2], [-4.9, -0.1]])
+            overlay.set_reference((1, 1), new_reference)
 
-        # The two previously-marked spots are marked again (matched to their
-        # new positions); the never-marked third spot stays unmarked.
-        assert ov.selected.sum() == 2
-        marked = ov.selected_reference()
-        assert len(marked) == 2
-        # Confirm it's specifically the (5.2,0.1)/(0.1,5.2) pair, not (-4.9,-0.1).
-        assert not any(np.allclose(m, [-4.9, -0.1]) for m in marked)
+            # The two previously-marked spots are marked again at their new
+            # positions; the never-marked third spot stays unmarked.
+            assert overlay.selected.sum() == 2
+            marked = overlay.selected_reference()
+            assert len(marked) == 2
+            assert not any(np.allclose(m, [-4.9, -0.1]) for m in marked)
+        finally:
+            close_session(session)
 
     def test_selection_carry_forward_drops_peak_outside_match_radius(self):
         """A marked peak with NO successor within match_radius at the new
         reference pixel is dropped (not carried forward to some unrelated
-        spot) — it simply becomes unmarked."""
-        ov, p2d = self._overlay()
-        p2d.handler(_Evt(5.0, 0.0))             # mark the (5,0) spot
-        assert ov.selected.sum() == 1
+        spot): it simply becomes unmarked."""
+        session = make_session()
+        try:
+            overlay, plot, _events = self._attach(session)
+            self._draw_at(plot, overlay.node, 0, 0, "excluded", 3)
+            overlay._click(_Evt(5.0, 0.0))              # mark the (5,0) spot
+            assert overlay.selected.sum() == 1
 
-        # New reference: no spot anywhere near (5,0) (match_radius_px=3.0).
-        new_ref = np.array([[50.0, 50.0], [0.0, 5.0], [-5.0, 0.0]])
-        ov.set_reference((1, 1), new_ref)
-        assert ov.selected.sum() == 0
+            # A new reference with no spot anywhere near (5,0).
+            overlay.set_reference((1, 1), np.array([[50.0, 50.0], [0.0, 5.0],
+                                                    [-5.0, 0.0]]))
+            assert overlay.selected.sum() == 0
+        finally:
+            close_session(session)
 
     def test_strain_run_without_vectors_errors(self):
         import de_shell.ipc as ipc

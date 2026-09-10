@@ -239,6 +239,34 @@ class _MoviePrefetcher:
 _movie_prefetcher = _MoviePrefetcher()
 
 
+def _step_signs(previous_point, point):
+    """Direction of travel per navigation axis: -1, 0 or +1."""
+    return tuple(int(np.sign(int(point[k]) - int(previous_point[k])))
+                 for k in range(len(point)))
+
+
+def _next_chunk_position(reader, point, signs, nav_shape):
+    """The first position past the chunk boundary ``point`` is travelling
+    towards, per axis, or None when the reader has no chunks.
+
+    An axis that is not moving keeps its position, so a drag straight along x
+    aims at the next chunk along x and stays in the same row of chunks.
+    """
+    span = getattr(reader, "chunk_span", None)
+    span = span(point) if span is not None else None
+    if span is None:
+        return None
+    ahead = []
+    for axis, (start, stop) in enumerate(span):
+        position = int(point[axis])
+        if signs[axis] > 0:
+            position = stop
+        elif signs[axis] < 0:
+            position = start - 1
+        ahead.append(int(np.clip(position, 0, int(nav_shape[axis]) - 1)))
+    return tuple(ahead)
+
+
 class _BlockPrefetcher:
     """Warm the nav-CHUNK block a 2-D drag is heading into, off the dispatcher.
 
@@ -248,11 +276,24 @@ class _BlockPrefetcher:
     are the only remaining stalls, and they are predictable: a drag has velocity,
     so the chunk it is about to enter can be decoded before it is asked for.
 
-    Extrapolates the last step one ROI-length ahead, and decodes that block through
-    the SAME reader — so the result lands in the plot's BlockCache and the
-    dispatcher's next read is a hit. Latest-target-wins (a newer position replaces
-    the pending one), single daemon thread, and every failure is swallowed: this is
-    pure speculation, so being wrong must cost nothing but wasted background work.
+    Aims at the first position past the chunk boundary it is travelling towards,
+    and decodes that block through the SAME reader, so the result lands in the
+    plot's BlockCache and the dispatcher's next read is a hit. Aiming a fixed
+    number of positions ahead instead misses: a drag of one position per step is
+    still inside its own chunk two positions later, so on a real .zspy the
+    read-ahead warmed a chunk that was already warm and every crossing decoded on
+    the dispatcher.
+
+    Latest-target-wins (a newer position replaces the pending one), single daemon
+    thread, and every failure is swallowed: this is pure speculation, so being
+    wrong must cost nothing but wasted background work. If the drag beats the
+    read-ahead to a chunk, the dispatcher waits for that decode rather than
+    starting a second one, in BlockCache.get_or_load.
+
+    Reading the compressed bytes of the chunk one further, to prepay its disk
+    read, was tried and removed: the single thread spent 20 to 50 ms in that
+    read instead of decoding the chunk the drag reached next, and every drag
+    measured slower for it.
 
     Distinct from _MoviePrefetcher, which warms the OS page cache for 1-D time
     scrubs; this warms the DECODED-block cache for 2-D nav. Both are latest-wins.
@@ -266,20 +307,28 @@ class _BlockPrefetcher:
         self._thread = None
 
     def prime(self, plot, signal, data, prev_point, point, reach: int) -> None:
-        """Queue a speculative decode of the block ``reach`` positions along the
-        travel direction. No-op without a previous point (no velocity yet)."""
+        """Queue a speculative decode of the chunk the drag is heading into.
+
+        ``reach`` is the fallback lookahead in positions, used only when the
+        reader has no chunks to aim at. No-op without a previous point (no
+        velocity yet)."""
         if plot is None or prev_point is None or point is None:
             return
         try:
             if len(prev_point) != len(point) or len(point) < 2:
                 return              # 2-D nav only; 1-D is _MoviePrefetcher's job
-            delta = [int(point[k]) - int(prev_point[k]) for k in range(len(point))]
-            if not any(delta):
+            signs = _step_signs(prev_point, point)
+            if not any(signs):
                 return              # not moving — nothing to guess
             nav_shape = data.shape[:len(point)]
-            ahead = tuple(
-                int(np.clip(int(point[k]) + delta[k] * reach, 0, nav_shape[k] - 1))
-                for k in range(len(point)))
+            reader = plot._local_transform_readers.get(id(signal))
+            ahead = (_next_chunk_position(reader, point, signs, nav_shape)
+                     if reader is not None else None)
+            if ahead is None:
+                ahead = tuple(
+                    int(np.clip(int(point[k]) + signs[k] * reach,
+                                0, nav_shape[k] - 1))
+                    for k in range(len(point)))
         except Exception:
             return
         with self._lock:
@@ -307,7 +356,8 @@ class _BlockPrefetcher:
                 from spyde.array_cache import (
                     get_local_frame, is_local_frame_resident,
                 )
-                if is_local_frame_resident(plot, signal, data, np.asarray(point)):
+                if is_local_frame_resident(plot, signal, data,
+                                           np.asarray(point)):
                     continue                    # already warm
                 get_local_frame(plot, signal, data, np.asarray(point))
             except Exception as e:
@@ -639,8 +689,10 @@ def _direct_read_frame(current_signal, selector, indices, prof, child=None):
                            else tuple(int(v) for v in np.atleast_1d(idx)))
                     prev = getattr(child, "_prefetch_prev_point", None)
                     child._prefetch_prev_point = cur
-                    # Reach one region-extent ahead so the block is decoded before
-                    # the ROI's leading edge arrives; a point gets a short lookahead.
+                    # A reader with chunks is aimed at its next chunk boundary
+                    # and ignores this. It is the lookahead for a reader without
+                    # one: a region-extent ahead so the block is there before the
+                    # ROI's leading edge arrives, a short step for a point.
                     reach = int(np.ptp(idx[:, 0])) + 1 if is_region else 2
                     _block_prefetcher.prime(child, current_signal, data,
                                             prev, cur, max(2, reach))
@@ -1045,6 +1097,51 @@ def _prepare_nav_indices(current_signal, indices, integrating: bool, data=None):
     return indices
 
 
+# Passed as ``data`` to _prepare_nav_indices to clamp against the signal's
+# navigation axes: it has no ``shape``, which is what selects that fallback.
+_NAVIGATION_AXES = object()
+
+
+def _read_through_override(override, indices):
+    """The frame a reader pinned on the tree answers with, for a point or an
+    integrating region.
+
+    None means the override has no frame at this position (a progressive
+    result whose block has not landed): the caller paints nothing and the
+    last frame stays up.
+
+    An override owns its region rule and states it with ``region_frame``: the
+    vectors window sums per-position maxima, a count map sums counts, a
+    progressive result shows the region's centre. One without it gets the mean
+    of its frames, rounded back to the frames' own dtype so an integer source
+    integrates to the same numbers the base read gives it."""
+    idx = np.asarray(indices)
+    if idx.ndim <= 1:
+        point = tuple(int(v) for v in np.atleast_1d(idx))
+        frame = override.read_frame(point)
+        return None if frame is None else np.asarray(frame)
+
+    n_points = int(idx.shape[0])
+    if n_points == 0:
+        return None
+    reduce_region = getattr(override, "region_frame", None)
+    if reduce_region is not None:
+        frame = reduce_region(idx)
+        return None if frame is None else np.asarray(frame)
+
+    total = None
+    for row in idx:
+        frame = override.read_frame(tuple(int(v) for v in row))
+        if frame is None:
+            return None
+        frame = np.asarray(frame)
+        total = frame.astype(np.float64) if total is None else total + frame
+    mean = total / n_points
+    if np.issubdtype(frame.dtype, np.integer):
+        mean = np.rint(mean)
+    return mean.astype(frame.dtype)
+
+
 def update_from_navigation_selection(
         selector: "BaseSelector",
         child: "Plot",
@@ -1080,6 +1177,28 @@ def update_from_navigation_selection(
     # get the data from the signal tree based on the current indices
 
     current_signal = child.plot_state.current_signal
+
+    # A node whose frames are not in its own array answers through a reader
+    # pinned on the tree: disks rendered from vectors, a progressive result
+    # that has only the blocks that have landed, one window of an event
+    # stream. That reader IS the read for this node, so it runs before every
+    # guard below: those guards ask whether `.data` can be sliced, and a
+    # placeholder or an unresolved future there is exactly the case an
+    # override exists to serve.
+    tree = getattr(child, "signal_tree", None)
+    override = (tree.reader_override_for(current_signal, child)
+                if tree is not None else None)
+    if override is not None:
+        # Clamp against the navigation axes, not `.data`: the override reads
+        # the position rather than that array, whose shape may be a
+        # placeholder's and would clamp a real coordinate to zero.
+        result = _read_through_override(
+            override,
+            _prepare_nav_indices(current_signal, indices,
+                                 selector.is_integrating,
+                                 data=_NAVIGATION_AXES))
+        _prof.done("reader override")
+        return result
 
     # A signal whose `.data` is still a pending FUTURE has nothing to slice yet,
     # and that is independent of `_lazy` — so it must be checked here rather

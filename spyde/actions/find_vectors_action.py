@@ -26,7 +26,7 @@ log = logging.getLogger(__name__)
 
 from de_shell.ipc import emit, emit_status, emit_error
 from spyde.backend import test_hold as _hold
-from spyde.actions.context import src_plot_tree as _src_plot_tree
+from spyde.actions.context import src_plot_tree as _src_plot_tree, current_signal as _current_signal
 from spyde.actions.find_vectors import _do_compute_vectors, _copy_nav_axes_to
 
 # Defaults mirror the old Qt CaretGroup sliders, plus the detection method:
@@ -96,7 +96,7 @@ def find_diffraction_vectors(ctx, action_name: str = "Find Diffraction Vectors",
     if src_tree is None or session is None:
         emit_error("Find Vectors: no active dataset")
         return None
-    src = src_tree.root
+    src = _current_signal(plot) or src_tree.root
     am = src.axes_manager
     if am.signal_dimension != 2 or am.navigation_dimension < 2:
         emit_error("Find Vectors needs a 4D-STEM dataset (2-D nav + 2-D signal)")
@@ -127,7 +127,7 @@ def _start_batch(session, plot, src_tree, p: dict, *, overlay_visible: bool = Tr
     thread. Shared by the toolbar one-shot and the staged-wizard ``fv_run``
     (which passes ``overlay_visible=False`` — after Compute the source DP stays
     clean; reopening the caret toggles the overlay back via ``set_overlay``)."""
-    src = src_tree.root
+    src = _current_signal(plot) or src_tree.root
     am = src.axes_manager
 
     # Pin the CONCRETE model id for neural runs ("" = registry default) so the
@@ -141,21 +141,15 @@ def _start_batch(session, plot, src_tree, p: dict, *, overlay_visible: bool = Tr
         except Exception as e:
             log.debug("resolving default model id failed: %s", e)
 
-    # Drop any live tuning preview — the final overlay replaces it.
-    prev = getattr(src_tree, "_fv_preview", None)
-    if prev is not None:
-        try:
-            prev.remove()
-        except Exception as e:
-            log.debug("dropping find-vectors preview failed: %s", e)
-        src_tree._fv_preview = None
-
-    # Drop the prior run's persistent source-DP overlay SYNCHRONOUSLY. The
-    # replace inside _overlay_on_source only runs at the TAIL of the async
-    # batch, so without this a second Compute leaves run 1's circles on the DP
-    # for the whole run — and a torn attach could stack a second marker group.
-    from spyde.actions.lifecycle import replace_tree_attr
-    replace_tree_attr(src_tree, "_vector_overlay", None)
+    # Drop the live tuning preview (the final overlay replaces it) and the
+    # prior run's persistent source-pattern overlay. The replace inside
+    # _overlay_on_source only runs at the TAIL of the async batch, so without
+    # this a second Compute leaves run 1's circles on the pattern all run.
+    from spyde.actions.vector_overlay import (
+        remove_find_vectors_preview, clear_tree_overlay,
+    )
+    remove_find_vectors_preview(src_tree)
+    clear_tree_overlay(src_tree, "_vector_overlay")
 
     # ── Build the result tree up front: a lazy zero placeholder with the
     #    source's axes (so we never reference the raw dataset) + a zero
@@ -187,11 +181,11 @@ def _start_batch(session, plot, src_tree, p: dict, *, overlay_visible: bool = Tr
         signal_type="spyde_diffraction_vectors_image",
         navigator_override=nav_sig, selector_type=CrosshairSelector,
         provenance={"action": "Find Diffraction Vectors",
-                    "source_title": base_title, "params": dict(p)},
+                    "source_title": base_title,
+                    "source_node": _node_name(src_tree, src), "params": dict(p)},
     )
 
     emit_status("Finding diffraction vectors…")
-    src_dp_plot = plot   # overlay the found vectors on the live DP we ran from
 
     # ── Progressive (live) count map: the compute writes per-chunk vector counts
     #    into a shared-memory buffer as chunks finish; a poller paints them into
@@ -308,8 +302,8 @@ def _start_batch(session, plot, src_tree, p: dict, *, overlay_visible: bool = Tr
                 return
             _finalize(new_tree, vecs)
             log.info("[fv-batch] finalized in %.1fs total", _time.monotonic() - t0)
-            _overlay_on_source(src_tree, src_dp_plot, vecs,
-                               visible=overlay_visible)
+            _overlay_on_source(src_tree, vecs, visible=overlay_visible,
+                               signal=src)
         except Exception as e:
             emit_error(f"Find Vectors failed: {e}")
             log.exception("Find Vectors compute failed")
@@ -348,25 +342,35 @@ def _start_batch(session, plot, src_tree, p: dict, *, overlay_visible: bool = Tr
     return None
 
 
-def _overlay_on_source(src_tree, dp_plot, vecs, *, visible: bool = True) -> None:
-    """Overlay the found vectors as live circle markers on the SOURCE diffraction
-    pattern (Qt parity: peaks tracked the navigator). Replaces any prior overlay
-    from an earlier run so re-running Find Vectors doesn't stack markers.
+def _node_name(tree, signal):
+    """The tree node name of ``signal``, for provenance; None if not a node."""
+    try:
+        node = tree.get_node(signal)
+    except Exception:
+        node = None
+    return getattr(node, "name", None)
 
-    ``visible=False`` (the wizard path) attaches it hidden: the DP stays clean
-    after Compute, and reopening the Find Vectors caret shows it again via the
+
+def _overlay_on_source(src_tree, vecs, *, visible: bool = True,
+                       signal=None) -> None:
+    """Overlay the found vectors as live circle markers on the SOURCE
+    diffraction pattern. Replaces any prior overlay from an earlier run so
+    re-running Find Vectors doesn't stack markers. ``signal`` is the node the
+    vectors were found on; the overlay draws only while a window displays it.
+
+    ``visible=False`` (the wizard path) attaches it hidden: the pattern stays
+    clean after Compute, and reopening the caret shows it again through the
     renderer's ``set_overlay`` toggle."""
-    if dp_plot is None or src_tree is None:
+    if src_tree is None:
         return
-    from spyde.actions.lifecycle import replace_tree_attr
-    from spyde.actions.vector_overlay import attach_vector_overlay
-    ov = replace_tree_attr(src_tree, "_vector_overlay",
-                           lambda: attach_vector_overlay(dp_plot, vecs, src_tree))
-    if ov is not None and not visible:
-        try:
-            ov.set_visible(False)
-        except Exception as e:
-            log.debug("hiding source vector overlay failed: %s", e)
+    from spyde.actions.vector_overlay import (
+        attach_vector_overlay, clear_tree_overlay,
+    )
+    clear_tree_overlay(src_tree, "_vector_overlay")
+    node = attach_vector_overlay(vecs, src_tree, signal=signal)
+    src_tree._vector_overlay = node
+    if not visible:
+        src_tree.set_overlay_visible(node, False)
 
 
 def _apply_axes_from_vecs(new_sig, nav_sig, vecs) -> None:
@@ -441,13 +445,12 @@ def _finalize(tree, vecs) -> None:
     display, and unlock the vector toolbar actions.
 
     The result window's frames are produced on every navigator move by
-    ``vecs.render_frame`` (an O(1) CSR slice; see ``_install_render_display``) —
-    NOT by reading the signal's lazy data. So the root keeps its cheap zero
-    placeholder array (right shape/axes for the window) and we never build or
-    store the lazy ``to_rendered_dask`` graph. That graph was vestigial here (the
-    render-display path overrides the navigator slice function) and its async
-    Future→shm delivery could leave frames stale; dropping it removes that lag and
-    is what makes Save tiny (we serialise the vectors, not rendered frames)."""
+    ``vecs.render_frame`` (an O(1) slice of the vector buffer; see
+    :class:`RenderedVectorsReader`), not by reading the signal's lazy data. So
+    the root keeps its cheap zero placeholder array, with the right shape and
+    axes for the window, and no rendered-frame dask graph is ever built or
+    stored, which is what makes Save tiny: the vectors are serialised, not the
+    frames they draw."""
     # The signal plot's CachedDaskArray captured the placeholder array when the
     # window first rendered (zeros). Drop it so the render-display re-slice paints
     # the disk frames instead of the cached zeros.
@@ -532,258 +535,148 @@ def _finalize(tree, vecs) -> None:
                 state._send_toolbar_config()
         except Exception as e:
             log.debug("re-sending toolbar config after find-vectors failed: %s", e)
-    _install_render_display(tree, vecs)
+    _install_result_readers(tree, vecs)
     _overlay_on_result(tree, vecs)
-    _attach_time_slice_repaint(tree, vecs)
 
     total = int(len(vecs.flat_buffer))   # total over ALL slices, not one slice
     emit_status(f"Found {total} diffraction vectors")
 
 
-def _install_render_display(tree, vecs) -> None:
-    """Drive the result window's signal plot by rendering vectors frames
-    IN-PROCESS on every navigator move (Qt parity) — ``render_frame`` is an O(1)
-    CSR slice. This REPLACES the navigator's slice function so navigation never
-    touches the lazy ``to_rendered_dask`` root, whose chunks are delivered
-    asynchronously (Future → shared-memory) and can leave the window black on
-    real distributed data. Each navigated position now paints its disks
-    synchronously, exactly like the Qt ``_make_hooked`` update."""
-    from spyde.actions.vector_overlay import _indices_to_iyix, _indices_lead_nav
-    H = int(vecs.sig_axes[1].size)
-    W = int(vecs.sig_axes[0].size)
+def _split_nav_index(index):
+    """A prepared navigation index as ``(time, iy, ix)``.
 
-    def _region_bounds(indices):
-        """If ``indices`` spans MORE THAN ONE nav position (a RectangleSelector
-        emits a grid of ``[ix, iy]`` rows; a crosshair emits exactly one), return
-        the half-open nav rectangle ``(y0, y1, x0, x1)`` covering it — else None.
-        Uses the SPATIAL (last two) coords of every row so a 5-D stack's leading
-        stack coord is ignored (it is handled via ``t=`` below)."""
-        idx = np.asarray(indices)
-        if idx.ndim != 2 or idx.shape[0] <= 1 or idx.shape[1] < 2:
-            return None
-        ixs = idx[:, -2].astype(np.int64)
-        iys = idx[:, -1].astype(np.int64)
-        y0, y1 = int(iys.min()), int(iys.max()) + 1
-        x0, x1 = int(ixs.min()), int(ixs.max()) + 1
-        if (y1 - y0) <= 1 and (x1 - x0) <= 1:
-            return None                     # collapsed to a single position
-        return y0, y1, x0, x1
-
-    def _fn(selector, child, indices):
-        iy, ix = _indices_to_iyix(indices)
-        # 5-D stack: the leading nav coord is the stack/time index → render that
-        # slice's disks (t=). 4-D: lead=() → t=None (all, i.e. the single slice).
-        lead = _indices_lead_nav(indices)
-        t = int(lead[0]) if lead else None
-        # Region selector on the navigator (rectangle/span) → SUM the disks over
-        # every nav position it covers (mirrors render_region's max-then-sum
-        # rule, so a 1x1 region == render_frame). A crosshair falls through to
-        # the single-position render_frame path unchanged.
-        region = _region_bounds(indices)
-        if region is not None:
-            y0, y1, x0, x1 = region
-            try:
-                return vecs.render_region(y0, y1, x0, x1, t=t)
-            except Exception as e:
-                log.debug("render_region(%s..%s, %s..%s, t=%s) failed, "
-                          "showing blank: %s", y0, y1, x0, x1, t, e)
-                return np.zeros((H, W), dtype=np.float32)
-        try:
-            return vecs.render_frame(iy, ix, t=t)
-        except Exception as e:
-            log.debug("render_frame(%s, %s, t=%s) failed, showing blank: %s",
-                      iy, ix, t, e)
-            return np.zeros((H, W), dtype=np.float32)
-
-    # Stash the render fn so a LATER-added navigator selector (e.g. "Add Selector"
-    # or the Strain reference crosshair) can be wired to render disks too, instead
-    # of slicing the lazy zero placeholder and painting black. See
-    # MultiplotManager.add_navigation_selector_and_signal_plot.
-    tree._render_frame_fn = _fn
-
-    # 5-D stack: the TOP (time) selector drives the 2-D REAL-SPACE navigator, and
-    # its signal is the tree's zero count-map placeholder — so scrubbing time
-    # sliced zeros over the count map. Give that child its own slice function:
-    # the count map OF THAT SLICE. (This is a navigator, NOT a signal plot — it
-    # must never get `_fn`, which is what drew diffraction patterns in the
-    # real-space window.)
-    spatial_2d = tuple(int(s) for s in vecs.nav_shape)
-    n_time = int(getattr(vecs, "n_time", 0) or 0)
-
-    def _count_fn(selector, child, indices):
-        idx = np.asarray(indices)
-        if idx.ndim >= 2:
-            ts = sorted({int(r[-1]) for r in idx})
-        else:
-            ts = [int(idx[-1])] if idx.size else [0]
-        ts = [t for t in ts if 0 <= t < n_time] or [0]
-        try:
-            # A span (integrate mode) sums the slices it covers, mirroring
-            # render_region: a 1-wide span equals the single-slice count map.
-            out = np.zeros(spatial_2d, dtype=np.float32)
-            for t in ts:
-                out += np.asarray(vecs.count_map_at_t(t), dtype=np.float32)
-            return out
-        except Exception as e:
-            log.debug("count_map_at_t(%s) failed, showing blank: %s", ts, e)
-            return np.zeros(spatial_2d, dtype=np.float32)
-
-    nav_targets = set()
-    if n_time > 0:
-        nav_targets = {id(p) for p in _all_nav_plots(tree)
-                       if getattr(p, "is_navigator", False)
-                       and _display_shape(p) == spatial_2d}
-
-    # Navigator plots are NOT signal plots (MultiplotManager files only real
-    # signal plots), but filter defensively — installing the DP renderer on a
-    # navigator is the exact failure this guards.
-    sig_plots = {p for p in getattr(tree, "signal_plots", [])
-                 if not getattr(p, "is_navigator", False)}
-    npm = getattr(tree, "navigator_plot_manager", None)
-    touched = set()
-    if npm is not None:
-        for sel in getattr(npm, "all_navigation_selectors", []):
-            for child in list(getattr(sel, "children", {}).keys()):
-                if child in sig_plots:
-                    sel.children[child] = _fn
-                elif id(child) in nav_targets:
-                    sel.children[child] = _count_fn
-                else:
-                    continue
-                child.needs_auto_level = True
-                touched.add(sel)
-    for sel in touched:
-        try:
-            sel.delayed_update_data(force=True)
-        except Exception as e:
-            log.debug("forcing navigator re-slice after find-vectors failed: %s", e)
-    if not touched:                      # fallback: the lazy nav path
-        _refresh_signal_from_navigator(tree)
-
-
-def _attach_time_slice_repaint(tree, vecs) -> None:
-    """Repaint the 2-D count map when the TIME axis moves (5-D stacks only).
-
-    `count_map_at_t(0)` is painted once when the vectors attach, and nothing
-    used to update it — so scrubbing the time navigator left the count map
-    showing slice 0 forever while the DP and the vector overlay moved on. The
-    map silently disagreed with everything else on screen.
-
-    Rides the SAME `BaseSelector.index_hooks` the vector overlay uses
-    (`vector_overlay._on_indices`), so the repaint is driven by exactly the
-    navigator event the overlay already follows — one mechanism, one ordering,
-    nothing new to keep in sync. Idempotent: re-running Find Vectors removes the
-    previous hook first, or a second run would paint twice per move.
+    The spatial pair is the last two coordinates in data order; a leading
+    coordinate is the stack slice a 5-D scan's vectors were found in, and a
+    4-D scan has none.
     """
-    from spyde.actions.vector_overlay import (
-        _indices_lead_nav, _navigator_selectors_for,
-    )
+    values = tuple(int(v) for v in np.atleast_1d(np.asarray(index)).ravel())
+    if len(values) < 2:
+        return None, 0, 0
+    return (int(values[0]) if len(values) > 2 else None), values[-2], values[-1]
 
-    _detach_time_slice_repaint(tree)
-    if getattr(vecs, "n_time", 0) <= 0:
-        return                                   # 4-D: nothing to slice
-    spatial_2d = tuple(int(s) for s in vecs.nav_shape)
-    n_t = int(vecs.n_time)
-    state = {"t": 0}
 
-    def _targets():
-        out = []
+class RenderedVectorsReader:
+    """Frames of a Find Vectors result window, drawn from the vector store.
+
+    The window's root is a zero placeholder with the right shape and axes; the
+    frame at a position is that position's vectors drawn as flat disks, an
+    O(1) slice of the compact vector buffer. A region is the store's own rule:
+    each position's disks are drawn with the intra-frame maximum and those
+    frames are summed.
+    """
+
+    def __init__(self, vecs):
+        self.vecs = vecs
+        self.frame_shape = (int(vecs.sig_axes[1].size), int(vecs.sig_axes[0].size))
+
+    @property
+    def frame_bytes(self) -> int:
+        return int(np.prod(self.frame_shape)) * np.dtype(np.float32).itemsize
+
+    def read_frame(self, indices):
+        slice_index, iy, ix = _split_nav_index(indices)
+        try:
+            return self.vecs.render_frame(iy, ix, t=slice_index)
+        except Exception as e:
+            log.debug("rendering the vectors at (%s, %s, t=%s) failed: %s",
+                      iy, ix, slice_index, e)
+            return np.zeros(self.frame_shape, dtype=np.float32)
+
+    def region_frame(self, points):
+        """The rectangle the region covers, rendered by the store's own rule:
+        each position's disks at their intra-frame maximum, summed across
+        positions."""
+        points = np.asarray(points)
+        slice_index = int(points[0][0]) if points.shape[1] > 2 else None
+        rows = points[:, -2].astype(np.int64)
+        columns = points[:, -1].astype(np.int64)
+        return self.vecs.render_region(
+            int(rows.min()), int(rows.max()) + 1,
+            int(columns.min()), int(columns.max()) + 1, t=slice_index)
+
+
+class CountMapReader:
+    """The vector count map of one slice of a stack, for the real-space
+    navigator of a Find Vectors result window.
+
+    That navigator's own array is a placeholder of zeros the time axis would
+    otherwise slice, so scrubbing time showed zeros over the map.
+    """
+
+    def __init__(self, vecs):
+        self.vecs = vecs
+        self.shape = tuple(int(s) for s in vecs.nav_shape)
+        self.n_time = int(getattr(vecs, "n_time", 0) or 0)
+        self._last_slice = None
+
+    @property
+    def frame_bytes(self) -> int:
+        return int(np.prod(self.shape)) * np.dtype(np.float32).itemsize
+
+    def _slice(self, t: int) -> int:
+        return max(0, min(int(t), self.n_time - 1))
+
+    def read_frame(self, indices):
+        values = np.atleast_1d(np.asarray(indices)).ravel()
+        t = self._slice(values[-1] if values.size else 0)
+        if t != self._last_slice:
+            self._last_slice = t
+            # INFO because it is the only honest handle the e2e has on "the map
+            # followed the time axis".
+            log.info("[fv-5d] count map -> slice %d", t)
+        try:
+            return np.asarray(self.vecs.count_map_at_t(t), dtype=np.float32)
+        except Exception as e:
+            log.debug("the count map of slice %s failed to build: %s", t, e)
+            return np.zeros(self.shape, dtype=np.float32)
+
+    def region_frame(self, points):
+        """The count maps of every slice a span covers, summed: a count map is
+        counts, so integrating a span of time adds them."""
+        slices = sorted({self._slice(row[-1]) for row in np.asarray(points)})
+        total = np.zeros(self.shape, dtype=np.float32)
+        for t in slices:
+            total += np.asarray(self.vecs.count_map_at_t(t), dtype=np.float32)
+        return total
+
+
+def _install_result_readers(tree, vecs) -> None:
+    """Read the result window's frames from the vector store.
+
+    The diffraction pattern is the navigated position's disks and, for a
+    stack, the real-space navigator is that slice's count map. Both are
+    pinned on the tree as reader overrides, so every window of the tree draws
+    them, including a signal plot opened later by "Add Selector"."""
+    tree.set_reader_override(tree.root, RenderedVectorsReader(vecs))
+    for plot in list(getattr(tree, "signal_plots", [])):
+        plot.needs_auto_level = True
+    if int(getattr(vecs, "n_time", 0) or 0) > 0:
+        spatial_2d = tuple(int(s) for s in vecs.nav_shape)
         for nav_plot in _all_nav_plots(tree):
-            cur = getattr(nav_plot, "current_data", None)
-            exp = tuple(cur.shape) if hasattr(cur, "shape") else None
-            if exp is not None and exp == spatial_2d:
-                out.append(nav_plot)
-        return out
-
-    def _on_indices(indices):
-        lead = _indices_lead_nav(indices)
-        if not lead:
-            return
-        t = int(lead[0])
-        if not (0 <= t < n_t) or t == state["t"]:
-            return                               # same slice — nothing to redo
-        state["t"] = t
-        try:
-            cm = np.asarray(vecs.count_map_at_t(t), dtype=np.float32)
-        except Exception as e:
-            log.debug("count_map_at_t(%s) failed: %s", t, e)
-            return
-        n_painted = 0
-        for nav_plot in _targets():
-            try:
+            if not getattr(nav_plot, "is_navigator", False):
+                continue
+            if _display_shape(nav_plot) != spatial_2d:
+                continue
+            state = getattr(nav_plot, "plot_state", None)
+            signal = getattr(state, "current_signal", None)
+            if signal is not None:
+                tree.set_reader_override(signal, CountMapReader(vecs))
                 nav_plot.needs_auto_level = True
-                nav_plot.set_data(cm)
-                n_painted += 1
-            except Exception as e:
-                log.debug("repainting the count map for t=%s failed: %s", t, e)
-        # INFO for the same reason as the time-nav paint: the e2e's only honest
-        # handle on "the map followed the time axis".
-        log.info("[fv-5d] count map -> slice %d (%d plot(s))", t, n_painted)
-
-    hooked = []
-    for sp in list(getattr(tree, "signal_plots", [])):
-        for sel in _navigator_selectors_for(tree, sp):
-            if _on_indices not in sel.index_hooks:
-                sel.index_hooks.append(_on_indices)
-                hooked.append(sel)
-    tree._vectors_time_repaint = (_on_indices, hooked)
-
-
-def _detach_time_slice_repaint(tree) -> None:
-    """Drop a previous run's time-slice hook (see the idempotence note above)."""
-    prev = getattr(tree, "_vectors_time_repaint", None)
-    if not prev:
-        return
-    fn, sels = prev
-    for sel in sels:
-        try:
-            if fn in sel.index_hooks:
-                sel.index_hooks.remove(fn)
-        except Exception as e:
-            log.debug("detaching the time-slice repaint failed: %s", e)
-    tree._vectors_time_repaint = None
+    _refresh_signal_from_navigator(tree)
 
 
 def _overlay_on_result(tree, vecs) -> None:
     """Overlay the found vectors as red circle markers on the RESULT window's
-    rendered diffraction pattern, tracking its count-map navigator (Qt parity:
-    the computed-vectors window drew red circles over the rendered disks).
-    Replaces any prior overlay so re-running doesn't stack markers."""
-    from spyde.actions.vector_overlay import attach_vector_overlay
-    for old in _result_overlays(tree):
-        try:
-            old.remove()
-        except Exception as e:
-            log.debug("removing prior vector overlay failed: %s", e)
-    tree._result_vector_overlay = None
+    rendered diffraction pattern, tracking its count-map navigator. Replaces
+    any prior overlay so re-running doesn't stack markers.
 
-    # SIGNAL plots only. A 5-D stack's intermediate real-space navigator used to
-    # land in `signal_plots`, so it got a circle overlay in k-space coordinates
-    # too — and its driving selector is the 1-D time selector, whose one-coord
-    # index blew up the (iy, ix) unpack mid-attach and left a raising hook wired
-    # to that selector for the rest of the session.
-    attached = []
-    for sp in list(getattr(tree, "signal_plots", [])):
-        if getattr(sp, "is_navigator", False):
-            continue
-        try:
-            attached.append(attach_vector_overlay(sp, vecs, tree))
-        except Exception as e:
-            log.debug("result vector overlay attach failed: %s", e)
-    # Every overlay is retained so re-running Find Vectors removes them ALL;
-    # `_result_vector_overlay` stays the primary (first signal plot) for callers
-    # and tests that reach for one.
-    tree._result_vector_overlays = attached
-    tree._result_vector_overlay = attached[0] if attached else None
-
-
-def _result_overlays(tree) -> list:
-    """Every result-window vector overlay attached by a previous run."""
-    out = list(getattr(tree, "_result_vector_overlays", None) or [])
-    primary = getattr(tree, "_result_vector_overlay", None)
-    if primary is not None and primary not in out:
-        out.append(primary)
-    return out
+    One node covers every window the result tree opens, including a signal plot
+    added later by "Add Selector"."""
+    from spyde.actions.vector_overlay import (
+        attach_vector_overlay, clear_tree_overlay,
+    )
+    clear_tree_overlay(tree, "_result_vector_overlay")
+    tree._result_vector_overlay = attach_vector_overlay(vecs, tree)
 
 
 def _first_nav_plot(tree):
@@ -880,20 +773,21 @@ def _refresh_signal_from_navigator(tree) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Staged "wizard" workflow (Qt parity): a live found-peaks PREVIEW on the source
-# DP while you tune the sliders, then Compute → the full-dataset batch. The
+# Staged "wizard" workflow: a live found-peaks PREVIEW on the source pattern
+# while you tune the sliders, then Compute runs the full-dataset batch. The
 # preview overlay lives on the source tree as `_fv_preview`.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def fv_open(session, plot, payload) -> None:
-    """'Tune' step: attach the LIVE found-peaks preview to the source DP so the
-    red circles update as you tune the sliders / move the navigator (Qt parity).
-    Idempotent — replaces any existing preview."""
+    """'Tune' step: attach the LIVE found-peaks preview to the source pattern
+    so the red circles update as you tune the sliders or move the navigator.
+    Idempotent: it replaces any existing preview."""
     src, tree = _src_plot_tree(session, plot)
     if src is None or tree is None:
         emit_error("Find Vectors: no active dataset")
         return
-    am = tree.root.axes_manager
+    source = _current_signal(src) or tree.root
+    am = source.axes_manager
     if am.signal_dimension != 2 or am.navigation_dimension < 2:
         emit_error("Find Vectors needs a 4D-STEM dataset (2-D nav + 2-D signal)")
         return
@@ -901,7 +795,7 @@ def fv_open(session, plot, payload) -> None:
     log.debug("[fv-preview] ATTACH method=%s thr=%s show_transform=%s beamstop=%s "
               "data.shape=%s lazy=%s", p["method"], p["threshold"],
               p.get("show_transform"), p.get("beamstop_auto"),
-              tuple(tree.root.data.shape), getattr(tree.root, "_lazy", "?"))
+              tuple(source.data.shape), getattr(source, "_lazy", "?"))
 
     # Run/stop generation guard (React StrictMode mounts the wizard twice
     # synchronously: fv_open, fv_close, fv_open — before either worker
@@ -912,47 +806,31 @@ def fv_open(session, plot, payload) -> None:
 
     def _work():
         try:
-            from spyde.actions.vector_overlay import attach_find_vectors_preview
+            from spyde.actions.vector_overlay import (
+                attach_find_vectors_preview, remove_overlay_node,
+                clear_tree_overlay,
+            )
             if not is_current(tree, "_fv_run_gen", gen):
                 return                     # superseded by fv_close / newer preview
             if p["method"] == "neural":
                 _ensure_model_local(p)   # a first-use HF model downloads here,
                                          # not inside the preview's frame compute
-            new_prev = attach_find_vectors_preview(
-                src, tree.root, tree, sigma=p["sigma"],
-                kernel_radius=p["kernel_radius"], threshold=p["threshold"],
-                min_distance=p["min_distance"], subpixel=p["subpixel"],
-                method=p["method"], model_id=p.get("model_id") or None,
-                bg_sigma=p["bg_sigma"],
-                spot_radius=p.get("spot_radius") or None,
-                dog_sigma1=p["dog_sigma1"],
-                dog_sigma2=p["dog_sigma2"],
-                beamstop_auto=bool(p.get("beamstop_auto")),
-                show_transform=p["show_transform"],
-            )
-            # Superseded while attaching (fv_close / a newer fv_open bumped
-            # the generation after the check above) → tear down what we just
+            new_prev = attach_find_vectors_preview(src, source, tree, p)
+            # Superseded while attaching (fv_close or a newer fv_open bumped the
+            # generation after the check above): tear down what was just
             # attached instead of installing a stale overlay.
             if not is_current(tree, "_fv_run_gen", gen):
-                try:
-                    new_prev.remove()
-                except Exception as e:
-                    log.debug("removing superseded fv preview failed: %s", e)
+                remove_overlay_node(tree, new_prev)
                 return
             old = getattr(tree, "_fv_preview", None)
             if old is not None and old is not new_prev:
-                try:
-                    old.remove()
-                except Exception as e:
-                    log.debug("dropping prior find-vectors preview failed: %s", e)
+                remove_overlay_node(tree, old)
             tree._fv_preview = new_prev
             # The live preview supersedes any persistent overlay from an
-            # earlier Compute — both drawing at once is exactly the
-            # "duplicated peaks" bug, so drop the old one here.
-            from spyde.actions.lifecycle import replace_tree_attr
-            replace_tree_attr(tree, "_vector_overlay", None)
-            # Qt parity: estimate the disk radius from the data (once) so the
-            # wizard's defaults match the pattern instead of a fixed 5.
+            # earlier Compute: both drawing at once duplicates every peak.
+            clear_tree_overlay(tree, "_vector_overlay")
+            # Estimate the disk radius from the data, once, so the wizard's
+            # defaults match the pattern instead of a fixed 5.
             if not getattr(tree, "_fv_auto_sent", False):
                 tree._fv_auto_sent = True
                 _emit_auto_params(src, tree)
@@ -981,7 +859,7 @@ def _emit_auto_params(plot, tree) -> None:
     Qt, which auto-sizes per dataset rather than using a fixed radius."""
     try:
         from spyde.actions.find_vectors import _auto_params
-        root = tree.root
+        root = _current_signal(plot) or tree.root
         nav_dim = root.axes_manager.navigation_dimension
         nav_shape = tuple(root.data.shape[:nav_dim])
         idx = tuple(int(s) // 2 for s in nav_shape)        # centre pattern
@@ -1038,7 +916,7 @@ def _emit_calibration(plot, tree, p: dict, gen) -> None:
 
     cal = getattr(tree, "_fv_calibration", None)
     if cal is None:
-        root = tree.root
+        root = _current_signal(plot) or tree.root
         sig_shape = root.axes_manager.signal_shape
         if int(sig_shape[0]) * int(sig_shape[1]) > _CAL_MAX_FRAME_PX:
             log.debug("[fv-cal] signal frame too large — keeping defaults")
@@ -1080,13 +958,14 @@ def fv_tune(session, plot, payload) -> None:
         return
 
     def _work():
+        from spyde.actions.vector_overlay import tune_find_vectors_preview
         try:
-            prev.set_params(**coerced)
-            log.info("[fv-tune] set_params APPLIED thr=%s md=%s kr=%s",
+            tune_find_vectors_preview(tree, prev, coerced)
+            log.info("[fv-tune] parameters APPLIED thr=%s md=%s kr=%s",
                      coerced.get("threshold"), coerced.get("min_distance"),
                      coerced.get("kernel_radius"))
         except Exception as e:
-            log.exception("[fv-tune] set_params FAILED: %s", e)
+            log.exception("[fv-tune] applying the parameters FAILED: %s", e)
 
     from spyde.actions.lifecycle import run_on_worker
     run_on_worker(session, _work, name="fv-tune")
@@ -1099,7 +978,8 @@ def fv_run(session, plot, payload) -> None:
     if src is None or tree is None:
         emit_error("Find Vectors: no active dataset")
         return
-    am = tree.root.axes_manager
+    source = _current_signal(src) or tree.root
+    am = source.axes_manager
     if am.signal_dimension != 2 or am.navigation_dimension < 2:
         emit_error("Find Vectors needs a 4D-STEM dataset (2-D nav + 2-D signal)")
         return
@@ -1160,11 +1040,8 @@ def fv_close(session, plot, payload=None) -> None:
     prev = getattr(tree, "_fv_preview", None) if tree is not None else None
     log.debug("[fv-stop] removing preview=%s", prev is not None)
     if prev is not None:
-        try:
-            prev.remove()
-        except Exception as e:
-            log.debug("removing find-vectors preview on stop failed: %s", e)
-        tree._fv_preview = None
+        from spyde.actions.vector_overlay import remove_find_vectors_preview
+        remove_find_vectors_preview(tree)
 
 
 def test_hold_release(session, plot, payload=None) -> None:

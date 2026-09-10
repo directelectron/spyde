@@ -28,7 +28,7 @@ class LineProfileAction(RegionAction):
         return LineProfileSelector
 
     def reduce(self, signal, selector, indices, **params):
-        img = getattr(self.plot, "current_data", None)
+        img = getattr(self.plot, "displayed_data", None)
         if not isinstance(img, np.ndarray) or img.ndim != 2:
             return None
         try:

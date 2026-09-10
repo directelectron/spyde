@@ -301,6 +301,22 @@ poll for the cheap nav path. This is the fast common case and stays fully synchr
   conservative: anything it can't reproduce exactly (unknown transform, non-integer
   rebin factor, changed nav grid, nav/time crop) returns None and falls back to
   `LocalTransformReader`. A silently wrong frame is far worse than a slow one.
+- **A node made by a hyperspy `map` (centre beam, azimuthal integration, per-pattern
+  filters) is displayed through its RECIPE, never its dask block.** Asking dask for
+  `derived[i]` computes the WHOLE enclosing block (decode the source chunk, run the
+  function on all its frames): measured **2196 ms** per chunk crossing on a centred
+  5-D `.zspy`. The same frame is the mapped function on the parent's one frame,
+  **0.55 ms, bit-identical**, because hyperspy's own block loop IS that per-frame
+  definition. `spyde/external/hyperspy/map_recipe.py` records (function, constants,
+  per-position arguments, source) on every lazy `map` output; `readers/recipe.py`
+  evaluates it on top of the parent's reader, so the parent's block cache does the
+  decoding. A chain that leaves the tree (a method that mapped an intermediate)
+  declines to the block path — a wrong frame is worse than a slow one; the parity
+  suite (`test_recipe_reader.py`, `array_equal` against the block) is the gate.
+  PLOTTING ONLY: nothing on the batch side (navigator sums, save, find-vectors)
+  reads a recipe. A node switch keeps the readers and blocks of the new node's
+  ancestor chain (`retain_readers`), so the root's decoded chunks survive
+  Center / Rebin instead of being re-decoded for the first frame.
 - **Two caches, two granularities, both per-plot.** `Plot._array_cache`
   (`ArrayCache`, 256 MiB) holds decoded FRAMES; `Plot._block_cache` (`BlockCache`,
   **3 GiB**) holds decoded nav-CHUNK blocks shared by every reader that has one.

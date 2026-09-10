@@ -1571,26 +1571,26 @@ def _snapshot_line_extras(plot) -> list:
 
 def _snapshot_plot(plot) -> "tuple[FigureSpec, dict] | None":
     """Snapshot a live ``Plot`` NOW into a single-panel FigureSpec + a
-    ``{(panel_id, layer_id): ndarray}`` snapshot map. Reads ``current_data``,
+    ``{(panel_id, layer_id): ndarray}`` snapshot map. Reads the displayed
+    image,
     ``_last_levels``, colormap, axes, title, nav indices, and the view label.
 
-    A 1-D ``current_data`` (a line-profile / spectrum plot) takes the
+    A 1-D displayed image (a line-profile / spectrum plot) takes the
     LINE-PANEL branch (``kind="line"``): axes carries ``x_axis`` + ``units``
     (from ``plot._axes_info_1d``, falling back to ``range(n)`` when
     unavailable — never crashing the snapshot), and the base LayerSpec's
     ``color``/``linewidth``/``label`` are read from the live anyplotlib 1-D
     state when reachable (see :func:`_snapshot_line_state`). Extra overlay
     curves (``plot._plot1d``'s ``extra_lines``) become extra LayerSpecs when
-    their y-data is cleanly readable; MDI overlay-LAYER harvesting
-    (``plot._layers``, the 2-D compositing path) does NOT apply to a 1-D plot
-    and is skipped entirely.
+    their y-data is cleanly readable; MDI overlay-LAYER harvesting (the 2-D
+    compositing path) does NOT apply to a 1-D plot and is skipped entirely.
 
-    If the plot carries live MDI overlay layers (``plot._layers``, 2-D only),
-    each is serialized into the same panel as an extra LayerSpec (same
-    cmap / alpha, its own source ref) with its current frame in the snapshot
+    If the plot carries live MDI overlay layers (2-D only), each is serialized
+    into the same panel as an extra LayerSpec (same cmap / alpha, its own
+    source ref) with its current frame in the snapshot
     map — so "Add to report" on a layered plot captures the whole composite.
     Returns None when the plot has no paintable base frame."""
-    data = getattr(plot, "current_data", None)
+    data = getattr(plot, "displayed_data", None)
     if not isinstance(data, np.ndarray) or data.dtype == object:
         return None
     arr = np.array(data, copy=True)   # detach from the live buffer
@@ -1651,16 +1651,20 @@ def _snapshot_plot(plot) -> "tuple[FigureSpec, dict] | None":
     snap_map = {("p1", base_layer.id): arr}
 
     # Live MDI overlay layers → extra LayerSpecs on the same panel (base + overlays).
-    for live in list(getattr(plot, "_layers", None) or []):
-        src = getattr(live, "source_plot", None)
-        frame = getattr(src, "current_data", None) if src is not None else None
+    from spyde.actions.overlay import layer_appearance, layer_nodes, layer_source_plot
+
+    for node in layer_nodes(plot):
+        src = layer_source_plot(node)
+        frame = getattr(src, "displayed_data", None) if src is not None else None
         if not isinstance(frame, np.ndarray) or frame.dtype == object or frame.ndim != 2:
             continue
+        appearance = layer_appearance(node)
+        clim = appearance.get("clim")
         ov = LayerSpec(source=(SignalRef.from_plot(src) if src is not None else SignalRef()),
-                       cmap=str(getattr(live, "cmap", "magma")),
-                       clim=(list(live.clim) if getattr(live, "clim", None) else None),
-                       alpha=float(getattr(live, "alpha", 0.5)),
-                       visible=bool(getattr(live, "visible", True)))
+                       cmap=str(appearance.get("cmap", "magma")),
+                       clim=(list(clim) if clim else None),
+                       alpha=float(appearance.get("alpha", 0.5)),
+                       visible=bool(node.visible))
         layers.append(ov)
         snap_map[("p1", ov.id)] = np.array(frame, copy=True)
 
@@ -1674,7 +1678,7 @@ def _snapshot_plot(plot) -> "tuple[FigureSpec, dict] | None":
 
 def _snapshot_line_plot(plot, arr: np.ndarray) -> "tuple[FigureSpec, dict]":
     """The ``kind="line"`` branch of :func:`_snapshot_plot`: build a
-    single-panel FigureSpec from a 1-D ``current_data`` array. Always
+    single-panel FigureSpec from a 1-D displayed image. Always
     succeeds (a 1-D array is always paintable) — unlike the 2-D branch there
     is no "no paintable frame" case to reject."""
     axes_dict = None
@@ -1737,7 +1741,7 @@ def _snapshot_layer_now(plot) -> "tuple[np.ndarray, str, list | None] | None":
     FigureSpec (axes/title/annotations/alpha/visible are left untouched — a
     refresh keeps the panel's edited chrome). Returns None when the plot has no
     paintable frame."""
-    data = getattr(plot, "current_data", None)
+    data = getattr(plot, "displayed_data", None)
     if not isinstance(data, np.ndarray) or data.dtype == object:
         return None
     arr = np.array(data, copy=True)   # detach from the live buffer
@@ -1935,7 +1939,7 @@ def refresh_panel(session, mgr: "ReportManager", cell: Cell, panel: PanelSpec) -
     or "leave silently as-is" — ``repfig_refresh_panel``).
 
     A LINE panel's layers refresh through this same generic path:
-    ``_snapshot_layer_now`` places no ndim gate on ``current_data``, so a 1-D
+    ``_snapshot_layer_now`` places no ndim gate on the displayed image, so a 1-D
     array flows through unchanged (cmap/clim are updated but stay unused —
     ``figure_builder`` ignores them for ``kind="line"``); the curve's
     color/linewidth/label styling is left as-is (a refresh pulls fresh DATA,
@@ -2139,7 +2143,7 @@ def report_open(session, plot, payload) -> None:
                 src_plot = layer.source.resolve(session) if layer.source else None
                 arr = None
                 if src_plot is not None:
-                    frame = getattr(src_plot, "current_data", None)
+                    frame = getattr(src_plot, "displayed_data", None)
                     if isinstance(frame, np.ndarray) and frame.dtype != object:
                         arr = np.array(frame, copy=True)
                 if arr is None:

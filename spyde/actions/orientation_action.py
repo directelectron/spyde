@@ -18,7 +18,7 @@ import numpy as np
 import hyperspy.api as hs
 
 from de_shell.ipc import emit, emit_status, emit_error
-from spyde.actions.context import src_plot_tree as _src_plot_tree
+from spyde.actions.context import src_plot_tree as _src_plot_tree, current_signal as _current_signal
 from spyde.actions._common import reciprocal_radius as _reciprocal_radius
 
 log = logging.getLogger(__name__)
@@ -49,7 +49,7 @@ def orientation_mapping(ctx, action_name: str = "Orientation Mapping",
         emit_error("Orientation Mapping: no active dataset")
         return None
 
-    src = src_tree.root
+    src = _current_signal(plot) or src_tree.root
     am = src.axes_manager
     if am.signal_dimension != 2 or am.navigation_dimension != 2:
         emit_error("Orientation Mapping needs a 4D-STEM dataset (2-D nav + 2-D signal)")
@@ -132,26 +132,24 @@ def run_orientation(session, src, src_tree, phases, sim_params, match_params,
 
 def _overlay_template_on_source(src_tree, dp_plot, src, sim, gamma) -> None:
     """Overlay the best-matching template's simulated spots on the SOURCE
-    diffraction pattern, tracking the navigator (Qt-parity orientation overlay).
-    Replaces any prior overlay so re-running doesn't stack markers."""
+    diffraction pattern, tracking the navigator. Replaces any prior overlay so
+    re-running doesn't stack markers."""
     if dp_plot is None or src_tree is None:
         return
-    from spyde.actions.lifecycle import replace_tree_attr
     from spyde.actions.orientation_compute import build_matching_cache
-    from spyde.actions.vector_overlay import attach_orientation_overlay
+    from spyde.actions.vector_overlay import (
+        attach_orientation_overlay, clear_tree_overlay,
+    )
 
-    def _attach():
-        cache = build_matching_cache(src, sim)
-        return attach_orientation_overlay(
-            dp_plot, src, sim, cache, src_tree,
-            gamma=gamma, max_radius=_reciprocal_radius(src),
-            normalize_templates=True,
-        )
-
-    replace_tree_attr(src_tree, "_orientation_overlay", _attach)
+    clear_tree_overlay(src_tree, "_orientation_overlay")
+    cache = build_matching_cache(src, sim)
+    node = attach_orientation_overlay(
+        src, sim, cache, src_tree, gamma=gamma,
+        max_radius=_reciprocal_radius(src), normalize_templates=True)
+    src_tree._orientation_overlay = node
 
 
-def _open_refine_ipf(session, dp_plot, signal, sim, cache, tree):
+def _open_refine_ipf(session, signal, sim, cache, tree):
     """Open the live per-phase IPF correlation-heatmap window for refine and wire
     a controller to the navigator. Returns the controller (or None)."""
     try:
@@ -167,7 +165,7 @@ def _open_refine_ipf(session, dp_plot, signal, sim, cache, tree):
         wid = emit_refine_window(session, _fig, fig_id, html,
                                  title=f"{base} — IPF Refine")
         ctrl = RefineIpfController(
-            dp_plot, signal, sim, cache, infos, panels,
+            signal, sim, cache, infos, panels,
             gamma=DEFAULTS["gamma"], normalize=False).attach(tree)
         # Give the bare-figure refine window a dispatch/teardown identity so
         # ✕-closing it unhooks the navigator controller (see registry.py).
@@ -291,17 +289,18 @@ class OmWizard(WizardController):
         self.refine: dict = {}
 
     def remove(self) -> None:
+        from spyde.actions.vector_overlay import remove_overlay_node
         if self._closed:
             return
         self._closed = True
-        for attr in ("overlay", "refine_ipf"):
-            obj = getattr(self, attr, None)
-            if obj is not None and hasattr(obj, "remove"):
-                try:
-                    obj.remove()
-                except Exception as e:
-                    log.debug("removing OM wizard %s failed: %s", attr, e)
-            setattr(self, attr, None)
+        remove_overlay_node(self.tree, self.overlay)
+        self.overlay = None
+        if self.refine_ipf is not None:
+            try:
+                self.refine_ipf.remove()
+            except Exception as e:
+                log.debug("removing the OM refine window controller failed: %s", e)
+            self.refine_ipf = None
         if getattr(self.tree, "_om_wizard", None) is self:
             self.tree._om_wizard = None
 
@@ -334,7 +333,7 @@ def om_generate_library(session, plot, payload) -> None:
                 generate_library_from_phases, build_matching_cache,
             )
             from spyde.actions.vector_overlay import attach_orientation_overlay
-            src_root = tree.root
+            src_root = _current_signal(src) or tree.root
             phases = [Phase.from_cif(p) for p in cif_paths]
             recip_r = _reciprocal_radius(src_root)
             sim = generate_library_from_phases(phases, voltage, resolution,
@@ -358,14 +357,14 @@ def om_generate_library(session, plot, payload) -> None:
             overlay = None
             if len(phases) == 1:
                 overlay = attach_orientation_overlay(
-                    src, src_root, sim, cache, tree,
+                    src_root, sim, cache, tree,
                     gamma=DEFAULTS["gamma"], max_radius=recip_r, normalize_templates=False,
                 )
 
             # Live IPF correlation-heatmap window (one triangle per phase): updates
             # as the navigator moves; double-click a triangle to limit the refined
             # IPF region. Multi-phase elegantly → multiple triangles.
-            refine_ipf = _open_refine_ipf(session, src, src_root, sim, cache, tree)
+            refine_ipf = _open_refine_ipf(session, src_root, sim, cache, tree)
 
             tree._om_wizard = OmWizard(
                 session, tree, phases=phases, sim=sim, cache=cache,
@@ -394,9 +393,11 @@ def om_refine(session, plot, payload) -> None:
         return
 
     def _work():
+        from spyde.actions.vector_overlay import set_orientation_refine_params
         if wiz.overlay is not None:
             try:
-                wiz.overlay.set_refine_params(
+                set_orientation_refine_params(
+                    tree, wiz.overlay,
                     gamma=payload.get("gamma"),
                     scale_override=payload.get("scale_override"),
                     min_intensity=payload.get("min_intensity"),
@@ -438,7 +439,7 @@ def om_run(session, plot, payload) -> None:
     def _work():
         try:
             om = _compute_with_live_ipf(
-                session, tree.root, tree, sim,
+                session, _current_signal(src) or tree.root, tree, sim,
                 dict(n_best=n_best, gamma=gamma, normalize_templates=normalize))
             if om is None:
                 # None also means "cancelled" (tree closed mid-compute) — don't

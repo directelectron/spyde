@@ -13,6 +13,9 @@ live controllers behind produces two of everything downstream.
 """
 from __future__ import annotations
 
+import threading
+import time
+
 import numpy as np
 import pytest
 
@@ -63,6 +66,18 @@ def fitted(window):
 
 def _messages_of(window, kind):
     return [m for m in window["messages"] if m.get("type") == kind]
+
+
+def _wait_for(predicate, timeout=30.0) -> bool:
+    """Block until ``predicate`` holds, for a value the navigator's own threads
+    produce (the curves are read on the dispatcher and drawn on the painter)."""
+    import time
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return False
 
 
 def _await_messages(window, kind, timeout=30.0):
@@ -324,7 +339,7 @@ class TestBackgroundAnchors:
                                       "Exponential"])
     def test_dragging_an_anchor_puts_the_curve_under_it(self, window, fitted,
                                                         kind):
-        from spyde.actions.fit_action import evaluate_component
+        from spyde.actions.fit_action import component_curve
         session, plot, tree, _ = fitted
         fit_open(session, plot, {})
         fit_add_component(session, plot, {"kind": kind})
@@ -334,10 +349,10 @@ class TestBackgroundAnchors:
         entry = wiz._widgets[name]
 
         x0 = entry["at"][0]
-        target = float(evaluate_component(comp, [x0])[0]) * 1.7
+        target = float(component_curve(comp, [x0])[0]) * 1.7
         wiz._on_widget_drag(name, "anchor:0", {"x": x0, "y": target})
 
-        assert float(evaluate_component(comp, [x0])[0]) == pytest.approx(
+        assert float(component_curve(comp, [x0])[0]) == pytest.approx(
             target, rel=1e-9)
 
     @pytest.mark.parametrize("kind", ["PowerLaw", "Exponential"])
@@ -345,7 +360,7 @@ class TestBackgroundAnchors:
                                                       kind):
         """Two anchors determine both parameters exactly. If the solve only
         used the dragged one the curve would pivot out from under the other."""
-        from spyde.actions.fit_action import evaluate_component
+        from spyde.actions.fit_action import component_curve
         session, plot, tree, _ = fitted
         fit_open(session, plot, {})
         fit_add_component(session, plot, {"kind": kind})
@@ -355,12 +370,12 @@ class TestBackgroundAnchors:
         entry = wiz._widgets[name]
 
         x0, x1 = entry["at"]
-        held = float(evaluate_component(comp, [x1])[0])
+        held = float(component_curve(comp, [x1])[0])
         wiz._on_widget_drag(
             name, "anchor:0",
-            {"x": x0, "y": float(evaluate_component(comp, [x0])[0]) * 2.0})
+            {"x": x0, "y": float(component_curve(comp, [x0])[0]) * 2.0})
 
-        assert float(evaluate_component(comp, [x1])[0]) == pytest.approx(
+        assert float(component_curve(comp, [x1])[0]) == pytest.approx(
             held, rel=1e-9)
 
     def test_a_background_gets_widgets_on_the_plot(self, window, fitted):
@@ -387,7 +402,7 @@ class TestBackgroundAnchors:
     def test_anchors_follow_a_parameter_edit(self, window, fitted):
         """Typing a value in the caret must move the handles onto the new
         curve, the same way it does for a gaussian."""
-        from spyde.actions.fit_action import evaluate_component
+        from spyde.actions.fit_action import component_curve
         session, plot, tree, _ = fitted
         fit_open(session, plot, {})
         fit_add_component(session, plot, {"kind": "Offset"})
@@ -397,7 +412,7 @@ class TestBackgroundAnchors:
                                       "value": 123.0})
         widget = wiz._widgets[name]["anchors"][0]
         assert widget.get("y") == pytest.approx(123.0)
-        assert evaluate_component(wiz.spec[name], [0.0])[0] == pytest.approx(123.0)
+        assert component_curve(wiz.spec[name], [0.0])[0] == pytest.approx(123.0)
 
 
 class TestARunFillsTheStore:
@@ -476,7 +491,7 @@ class TestARunFillsTheStore:
         wiz, result = self._run(window, fitted)
         result.converged[:] = False
         wiz.record_run(result, wiz.nav_shape())
-        _fake_nav(tree, (0, 0))
+        _navigate(wiz, (0, 0))
         wiz.remember(np.zeros(len(tree.fit_spec.parameter_names())), chisq=0.0)
         assert tree.fit_store.chisq_at((0, 0)) == 0.0
 
@@ -484,7 +499,7 @@ class TestARunFillsTheStore:
                                                                  fitted):
         _session, _plot, tree, _ = fitted
         wiz, _result = self._run(window, fitted)
-        _fake_nav(tree, (2, 1))
+        _navigate(wiz, (2, 1))
         assert wiz.recall() is True
 
     def test_a_run_reports_its_coverage(self, window, fitted):
@@ -743,7 +758,7 @@ class TestTheResultMaps:
         fit_open(session, plot, {})
         fit_add_component(session, plot, {"kind": "Gaussian"})
         wiz = tree._fit_wizard
-        _fake_nav(tree, (2, 1))
+        _navigate(wiz, (2, 1))
         wiz.remember(wiz.spec.flat_values(), chisq=7.0)
         maps = wiz.result_maps()
         assert int(np.isfinite(maps["Gaussian"]).sum()) == 1
@@ -775,14 +790,14 @@ class TestBackgroundSeeding:
                                       "Polynomial"])
     def test_a_seeded_background_is_the_same_size_as_the_data(self, kind):
         from spyde.actions.fit_action import (
-            evaluate_component, new_component_spec, seed_background,
+            component_curve, new_component_spec, seed_background,
             _seed_for_preview,
         )
         x, y = self._spectrum()
         cspec = new_component_spec(kind, 2 if kind == "Polynomial" else None)
         _seed_for_preview(cspec, float(x[0]), float(x[-1]))
         assert seed_background(cspec, x, y) is True
-        curve = evaluate_component(cspec, x)
+        curve = component_curve(cspec, x)
         assert np.isfinite(curve).all(), f"{kind} seeded to a non-finite curve"
         # Within an order of magnitude of the data at both ends — the two
         # failures this replaced were 5 orders low and 7 orders high.
@@ -828,14 +843,14 @@ class TestBackgroundSeeding:
     def test_adding_a_background_puts_its_handles_on_the_curve(self, window,
                                                                fitted):
         """The end-to-end version: the handles must not start at y=0."""
-        from spyde.actions.fit_action import evaluate_component
+        from spyde.actions.fit_action import component_curve
         session, plot, tree, _ = fitted
         fit_open(session, plot, {})
         fit_add_component(session, plot, {"kind": "PowerLaw"})
         wiz = tree._fit_wizard
         name = wiz.spec.components[-1].name
         entry = wiz._widgets[name]
-        ys = evaluate_component(wiz.spec[name], entry["at"])
+        ys = component_curve(wiz.spec[name], entry["at"])
         assert all(v > 0 for v in ys), "a background arrived flat on the axis"
 
 
@@ -1318,46 +1333,71 @@ class TestParameterEditsMoveTheHandles:
 class TestFitsWhatIsOnScreen:
     """"Fit spectrum" must fit the spectrum being DISPLAYED.
 
-    `plot.current_data` is the authority — it is the array the plot is showing,
-    already resolved through whatever navigator or region path produced it.
-    Reconstructing it from `signal.data` plus a navigator index failed in the
-    worst way available: it fell through to the mean over navigation, so the
-    fit converged happily against a spectrum nobody was looking at and the
-    drawn model came out at about half the data's height with "converged"
-    beside it.
+    The curves are evaluated on the frame the navigator read, and hand that
+    frame back with every value, so the caret fits the array the window is
+    showing rather than reconstructing one. Reconstructing it from
+    `signal.data` plus a navigator index failed in the worst way available: it
+    fell through to the mean over navigation, so the fit converged happily
+    against a spectrum nobody was looking at and the drawn model came out at
+    about half the data's height with "converged" beside it.
     """
 
-    def test_uses_the_painted_spectrum(self, window, fitted):
+    def test_the_spectrum_is_the_frame_the_curves_were_drawn_on(self, window,
+                                                                fitted):
         session, plot, tree, _ = fitted
         fit_open(session, plot, {})
         wiz = tree._fit_wizard
-        painted = np.linspace(1.0, 2.0, len(wiz.axis()))
-        plot.current_data = painted
-        np.testing.assert_allclose(wiz.current_spectrum(), painted)
+        drawn = np.linspace(1.0, 2.0, len(wiz.axis()))
+        _navigate(wiz, (1, 2), spectrum=drawn)
+        np.testing.assert_allclose(wiz.spectrum, drawn)
 
-    def test_does_not_silently_use_the_navigation_mean(self, window, fitted):
-        """The specific failure. The mean is a fine PREVIEW stand-in before the
-        first frame lands, but once something is painted it must win."""
+    def test_it_is_never_the_navigation_mean(self, window, fitted):
+        """The specific failure: a spectrum reconstructed from the signal fell
+        through to the mean over navigation whenever the index was not where it
+        was expected."""
         session, plot, tree, _ = fitted
         fit_open(session, plot, {})
+        fit_add_component(session, plot, {"kind": "Offset"})
         wiz = tree._fit_wizard
+        assert _wait_for(lambda: wiz.spectrum is not None), \
+            "the curves were never drawn on a spectrum"
         nav_mean = np.asarray(wiz.signal.data, float).reshape(
             -1, len(wiz.axis())).mean(0)
-        plot.current_data = np.asarray(wiz.signal.data, float)[0, 0]
-        got = wiz.current_spectrum()
-        assert not np.allclose(got, nav_mean), \
-            "fell back to the navigation mean despite painted data"
-        np.testing.assert_allclose(got, np.asarray(wiz.signal.data, float)[0, 0])
+        assert not np.allclose(wiz.spectrum, nav_mean), \
+            "the caret is holding the navigation mean, not a position"
+        row = np.asarray(wiz.signal.data, float).reshape(-1, len(wiz.axis()))
+        assert any(np.allclose(wiz.spectrum, one) for one in row), \
+            "the caret is holding something that is not a spectrum of this scan"
 
-    def test_ignores_a_stale_shape(self, window, fitted):
-        """current_data can hold a dask Future or a differently-shaped frame
-        mid-transition; neither is this signal's spectrum."""
+    def test_a_real_navigator_move_reaches_the_caret(self, window, fitted):
+        """Driven through the navigator selector, the way a drag does it.
+
+        The caret's position IS the index the frame read prepared, and its
+        spectrum is the frame that read produced, not a second reading of the
+        selector that could resolve the position differently. That is what
+        makes the store's key and the display agree by construction."""
+        from spyde.drawing.update_functions import _prepare_nav_indices
+
         session, plot, tree, _ = fitted
         fit_open(session, plot, {})
+        fit_add_component(session, plot, {"kind": "Offset"})
         wiz = tree._fit_wizard
-        for bad in (object(), np.zeros((4, 4)), np.zeros(7)):
-            plot.current_data = bad
-            assert len(wiz.current_spectrum()) == len(wiz.axis())
+        assert _wait_for(lambda: wiz.position is not None)
+
+        manager = tree.navigator_plot_manager
+        selectors = [s for sels in manager.navigation_selectors.values()
+                     for s in sels]
+        inner = getattr(selectors[0], "selector", selectors[0])
+        indices = np.array([[3, 2]])
+        inner.get_selected_indices = lambda: indices
+        inner._run_update(force=True)
+
+        signal = plot.plot_state.current_signal
+        prepared = tuple(int(v) for v in _prepare_nav_indices(
+            signal, indices, integrating=False))
+        assert _wait_for(lambda: wiz.position == prepared), wiz.position
+        np.testing.assert_allclose(
+            wiz.spectrum, np.asarray(wiz.signal.data, float)[prepared])
 
     def test_fit_current_matches_the_displayed_pixel(self, window, fitted):
         """End to end: the fitted amplitude must track the pixel on screen, not
@@ -1374,26 +1414,53 @@ class TestFitsWhatIsOnScreen:
         # The BRIGHTEST pixel — its amplitude is well above the scan mean, so a
         # fit against the mean cannot pass this.
         iy, ix = np.unravel_index(int(np.argmax(amp)), amp.shape)
-        plot.current_data = np.asarray(wiz.signal.data, float)[iy, ix]
+        _navigate(wiz, (iy, ix))
         fit_current(session, plot, {})
         assert wiz.spec["Gaussian"]["A"].value == pytest.approx(
             float(amp[iy, ix]), rel=0.05)
 
+    def test_fit_current_refuses_before_a_spectrum_is_drawn(self, window,
+                                                            fitted):
+        """Better a refusal than a fit against a spectrum nobody chose."""
+        from spyde.actions.fit_action import fit_current
+        session, plot, tree, _ = fitted
+        fit_open(session, plot, {})
+        fit_add_component(session, plot, {"kind": "Offset"})
+        wiz = tree._fit_wizard
+        wiz.spectrum = None
+        fit_current(session, plot, {})
+        assert any("spectrum" in (m.get("text") or "").lower()
+                   for m in _messages_of(window, "error"))
 
-def _fake_nav(tree, idx):
-    """Stand in for the navigation selector.
+def _navigate(wiz, index, spectrum=None):
+    """Stand in for one delivery of the curves overlay.
 
-    `current_indices` lives on the SELECTOR, not the plot — reading it off the
-    plot is what made "Fit spectrum" silently fit the navigation mean, so the
-    fake deliberately mirrors the real shape.
+    The caret learns where the navigator is, and what spectrum the curves were
+    drawn against, from the overlay's own value: it is the only thing that has
+    read that position. This is that value, without a navigator to produce it.
+
+    The session is settled first, and the painter drained, because a real
+    delivery still in flight would land after this one and overwrite it.
     """
-    class _Sel:
-        current_indices = idx
+    from spyde.tests.migrated._async import quiesce
+    quiesce(wiz.session)
+    _wait_for(lambda: not wiz.plot._pending_overlay_values, timeout=5.0)
+    index = tuple(int(v) for v in index)
+    if spectrum is None:
+        spectrum = np.asarray(wiz.signal.data, float)[index]
+    row = wiz.store.get(index) if wiz.store is not None else None
+    arrived = index != wiz.position
+    _deliver(wiz, {"components": [], "position": index, "spectrum": spectrum,
+                   "recall": row if (row is not None and arrived) else None,
+                   "status": None})
 
-    class _NPM:
-        navigation_selectors = {0: [_Sel()]}
 
-    tree.navigator_plot_manager = _NPM()
+def _deliver(wiz, value):
+    """Hand a value to the caret and wait for what it marshals to the main
+    thread, which is where the model write and the state message happen."""
+    from spyde.tests.migrated._async import drain_loop
+    wiz._drew(value)
+    drain_loop(wiz.session)
 
 
 class TestPerPositionMemory:
@@ -1403,31 +1470,41 @@ class TestPerPositionMemory:
     the last pixel left in the model.
     """
 
-    def test_reads_the_position_from_the_selector(self, window, fitted):
+    def test_the_position_is_where_the_curves_were_drawn(self, window, fitted):
+        """The caret does not go looking for the navigator: the curves are
+        evaluated at a position and hand it back, so the caret's idea of where
+        it is and the drawing on screen cannot disagree."""
         session, plot, tree, _ = fitted
         fit_open(session, plot, {})
-        _fake_nav(tree, (2, 3))
-        assert tree._fit_wizard.current_indices() == (2, 3)
-
-    def test_no_selector_means_no_position(self, window, fitted):
-        """With nothing to ask, the answer is None — and `remember` then stores
-        nothing rather than inventing a key that would collide with every other
-        position that also had no selector."""
-        session, plot, tree, _ = fitted
-        fit_open(session, plot, {})
-        tree.navigator_plot_manager = None
         wiz = tree._fit_wizard
-        assert wiz.current_indices() is None
+        _navigate(wiz, (2, 3))
+        assert wiz.position == (2, 3)
+        np.testing.assert_allclose(
+            wiz.spectrum, np.asarray(wiz.signal.data, float)[2, 3])
+
+    def test_no_position_means_nothing_is_stored(self, window, fitted):
+        """Before the curves have been drawn anywhere there is no position,
+        and `remember` then stores nothing rather than inventing a key that
+        would collide with every other position that also had none."""
+        session, plot, tree, _ = fitted
+        fit_open(session, plot, {})
+        wiz = tree._fit_wizard
+        assert wiz.position is None
         wiz.remember([1.0])
         assert tree.fit_store.coverage()[0] == 0
 
-    def test_a_real_session_exposes_a_position(self, window, fitted):
-        """The accessor works against the REAL selector, not just the fake —
-        this is the half that was wrong before (it read the plot, not the
-        selector, and so always saw None)."""
+    def test_a_real_session_draws_the_curves_at_a_position(self, window, fitted):
+        """Against the REAL navigator, not just the stand-in: opening the caret
+        attaches the curves, and the navigator's own position is what they are
+        evaluated at."""
         session, plot, tree, _ = fitted
         fit_open(session, plot, {})
-        assert tree._fit_wizard.current_indices() is not None
+        fit_add_component(session, plot, {"kind": "Offset"})
+        wiz = tree._fit_wizard
+        assert _wait_for(lambda: wiz.position is not None), \
+            "the curves were never drawn at a navigator position"
+        assert wiz.spectrum is not None
+        assert len(wiz.spectrum) == len(wiz.axis())
 
     def test_remembers_and_recalls_per_position(self, window, fitted):
         session, plot, tree, _ = fitted
@@ -1435,15 +1512,15 @@ class TestPerPositionMemory:
         fit_add_component(session, plot, {"kind": "Offset"})
         wiz = tree._fit_wizard
 
-        _fake_nav(tree, (0, 0))
+        _navigate(wiz, (0, 0))
         wiz.remember([11.0])
-        _fake_nav(tree, (1, 1))
+        _navigate(wiz, (1, 1))
         wiz.remember([22.0])
 
-        _fake_nav(tree, (0, 0))
+        _navigate(wiz, (0, 0))
         assert wiz.recall() is True
         assert wiz.spec["Offset"]["offset"].value == pytest.approx(11.0)
-        _fake_nav(tree, (1, 1))
+        _navigate(wiz, (1, 1))
         assert wiz.recall() is True
         assert wiz.spec["Offset"]["offset"].value == pytest.approx(22.0)
 
@@ -1452,9 +1529,9 @@ class TestPerPositionMemory:
         fit_open(session, plot, {})
         fit_add_component(session, plot, {"kind": "Offset"})
         wiz = tree._fit_wizard
-        _fake_nav(tree, (0, 0))
+        _navigate(wiz, (0, 0))
         wiz.remember([11.0])
-        _fake_nav(tree, (3, 3))
+        _navigate(wiz, (3, 3))
         assert wiz.recall() is False
 
     def test_changing_the_model_clears_the_store(self, window, fitted):
@@ -1465,7 +1542,7 @@ class TestPerPositionMemory:
         fit_open(session, plot, {})
         fit_add_component(session, plot, {"kind": "Offset"})
         wiz = tree._fit_wizard
-        _fake_nav(tree, (0, 0))
+        _navigate(wiz, (0, 0))
         wiz.remember([11.0])
         assert tree.fit_store.coverage()[0] == 1
 
@@ -1479,7 +1556,7 @@ class TestPerPositionMemory:
         fit_open(session, plot, {})
         fit_add_component(session, plot, {"kind": "Offset"})
         wiz = tree._fit_wizard
-        _fake_nav(tree, (0, 0))
+        _navigate(wiz, (0, 0))
         assert tree.fit_store.put((0, 0), np.array([1.0, 2.0, 3.0])) is False
         assert wiz.recall() is False
 
@@ -1487,89 +1564,279 @@ class TestPerPositionMemory:
         session, plot, tree, _ = fitted
         fit_open(session, plot, {})
         fit_add_component(session, plot, {"kind": "Offset"})
-        _fake_nav(tree, (0, 0))
+        _navigate(tree._fit_wizard, (0, 0))
         tree._fit_wizard.remember([7.0])
         fit_close(session, plot, {})
         fit_open(session, plot, {})
+        _navigate(tree._fit_wizard, (0, 0))
         assert tree._fit_wizard.recall() is True
 
 
-class TestAdaptiveFit:
-    def test_navigating_recalls_before_it_refits(self, window, fitted):
-        """A stored answer wins over a fresh fit — same computation, already
-        done, and re-running it could land somewhere slightly different."""
-        from spyde.actions.fit_action import fit_navigated
+class _QueueingSession:
+    """A session whose ``_dispatch_to_main`` queues instead of running, and
+    records the thread each hand-off came from."""
+
+    def __init__(self, real):
+        self._real = real
+        self.queued = []
+        self.dispatched_from = []
+
+    def _dispatch_to_main(self, fn):
+        self.dispatched_from.append(threading.current_thread().name)
+        self.queued.append(fn)
+
+    def drain(self):
+        while self.queued:
+            self.queued.pop(0)()
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+class TestTheDeliveryIsMarshalled:
+    """A value callback runs on the painter thread, which may not write the
+    model or send a message.
+
+    The model is edited by every handler on the main thread and read by the
+    curves on the navigator's, so a third writer is a race however small; and
+    a message must leave from the main thread. `_drew` rebinds its own record
+    of the position and hands the rest over.
+    """
+
+    def _wizard(self, session, plot, tree):
+        fit_open(session, plot, {})
+        fit_add_component(session, plot, {"kind": "Offset"})
+        wiz = tree._fit_wizard
+        wiz.session = _QueueingSession(session)
+        return wiz
+
+    def _delivery(self, wiz, index, recall):
+        return {"components": [], "position": tuple(index),
+                "spectrum": np.asarray(wiz.signal.data, float)[tuple(index)],
+                "recall": recall, "status": None}
+
+    def test_the_model_write_and_the_state_leave_the_painter(self, window,
+                                                             fitted):
+        session, plot, tree, _ = fitted
+        wiz = self._wizard(session, plot, tree)
+        before = wiz.spec["Offset"]["offset"].value
+
+        emitted_on = []
+        real_emit = wiz.emit_state
+        wiz.emit_state = lambda status=None: (
+            emitted_on.append(threading.current_thread().name),
+            real_emit(status))
+
+        delivery = self._delivery(wiz, (1, 2), [42.0])
+        painter = threading.Thread(target=lambda: wiz._drew(delivery),
+                                   name="nav-paint")
+        painter.start()
+        painter.join(5.0)
+
+        # The painter recorded where the drawing is and handed the rest over.
+        assert wiz.position == (1, 2)
+        assert wiz.spec["Offset"]["offset"].value == before, \
+            "the model was written from the painter thread"
+        assert emitted_on == [], "the state was emitted from the painter thread"
+        assert wiz.session.dispatched_from == ["nav-paint"]
+
+        wiz.session.drain()
+        assert wiz.spec["Offset"]["offset"].value == pytest.approx(42.0)
+        assert emitted_on == [threading.current_thread().name]
+
+    def test_deliveries_apply_in_the_order_they_were_handed_over(self, window,
+                                                                 fitted):
+        """Dispatch order is the whole ordering guarantee: a value landing
+        while a drag is in flight is applied after the edit that preceded it,
+        never on top of a half-written model."""
+        session, plot, tree, _ = fitted
+        wiz = self._wizard(session, plot, tree)
+
+        wiz._drew(self._delivery(wiz, (0, 0), [11.0]))
+        wiz._on_widget_drag("Offset", "anchor:0", {"x": 25.0, "y": 33.0})
+        dragged = wiz.spec["Offset"]["offset"].value
+        wiz._drew(self._delivery(wiz, (1, 1), [22.0]))
+
+        assert wiz.spec["Offset"]["offset"].value == dragged, \
+            "a queued delivery wrote the model before the drag it followed"
+        wiz.session.drain()
+        assert wiz.spec["Offset"]["offset"].value == pytest.approx(22.0)
+
+
+class TestTheStoreIndexesOneWay:
+    """A position becomes a row in exactly one place.
+
+    `FitStore._key` answers "which position is this" and `flat_index` answers
+    "which row of a whole-scan result is it", and they were derived
+    separately, one reading the indices as given and the other reversing them.
+    On a square scan both look right and every position quietly shows its
+    transpose's fit.
+    """
+
+    def test_the_row_and_the_key_agree(self, window, fitted):
+        _session, _plot, tree, _ = fitted
+        from spyde.fitting.store import FitStore
+        from spyde.fitting import ModelSpec
+        from spyde.actions.fit_action import new_component_spec
+
+        spec = ModelSpec()
+        spec.append(new_component_spec("Offset"))
+        store = FitStore(spec, tree.root)
+        ny, nx = store.nav_shape
+        values = np.arange(ny * nx, dtype=float).reshape(-1, 1)
+        store.put_all(values)
+        for iy in range(ny):
+            for ix in range(nx):
+                row = store.flat_index((iy, ix))
+                assert np.array_equal(store.get((iy, ix)), values[row])
+
+    def test_a_position_written_here_is_read_back_by_the_curves(self, window,
+                                                                fitted):
+        """Write at (iy, ix) and the curves at that position draw that row."""
+        from spyde.actions.fit_action import FitStoreRows
         session, plot, tree, _ = fitted
         fit_open(session, plot, {})
         fit_add_component(session, plot, {"kind": "Offset"})
         wiz = tree._fit_wizard
-        _fake_nav(tree, (0, 0))
-        wiz.remember([42.0])
+        tree.fit_store.put((2, 3), [77.0])
+
+        rows = FitStoreRows(tree)
+        np.testing.assert_allclose(rows.at(2, 3), [77.0])
+        assert rows.at(3, 2) is None
+
+        value = _draw_curves(wiz, (2, 3))
+        assert value["recall"] is not None
+        np.testing.assert_allclose(value["recall"], [77.0])
+        # …and the curve drawn is that row's, not the model's current value.
+        _x, y = value["components"][0]["data"]
+        np.testing.assert_allclose(y, np.full(len(wiz.axis()), 77.0))
+
+
+def _draw_curves(wiz, index, adaptive=False, spectrum=None):
+    """Evaluate the curves node at ``index``, the way the navigator does."""
+    from spyde.actions.fit_action import FitStoreRows, model_curves
+    if spectrum is None:
+        spectrum = np.asarray(wiz.signal.data, float)[tuple(index)]
+    return model_curves(
+        spectrum, values=FitStoreRows(wiz.tree).at(*index),
+        position=tuple(index), caret=wiz, x=wiz.axis(),
+        colors=wiz._COMP_COLORS, adaptive=adaptive, max_iter=120)
+
+
+class TestAdaptiveFit:
+    def test_arriving_on_a_fitted_position_shows_its_fit(self, window, fitted):
+        """A stored answer wins over a fresh fit — same computation, already
+        done, and re-running it could land somewhere slightly different."""
+        session, plot, tree, _ = fitted
+        fit_open(session, plot, {})
+        fit_add_component(session, plot, {"kind": "Offset"})
+        wiz = tree._fit_wizard
+        _navigate(wiz, (1, 1))
+        tree.fit_store.put((0, 0), [42.0])
         wiz.spec["Offset"]["offset"].value = 0.0
 
-        fit_navigated(session, plot, {"adaptive": True})
+        value = _draw_curves(wiz, (0, 0), adaptive=True)
+        np.testing.assert_allclose(value["recall"], [42.0])
+        _deliver(wiz, value)
         assert wiz.spec["Offset"]["offset"].value == pytest.approx(42.0)
 
     def test_adaptive_off_leaves_the_model_alone(self, window, fitted):
-        from spyde.actions.fit_action import fit_navigated
         session, plot, tree, _ = fitted
         fit_open(session, plot, {})
         fit_add_component(session, plot, {"kind": "Offset"})
         wiz = tree._fit_wizard
-        _fake_nav(tree, (3, 3))
         before = wiz.spec["Offset"]["offset"].value
-        fit_navigated(session, plot, {"adaptive": False})
+        value = _draw_curves(wiz, (3, 3), adaptive=False)
+        _deliver(wiz, value)
         assert wiz.spec["Offset"]["offset"].value == before
+        assert tree.fit_store.is_set((3, 3)) is False
+        # The model as it stands is still what is drawn against the spectrum.
+        assert len(value["components"]) == 2
 
     def test_adaptive_on_fits_an_unvisited_position(self, window, fitted):
-        from spyde.actions.fit_action import fit_navigated
-        session, plot, tree, amp = fitted
+        session, plot, tree, _ = fitted
         fit_open(session, plot, {})
         fit_add_component(session, plot, {"kind": "Offset"})
         wiz = tree._fit_wizard
-        _fake_nav(tree, (0, 0))
-        plot.current_data = np.asarray(wiz.signal.data, float)[0, 0]
         wiz.spec["Offset"]["offset"].value = 0.0
 
-        fit_navigated(session, plot, {"adaptive": True})
-        # The data sits on a constant 5.0.
-        assert wiz.spec["Offset"]["offset"].value == pytest.approx(5.0, abs=0.5)
+        value = _draw_curves(wiz, (0, 0), adaptive=True)
         assert tree.fit_store.is_set((0, 0)), "an adaptive fit was not remembered"
+        # The data sits on a constant 5.0.
+        assert float(tree.fit_store.get((0, 0))[0]) == pytest.approx(5.0, abs=0.5)
+        _x, y = value["components"][0]["data"]
+        assert float(np.mean(y)) == pytest.approx(5.0, abs=0.5)
 
-    def test_every_navigation_path_answers(self, window, fitted):
-        """The caret keeps ONE `fit_navigated` in flight and waits for the
-        state to come back before sending the next. A branch that returned
-        silently would stall the next move until a 2-second wedge timer — the
-        pause-and-snap the coalescer exists to remove."""
-        from spyde.actions.fit_action import fit_navigated
+    def test_a_second_visit_does_not_fit_again(self, window, fitted):
+        """The store is the memory: the fit runs once per position, however
+        many times the navigator comes back to it."""
+        session, plot, tree, _ = fitted
+        fit_open(session, plot, {})
+        fit_add_component(session, plot, {"kind": "Offset"})
+        wiz = tree._fit_wizard
+
+        fits = []
+        real = fit_action.fit_one_spectrum
+
+        def counting(*args, **kwargs):
+            fits.append(1)
+            return real(*args, **kwargs)
+
+        fit_action.fit_one_spectrum = counting
+        try:
+            _deliver(wiz, _draw_curves(wiz, (0, 0), adaptive=True))
+            assert len(fits) == 1
+            _deliver(wiz, _draw_curves(wiz, (0, 0), adaptive=True))
+            assert len(fits) == 1, "the position was fitted a second time"
+        finally:
+            fit_action.fit_one_spectrum = real
+
+    def test_every_delivery_sends_the_state(self, window, fitted):
+        """The caret rebuilds itself from `fit_state`, so a delivery that drew
+        nothing must still say so: a silent one leaves the numbers showing the
+        previous position's answers."""
         session, plot, tree, _ = fitted
         fit_open(session, plot, {})
         wiz = tree._fit_wizard
 
         # 1. no components at all
         n = len(_messages_of(window, "fit_state"))
-        fit_navigated(session, plot, {"adaptive": False})
+        _deliver(wiz, _draw_curves(wiz, (3, 3)))
         assert len(_messages_of(window, "fit_state")) > n, "no model: silent"
 
-        # 2. a model, but nothing stored here, adaptive OFF
+        # 2. a model, but nothing stored here
         fit_add_component(session, plot, {"kind": "Offset"})
-        _fake_nav(tree, (3, 3))
         n = len(_messages_of(window, "fit_state"))
-        fit_navigated(session, plot, {"adaptive": False})
+        _deliver(wiz, _draw_curves(wiz, (3, 3)))
         assert len(_messages_of(window, "fit_state")) > n, "nothing stored: silent"
 
-        # 3. a stored fit to recall
-        wiz.remember(wiz.spec.flat_values(), chisq=1.0)
+        # 3. a stored fit to show
+        tree.fit_store.put((0, 0), wiz.spec.flat_values(), chisq=1.0)
         n = len(_messages_of(window, "fit_state"))
-        fit_navigated(session, plot, {"adaptive": False})
-        assert len(_messages_of(window, "fit_state")) > n, "recall: silent"
+        _deliver(wiz, _draw_curves(wiz, (0, 0)))
+        assert len(_messages_of(window, "fit_state")) > n, "a stored fit: silent"
 
-    def test_navigating_with_no_model_does_nothing(self, window, fitted):
-        from spyde.actions.fit_action import fit_navigated
+    def test_drawing_with_no_model_draws_no_curves(self, window, fitted):
         session, plot, tree, _ = fitted
         fit_open(session, plot, {})
-        fit_navigated(session, plot, {"adaptive": True})   # must not raise
+        value = _draw_curves(tree._fit_wizard, (0, 0), adaptive=True)
+        assert value["components"] == []
 
+    def test_the_toggle_moves_the_curves_off_the_navigator_thread(self, window,
+                                                                  fitted):
+        """An adaptive move runs a fit, which cannot happen on the thread the
+        navigator reads on."""
+        session, plot, tree, _ = fitted
+        fit_open(session, plot, {})
+        fit_add_component(session, plot, {"kind": "Offset"})
+        wiz = tree._fit_wizard
+        assert wiz._curves.expensive is False
+        from spyde.actions.fit_action import fit_tune
+        fit_tune(session, plot, {"adaptive": True})
+        assert wiz.adaptive is True
+        assert wiz._curves.expensive is True
+        fit_tune(session, plot, {"adaptive": False})
+        assert wiz._curves.expensive is False
 
 class TestDragSmoothness:
     """A pointer_move must do LESS work than a pointer_up.
@@ -1605,3 +1872,182 @@ class TestDragSmoothness:
         wiz = tree._fit_wizard
         wiz._on_widget_drag("Gaussian", "point", {"x": 33.0}, live=True)
         assert wiz.spec["Gaussian"]["centre"].value == pytest.approx(33.0)
+
+
+def _lazy_spectrum_image(ny=6, nx=6, nc=64, chunk=3):
+    """A lazy spectrum image in navigation chunks, so the curves are evaluated
+    through the same reader chain the spectrum itself is read through."""
+    x = np.linspace(0.0, 50.0, nc)
+    data = np.empty((ny, nx, nc))
+    for iy in range(ny):
+        for ix in range(nx):
+            data[iy, ix] = 5.0 + (10.0 + iy + ix) * np.exp(
+                -((x - 25.0) ** 2) / 18.0)
+    signal = hs.signals.Signal1D(data).as_lazy()
+    signal.data = signal.data.rechunk((chunk, chunk, -1))
+    axis = signal.axes_manager.signal_axes[0]
+    axis.offset, axis.scale = float(x[0]), float(x[1] - x[0])
+    signal.metadata.General.title = "lazy fit test"
+    return signal
+
+
+class TestTheCurvesAreAnOverlay:
+    """The curves are a child of the spectrum node, read where the spectrum is
+    read and drawn where the spectrum is drawn.
+
+    Everything here runs on a LAZY, chunked signal, so the reader chain and the
+    caches are the ones the app uses rather than a numpy index.
+    """
+
+    def _session(self):
+        from spyde.backend.session import Session
+        from spyde.tests.migrated.conftest import _settle
+        session = Session(n_workers=1, threads_per_worker=1)
+        session._add_signal(_lazy_spectrum_image())
+        _settle(session)
+        plot = [p for p in session._plots if not p.is_navigator][0]
+        return session, plot
+
+    def _selectors(self, tree):
+        manager = tree.navigator_plot_manager
+        return [s for sels in manager.navigation_selectors.values() for s in sels]
+
+    def _move(self, tree, indices, integrating=False):
+        inner = getattr(self._selectors(tree)[0], "selector",
+                        self._selectors(tree)[0])
+        inner.get_selected_indices = lambda: np.asarray(indices)
+        inner.is_integrating = integrating
+        inner._run_update(force=True)
+
+    def test_the_curves_evaluate_through_the_plots_reader(self):
+        from spyde.array_cache import reader_for_overlay
+        from spyde.array_cache.readers.recipe import RecipeReader
+
+        session, plot = self._session()
+        try:
+            tree = plot.signal_tree
+            fit_open(session, plot, {})
+            fit_add_component(session, plot, {"kind": "Offset"})
+            wiz = tree._fit_wizard
+
+            reader = reader_for_overlay(plot, wiz._curves)
+            assert isinstance(reader, RecipeReader)
+            value = reader.read_frame((2, 3))
+            assert value["position"] == (2, 3)
+            # The spectrum it drew on is the one the frame read produces.
+            np.testing.assert_allclose(
+                value["spectrum"],
+                np.asarray(wiz.signal.data[2, 3].compute(), float))
+            # One line per component, then the dashed sum.
+            assert len(value["components"]) == 2
+            assert value["components"][-1]["linestyle"] == "dashed"
+        finally:
+            session.shutdown()
+
+    def test_an_unfitted_position_says_so(self, monkeypatch):
+        """No row stored here: the model as it stands is drawn against this
+        spectrum, and the state says the position has not been fitted."""
+        session, plot = self._session()
+        try:
+            tree = plot.signal_tree
+            fit_open(session, plot, {})
+            fit_add_component(session, plot, {"kind": "Offset"})
+            wiz = tree._fit_wizard
+            wiz.spec["Offset"]["offset"].value = 3.0
+
+            captured = []
+            monkeypatch.setattr(fit_action.ipc, "emit", captured.append)
+            self._move(tree, [[1, 2]])
+            assert _wait_for(
+                lambda: [m for m in captured if m.get("type") == "fit_state"])
+            state = [m for m in captured if m.get("type") == "fit_state"][-1]
+            assert state["position_fitted"] is False
+            assert state["fitted_count"] == 0
+            # The model is still drawn against the new spectrum: one line per
+            # component and the dashed sum.
+            drawn = plot._overlay_groups[(id(wiz._curves), "components")]
+            assert len(drawn) == 2
+        finally:
+            session.shutdown()
+
+    def test_adaptive_fits_a_position_once(self):
+        session, plot = self._session()
+        try:
+            tree = plot.signal_tree
+            fit_open(session, plot, {})
+            fit_add_component(session, plot, {"kind": "Offset"})
+            wiz = tree._fit_wizard
+            wiz.set_adaptive(True)
+            # Opening the caret already drew the curves at the navigator's
+            # resting position, and with adaptive on that fitted it. Count only
+            # what the moves below do.
+            assert _wait_for(lambda: wiz.position is not None)
+
+            fits = []
+            real = fit_action.fit_one_spectrum
+
+            def counting(*args, **kwargs):
+                fits.append(1)
+                return real(*args, **kwargs)
+
+            fit_action.fit_one_spectrum = counting
+            try:
+                self._move(tree, [[2, 1]])
+                assert _wait_for(lambda: wiz.position == (2, 1)), wiz.position
+                assert _wait_for(lambda: len(fits) == 1), fits
+                assert tree.fit_store.is_set((2, 1))
+
+                self._move(tree, [[4, 4]])
+                assert _wait_for(lambda: wiz.position == (4, 4)), wiz.position
+                # Back to a position the store already has an answer for.
+                self._move(tree, [[2, 1]])
+                assert _wait_for(lambda: wiz.position == (2, 1)), wiz.position
+                time.sleep(0.4)
+                assert len(fits) == 2, \
+                    f"a stored position was fitted again ({len(fits)} fits)"
+            finally:
+                fit_action.fit_one_spectrum = real
+        finally:
+            session.shutdown()
+
+    def test_a_region_leaves_the_curves_at_its_centre(self):
+        """A model is one spectrum's, so the curves follow the centre of an
+        integrating region rather than trying to be the region's."""
+        from spyde.drawing.update_functions import _prepare_nav_indices
+
+        session, plot = self._session()
+        try:
+            tree = plot.signal_tree
+            fit_open(session, plot, {})
+            fit_add_component(session, plot, {"kind": "Offset"})
+            wiz = tree._fit_wizard
+
+            region = np.array([[ix, iy] for iy in (1, 2) for ix in (2, 3)])
+            self._move(tree, region, integrating=True)
+            signal = plot.plot_state.current_signal
+            centre = tuple(int(v) for v in _prepare_nav_indices(
+                signal, region, integrating=False))
+            assert _wait_for(lambda: wiz.position == centre), wiz.position
+            assert wiz._curves.follows_region is False
+        finally:
+            session.shutdown()
+
+    def test_the_value_is_delivered_on_the_painter_thread(self):
+        session, plot = self._session()
+        try:
+            tree = plot.signal_tree
+            fit_open(session, plot, {})
+            fit_add_component(session, plot, {"kind": "Offset"})
+            wiz = tree._fit_wizard
+
+            threads = []
+            delivered = wiz._drew
+            wiz._curves.on_value = lambda value: (
+                threads.append(threading.current_thread().name),
+                delivered(value))
+
+            self._move(tree, [[3, 3]])
+            assert _wait_for(lambda: threads), "the value was never delivered"
+            assert set(threads) == {"nav-paint"}, threads
+        finally:
+            session.shutdown()

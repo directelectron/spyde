@@ -83,6 +83,37 @@ class LocalTransformReader:
         else:
             self._memo = (key, block)
 
+    def _compute_block(self, nav_slices):
+        full = tuple(nav_slices) + \
+            (slice(None),) * (self.data.ndim - self._nav_ndim)
+        return np.asarray(self.data[full].compute(scheduler="synchronous"))
+
+    def _load_block(self, key, nav_slices):
+        """The decoded block for ``key``, running the view's graph on a miss.
+
+        Through the cache's ``get_or_load``, so the prefetcher and the
+        dispatcher chasing the same chunk run the transform once between them
+        instead of twice at the same time."""
+        if self._block_cache is None:
+            block = self._cached_block(key)
+            if block is None:
+                block = self._compute_block(nav_slices)
+                self._store_block(key, block)
+            return block
+        return self._block_cache.get_or_load(
+            id(self), key, lambda: self._compute_block(nav_slices))
+
+    def chunk_span(self, point):
+        """``(start, stop)`` of the dask chunk holding ``point``, one pair per
+        navigation axis, or None when this array is not chunked.
+
+        The read-ahead uses it to aim at the first position past the boundary
+        it is travelling towards."""
+        located = self._locate(tuple(int(v) for v in point[:self._nav_ndim]))
+        if located is None:
+            return None
+        return tuple((int(s.start), int(s.stop)) for s in located[1])
+
     def is_chunk_resident(self, indices) -> bool:
         """Is the decoded chunk holding ``indices`` already cached — i.e.
         would read_frame be a ~0 ms numpy slice? Side-effect-free. This is the
@@ -118,16 +149,11 @@ class LocalTransformReader:
             key, nav_slices = located
             groups.setdefault(key, (nav_slices, []))[1].append(point)
 
+        from .source_array import _sum_block_points
+
         acc = None
         for key, (nav_slices, pts) in groups.items():
-            block = self._cached_block(key)
-            if block is None:
-                full = tuple(nav_slices) + \
-                    (slice(None),) * (self.data.ndim - self._nav_ndim)
-                block = np.asarray(
-                    self.data[full].compute(scheduler="synchronous"))
-                self._store_block(key, block)
-            from .source_array import _sum_block_points
+            block = self._load_block(key, nav_slices)
             part = _sum_block_points(block, nav_slices, pts, self._nav_ndim,
                                      out_dtype)
             acc = part if acc is None else acc + part
@@ -139,12 +165,7 @@ class LocalTransformReader:
             # Not dask-chunked (shouldn't happen for a lazy signal) — plain compute.
             return np.asarray(self.data[indices].compute(scheduler="synchronous"))
         key, nav_slices = located
-
-        block = self._cached_block(key)
-        if block is None:
-            full_slice = tuple(nav_slices) + (slice(None),) * (self.data.ndim - self._nav_ndim)
-            block = np.asarray(self.data[full_slice].compute(scheduler="synchronous"))
-            self._store_block(key, block)
+        block = self._load_block(key, nav_slices)
 
         local = tuple(indices[ax] - nav_slices[ax].start for ax in range(self._nav_ndim))
         frame = block[local]
