@@ -21,16 +21,22 @@ Modules:
   (:mod:`spyde.external.rsciio_csb`, written as a drop-in rsciio plugin) so
   ``hs.load`` dispatches ``.csb`` to it. Deleted when that plugin lands in
   rosettasciio proper.
+* :mod:`~spyde.external.rosettasciio.de5` — makes the EMD reader accept Direct
+  Electron ``.de5`` files: flattens their ``(N, 1)`` axis arrays (otherwise a
+  ``TypeError``) and restores the datacube's stored scan-first order with the
+  scan axes as navigation (otherwise a transposed, signal-only array).
 """
 from __future__ import annotations
 
 from spyde.external import register
 from spyde.external.rosettasciio.csb_format import apply as _apply_csb
+from spyde.external.rosettasciio.de5 import apply as _apply_de5
 from spyde.external.rosettasciio.mrc import apply as _apply_mrc
 from spyde.external.rosettasciio.tiff import apply as _apply_tiff
 
 register("rosettasciio", _apply_mrc)
 register("rosettasciio", _apply_tiff)
 register("rosettasciio", _apply_csb)
+register("rosettasciio", _apply_de5)
 
-__all__ = ["_apply_mrc", "_apply_tiff", "_apply_csb"]
+__all__ = ["_apply_mrc", "_apply_tiff", "_apply_csb", "_apply_de5"]
