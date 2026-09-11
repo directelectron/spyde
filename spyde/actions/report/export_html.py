@@ -664,6 +664,14 @@ figure.report-figure img { max-width: 100%; max-height: 62vh; height: auto;
   border-radius: 6px; }
 figure.report-figure iframe { width: 100%; height: 62vh; border: 1px solid #313244;
   border-radius: 6px; }
+/* Same shaped box as the article page: an interactive figure carries its own
+   natural pixel size, so without a box to scale it into a big one overruns the
+   slide. */
+figure.report-figure .fig-box { position: relative; line-height: 0;
+  overflow: hidden; border: 1px solid #313244; border-radius: 6px;
+  max-height: 62vh; background: #1e1e2e; }
+figure.report-figure .fig-box iframe { display: block; border: none;
+  transform-origin: top left; }
 figure.report-figure video { max-width: 100%; max-height: 62vh; height: auto;
   border: 1px solid #313244; border-radius: 6px; }
 .report-movie .movie-still { position: relative; display: inline-block;
@@ -792,6 +800,7 @@ def _slides_page(title: str, slides_html: str) -> str:
         f"<div id=\"deck\">\n{slides_html}\n</div>\n"
         "<div id=\"deck-counter\"></div>\n"
         "<div id=\"deck-hint\">← → / Space to navigate</div>\n"
+        f"{_IFRAME_AUTOSIZE_JS}"
         f"<script>{_SLIDES_JS}</script>\n"
         "</body>\n</html>\n"
     )
