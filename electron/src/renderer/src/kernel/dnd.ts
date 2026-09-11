@@ -78,10 +78,9 @@ export function peekWindowDrag(): WindowDragPayload | null {
  * IPF explorer is up, which `report_add_figure` branches on). `null` when the
  * drop carries no window at all.
  *
- * THE one reader for every report drop target. Each target had its own copy and
- * they drifted: the sidebar body's lacked the stash fallback above, so a real
- * drag whose payload arrives unreadable resolved nothing there and the drop was
- * a silent no-op at the very target a user aims at to add a cell.
+ * THE one reader for every report drop target: the stash fallback above is what
+ * makes a drop whose payload arrives unreadable still resolve a window, and a
+ * target that skips it is a silent no-op on a real drag.
  */
 export function figurePayloadFromDrop(dt: DataTransfer): WindowDragPayload | null {
   const figure = dt.getData(FIGURE_DRAG_MIME)
@@ -93,10 +92,10 @@ export function figurePayloadFromDrop(dt: DataTransfer): WindowDragPayload | nul
       if (typeof windowId === 'number') return { windowId, figId, view }
     } catch { /* malformed */ }
   }
-  const window = dt.getData(WINDOW_DRAG_MIME)
-  if (window) {
-    const id = parseInt(window, 10)
-    if (Number.isFinite(id)) return { windowId: id }
+  const dragged = dt.getData(WINDOW_DRAG_MIME)
+  if (dragged) {
+    const windowId = parseInt(dragged, 10)
+    if (Number.isFinite(windowId)) return { windowId }
   }
   return peekWindowDrag()
 }

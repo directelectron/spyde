@@ -235,9 +235,7 @@ const TOOLBAR: Array<[ToolbarCommand, string, string, React.CSSProperties?]> = [
  * chrome, because a cell must not be draggable while its text is being edited.
  *
  * `testidPrefix` names the pane's testids, so each host keeps the ones its
- * tests already use. A split block's text side rendered a bare textarea with
- * neither toolbar nor shortcuts, so which markdown editor you got depended on
- * which kind of cell you had double-clicked.
+ * tests already use.
  */
 export function MarkdownPane({
   cell, testidPrefix, emptyHint, onCommit, onEditingChange, renderedStyle,
