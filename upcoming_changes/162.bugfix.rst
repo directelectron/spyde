@@ -1,1 +1,0 @@
-Direct Electron ``.de5`` files open again as 4D-STEM scans; the EMD reader rejected the camera's column-shaped axis arrays with a ``TypeError``, and once past that it handed the datacube back transposed with no navigation axes.
