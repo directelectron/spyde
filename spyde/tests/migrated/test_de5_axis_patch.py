@@ -1,9 +1,10 @@
 """
 Direct Electron writes ``.de5`` axis arrays as ``(N, 1)`` columns and stores the
-datacube scan-first in C order. Stock rsciio's EMD reader dies on the former and
-transposes the latter into a signal-only array. The patch in
-``spyde.external.rosettasciio.de5`` fixes both; these tests pin that contract
-against a synthetic file shaped like the camera's output.
+datacube scan-first in C order. Stock rsciio's EMD reader dies on the former,
+reads the whole datacube into RAM even for a lazy load, and transposes the
+latter into a signal-only array. The patch in ``spyde.external.rosettasciio.de5``
+fixes all three; these tests pin that contract against a synthetic file shaped
+like the camera's output.
 """
 import h5py
 import numpy as np
@@ -11,8 +12,14 @@ import numpy as np
 from spyde.external.rosettasciio import de5 as de5_patch
 
 
-def write_de5(path, nav=(3, 2), signal=(4, 5), direct_electron=True):
-    """A minimal ``.de5`` shaped like the camera's output, with column axes."""
+def write_de5(path, nav=(3, 2), signal=(4, 5), direct_electron=True,
+              chunks="frame", written=None):
+    """A minimal ``.de5`` shaped like the camera's output, with column axes.
+
+    ``chunks="frame"`` stores one frame per HDF5 chunk as the camera does;
+    ``None`` stores a contiguous dataset. ``written`` limits the scan positions
+    that receive data, which is what an acquisition stopped early looks like:
+    the dataset is declared at the planned size and the rest is never written."""
     shape = nav + signal
     with h5py.File(path, "w") as file:
         experiment = file.create_group("4DSTEM_experiment")
@@ -26,7 +33,17 @@ def write_de5(path, nav=(3, 2), signal=(4, 5), direct_electron=True):
         datacube.attrs["emd_group_type"] = np.array([1], dtype=np.int32)
         datacube.attrs["metadata"] = np.array([0], dtype=np.int32)
         data = np.arange(np.prod(shape), dtype=np.uint16).reshape(shape)
-        datacube.create_dataset("data", data=data, chunks=(1, 1) + signal)
+        h5_chunks = (1,) * len(nav) + signal if chunks == "frame" else chunks
+        if written is None:
+            datacube.create_dataset("data", data=data, chunks=h5_chunks)
+        else:
+            dataset = datacube.create_dataset(
+                "data", shape=shape, dtype=np.uint16, chunks=h5_chunks)
+            for position in written:
+                dataset[position] = data[position]
+            data = np.zeros(shape, dtype=np.uint16)
+            for position in written:
+                data[position] = dataset[position]
         names = ["R_y", "R_x", "Q_y", "Q_x"]
         for index, (size, name) in enumerate(zip(shape, names), start=1):
             axis = datacube.create_dataset(
@@ -35,6 +52,16 @@ def write_de5(path, nav=(3, 2), signal=(4, 5), direct_electron=True):
             axis.attrs["units"] = np.bytes_(b"[pix]")
         experiment.create_group("metadata/metadata_0")
     return data
+
+
+def dask_source(signal):
+    """The object dask reads from for this lazy signal: the live HDF5 dataset
+    when the load is lazy, an in-RAM ndarray when the reader materialised it."""
+    layers = signal.data.dask.layers
+    sources = [list(layer.values())[0]
+               for name, layer in layers.items() if name.startswith("original-")]
+    assert len(sources) == 1, "expected exactly one from_array source layer"
+    return sources[0]
 
 
 class TestDe5Patch:
@@ -62,6 +89,45 @@ class TestDe5Patch:
         assert [axis.name for axis in signal.axes_manager._axes] == ["R_y", "R_x", "Q_y", "Q_x"]
         np.testing.assert_array_equal(signal.data.compute(), expected)
         np.testing.assert_array_equal(signal.inav[1, 2].data.compute(), expected[2, 1])
+
+    def test_lazy_load_reads_from_the_file_not_from_ram(self, tmp_path):
+        """A stopped-early acquisition: 8 x 8 declared, only the first row
+        written. The lazy load must wrap the HDF5 dataset, keep its one-frame
+        chunks, and read only the frames asked for."""
+        import hyperspy.api as hs
+
+        de5_patch.apply()
+        path = tmp_path / "stopped_early.de5"
+        written = [(0, column) for column in range(8)]
+        expected = write_de5(path, nav=(8, 8), signal=(16, 16), written=written)
+        signal = hs.load(str(path), lazy=True)
+        assert isinstance(dask_source(signal), h5py.Dataset)
+        assert signal.data.shape == (8, 8, 16, 16)
+        assert signal.data.chunks[:2] == ((1,) * 8, (1,) * 8)
+        assert all(len(chunk) == 1 for chunk in signal.data.chunks[2:])
+        np.testing.assert_array_equal(signal.inav[3, 0].data.compute(), expected[0, 3])
+        assert not signal.inav[3, 5].data.compute().any()
+
+    def test_contiguous_dataset_gets_one_frame_per_chunk(self, tmp_path):
+        import hyperspy.api as hs
+
+        de5_patch.apply()
+        path = tmp_path / "contiguous.de5"
+        expected = write_de5(path, nav=(3, 2), signal=(4, 5), chunks=None)
+        signal = hs.load(str(path), lazy=True)
+        assert isinstance(dask_source(signal), h5py.Dataset)
+        assert signal.data.chunks == ((1, 1, 1), (1, 1), (4,), (5,))
+        np.testing.assert_array_equal(signal.data.compute(), expected)
+
+    def test_eager_load_is_unchanged(self, tmp_path):
+        import hyperspy.api as hs
+
+        de5_patch.apply()
+        path = tmp_path / "eager.de5"
+        expected = write_de5(path)
+        signal = hs.load(str(path), lazy=False)
+        assert isinstance(signal.data, np.ndarray)
+        np.testing.assert_array_equal(signal.data, expected)
 
     def test_other_emd_files_keep_the_readers_layout(self, tmp_path):
         import hyperspy.api as hs
