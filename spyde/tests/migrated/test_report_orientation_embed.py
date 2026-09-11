@@ -340,7 +340,7 @@ class TestExportHonoursMode:
         # Keep the fallback figure path inert — this is only about WHICH
         # renderer is chosen, and the real one needs a live manager.
         monkeypatch.setattr(ex, "_build_interactive_figure_html",
-                            lambda mgr, c: None)
+                            lambda mgr, c: (None, (0, 0)))
         spec = FigureSpec()
         spec.orientation_mode = mode
         cell = Cell(id="c1", cell_type="figure", caption="", spec=spec)

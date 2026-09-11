@@ -803,12 +803,19 @@ class MovieSpec:
         return cls.from_dict(yaml.safe_load(text) or {})
 
 
+# Every cell type the document model can hold. Export dispatch is checked
+# against this tuple (test_report_export), so adding a type here without giving
+# it a branch in export_html._render_cell_html fails loudly, rather than that
+# cell exporting as nothing at all, caption included.
+CELL_TYPES = ("markdown", "figure", "image", "split", "movie")
+
+
 @dataclass
 class Cell:
     """A document cell.
 
-    ``cell_type`` is ``"markdown"``, ``"figure"``, ``"image"``, ``"split"``, or
-    ``"movie"``. A figure cell carries a ``caption``, a ``fig_id`` (the FigureSpec
+    ``cell_type`` is one of :data:`CELL_TYPES`. A figure cell carries a
+    ``caption``, a ``fig_id`` (the FigureSpec
     / asset basename == this cell's id), a ``spec`` (FigureSpec, in memory), and —
     for a template — a ``placeholder`` flag when no figure has been dropped yet.
 
