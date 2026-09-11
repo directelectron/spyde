@@ -23,10 +23,12 @@ module wraps three of its methods to absorb them:
    scan (hundreds of GB) and dies with "Unable to allocate". Measured on a
    302 MB file: a "lazy" load grew the process by 308 MB. The wrapper, on a
    lazy read, hands dask the ``h5py.Dataset`` itself (as hyperspy's own
-   ``.hspy`` reader does), chunked by the file's chunk grid or, for an
-   unchunked dataset, one frame per chunk — the storage-aligned shape
-   CLAUDE.md Live-Display §1 requires. This applies to every EMD file the
-   Berkeley reader opens lazily, since lazy should mean lazy for all of them.
+   ``.hspy`` reader does), in blocks of whole frames sized to about 64 MB —
+   the storage-aligned shape CLAUDE.md Live-Display §1 requires, and NOT the
+   camera's one-frame-per-chunk grid, which drowns dask in tasks (see
+   :func:`lazy_dataset_chunks` for the measurements). This applies to every
+   EMD file the Berkeley reader opens lazily, since lazy should mean lazy for
+   all of them.
 
 3. The datacube is stored in C order, scan axes first: ``(R_y, R_x, Q_y, Q_x)``
    with one whole frame per HDF5 chunk, and ``dim1`` … ``dim4`` name the array
@@ -86,20 +88,70 @@ def is_direct_electron_file(file) -> bool:
         return False
 
 
+CHUNK_TARGET_BYTES = 64 << 20
+NAV_BLOCK_MAX = 32
+
+
+def _largest_power_of_two_at_most(value: int) -> int:
+    return 1 << max(0, int(value).bit_length() - 1)
+
+
 def lazy_dataset_chunks(dataset) -> tuple:
     """The dask chunk grid for a lazily wrapped HDF5 dataset.
 
-    A chunked dataset keeps its own grid: an HDF5 chunk is the unit the library
-    decodes, so any other grid re-reads chunks. An unchunked (contiguous)
-    dataset gets one frame per chunk: a frame is an exact hyperslab there, and
-    it is the unit the navigator asks for. Splitting the frame axes instead
-    (dask's ``"auto"`` cubes) makes one frame cost several partial reads."""
-    if dataset.chunks is not None:
-        return tuple(int(c) for c in dataset.chunks)
+    Whole frames, in blocks of scan positions sized to about 64 MB. The camera
+    stores one frame per HDF5 chunk, and taking that grid as the dask grid was
+    measured on a 1 GB, 128×64 scan of 256² frames: 24,577 tasks, a navigator
+    fill of one compute per 128 KB chunk (10 ms × 8192 ≈ 80 s) and 12.5 s for
+    the sum as a single compute. The same dataset in 8×8 blocks: 129 tasks and
+    1.2 s, the speed of a plain numpy loop over h5py. A block is a single
+    hyperslab read for HDF5 whatever its own chunk grid, and a per-frame read
+    never goes through dask at all (see :mod:`spyde.array_cache.readers.
+    source_array`), so the dask grid only has to suit whole-scan computes.
+
+    The block edge is a power of two, capped at 32 positions per axis, and a
+    multiple of the file's own chunk edge where that is larger than one, so a
+    dask chunk never straddles an HDF5 chunk. The frame axes are always whole:
+    splitting them (dask's ``"auto"`` cubes) makes one frame cost several
+    partial reads."""
     shape = tuple(int(n) for n in dataset.shape)
     if len(shape) <= 2:
         return shape
-    return (1,) * (len(shape) - 2) + shape[-2:]
+    nav_shape, frame_shape = shape[:-2], shape[-2:]
+    frame_bytes = max(1, int(np.prod(frame_shape)) * np.dtype(dataset.dtype).itemsize)
+    frames_per_chunk = max(1, CHUNK_TARGET_BYTES // frame_bytes)
+    edge = _largest_power_of_two_at_most(
+        int(frames_per_chunk ** (1.0 / len(nav_shape))))
+    edge = min(NAV_BLOCK_MAX, edge)
+    storage = dataset.chunks
+    block = []
+    for axis, size in enumerate(nav_shape):
+        axis_edge = edge
+        if storage is not None and storage[axis] > 1:
+            axis_edge = max(storage[axis], axis_edge - axis_edge % storage[axis])
+        block.append(min(size, axis_edge))
+    return tuple(block) + frame_shape
+
+
+def _wrapped_source(data):
+    """The live HDF5 dataset a ``da.from_array`` wrap reads from, when ``data``
+    is that wrap (possibly transposed) and nothing else; None otherwise."""
+    try:
+        for name, layer in data.dask.layers.items():
+            if not name.startswith("original-"):
+                continue
+            values = list(layer.values())
+            if len(values) != 1:
+                return None
+            source = values[0]
+            if isinstance(source, np.ndarray) or not hasattr(source, "__getitem__"):
+                return None
+            if tuple(int(n) for n in source.shape) != tuple(data.shape)[::-1]:
+                return None
+            return source
+    except Exception:
+        return None
+    return None
 
 
 def restore_storage_order(dictionary: dict) -> None:
@@ -108,13 +160,25 @@ def restore_storage_order(dictionary: dict) -> None:
     The data is reversed back to the file's C order and the axes list with it,
     with ``index_in_array`` renumbered. The last two axes stay the signal
     (detector) axes and everything before them navigates: the scan for a
-    datacube, time for a frame stack, nothing for a single image."""
+    datacube, time for a frame stack, nothing for a single image.
+
+    For a lazy load the array is rebuilt as a plain ``da.from_array`` of the
+    HDF5 dataset in storage order rather than transposed back: two transpose
+    layers on top of the wrap hide the dataset from SpyDE's frame readers,
+    which then serve every frame through a dask compute (6 ms) instead of an
+    h5py read (0.2 ms)."""
     data = dictionary.get("data")
     axes = dictionary.get("axes") or []
     ndim = getattr(data, "ndim", 0)
     if ndim < 3 or len(axes) != ndim:
         return
-    dictionary["data"] = data.transpose()
+    source = _wrapped_source(data) if hasattr(data, "dask") else None
+    if source is not None:
+        import dask.array as da
+        dictionary["data"] = da.from_array(
+            source, chunks=tuple(reversed(data.chunks)))
+    else:
+        dictionary["data"] = data.transpose()
     restored = []
     for position, axis in enumerate(reversed(axes)):
         axis = dict(axis)

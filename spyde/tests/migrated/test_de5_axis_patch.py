@@ -92,23 +92,26 @@ class TestDe5Patch:
 
     def test_lazy_load_reads_from_the_file_not_from_ram(self, tmp_path):
         """A stopped-early acquisition: 8 x 8 declared, only the first row
-        written. The lazy load must wrap the HDF5 dataset, keep its one-frame
-        chunks, and read only the frames asked for."""
+        written. The lazy load must wrap the HDF5 dataset itself, in storage
+        order with no transpose layers, so SpyDE's frame reader can read
+        straight from the file and only the frames asked for."""
         import hyperspy.api as hs
+        from spyde.array_cache.readers.source_array import find_source_array
 
         de5_patch.apply()
         path = tmp_path / "stopped_early.de5"
         written = [(0, column) for column in range(8)]
         expected = write_de5(path, nav=(8, 8), signal=(16, 16), written=written)
         signal = hs.load(str(path), lazy=True)
-        assert isinstance(dask_source(signal), h5py.Dataset)
+        source = dask_source(signal)
+        assert isinstance(source, h5py.Dataset)
+        assert find_source_array(signal.data) is source
         assert signal.data.shape == (8, 8, 16, 16)
-        assert signal.data.chunks[:2] == ((1,) * 8, (1,) * 8)
         assert all(len(chunk) == 1 for chunk in signal.data.chunks[2:])
         np.testing.assert_array_equal(signal.inav[3, 0].data.compute(), expected[0, 3])
         assert not signal.inav[3, 5].data.compute().any()
 
-    def test_contiguous_dataset_gets_one_frame_per_chunk(self, tmp_path):
+    def test_contiguous_dataset_keeps_frames_whole(self, tmp_path):
         import hyperspy.api as hs
 
         de5_patch.apply()
@@ -116,8 +119,33 @@ class TestDe5Patch:
         expected = write_de5(path, nav=(3, 2), signal=(4, 5), chunks=None)
         signal = hs.load(str(path), lazy=True)
         assert isinstance(dask_source(signal), h5py.Dataset)
-        assert signal.data.chunks == ((1, 1, 1), (1, 1), (4,), (5,))
+        assert signal.data.chunks == ((3,), (2,), (4,), (5,))
         np.testing.assert_array_equal(signal.data.compute(), expected)
+
+    def test_lazy_chunks_are_64mb_blocks_of_whole_frames(self):
+        class Dataset:
+            def __init__(self, shape, dtype, chunks):
+                self.shape, self.dtype, self.chunks = shape, np.dtype(dtype), chunks
+
+        # The camera's real layout: 128 KB frames, one per HDF5 chunk. 64 MB is
+        # 512 frames; the largest power-of-two square inside that is 16 x 16.
+        camera = Dataset((128, 64, 256, 256), np.uint16, (1, 1, 256, 256))
+        assert de5_patch.lazy_dataset_chunks(camera) == (16, 16, 256, 256)
+        # 2 MB frames: 32 per block, so a 4 x 4 square.
+        large = Dataset((12, 12, 1024, 1024), np.uint16, (1, 1, 1024, 1024))
+        assert de5_patch.lazy_dataset_chunks(large) == (4, 4, 1024, 1024)
+        # A block never exceeds the scan, and never exceeds 32 per axis.
+        tiny = Dataset((8, 8, 16, 16), np.uint16, (1, 1, 16, 16))
+        assert de5_patch.lazy_dataset_chunks(tiny) == (8, 8, 16, 16)
+        huge_scan = Dataset((1000, 1000, 16, 16), np.uint16, (1, 1, 16, 16))
+        assert de5_patch.lazy_dataset_chunks(huge_scan) == (32, 32, 16, 16)
+        # A file chunked in 3 x 3 scan blocks gets a multiple of 3, not 16.
+        blocked = Dataset((128, 64, 256, 256), np.uint16, (3, 3, 256, 256))
+        assert de5_patch.lazy_dataset_chunks(blocked) == (15, 15, 256, 256)
+        # A frame stack blocks along time; an image is one chunk.
+        stack = Dataset((5000, 256, 256), np.uint16, (1, 256, 256))
+        assert de5_patch.lazy_dataset_chunks(stack) == (32, 256, 256)
+        assert de5_patch.lazy_dataset_chunks(Dataset((256, 256), np.uint16, None)) == (256, 256)
 
     def test_eager_load_is_unchanged(self, tmp_path):
         import hyperspy.api as hs
