@@ -350,6 +350,12 @@ class TestSlidesExport:
         assert "A pattern" in html
         assert ("<iframe" in html
                 or '<img src="data:image/png;base64,' in html)
+        if "<iframe" in html:
+            # An interactive embed carries its own natural pixel size, so the
+            # deck needs the same shaped box and fit script the article page has
+            # or a big figure runs off the slide.
+            assert "fig-box" in html
+            assert "spydeEmbedHeight" in html
 
     def test_slides_export_no_open_report_errors(self, window):
         session, messages = window["window"], window["messages"]
