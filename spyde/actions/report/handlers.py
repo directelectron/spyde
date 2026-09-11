@@ -126,6 +126,11 @@ class ReportManager:
         self._snapshots: dict[str, dict] = {}
         # cell_id -> baked PNG bytes read from an opened report (offline fallback)
         self._baked: dict[str, bytes] = {}
+        # cell_id -> the file a movie cell was last rendered to. An interactive
+        # export inlines it as a data URL when it is still there and inside the
+        # embed budget; otherwise the cell exports as its poster still. Session-
+        # scoped on purpose: a path is not something a saved report can carry.
+        self._movie_files: dict[str, str] = {}
         # figure cells the last assemble_assets could not produce any pixels for
         # (dangling-ref risk on save) — read by _finish_save to warn the user.
         self._dropped_assets: list = []
@@ -247,6 +252,7 @@ class ReportManager:
         self.dirty = False
         self._snapshots.clear()
         self._baked.clear()
+        self._movie_files.clear()
         self._images.clear()
         self._offline.clear()
         self._editing.clear()
@@ -304,6 +310,7 @@ class ReportManager:
         self.dirty = False
         self._snapshots.clear()
         self._baked.clear()
+        self._movie_files.clear()
         self._images.clear()
         self._offline.clear()
         self._pending_save.clear()
@@ -915,6 +922,11 @@ class ReportManager:
                 poster = self._baked.get(c.id)
                 if poster:
                     assets[c.id] = poster
+                else:
+                    # write_report writes this cell's image ref either way, so a
+                    # movie that was never rendered is the same dangling-ref
+                    # hazard a pixel-less figure is.
+                    dropped.append(c)
                 continue
             # A SPLIT cell whose figure side is a PHOTO (spec-less, image_ext): the
             # held raw bytes, exactly like an image cell. A split whose figure side
