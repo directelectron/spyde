@@ -1,0 +1,1 @@
+Opening a Direct Electron ``.de5`` no longer reads the whole datacube into memory (an acquisition stopped early tried to allocate its full planned scan), and its navigator now fills in about 2 s instead of 80 s on a 1 GB 128×64 scan, with a frame read in 0.1 ms.
