@@ -21,6 +21,8 @@ import { join } from 'path'
 const { launchApp, backendAction, waitForSubwindowCount } = require('./_harness.cjs')
 
 const SHOTS = join(__dirname, '..', 'compose_drag_shots')
+// The two sidebar defects this file grew to cover keep their shots apart.
+const FIX_SHOTS = join(__dirname, '..', 'report_fixes_shots')
 
 let ctx: Awaited<ReturnType<typeof launchApp>>
 
@@ -591,4 +593,167 @@ test('＋ Add figure: click path builds the grid without any drag', async () => 
               'layout =', JSON.stringify(after?.figure?.layout ?? null))
   expect(after?.figure?.panels?.length ?? 0,
     '＋ Add figure did not tile a second panel in').toBe(2)
+})
+
+/** Append one markdown cell per line of text and wait for them to mount. */
+async function addTextCells(page: any, texts: string[]) {
+  for (const text of texts) {
+    await backendAction(page, 'report_add_cell', {
+      cell_type: 'markdown', source: text, html: `<p>${text}</p>`,
+    })
+  }
+  await expect.poll(() => page.locator('[data-report-cell="1"]').count(), {
+    timeout: 10_000, message: 'the text cells never appeared',
+  }).toBe(texts.length)
+}
+
+/**
+ * A drop on the SIDEBAR BODY, between two cells, rather than on a figure cell.
+ *
+ * The three copies of the drop-payload reader had drifted: the sidebar's one
+ * lacked the in-process stash fallback the other two carry, so a real OS-level
+ * drag whose getData() comes back empty resolved no source window and the drop
+ * was a silent no-op. That is the same failure the compose tests above pin, at
+ * the one target a user aims at to ADD a cell rather than combine one.
+ */
+test('sidebar body: a window dropped between two cells becomes a figure cell', async () => {
+  const { page } = ctx
+  if (!(await page.getByTestId('report-sidebar').count())) {
+    await page.getByTestId('toggle-report').click()
+    await expect(page.getByTestId('report-sidebar')).toBeVisible()
+  }
+  await backendAction(page, 'report_new', {})
+  await expect(page.getByTestId('report-body')).toBeVisible()
+  await page.waitForTimeout(800)
+
+  // Two text cells, so there is a gap BETWEEN them to aim at. Added through the
+  // backend rather than the editor: the subject here is the drop, and typing
+  // into the sidebar is what the markdown-pane test drives.
+  await addTextCells(page, ['Alpha', 'Beta'])
+
+  // The gap: the top edge of the SECOND cell.
+  const gapY = async () => {
+    const box = (await page.locator('[data-report-cell="1"]').nth(1).boundingBox())!
+    return box.y + 2
+  }
+  const bodyBox = (await page.getByTestId('report-body').boundingBox())!
+
+  // 1) The real gesture: press on a window's titlebar pill and drag it into the
+  //    gap. Chromium runs its own drag machinery for this one.
+  const pill = sigWindows(page).nth(0).getByTestId('window-breadcrumb')
+  await expect(pill).toBeVisible()
+  const from = (await pill.boundingBox())!
+  await page.mouse.move(from.x + from.width / 2, from.y + from.height / 2)
+  await page.mouse.down()
+  await page.mouse.move(from.x + from.width / 2 + 12, from.y + from.height / 2 + 12,
+                        { steps: 6 })
+  await page.mouse.move(bodyBox.x + bodyBox.width / 2, await gapY(), { steps: 20 })
+  await page.waitForTimeout(300)
+  await page.screenshot({ path: join(FIX_SHOTS, '13-sidebar-gap-mid-drag.png') })
+  await page.mouse.up()
+
+  await expect.poll(() => page.locator(
+    '[data-report-cell="1"] > [data-testid^="report-figcell-"]').count(), {
+    timeout: 25_000,
+    message: 'a real drag into the gap between two cells produced no figure cell',
+  }).toBe(1)
+  await page.waitForTimeout(2500)
+  await page.screenshot({ path: join(FIX_SHOTS, '14-sidebar-gap-figure-cell.png') })
+
+  const order = await page.evaluate(() =>
+    (((window as any)._spyde_test_report?.()?.cells ?? []) as any[])
+      .map((c) => c.cell_type))
+  console.log('[sidebar-drop] cell order =', JSON.stringify(order))
+  expect(order[1], 'the figure landed somewhere other than the gap it was dropped in')
+    .toBe('figure')
+
+  // 2) The same drop with an UNREADABLE payload: `types` advertises the MIME
+  //    (so the body accepts the drop) while getData() hands back "". Only the
+  //    stash fallback can resolve a source window from that.
+  await backendAction(page, 'report_new', {})
+  await expect(page.getByTestId('report-body')).toBeVisible()
+  await page.waitForTimeout(800)
+  await addTextCells(page, ['Gamma', 'Delta'])
+
+  // A real dragstart on the pill fills the in-process stash.
+  const started = await page.evaluate(() => {
+    const target = document.querySelectorAll('[data-testid="window-breadcrumb"]')[0] as HTMLElement
+    if (!target) return false
+    const transfer = new DataTransfer()
+    const event = new DragEvent('dragstart', { bubbles: true, cancelable: true })
+    Object.defineProperty(event, 'dataTransfer', { value: transfer, configurable: true })
+    target.dispatchEvent(event)
+    return true
+  })
+  expect(started, 'no window pill to drag').toBe(true)
+  await page.waitForTimeout(400)
+
+  const dropY = await gapY()
+  await page.evaluate((y: number) => {
+    const body = document.querySelector('[data-testid="report-body"]') as HTMLElement
+    const crippled = {
+      types: ['application/x-spyde-figure', 'application/x-spyde-window'],
+      getData: () => '',
+      files: [],
+      dropEffect: 'copy', effectAllowed: 'copy',
+      setData: () => {},
+    }
+    const rect = body.getBoundingClientRect()
+    const x = rect.left + rect.width / 2
+    for (const type of ['dragenter', 'dragover', 'drop']) {
+      const event = new DragEvent(type, {
+        bubbles: true, cancelable: true, clientX: x, clientY: y,
+      })
+      Object.defineProperty(event, 'dataTransfer', { value: crippled, configurable: true })
+      body.dispatchEvent(event)
+    }
+  }, dropY)
+
+  await expect.poll(() => page.locator(
+    '[data-report-cell="1"] > [data-testid^="report-figcell-"]').count(), {
+    timeout: 25_000,
+    message: 'a drop whose getData() was empty added nothing: the sidebar body '
+      + 'has no stash fallback',
+  }).toBe(1)
+  await page.waitForTimeout(2500)
+  await page.screenshot({ path: join(FIX_SHOTS, '15-sidebar-empty-payload.png') })
+})
+
+/**
+ * A split block's TEXT pane is the same markdown editor a text cell has, so it
+ * has the same formatting toolbar and the same Ctrl-B / Ctrl-I. It was a bare
+ * textarea: the buttons and the shortcuts simply were not there, and which
+ * editor you got depended on which kind of cell you had double-clicked.
+ */
+test('SPLIT block text pane: Ctrl-B wraps the selection in **', async () => {
+  const { page } = ctx
+  if (!(await page.getByTestId('report-sidebar').count())) {
+    await page.getByTestId('toggle-report').click()
+    await expect(page.getByTestId('report-sidebar')).toBeVisible()
+  }
+  await backendAction(page, 'report_new', {})
+  await expect(page.getByTestId('report-body')).toBeVisible()
+  await page.waitForTimeout(800)
+
+  await backendAction(page, 'report_add_split_cell', {})
+  const dropzone = page.locator('[data-testid^="report-split-dropzone-"]').first()
+  await expect(dropzone).toBeVisible({ timeout: 10_000 })
+  const splitId = (await dropzone.getAttribute('data-testid'))!
+    .replace('report-split-dropzone-', '')
+
+  await page.getByTestId(`report-split-rendered-${splitId}`).dblclick()
+  const textarea = page.getByTestId(`report-split-textarea-${splitId}`)
+  await expect(textarea).toBeVisible()
+  await textarea.fill('emphasise me')
+  await textarea.press('Control+a')
+
+  // The toolbar the text cell has, on the pane that had none.
+  await expect(page.getByTestId(`report-split-toolbar-${splitId}`),
+               'the split text pane has no formatting toolbar').toBeVisible()
+  await page.screenshot({ path: join(FIX_SHOTS, '16-split-text-toolbar.png') })
+
+  await textarea.press('Control+b')
+  await expect(textarea, 'Ctrl-B did not wrap the selection')
+    .toHaveValue('**emphasise me**')
+  await page.screenshot({ path: join(FIX_SHOTS, '17-split-ctrl-b.png') })
 })
