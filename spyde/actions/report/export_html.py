@@ -430,9 +430,9 @@ def _figure_iframe_html(caption: str, figure_html: str, *,
 
 def _build_interactive_figure_html(mgr, cell: Cell) -> "tuple[str | None, tuple]":
     """``(standalone HTML, natural size)`` for a figure cell's LIVE anyplotlib
-    figure — pixels materialised via ``build_cell_figure`` →
-    ``_resolve_pixels_for_standalone`` so no binary tokens leak. ``(None, (0, 0))``
-    when the cell has no snapshot to rebuild (offline).
+    figure, with its pixels materialised by ``build_cell_figure`` so no binary
+    tokens leak. ``(None, (0, 0))`` when the cell has no snapshot to rebuild
+    (offline).
 
     The natural size is the figure's own laid-out pixel size, which is what lets
     the export's box fit the figure exactly instead of letterboxing it."""

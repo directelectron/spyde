@@ -513,7 +513,7 @@ class TestExportToken:
 
 
 def _tiny_png() -> bytes:
-    """A 2x2 PNG — stands in for a baked poster / snapshot."""
+    """A 2x2 PNG standing in for a baked poster or snapshot."""
     import io
 
     from PIL import Image
@@ -525,11 +525,11 @@ def _tiny_png() -> bytes:
 class TestCellKindCoverage:
     """Export dispatch must be TOTAL over the document model's cell types.
 
-    Movie cells shipped for a release exporting as nothing at all — no image, no
-    caption, in static HTML, interactive HTML, the slides deck and the PDF that
-    renders from the static file. An unhandled type is indistinguishable from an
-    empty report, so the dispatch is pinned against ``model.CELL_TYPES`` rather
-    than a list copied into the test."""
+    Movie cells shipped for a release exporting as nothing at all, image and
+    caption both, in static HTML, interactive HTML, the slides deck and the PDF
+    that renders from the static file. An unhandled type is indistinguishable
+    from an empty report, so the dispatch is pinned against ``model.CELL_TYPES``
+    rather than a list copied into the test."""
 
     def test_every_cell_type_has_an_export_branch(self, window):
         from spyde.actions.report.model import CELL_TYPES, Cell
