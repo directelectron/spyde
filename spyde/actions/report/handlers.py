@@ -592,16 +592,10 @@ class ReportManager:
         falls through to the anyplotlib figure below."""
         snap_map = self.snapshot_map(cell.id)
         if not snap_map or cell.spec is None:
-            # Nothing to build — but STILL tear down any prior window/controller for
-            # this cell (a refresh that lost its snapshot, or a spec-cleared cell),
-            # so a stale live figure is never left mapped to a now-figure-less cell.
-            # _forget clears both _controllers and _window_by_cell for the cell.
-            prev_wid = self._window_by_cell.get(cell.id)
-            if prev_wid is not None:
-                self._forget(prev_wid)
-                self._window_by_cell.pop(cell.id, None)
-            self._edit_wiring.pop(cell.id, None)
-            self._ann_widgets.pop(cell.id, None)
+            # Nothing to build, but a stale live figure must never be left mapped
+            # to a now-figure-less cell. The cell stays in the document, so what
+            # it is still displayed from is kept.
+            self.drop_cell_resources(cell.id, keep_displayable=True)
             return
         # Tear down any prior window for this cell first (re-snapshot / refresh).
         prev_wid = self._window_by_cell.get(cell.id)
@@ -990,6 +984,36 @@ class ReportManager:
         for cid, wid in list(self._window_by_cell.items()):
             if wid == window_id:
                 self._window_by_cell.pop(cid, None)
+
+    def drop_cell_resources(self, cell_id: str, *,
+                            keep_displayable: bool = False) -> None:
+        """Forget what this manager holds for one cell.
+
+        Always drops the LIVE half: the figure window, the panel snapshots, edit
+        mode with its annotation wiring, the panel selection, and the memoized
+        vectors-explorer page. ``keep_displayable`` keeps what a cell that STAYS
+        in the document is still shown from (the baked PNG, a photo side's raw
+        bytes, the offline flag); the default drops those too, which is what a
+        caller removing the cell or its figure side wants.
+
+        Every per-cell teardown goes through here. Each copy of it used to drop a
+        slightly different set, and the one that kept the baked PNG and the photo
+        bytes left a placeholder cell owning assets a save would then write."""
+        window_id = self._window_by_cell.get(cell_id)
+        if window_id is not None:
+            self._forget(window_id)
+        self._window_by_cell.pop(cell_id, None)
+        self._snapshots.pop(cell_id, None)
+        self._editing.discard(cell_id)
+        self._edit_wiring.pop(cell_id, None)
+        self._ann_widgets.pop(cell_id, None)
+        self._selected.pop(cell_id, None)
+        _clear_vectors_explorer_cache(cell_id)
+        if not keep_displayable:
+            self._baked.pop(cell_id, None)
+            self._images.pop(cell_id, None)
+            self._movie_files.pop(cell_id, None)
+            self._offline.discard(cell_id)
 
 
 # ── edit-mode annotation drag persistence ──────────────────────────────────────
@@ -2539,9 +2563,8 @@ def report_split_remove_figure(session, plot, payload) -> None:
     and stays untouched).
 
     ``{cell_id}``. Tears down the figure side's resources exactly like
-    :func:`report_remove_cell` does for a split cell (figure window, snapshot,
-    baked PNG, offline flag, edit-mode wiring, annotation-widget map, panel
-    selection, held photo bytes, vectors-explorer cache) so nothing leaks, then
+    :func:`report_remove_cell` does for a split cell, through
+    :meth:`ReportManager.drop_cell_resources`, then
     flips ``cell_type`` to ``"markdown"`` and clears the split-only fields
     (``spec``, ``image_ext``, ``split_layout`` back to its default). A non-split
     / unknown cell is a no-op (no crash)."""
@@ -2551,18 +2574,7 @@ def report_split_remove_figure(session, plot, payload) -> None:
     cell = mgr.doc.cell_by_id(payload.get("cell_id"))
     if cell is None or cell.cell_type != "split":
         return
-    wid = mgr._window_by_cell.get(cell.id)
-    if wid is not None:
-        mgr._forget(wid)
-    mgr._snapshots.pop(cell.id, None)
-    mgr._baked.pop(cell.id, None)
-    mgr._offline.discard(cell.id)
-    mgr._editing.discard(cell.id)
-    mgr._edit_wiring.pop(cell.id, None)
-    mgr._ann_widgets.pop(cell.id, None)
-    mgr._selected.pop(cell.id, None)
-    mgr._images.pop(cell.id, None)
-    _clear_vectors_explorer_cache(cell.id)
+    mgr.drop_cell_resources(cell.id)
     cell.cell_type = "markdown"
     cell.spec = None
     cell.image_ext = ""
@@ -2681,36 +2693,16 @@ def report_remove_cell(session, plot, payload) -> None:
 
     mgr.push_undo(f"Delete {cell.cell_type} cell", _restore)
 
-    # Tear down the figure window (if any) so nothing leaks. A SPLIT cell holds a
-    # figure side (same figure-window resources) AND possibly a held photo, so it
-    # gets BOTH cleanups.
-    if cell.cell_type in ("figure", "split"):
-        wid = mgr._window_by_cell.get(cell.id)
-        if wid is not None:
-            mgr._forget(wid)
-        mgr._snapshots.pop(cell.id, None)
-        mgr._baked.pop(cell.id, None)
-        mgr._offline.discard(cell.id)
-        mgr._editing.discard(cell.id)
-        mgr._edit_wiring.pop(cell.id, None)
-        mgr._ann_widgets.pop(cell.id, None)
-        mgr._selected.pop(cell.id, None)
-        mgr._images.pop(cell.id, None)
-        _clear_vectors_explorer_cache(cell.id)
-    elif cell.cell_type == "image":
-        mgr._images.pop(cell.id, None)
-    elif cell.cell_type == "movie":
-        # Tear down any open Movie editor session for THIS cell so a delete
-        # while its editor happens to be open (undo/redo, a future UI path)
-        # doesn't leak the annotation/crop/overlay-image widgets it drew on
-        # the live signal plot — the session dict would otherwise keep a
-        # reference to a cell that no longer exists in the doc (laundry #6).
+    if cell.cell_type == "movie":
+        # An open Movie editor for THIS cell draws annotation/crop/overlay-image
+        # widgets on the live signal plot, and its session dict would outlive the
+        # cell that owns them.
         sessions = getattr(mgr, "_movie_sessions", None)
         st = sessions.pop(cell.id, None) if sessions else None
         if st is not None:
             from spyde.actions.report.movie import _teardown_session
             _teardown_session(session, st)
-        mgr._baked.pop(cell.id, None)
+    mgr.drop_cell_resources(cell.id)
     _inherit_slide_identity(mgr.doc, cell)
     mgr.doc.cells = [c for c in mgr.doc.cells if c.id != cell.id]
     mgr.dirty = True
