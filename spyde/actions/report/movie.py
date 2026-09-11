@@ -1554,6 +1554,9 @@ def movie_export(session, plot, payload) -> None:
         st._cancel_flag = None
         if poster is not None:
             mgr._baked[cell.id] = poster
+        # Where it landed, so an interactive export can inline the real video
+        # instead of falling back to the poster still.
+        mgr._movie_files[cell.id] = str(path)
         ipc.emit({"type": "movie_done", "cell_id": cell.id,
                   "path": str(path), "frames": int(frames)})
         emit_status(f"Movie exported: {frames} frames.")
