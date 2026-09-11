@@ -543,14 +543,6 @@ const styles: Record<string, React.CSSProperties> = {
     height: 24, padding: '0 3px',
   },
   renderedPane: { minHeight: 40, flex: 1 },
-  textarea: {
-    width: '100%', boxSizing: 'border-box', resize: 'none',
-    background: '#11111b', color: '#cdd6f4',
-    border: '1px solid #313244', borderRadius: 5,
-    padding: '6px 8px', fontSize: 12.5,
-    fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
-    lineHeight: 1.5, outline: 'none', overflow: 'hidden', minHeight: 60,
-  },
   figBox: {
     position: 'relative', width: '100%', aspectRatio: '4 / 3',
     background: '#11111b', borderRadius: 6, border: '1px solid #313244',
