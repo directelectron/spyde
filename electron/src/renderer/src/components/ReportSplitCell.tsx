@@ -102,7 +102,6 @@ export function ReportSplitCell({ cell, onRemove, index, dragProps, reorderActiv
   const hasImage = !empty && !cell.figure && !!cell.image
   const isLive = !empty && !!cell.figure && !!fig
 
-
   // Figure-side actions — available only when the figure side is a live FIGURE
   // (not a photo, not an empty drop zone). The backend admits a split's figure
   // side into report_refresh_figure / repfig_set_edit_mode (it reuses the same
