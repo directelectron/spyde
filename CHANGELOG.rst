@@ -12,6 +12,15 @@ Earlier releases are described by their GitHub release notes and tags.
 
 .. towncrier release notes start
 
+0.5.0 (2026-09-11)
+==================
+
+Bug Fixes
+---------
+
+- Direct Electron ``.de5`` files open again as 4D-STEM scans; the EMD reader rejected the camera's column-shaped axis arrays with a ``TypeError``, and once past that it handed the datacube back transposed with no navigation axes. (`#162 <https://github.com/directelectron/spyde/pull/162>`_)
+
+
 0.4.4 (2026-09-11)
 ==================
 
