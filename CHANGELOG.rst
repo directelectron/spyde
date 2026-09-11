@@ -12,6 +12,33 @@ Earlier releases are described by their GitHub release notes and tags.
 
 .. towncrier release notes start
 
+0.4.4 (2026-09-11)
+==================
+
+Bug Fixes
+---------
+
+- Every display that follows the navigator (the Find Vectors preview and its found
+  vectors, the orientation template, the EBSD bands, the refine panels, the strain
+  selection, image layers from another window, the fit's curves, the vectors
+  window, the progressive result preview, the CSB raw frame) is now a node of the
+  signal tree read through the same cached path as the pattern itself and drawn by
+  the one painter thread. After centring a pattern, Find Vectors and Orientation
+  Mapping run on the node the window shows, so their overlays land on the centred
+  disks instead of the root's; on a centred lazy scan a preview move costs under a
+  millisecond instead of a whole-block compute. (`#155 <https://github.com/directelectron/spyde/pull/155>`_)
+
+
+Performance
+-----------
+
+- Displaying a node made by a hyperspy ``map`` (a centred pattern, an azimuthal
+  integration, a per-pattern filter) went from about 2.2 s to 0.55 ms for the
+  first frame in every chunk, by evaluating the mapped function on the parent's
+  one frame instead of computing the whole dask block; switching between tree
+  nodes now also keeps the root's decoded chunks instead of re-decoding them. (`#153 <https://github.com/directelectron/spyde/pull/153>`_)
+
+
 0.4.3 (2026-08-31)
 ==================
 
