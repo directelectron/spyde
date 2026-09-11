@@ -1065,6 +1065,45 @@ class TestCalloutRegionFiltering:
         assert inset["connector"]["region"] == [110.0, 10.0, 20.0, 5.0]
 
 
+
+class TestFinalizeEditDropsEverything:
+    """Emptying a cell back to a placeholder must leave nothing behind.
+
+    The teardown was copied per call site, and this copy dropped the snapshots
+    but kept the baked PNG, the offline flag and any held photo bytes. Those
+    tables are keyed by cell id, so the leak is silent until the id is reused
+    or the report is saved, and then a placeholder cell writes an asset it does
+    not own."""
+
+    def test_no_side_table_still_holds_the_emptied_cell(self, tem_2d_dataset):
+        session, messages = tem_2d_dataset["window"], tem_2d_dataset["messages"]
+        _prime_plot_data(session)
+        wid = _signal_wid(session)
+        h.report_new(session, None, {})
+        cid = _make_figure_cell(session, messages, wid)
+        fig = _fig_dict_of(messages, cid)
+        panel_id = fig["panels"][0]["id"]
+        layer_id = fig["panels"][0]["layers"][0]["id"]
+
+        mgr = session._report
+        # The state a cell picks up over its life: a baked fallback PNG, the
+        # offline flag, photo bytes from a photo side, edit mode and a selection.
+        mgr._baked[cid] = b"baked"
+        mgr._offline.add(cid)
+        mgr._images[cid] = b"photo"
+        mgr._editing.add(cid)
+        mgr._selected[cid] = panel_id
+
+        cx.repfig_remove_layer(session, None,
+                               {"cell_id": cid, "panel_id": panel_id,
+                                "layer_id": layer_id})
+
+        for name in ("_snapshots", "_baked", "_images", "_edit_wiring",
+                     "_ann_widgets", "_selected", "_window_by_cell"):
+            assert cid not in getattr(mgr, name), f"{name} still holds the cell"
+        for name in ("_offline", "_editing"):
+            assert cid not in getattr(mgr, name), f"{name} still holds the cell"
+
 class _StubRef:
     """A SignalRef-like object whose resolve() returns a fixed plot."""
     def __init__(self, plot):

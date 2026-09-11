@@ -1142,14 +1142,7 @@ def _finalize_edit(mgr, cell) -> None:
     """Rebuild + emit after an edit; if the cell has NO panels left, empty it back
     to a placeholder (tear down the window, drop snapshots)."""
     if not cell.spec.panels:
-        wid = mgr._window_by_cell.get(cell.id)
-        if wid is not None:
-            mgr._forget(wid)
-        mgr._snapshots.pop(cell.id, None)
-        mgr._editing.discard(cell.id)
-        mgr._edit_wiring.pop(cell.id, None)
-        mgr._ann_widgets.pop(cell.id, None)
-        mgr._selected.pop(cell.id, None)
+        mgr.drop_cell_resources(cell.id)
         cell.spec = None
         cell.placeholder = True
         mgr.dirty = True
