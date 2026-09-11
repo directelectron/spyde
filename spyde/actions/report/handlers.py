@@ -592,10 +592,12 @@ class ReportManager:
         falls through to the anyplotlib figure below."""
         snap_map = self.snapshot_map(cell.id)
         if not snap_map or cell.spec is None:
-            # Nothing to build, but a stale live figure must never be left mapped
-            # to a now-figure-less cell. The cell stays in the document, so what
-            # it is still displayed from is kept.
-            self.drop_cell_resources(cell.id, keep_displayable=True)
+            # Nothing to build, but a stale live figure must never be left
+            # mapped to a now-figure-less cell. A refresh can bring the snapshot
+            # back, so the cell keeps its edit mode and its baked pixels: only
+            # report_state moves the renderer out of edit mode, and dropping the
+            # flag here would leave the two disagreeing.
+            self.drop_cell_resources(cell.id, figure_returns=True)
             return
         # Tear down any prior window for this cell first (re-snapshot / refresh).
         prev_wid = self._window_by_cell.get(cell.id)
@@ -916,10 +918,11 @@ class ReportManager:
                 poster = self._baked.get(c.id)
                 if poster:
                     assets[c.id] = poster
-                else:
+                elif not c.placeholder:
                     # write_report writes this cell's image ref either way, so a
                     # movie that was never rendered is the same dangling-ref
-                    # hazard a pixel-less figure is.
+                    # hazard a pixel-less figure is. A PLACEHOLDER movie has no
+                    # source yet, so there is nothing it failed to render.
                     dropped.append(c)
                 continue
             # A SPLIT cell whose figure side is a PHOTO (spec-less, image_ext): the
@@ -986,30 +989,28 @@ class ReportManager:
                 self._window_by_cell.pop(cid, None)
 
     def drop_cell_resources(self, cell_id: str, *,
-                            keep_displayable: bool = False) -> None:
-        """Forget what this manager holds for one cell.
+                            figure_returns: bool = False) -> None:
+        """Forget what this manager holds for one cell. The single per-cell
+        teardown: every site that tears one down calls this.
 
-        Always drops the LIVE half: the figure window, the panel snapshots, edit
-        mode with its annotation wiring, the panel selection, and the memoized
-        vectors-explorer page. ``keep_displayable`` keeps what a cell that STAYS
-        in the document is still shown from (the baked PNG, a photo side's raw
-        bytes, the offline flag); the default drops those too, which is what a
-        caller removing the cell or its figure side wants.
-
-        Every per-cell teardown goes through here. Each copy of it used to drop a
-        slightly different set, and the one that kept the baked PNG and the photo
-        bytes left a placeholder cell owning assets a save would then write."""
+        Always drops the built figure and what hangs off it: the window, the
+        panel snapshots, the annotation wiring, and the memoized vectors-explorer
+        page. ``figure_returns`` is for a caller that is only UN-BUILDING a
+        figure it expects to build again, and keeps everything the cell is still
+        shown from and still edited in (the baked PNG, a photo side's raw bytes,
+        the offline flag, edit mode and the panel selection); the default drops
+        those too, for a caller removing the cell or its figure side."""
         window_id = self._window_by_cell.get(cell_id)
         if window_id is not None:
             self._forget(window_id)
         self._window_by_cell.pop(cell_id, None)
         self._snapshots.pop(cell_id, None)
-        self._editing.discard(cell_id)
         self._edit_wiring.pop(cell_id, None)
         self._ann_widgets.pop(cell_id, None)
-        self._selected.pop(cell_id, None)
         _clear_vectors_explorer_cache(cell_id)
-        if not keep_displayable:
+        if not figure_returns:
+            self._editing.discard(cell_id)
+            self._selected.pop(cell_id, None)
             self._baked.pop(cell_id, None)
             self._images.pop(cell_id, None)
             self._movie_files.pop(cell_id, None)

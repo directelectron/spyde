@@ -1065,6 +1065,33 @@ class TestCalloutRegionFiltering:
         assert inset["connector"]["region"] == [110.0, 10.0, 20.0, 5.0]
 
 
+class TestUnbuiltFigureKeepsEditMode:
+    """Un-building a cell's figure must not silently take it out of edit mode.
+
+    The renderer holds its own edit-mode flag and is told to change it only by a
+    report_state emission, so dropping the backend's copy here leaves the two
+    disagreeing: the cell still shows its editing chrome while the backend builds
+    it non-interactive."""
+
+    def test_a_cell_with_no_snapshot_stays_in_edit_mode(self, tem_2d_dataset):
+        session, messages = tem_2d_dataset["window"], tem_2d_dataset["messages"]
+        _prime_plot_data(session)
+        wid = _signal_wid(session)
+        h.report_new(session, None, {})
+        cid = _make_figure_cell(session, messages, wid)
+        mgr = session._report
+        mgr._editing.add(cid)
+        mgr._selected[cid] = "p1"
+
+        # A refresh that lost its snapshot: the figure cannot be rebuilt now, but
+        # the cell is still there and still being edited.
+        mgr._snapshots.pop(cid, None)
+        cell = mgr.doc.cell_by_id(cid)
+        mgr.build_figure_window(cell)
+
+        assert cid in mgr._editing
+        assert mgr._selected.get(cid) == "p1"
+
 
 class TestFinalizeEditDropsEverything:
     """Emptying a cell back to a placeholder must leave nothing behind.

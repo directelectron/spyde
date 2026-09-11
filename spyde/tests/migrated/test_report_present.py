@@ -320,8 +320,8 @@ class TestSlidesExport:
         assert "<p>subtitle body</p>" in html
 
     def test_slides_export_with_figure(self, tem_2d_dataset, tmp_path):
-        """A figure slide's baked snapshot (or interactive embed) lands in the
-        deck — static <img> fallback is fine for this headless path."""
+        """A figure slide's interactive embed lands in the deck, in the same
+        shaped box the article page gives it."""
         session = tem_2d_dataset["window"]
         messages = tem_2d_dataset["messages"]
         _prime_plot_data(session)
@@ -345,17 +345,13 @@ class TestSlidesExport:
         assert not _errors(messages)
         html = open(path, encoding="utf-8").read()
         assert html.count('<section class="slide">') == 2
-        # The figure rode in as an interactive iframe OR a static <img> — either
-        # way the figure caption is present.
         assert "A pattern" in html
-        assert ("<iframe" in html
-                or '<img src="data:image/png;base64,' in html)
-        if "<iframe" in html:
-            # An interactive embed carries its own natural pixel size, so the
-            # deck needs the same shaped box and fit script the article page has
-            # or a big figure runs off the slide.
-            assert "fig-box" in html
-            assert "spydeEmbedHeight" in html
+        assert "<iframe" in html, "the figure slide has no interactive embed"
+        # An interactive embed carries its own natural pixel size, so the deck
+        # needs the same shaped box and fit script the article page has or a big
+        # figure runs off the slide.
+        assert "fig-box" in html
+        assert "spydeEmbedHeight" in html
 
     def test_slides_export_no_open_report_errors(self, window):
         session, messages = window["window"], window["messages"]

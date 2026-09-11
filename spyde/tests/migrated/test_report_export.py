@@ -604,6 +604,19 @@ class TestCellKindCoverage:
         # warn rather than report clean.
         assert [c.id for c in mgr._dropped_assets] == [cell.id]
 
+    def test_a_placeholder_movie_cell_is_not_a_dropped_asset(self, window):
+        from spyde.actions.report.model import Cell
+
+        session = window["window"]
+        h.report_new(session, None, {})
+        mgr = session._report
+        # The card a user gets from "Add movie" before picking a signal: nothing
+        # was ever rendered, so there is nothing to warn about on save.
+        mgr.doc.cells.append(Cell(cell_type="movie", placeholder=True))
+
+        mgr.assemble_assets({})
+        assert mgr._dropped_assets == []
+
     def test_a_rendered_movie_is_inlined_in_an_interactive_export(self, window,
                                                                   tmp_path):
         from spyde.actions.report.model import Cell
@@ -661,6 +674,81 @@ class TestCellKindCoverage:
         assert ex._figure_img_html("", None) == ""
 
 
+
+def _figure_cell_tsx() -> str:
+    """The renderer's ReportFigureCell.tsx source, for the aspect-ratio guard."""
+    from pathlib import Path
+
+    return (Path(__file__).resolve().parents[3] / "electron" / "src" / "renderer"
+            / "src" / "components" / "ReportFigureCell.tsx").read_text(
+                encoding="utf-8")
+
+
+def _ratio_in(source: str, pattern: str) -> float:
+    """The ``a / b`` ratio the first match of *pattern* captures."""
+    import re
+
+    match = re.search(pattern, source)
+    assert match, f"could not find {pattern!r} in ReportFigureCell.tsx"
+    return int(match.group(1)) / int(match.group(2))
+
+
+# Each pattern is anchored on the CODE around its ratio, not on where that code
+# happens to sit, so reflowing the component does not fail the guard and only a
+# changed number does.
+_TSX_RATIOS = {
+    r"PANEL_ASPECT\s*=\s*(\d+)\s*/\s*(\d+)": ex._PANEL_ASPECT,
+    r"vectors_mode\)\s*!==\s*'image'\)\s*\{\s*return\s+(\d+)\s*/\s*(\d+)":
+        ex._VECTORS_ASPECT,
+    r"layout\.kind\s*!==\s*'grid'\)\s*return\s+(\d+)\s*/\s*(\d+)":
+        ex._DEFAULT_ASPECT,
+}
+
+
+def _fig_box_iframe_rule(css: str) -> str:
+    """The ``.fig-box iframe`` declaration block of a page stylesheet."""
+    import re
+
+    match = re.search(r"\.fig-box iframe \{([^}]*)\}", css)
+    assert match, "no .fig-box iframe rule in the stylesheet"
+    return match.group(1)
+
+
+class TestAnEmbedWithNoHeightOfItsOwnFillsItsBox:
+    """The bespoke explorer pages carry no height, so the BOX must give them one.
+
+    The orientation explorer and the overlay blender are emitted with only
+    ``width:100%``: nothing posts a measured height and the fit script skips
+    them. Inside an ``overflow:hidden`` box with no height rule they collapse to
+    the browser's default 150 px and the reader sees a sliver of the page.
+    """
+
+    def test_the_stylesheet_gives_such_an_iframe_the_full_box(self):
+        for css in (ex._ARTICLE_CSS, ex._SLIDES_CSS):
+            assert "height: 100%" in _fig_box_iframe_rule(css)
+
+    def test_a_blender_cell_carries_no_pixel_height_of_its_own(
+            self, tem_2d_dataset, tmp_path, monkeypatch):
+        session = tem_2d_dataset["window"]
+        messages = tem_2d_dataset["messages"]
+        _prime_plot_data(session)
+        monkeypatch.setattr(
+            "spyde.actions.report.overlay_embed.overlay_blender_html",
+            lambda mgr, cell, caption="": "<html><body>blended</body></html>")
+
+        h.report_new(session, None, {})
+        h.report_add_figure(session, None,
+                            {"source_window_id": _signal_window_id(session)})
+        path = str(tmp_path / "blender.html")
+        messages.clear()
+        ex.report_export_html(session, None, {"mode": "interactive", "path": path})
+        assert _exported(messages, session)
+        html = open(path, encoding="utf-8").read()
+
+        assert 'srcdoc="&lt;html&gt;' in html, "the blender page was not embedded"
+        # No inline height, so the stylesheet above is the only thing sizing it.
+        assert 'style="width:100%;"' in html
+
 class TestFigureBoxMatchesTheSidebar:
     """The exported figure box is sized the way the sidebar cell is.
 
@@ -703,35 +791,31 @@ class TestFigureBoxMatchesTheSidebar:
         ex.report_export_html(session, None, {"mode": "interactive", "path": path})
         assert _exported(messages, session)
         html = open(path, encoding="utf-8").read()
-        assert "aspect-ratio:" in html
-        assert "height:480px" not in html
+        import re
+
+        box = re.search(r'<div class="fig-box" style="aspect-ratio:([\d.]+);', html)
+        assert box, "the figure has no aspect-shaped box"
+        # The box is shaped BY THIS FIGURE, not by a page-wide constant: its
+        # ratio is the figure's own laid-out width over its height.
+        iframe = re.search(r'<iframe [^>]*style="width:(\d+)px;height:(\d+)px;',
+                           html)
+        assert iframe, "the iframe does not carry the figure's natural size"
+        natural = int(iframe.group(1)) / int(iframe.group(2))
+        assert abs(float(box.group(1)) - natural) < 0.001
 
     def test_the_ratios_match_the_sidebar_component(self):
         # The renderer has its own copy (ReportFigureCell.tsx) and the two must
         # agree, or the export silently disagrees with the thing it is a copy of.
         # PARSE the TSX rather than trust a comment: the caret-defaults trap was
         # exactly a TSX value drifting from its Python twin and winning silently.
-        import re
-        from pathlib import Path
-
-        tsx = (Path(__file__).resolve().parents[3] / "electron" / "src"
-               / "renderer" / "src" / "components" / "ReportFigureCell.tsx")
-        src = tsx.read_text(encoding="utf-8")
-
-        def ratio(pattern: str) -> float:
-            m = re.search(pattern, src)
-            assert m, f"could not find {pattern!r} in ReportFigureCell.tsx"
-            return int(m.group(1)) / int(m.group(2))
-
-        assert ratio(r"PANEL_ASPECT\s*=\s*(\d+)\s*/\s*(\d+)") == ex._PANEL_ASPECT
-        assert ratio(r"return\s+(\d+)\s*/\s*(\d+)\s*\n\s*\}\s*\n\s*const layout") \
-            == ex._VECTORS_ASPECT
-        assert ratio(r"layout\.kind !== 'grid'\) return (\d+) / (\d+)") \
-            == ex._DEFAULT_ASPECT
+        source = _figure_cell_tsx()
+        for pattern, expected in _TSX_RATIOS.items():
+            assert _ratio_in(source, pattern) == expected
 
     def test_the_guard_would_catch_a_drift(self):
-        # The check above is only worth having if it fails on a changed value.
-        import re
-        src = "const PANEL_ASPECT = 5 / 3"
-        m = re.search(r"PANEL_ASPECT\s*=\s*(\d+)\s*/\s*(\d+)", src)
-        assert m and int(m.group(1)) / int(m.group(2)) != ex._PANEL_ASPECT
+        # The check above is only worth having if it fails on a changed value, so
+        # run the REAL patterns over a TSX with one ratio edited.
+        source = _figure_cell_tsx().replace("const PANEL_ASPECT = 4 / 3",
+                                            "const PANEL_ASPECT = 5 / 3")
+        drifted = {pattern: _ratio_in(source, pattern) for pattern in _TSX_RATIOS}
+        assert drifted != _TSX_RATIOS

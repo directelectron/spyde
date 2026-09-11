@@ -45,10 +45,31 @@ log = logging.getLogger(__name__)
 
 # ── the page skeleton + article CSS ───────────────────────────────────────────
 
+# The figure rules both page skeletons share verbatim. Colours differ between the
+# light article and the dark deck and stay in each skeleton below; these do not.
+_SHARED_FIGURE_CSS = """
+/* height:100% because an embed that does not post a measured height (the
+   explorer pages, the blender) is emitted with only a width, and the box clips
+   whatever it gets: without this the browser's default 150 px shows a sliver of
+   the page. The fit script reads the INLINE width/height, so a figure carrying
+   its natural size is untouched by this rule. */
+figure.report-figure .fig-box iframe { display: block; border: none;
+  height: 100%; transform-origin: top left; }
+/* A movie exported as its poster still: the badge is what tells the reader this
+   is one frame of a movie and not a static figure. */
+.report-movie .movie-still { position: relative; display: inline-block;
+  max-width: 100%; }
+.report-movie .movie-badge { position: absolute; left: 50%; top: 50%;
+  transform: translate(-50%, -50%); width: 3rem; height: 3rem;
+  display: flex; align-items: center; justify-content: center;
+  border-radius: 50%; background: rgba(0, 0, 0, 0.55); color: #fff;
+  font-size: 1.2rem; line-height: 1; pointer-events: none; }
+"""
+
 # A clean neutral article stylesheet: readable column, works when printed. The
 # print block forces black-on-white (this exact file is what Electron
 # printToPDF consumes) so a dark UI theme never bleeds into the PDF.
-_ARTICLE_CSS = """
+_ARTICLE_CSS = _SHARED_FIGURE_CSS + """
 :root { color-scheme: light; }
 * { box-sizing: border-box; }
 body {
@@ -100,21 +121,10 @@ figure.report-figure .fig-box { position: relative; line-height: 0;
   /* The figure's own background, so a letterbox left by a box whose aspect
      differs from the figure's reads as part of the figure. */
   background: #1e1e2e; }
-figure.report-figure .fig-box iframe { display: block; border: none;
-  transform-origin: top left; }
 figure.report-figure figcaption { margin-top: 0.6rem; font-size: 0.9rem;
   color: #555; font-style: italic; }
 figure.report-figure video { max-width: 100%; height: auto;
   border: 1px solid #e2e2e6; border-radius: 6px; }
-/* A movie exported as its poster still: the badge is what tells the reader this
-   is one frame of a movie and not a static figure. */
-.report-movie .movie-still { position: relative; display: inline-block;
-  max-width: 100%; }
-.report-movie .movie-badge { position: absolute; left: 50%; top: 50%;
-  transform: translate(-50%, -50%); width: 3rem; height: 3rem;
-  display: flex; align-items: center; justify-content: center;
-  border-radius: 50%; background: rgba(0, 0, 0, 0.55); color: #fff;
-  font-size: 1.2rem; line-height: 1; pointer-events: none; }
 .report-movie .movie-note { margin-top: 0.4rem; font-size: 0.8rem;
   color: #8a8a92; }
 .report-figure--missing .missing-box { border: 1px dashed #c8c8ce;
@@ -142,9 +152,7 @@ figure.report-figure video { max-width: 100%; height: auto;
 """
 
 # The exported figure box is sized the SAME way the sidebar cell is: width 100%
-# of the column, height from a CSS aspect-ratio derived from the panel grid. A
-# fixed pixel height made every exported figure the same tall box regardless of
-# its shape, so a wide 1x3 row was letterboxed and a square pattern stretched.
+# of the column, height from a CSS aspect-ratio derived from the panel grid.
 #
 # These MIRROR ReportFigureCell.tsx (PANEL_ASPECT / figureAspectRatio) and are
 # pinned against it by test_report_export, because a silent drift between two
@@ -200,28 +208,26 @@ def _page(title: str, body_html: str) -> str:
     )
 
 
-# An embed that knows its own height says so; without this the page held every
-# interactive figure in one fixed box, leaving a dead band under the controls,
-# worst on a phone where the figure scales down and the gap is most of the
-# screen. Sandboxed srcdoc iframes are cross-origin, so the frame is identified
-# by matching event.source against each contentWindow.
+# An embed that knows its own height says so, because it knows about controls
+# below the figure that no outside measurement can account for. Sandboxed srcdoc
+# iframes are cross-origin, so the frame is identified by matching event.source
+# against each contentWindow.
 _IFRAME_AUTOSIZE_JS = """<script>
 (function () {
   var frames = function () {
     return document.querySelectorAll('figure.report-figure iframe');
   };
 
-  // An embed that measures itself wins: it knows about its own controls below
-  // the figure, which no outside measurement can account for.
-  window.addEventListener('message', function (e) {
-    var d = e.data || {};
-    var h = d.spydeEmbedHeight || d.vxHeight;
-    if (!h || !isFinite(h)) return;
-    var f = frames();
-    for (var i = 0; i < f.length; i++) {
-      if (f[i].contentWindow === e.source) {
-        f[i].dataset.selfSized = '1';
-        f[i].style.height = Math.max(120, Math.round(h)) + 'px';
+  // An embed that measures itself wins over the box.
+  window.addEventListener('message', function (event) {
+    var message = event.data || {};
+    var height = message.spydeEmbedHeight || message.vxHeight;
+    if (!height || !isFinite(height)) return;
+    var candidates = frames();
+    for (var i = 0; i < candidates.length; i++) {
+      if (candidates[i].contentWindow === event.source) {
+        candidates[i].dataset.selfSized = '1';
+        candidates[i].style.height = Math.max(120, Math.round(height)) + 'px';
         return;
       }
     }
@@ -236,18 +242,22 @@ _IFRAME_AUTOSIZE_JS = """<script>
     var boxes = document.querySelectorAll('figure.report-figure .fig-box');
     for (var i = 0; i < boxes.length; i++) {
       var box = boxes[i];
-      var f = box.querySelector('iframe');
-      if (!f || f.dataset.selfSized === '1') continue;
-      var natW = parseFloat(f.style.width), natH = parseFloat(f.style.height);
-      if (!natW || !natH) continue;                 // width:100%, nothing to map
-      var r = box.getBoundingClientRect();
-      if (r.width < 40) continue;
+      var frame = box.querySelector('iframe');
+      if (!frame || frame.dataset.selfSized === '1') continue;
+      var naturalWidth = parseFloat(frame.style.width);
+      var naturalHeight = parseFloat(frame.style.height);
+      if (!naturalWidth || !naturalHeight) continue;   // sized by the box's CSS
+      var boxRect = box.getBoundingClientRect();
+      if (boxRect.width < 40) continue;
       // Contain, so a box whose aspect differs from the figure's letterboxes
       // rather than distorting or cropping it.
-      var k = Math.min(r.width / natW, r.height / natH);
-      f.style.transform = 'scale(' + k.toFixed(4) + ')';
-      f.style.marginLeft = Math.max(0, (r.width - natW * k) / 2).toFixed(1) + 'px';
-      f.style.marginTop = Math.max(0, (r.height - natH * k) / 2).toFixed(1) + 'px';
+      var scale = Math.min(boxRect.width / naturalWidth,
+                           boxRect.height / naturalHeight);
+      frame.style.transform = 'scale(' + scale.toFixed(4) + ')';
+      frame.style.marginLeft =
+        Math.max(0, (boxRect.width - naturalWidth * scale) / 2).toFixed(1) + 'px';
+      frame.style.marginTop =
+        Math.max(0, (boxRect.height - naturalHeight * scale) / 2).toFixed(1) + 'px';
     }
   }
   window.addEventListener('load', fit);
@@ -255,9 +265,9 @@ _IFRAME_AUTOSIZE_JS = """<script>
   // Follow the container, not just the window: an aspect-ratio box changes
   // height whenever the column width does.
   if (typeof ResizeObserver !== 'undefined') {
-    var ro = new ResizeObserver(fit);
+    var observer = new ResizeObserver(fit);
     document.querySelectorAll('figure.report-figure .fig-box')
-      .forEach(function (b) { ro.observe(b); });
+      .forEach(function (box) { observer.observe(box); });
   } else {
     window.addEventListener('resize', fit);
   }
@@ -353,12 +363,12 @@ def _movie_cell_html(mgr, cell: Cell, poster: "bytes | None", *,
         )
     note_html = f"<div class=\"movie-note\">{_html.escape(note)}</div>" if note else ""
     if not poster:
-        if not cap:
+        if not cap and not note_html:
             return ""
         return (
             "<figure class=\"report-figure report-movie report-figure--missing\">"
             "<div class=\"missing-box\">movie not yet rendered</div>"
-            f"{figcap}</figure>"
+            f"{note_html}{figcap}</figure>"
         )
     b64 = base64.b64encode(poster).decode("ascii")
     return (
@@ -625,7 +635,7 @@ def _render_body(mgr, assets: dict, *, interactive: bool, session=None) -> str:
 # SAME self-contained srcdoc iframes the interactive HTML export emits, so they
 # work here too with zero runtime Python. Print falls back to showing every slide
 # stacked (so a browser "Print to PDF" of the deck yields one slide per page-ish).
-_SLIDES_CSS = """
+_SLIDES_CSS = _SHARED_FIGURE_CSS + """
 :root { color-scheme: dark; }
 * { box-sizing: border-box; }
 html, body { margin: 0; padding: 0; height: 100%; }
@@ -662,25 +672,14 @@ body {
 figure.report-figure { margin: 1rem 0; text-align: center; }
 figure.report-figure img { max-width: 100%; max-height: 62vh; height: auto;
   border-radius: 6px; }
-figure.report-figure iframe { width: 100%; height: 62vh; border: 1px solid #313244;
-  border-radius: 6px; }
 /* Same shaped box as the article page: an interactive figure carries its own
    natural pixel size, so without a box to scale it into a big one overruns the
    slide. */
 figure.report-figure .fig-box { position: relative; line-height: 0;
   overflow: hidden; border: 1px solid #313244; border-radius: 6px;
   max-height: 62vh; background: #1e1e2e; }
-figure.report-figure .fig-box iframe { display: block; border: none;
-  transform-origin: top left; }
 figure.report-figure video { max-width: 100%; max-height: 62vh; height: auto;
   border: 1px solid #313244; border-radius: 6px; }
-.report-movie .movie-still { position: relative; display: inline-block;
-  max-width: 100%; }
-.report-movie .movie-badge { position: absolute; left: 50%; top: 50%;
-  transform: translate(-50%, -50%); width: 3rem; height: 3rem;
-  display: flex; align-items: center; justify-content: center;
-  border-radius: 50%; background: rgba(0, 0, 0, 0.55); color: #fff;
-  font-size: 1.2rem; line-height: 1; pointer-events: none; }
 .report-movie .movie-note { margin-top: 0.4rem; font-size: 0.8rem;
   color: #a6adc8; }
 .report-figure--missing .missing-box { border: 1px dashed #45475a;
@@ -699,7 +698,6 @@ figure.report-figure figcaption { margin-top: 0.5rem; font-size: 0.85rem;
 .split-col { min-width: 0; }
 .split-fig figure.report-figure { margin: 0.5rem 0; }
 .split-fig figure.report-figure img { max-height: 74vh; }
-.split-fig figure.report-figure iframe { height: 56vh; }
 @media (max-width: 720px), (orientation: portrait) {
   .split-block { grid-template-columns: 1fr; }
 }
