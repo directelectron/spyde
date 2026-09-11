@@ -1,6 +1,7 @@
 /**
- * report_export_movie.spec.ts — a MOVIE cell survives every HTML export, and an
- * exported figure box is sized by its shape rather than by one fixed height.
+ * report_export_movie.spec.ts: a MOVIE cell survives every HTML export, and
+ * an exported figure box is sized by its shape rather than by one fixed
+ * height.
  *
  * A movie cell exported as nothing at all: no poster, no caption, in static
  * HTML, interactive HTML and the PDF that renders from the static file. A
@@ -11,13 +12,13 @@
  *   1. Build a report on the synthetic in-situ movie: a markdown cell, a live
  *      figure cell, and a movie cell rendered to a real .gif (so the manager
  *      holds a poster AND a file to inline).
- *   2. Static HTML — poster, caption and play badge, rendering as real pixels.
- *   3. Interactive HTML — the movie itself inlined, and the figure iframe sized
+ *   2. Static HTML: poster, caption and play badge, rendering as real pixels.
+ *   3. Interactive HTML: the movie itself inlined, and the figure iframe sized
  *      from the figure's shape instead of the retired fixed 480 px box.
  *
- * Screenshots land in report_fixes_shots/ — a blank frame is a failure, not a
- * pass. SPYDE_LOG_LEVEL=WARNING tees backend logging to stderr so the final
- * audit can scan for Python tracebacks.
+ * Screenshots land in report_fixes_shots/, where a blank frame is a failure
+ * rather than a pass. SPYDE_LOG_LEVEL=WARNING tees backend logging to stderr
+ * so the final audit can scan for Python tracebacks.
  */
 import { test, expect } from '@playwright/test'
 import { join } from 'path'
