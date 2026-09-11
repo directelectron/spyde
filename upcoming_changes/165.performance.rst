@@ -1,0 +1,1 @@
+A lazily opened ``.hspy`` or ``.zspy`` stored in small chunks is now re-blocked at load into ~64 MB dask chunks of whole frames, so a scan written one frame per chunk no longer costs a dask task per frame; the readers ignore ``chunks=``, so this happens by rebuilding the wrap of the stored dataset, which reads nothing.

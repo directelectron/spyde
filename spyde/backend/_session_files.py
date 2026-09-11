@@ -249,6 +249,8 @@ class FileLoaderMixin:
         ch = cls._signal_spanning_chunks(first)
         if ch is None:
             return sig
+        if cls._reblock_wrapped_source(first, ch):
+            return sig
         try:
             return hs.load(path, lazy=True, chunks=ch, **kw)
         except Exception as e:
@@ -257,6 +259,58 @@ class FileLoaderMixin:
             log.debug("signal-spanning re-load of %s failed (%s); using the "
                       "reader default", os.path.basename(path), e)
             return sig
+
+    @classmethod
+    def _reblock_wrapped_source(cls, sig, chunks) -> bool:
+        """Re-block a lazy signal whose dask array directly wraps a stored
+        dataset (an HDF5 or zarr array) to ``chunks``, in place. True if done.
+
+        The HDF5 and zarr readers ignore ``chunks=`` and hand dask the file's
+        own chunk grid, so this is the only way their chunking can change at
+        load. It is a graph rebuild, not a data move: ``da.from_array`` of the
+        same open dataset with a different grid reads nothing, and each block
+        is then one hyperslab read spanning as many storage chunks as it covers.
+        The per-frame navigator read is unaffected either way: it goes to the
+        dataset directly, by storage chunk (``readers.source_array``).
+
+        A rebuilt block is held whole in RAM by the threaded navigator fill, so
+        it is capped at ``_CHUNK_TARGET_BYTES`` however the nav rule sized it."""
+        try:
+            from spyde.array_cache.readers.source_array import find_source_array
+            import dask.array as da
+
+            data = sig.data
+            source = find_source_array(data)
+            if source is None:
+                return False
+            block = cls._cap_block_bytes(chunks, data.shape, data.dtype.itemsize)
+            if block == tuple(c[0] for c in data.chunks):
+                return False
+            sig.data = da.from_array(source, chunks=block)
+            log.info("re-blocked %s from %s-frame storage chunks to %s (%d -> %d chunks)",
+                     type(source).__name__,
+                     "x".join(str(c[0]) for c in data.chunks[:-2]),
+                     block, data.npartitions, sig.data.npartitions)
+            return True
+        except Exception as e:
+            log.debug("re-blocking the wrapped source failed: %s", e)
+            return False
+
+    @classmethod
+    def _cap_block_bytes(cls, chunks, shape, itemsize) -> tuple:
+        """``chunks`` as concrete sizes (``-1`` resolved to the full axis), with
+        the nav block halved along its largest axis until a block fits in
+        ``_CHUNK_TARGET_BYTES`` or is a single frame."""
+        block = [int(n) if c == -1 else min(int(c), int(n))
+                 for c, n in zip(chunks, shape)]
+        signal_ndim = sum(1 for c in chunks if c == -1)
+        nav_ndim = len(block) - signal_ndim
+        frame_bytes = int(np.prod(block[nav_ndim:])) * int(itemsize)
+        while (int(np.prod(block[:nav_ndim])) * frame_bytes > cls._CHUNK_TARGET_BYTES
+               and max(block[:nav_ndim], default=1) > 1):
+            largest = max(range(nav_ndim), key=lambda axis: block[axis])
+            block[largest] = max(1, block[largest] // 2)
+        return tuple(block)
 
     @classmethod
     def _signal_spanning_chunks(cls, sig, nav_chunk: "int | None" = None):
@@ -304,18 +358,28 @@ class FileLoaderMixin:
 
             sig_chunks = data.chunks[nav_dim:]
             sig_whole = all(len(c) == 1 for c in sig_chunks)
-            # Current nav-block size (frames per chunk on the fastest-varying nav
-            # axis the reader split); used to decide if a re-chunk is warranted.
-            cur_nav0 = data.chunks[0][0] if data.chunks and data.chunks[0] else 1
-
-            # If the signal axes are ALREADY whole AND the reader's nav block is
-            # no bigger than our target, the chunking is fine — don't rebuild the
-            # graph for nothing (the common self-describing / already-good case).
-            if sig_whole and cur_nav0 <= nav_chunk:
-                return None
+            # The reader's nav block: frames per chunk on the fastest-varying
+            # nav axis, and the bytes one chunk holds.
+            cur_nav = tuple(int(c[0]) for c in data.chunks[:nav_dim])
+            cur_nav0 = cur_nav[0] if cur_nav else 1
+            chunk_bytes = int(np.prod(cur_nav)) * frame_bytes
 
             nav_shape = data.shape[:nav_dim]
             nav = tuple(min(nav_chunk, int(n)) for n in nav_shape)
+
+            # Whole frames, a nav block no bigger than the target, and chunks
+            # that are not tiny: the chunking is fine, don't rebuild the graph.
+            # Tiny chunks are the other way to lose: a file stored one 128 KB
+            # frame per chunk gave a 1 GB scan 24,577 dask tasks, and the
+            # navigator fill (one compute per chunk, each optimising the whole
+            # graph) took ~80 s where the same bytes sum in 1.2 s as 33 blocks.
+            # A chunk under an eighth of the target is re-blocked up to it;
+            # the nav rule's own block (a movie's single frame, a scan that
+            # fits in one chunk) is left as it is.
+            too_small = chunk_bytes < cls._CHUNK_TARGET_BYTES // 8 and nav != cur_nav
+            if sig_whole and cur_nav0 <= nav_chunk and not too_small:
+                return None
+
             return nav + (-1,) * sig_dim
         except Exception as e:
             log.debug("computing signal-spanning chunks failed: %s", e)
