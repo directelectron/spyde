@@ -1,6 +1,0 @@
-Entering a transform view — the Find Vectors detector response, and every
-overlay that replaces the diffraction pattern with an image of its own — no
-longer flashes the raw pattern underneath first. The navigator's own frame
-waits for the transform to say whether it owns the display, and an overlay
-whose function fails now clears its groups instead of leaving the window on
-the last image it drew.
