@@ -882,6 +882,10 @@ class TestHarnessMixin:
             ax.scale = 0.1
             ax.offset = -(ax.size / 2.0) * 0.1
             ax.units = "1/nm"
+        # A calibrated scan, so every map computed over it (strain, orientation)
+        # is checked for a scale bar, not just for pixels.
+        for ax, name in zip(s.axes_manager.navigation_axes, ("x", "y")):
+            ax.scale, ax.units, ax.name = 2.0, "nm", name
         self._add_signal(s, source_path="test_vectors")
 
         src = next((p for p in self._plots

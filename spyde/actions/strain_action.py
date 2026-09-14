@@ -19,6 +19,7 @@ from spyde.actions.lifecycle import bump_generation, is_current
 # scripted strain uses the SAME zero-beam filter + default-reference heuristic).
 from spyde.actions.strain_mapping import (
     default_reference as _default_reference,
+    rotate_strain_basis,
     zero_beam_filtered as _zero_beam_filtered,
 )
 from de_shell.actions.wizard import WizardController
@@ -61,19 +62,36 @@ class StrainController(WizardController):
             "name": "Match radius (px)", "type": "int", "default": 6,
             "min": 1, "max": 30,
         },
+        # The detector's frame turned into the scan's (see rotate_strain_basis):
+        # the same angle and handedness DPC finds for the scan.
+        "rotation": {
+            "name": "Rotation (°)", "type": "float", "default": 0.0,
+            "min": -180.0, "max": 180.0,
+        },
+        "flip": {"name": "Flip x/y", "type": "bool", "default": False},
     }
 
     def __init__(self, vecs, plot2d, *, window_id=None,
                  component="exx", ref_yx=(0, 0), session=None,
                  src_tree=None, src_dp_plot=None, match_radius_px=6.0,
-                 min_matches=3, ref_radius=2):
+                 min_matches=3, ref_radius=2, rotation=0.0, flip=False):
         super().__init__(session, src_tree)
         self.vecs = vecs
         self.p = plot2d                  # the strain MAP figure (output)
         self.window_id = window_id
         self.component = component
         self.ref_yx = (int(ref_yx[0]), int(ref_yx[1]))
+        # `raw_field` is the fit as computed, in the DETECTOR's frame; `field`
+        # is what the window shows and Commit freezes — the same fit expressed
+        # in the scan's x/y (rotate_strain_basis with `rotation` / `flip`).
+        self.raw_field = None
         self.field = None
+        self.rotation = float(rotation)
+        self.flip = bool(flip)
+        # The x/y arrows on the reference pattern (ScanAxesGlyph) and the
+        # window the caret lives in, which hears about the basis it shows.
+        self.axes_glyph = None
+        self.caret_window_id = None
         self.cif_mode = False
         # Fit robustness (backend knobs — scripted via strain_set_fit, no wizard
         # clutter; defaults are the measured-good ones).
@@ -111,6 +129,7 @@ class StrainController(WizardController):
         self.own_window(self.window_id)
         self._attach_reference_selector()
         self._attach_selection_overlay()
+        self._attach_axes_glyph()
         # Skip the initial recompute when the field was already computed by the
         # caller (_build_window pre-populates ctrl.field and the figure already
         # shows it) — recomputing here would run the full per-pixel fit a second
@@ -226,6 +245,74 @@ class StrainController(WizardController):
         except Exception as e:
             log.exception("strain selection overlay attach failed: %s", e)
 
+    def _attach_axes_glyph(self) -> None:
+        """Draw the scan's x/y on the reference pattern; dragging either arrow
+        turns the displayed tensor (the same rotation the caret shows)."""
+        dp = self.src_dp_plot
+        if dp is None or getattr(dp, "_plot2d", None) is None:
+            return
+        from spyde.actions.strain_axes_glyph import ScanAxesGlyph
+        try:
+            self.axes_glyph = ScanAxesGlyph(dp, rotation=self.rotation, flip=self.flip,
+                                            on_change=self._on_glyph_rotation)
+        except Exception as e:
+            log.debug("strain axes glyph attach failed: %s", e)
+
+    def _on_glyph_rotation(self, rotation: float) -> None:
+        self.set_rotation(rotation)
+        self.emit_basis()
+
+    def emit_basis(self, *, sources: bool = False) -> None:
+        """Tell the caret the basis the map is drawn with — and, on request,
+        which DPC results in the session it could take one from."""
+        if self.caret_window_id is None:
+            return
+        from de_shell.ipc import emit
+        message = {"type": "strain_rotation", "window_id": self.caret_window_id,
+                   "rotation": float(self.rotation), "flip": bool(self.flip)}
+        if sources:
+            message["dpc_sources"] = [
+                {"index": i, "label": label} for i, (label, _r, _f) in
+                enumerate(self.dpc_sources())]
+        emit(message)
+
+    def dpc_sources(self) -> list:
+        """Every DPC result in the session a basis could be taken from, as
+        ``(label, rotation, flip)``: live wizards first, then committed trees.
+        DPC's rotation search answers the same question this control asks —
+        how the detector sits relative to the scan."""
+        session = self.session
+        if session is None:
+            return []
+        found = []
+        controllers = getattr(session, "_window_controllers", None) or {}
+        for ctrl in list(controllers.values()):
+            result = getattr(ctrl, "result", None)
+            if _has_basis(result):
+                found.append((f"{_title_of(getattr(ctrl, 'tree', None))} (live)",
+                              float(result.rotation), bool(result.flip)))
+        for tree in getattr(session, "signal_trees", []) or []:
+            result = getattr(tree, "dpc_result", None)
+            if _has_basis(result):
+                found.append((_title_of(tree), float(result.rotation),
+                              bool(result.flip)))
+        return [(f"{label} — {rotation:.1f}°{', flipped' if flip else ''}",
+                 rotation, flip) for label, rotation, flip in found]
+
+    def rotation_from_dpc(self, index=None):
+        """The ``(rotation, flip)`` of one DPC result — *index* into
+        :meth:`dpc_sources`, or the first — else ``None``."""
+        sources = self.dpc_sources()
+        if not sources:
+            return None
+        # `is`, not `in`: 1 == True, so a membership test would send the
+        # second entry to the first.
+        position = 0 if (index is None or index is True) else int(index)
+        if not 0 <= position < len(sources):
+            return None
+        _label, rotation, flip = sources[position]
+        return rotation, flip
+
     def _on_ref_selector(self, indices) -> None:
         """The DEDICATED reference crosshair moved → adopt its position as the
         new reference pixel (Region mode) and re-fit."""
@@ -299,7 +386,7 @@ class StrainController(WizardController):
                 log.debug("[strain-ref] _recompute gen=%d SUPERSEDED (current=%d) — dropped",
                           gen, self._recompute_gen)
                 return
-            self.field = field
+            self.set_raw_field(field)
             update_strain_view(self.p, self.field, self.component, clim=self.clim)
             self._emit_histogram()
             log.debug("[strain-ref] _recompute gen=%d applied to plot", gen)
@@ -340,6 +427,29 @@ class StrainController(WizardController):
         if self.overlay is not None:
             self.overlay.set_match_radius(self.match_radius_px)
 
+    # ── the scan frame ────────────────────────────────────────────────────────
+    def set_raw_field(self, field) -> None:
+        """A fresh fit (detector frame) → the displayed field (scan frame)."""
+        self.raw_field = field
+        self.field = (None if field is None else
+                      rotate_strain_basis(field, self.rotation, flip=self.flip))
+
+    def set_rotation(self, rotation=None, flip=None) -> None:
+        """Turn the displayed tensor into the scan's x/y. No re-fit: the
+        detector-frame fit is kept and only re-expressed."""
+        from spyde.actions.strain_display import update_strain_view
+        if rotation is not None:
+            self.rotation = float(rotation)
+        if flip is not None:
+            self.flip = bool(flip)
+        if self.axes_glyph is not None:
+            self.axes_glyph.set_rotation(self.rotation, self.flip)
+        if self.raw_field is None:
+            return
+        self.set_raw_field(self.raw_field)
+        update_strain_view(self.p, self.field, self.component, clim=self.clim)
+        self._emit_histogram()
+
     def set_component(self, component: str) -> None:
         from spyde.actions.strain_display import update_strain_view
         if component not in _COMPONENTS or self.field is None:
@@ -353,18 +463,26 @@ class StrainController(WizardController):
     # ── plot-widget dock integration (session controller fallback) ────────────
     def _emit_histogram(self) -> None:
         from spyde.actions.strain_display import emit_strain_histogram, _auto_clim, \
-            _component_map
+            display_component
         if self.field is None:
             return
-        clim = self.clim or _auto_clim(_component_map(self.field, self.component))
-        emit_strain_histogram(self.window_id, self.field, self.component, clim)
+        clim = self.clim or _auto_clim(display_component(self.field, self.component))
+        emit_strain_histogram(self.window_id, self.field, self.component, clim,
+                              colormap=self.cmap)
 
     def set_clim(self, vmin, vmax) -> None:
         """Dock histogram handles → the displayed contrast (kept across component
-        switches and recomputes until changed again)."""
+        switches and recomputes until changed again). Every component is signed,
+        so the range stays centred on zero: the handle that moved sets it."""
+        from spyde.actions._common import symmetric_range
+        from spyde.actions.strain_display import _auto_clim, display_component
         try:
-            self.clim = (float(vmin), float(vmax))
+            previous = self.clim
+            if previous is None and self.field is not None:
+                previous = _auto_clim(display_component(self.field, self.component))
+            self.clim = symmetric_range(previous, vmin, vmax)
             self.p.set_clim(*self.clim)
+            self._emit_histogram()
         except Exception as e:
             log.debug("strain set_clim failed: %s", e)
 
@@ -377,12 +495,12 @@ class StrainController(WizardController):
         until the handles are dragged again). ``full`` (Reset) spans the finite
         extent instead of the robust 98th-percentile band."""
         import numpy as np
-        from spyde.actions.strain_display import _auto_clim, _component_map
+        from spyde.actions.strain_display import _auto_clim, display_component
         if self.field is None:
             return
         try:
             self.clim = None
-            arr = np.asarray(_component_map(self.field, self.component), float)
+            arr = display_component(self.field, self.component)
             if mode == "full":
                 finite = arr[np.isfinite(arr)]
                 clim = ((float(np.min(finite)), float(np.max(finite)))
@@ -421,24 +539,31 @@ class StrainController(WizardController):
     def commit(self):
         """Freeze the current strain field as a NEW SignalTree — εxx is the signal
         plot, εyy / εxy / ω ride along as chip-selectable view figures (same shape
-        as the Vector-OM result window). The live window stays open for tuning."""
+        as the Vector-OM result window). The live window stays open for tuning.
+
+        The tree holds what the window shows: percent strain and degrees of
+        rotation, each node saying so in ``Signal.quantity``, over the scan's
+        own spatial calibration."""
         if self.field is None or self.session is None:
             return None
-        from spyde.actions._common import STRAIN_TITLES as titles
+        from spyde.actions._common import STRAIN_TITLES as titles, strain_quantity
         from spyde.actions.commit import commit_result_tree
-        f = self.field
+        from spyde.actions.strain_display import display_component
+        maps = {c: display_component(self.field, c) for c in _COMPONENTS}
         return commit_result_tree(
             self.session, title="Strain",
-            primary=f.exx, primary_label=titles["exx"],
-            views=[(titles["eyy"], f.eyy), (titles["exy"], f.exy),
-                   (titles["omega"], f.omega)],
-            levels="auto_sym",
+            primary=maps["exx"], primary_label=titles["exx"],
+            views=[(titles[c], maps[c]) for c in ("eyy", "exy", "omega")],
+            levels="auto_sym", cmap=self.cmap,
+            source_signal=getattr(self.src_tree, "root", None),
+            value_units={titles[c]: strain_quantity(c) for c in _COMPONENTS},
             provenance={
                 "action": "Strain Mapping",
                 "params": {"ref_yx": list(self.ref_yx), "cif_mode": self.cif_mode,
                            "match_radius_px": self.match_radius_px,
                            "min_matches": self.min_matches,
-                           "ref_radius": self.ref_radius},
+                           "ref_radius": self.ref_radius,
+                           "rotation": self.rotation, "flip": self.flip},
             },
         )
 
@@ -454,6 +579,12 @@ class StrainController(WizardController):
         if getattr(self, "_closed", False):
             return
         self._closed = True
+        if self.axes_glyph is not None:
+            try:
+                self.axes_glyph.remove()
+            except Exception as e:
+                log.debug("removing the strain axes glyph failed: %s", e)
+            self.axes_glyph = None
         if self.overlay is not None:
             try:
                 self.overlay.remove()
@@ -575,11 +706,18 @@ def strain_open(session, plot, payload) -> None:
     ref_yx = _default_reference(vecs)
     min_matches = max(3, int(payload.get("min_matches", 3)))
     ref_radius = max(0, int(payload.get("ref_radius", 2)))
+    rotation = float(payload.get("rotation", _scan_rotation(tree)))
+    flip = bool(payload.get("flip", False))
 
     def _build_window(field):
         if not is_current(tree, "_strain_run_gen", gen):
             return   # superseded by a strain_close or a newer strain_open
-        _fig, fig_id, html, p = build_strain_figure(field, component="exx")
+        from spyde.actions.commit import navigation_extent
+        scan_axes = navigation_extent(getattr(tree, "root", None), field.nav_shape)
+        # The window shows the SCAN frame from its first paint.
+        shown = rotate_strain_basis(field, rotation, flip=flip)
+        _fig, fig_id, html, p = build_strain_figure(shown, component="exx",
+                                                    axes=scan_axes)
         wid = session.next_window_id()
         from de_shell.actions.figure_registry import keep_alive
         keep_alive(int(wid), _fig)
@@ -591,11 +729,14 @@ def strain_open(session, plot, payload) -> None:
                                 ref_yx=ref_yx, session=session,
                                 src_tree=tree, src_dp_plot=src_dp,
                                 match_radius_px=float(payload.get("match_radius_px", 6.0)),
-                                min_matches=min_matches, ref_radius=ref_radius)
-        ctrl.field = field
+                                min_matches=min_matches, ref_radius=ref_radius,
+                                rotation=rotation, flip=flip)
+        ctrl.set_raw_field(field)
+        ctrl.caret_window_id = payload.get("window_id")
         ctrl.attach()
         tree._strain_controller = ctrl
         ctrl._emit_histogram()          # arm the dock's contrast handles
+        ctrl.emit_basis(sources=True)   # the caret's rotation + DPC picker
         emit_status("Strain field ready.")
 
     if getattr(session, "_dispatch_to_main", None) is not None:
@@ -615,6 +756,62 @@ def strain_open(session, plot, payload) -> None:
         name="strain-run", on_done=_finished,
         on_error=lambda e: emit_error(f"Strain mapping failed: {e}"),
     )
+
+
+def _scan_rotation(tree) -> float:
+    """The scan rotation a file records (pyxem's
+    ``Acquisition_instrument.TEM.scan_rotation``), else 0 — the caret's
+    starting angle, always overridable."""
+    root = getattr(tree, "root", None)
+    try:
+        value = root.metadata.get_item("Acquisition_instrument.TEM.scan_rotation", None)
+        return float(value) if value is not None else 0.0
+    except Exception:
+        return 0.0
+
+
+def _has_basis(result) -> bool:
+    return (getattr(result, "rotation", None) is not None
+            and hasattr(result, "flip"))
+
+
+def _title_of(tree) -> str:
+    try:
+        return str(tree.root.metadata.General.title) or "untitled"
+    except Exception:
+        return "untitled"
+
+
+def strain_set_rotation(session, plot, payload) -> None:
+    """Rotation / flip caret: express the field in the scan's x/y.
+
+    ``list_dpc`` asks for the DPC results in the session (answered with a
+    ``strain_rotation`` message carrying ``dpc_sources``); ``from_dpc`` — an
+    index into that list — takes that run's angle and handedness, and the
+    same message tells the caret what the map is now drawn with."""
+    from de_shell.ipc import emit_error, emit_status
+    ctrl = _ctrl_for(session, plot, payload)
+    if ctrl is None:
+        return
+    if payload.get("window_id") is not None:
+        ctrl.caret_window_id = payload.get("window_id")
+    if payload.get("list_dpc"):
+        ctrl.emit_basis(sources=True)
+        return
+    if payload.get("from_dpc") is not None and payload.get("from_dpc") is not False:
+        found = ctrl.rotation_from_dpc(payload.get("from_dpc"))
+        if found is None:
+            emit_error("Strain: no DPC result to take the rotation from — run DPC "
+                       "on this scan first.")
+            ctrl.emit_basis(sources=True)
+            return
+        rotation, flip = found
+        ctrl.set_rotation(rotation, flip)
+        emit_status(f"Strain basis from DPC: {rotation:.1f}°"
+                    f"{', x/y flipped' if flip else ''}.")
+        ctrl.emit_basis(sources=True)
+        return
+    ctrl.set_rotation(payload.get("rotation"), payload.get("flip"))
 
 
 def strain_set_component(session, plot, payload) -> None:
@@ -678,12 +875,16 @@ def strain_set_overlay(session, plot, payload) -> None:
     """Show/hide the reference-spot selection + displacement overlay on the source
     DP (fired by the renderer when the Strain caret opens/closes)."""
     ctrl = _ctrl_for(session, plot, payload)
-    if ctrl is None or ctrl.overlay is None:
+    if ctrl is None:
         return
-    try:
-        ctrl.overlay.set_visible(bool(payload.get("visible", True)))
-    except Exception as e:
-        log.debug("strain set_overlay failed: %s", e)
+    visible = bool(payload.get("visible", True))
+    for part in (ctrl.overlay, ctrl.axes_glyph):
+        if part is None:
+            continue
+        try:
+            part.set_visible(visible)
+        except Exception as e:
+            log.debug("strain set_overlay failed: %s", e)
 
 
 def strain_close(session, plot, payload) -> None:

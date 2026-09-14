@@ -232,6 +232,10 @@ export interface HistogramMessage extends MsgBase {
   data_min?: number
   data_max?: number
   clipped?: boolean
+  // A signed map: the two handles are one number, mirrored about zero.
+  symmetric?: boolean
+  // What the figure shows, by the dock's name — so its picker can follow.
+  colormap?: string
 }
 
 export interface NavShapePromptMessage extends MsgBase, NavShapePrompt {
@@ -983,6 +987,18 @@ export interface DpcEstimateMessage extends MsgBase {
  *  `brightness` is the region's intensity density over the frame average —
  *  scale-free, unlike a captured-intensity fraction. Null when the region is
  *  off. */
+// Strain caret: the rotation / flip the backend took over from a DPC run, so
+// the caret's controls show what the map is now drawn with.
+export interface StrainRotationMessage extends MsgBase {
+  type: 'strain_rotation'
+  window_id: number | null
+  rotation: number
+  flip: boolean
+  // The DPC results open in the session a basis could be taken from (only
+  // when the caret asked for them).
+  dpc_sources?: { index: number; label: string }[]
+}
+
 export interface DpcRegionMessage extends MsgBase {
   type: 'dpc_region'
   window_id: number | null
@@ -1147,6 +1163,7 @@ export type PlotAppMessage =
   | DpcEstimateMessage
   | DpcResultMessage
   | DpcRegionMessage
+  | StrainRotationMessage
 
 /**
  * Narrow a raw incoming message (`Record<string, unknown>` from the IPC bridge)

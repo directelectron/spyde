@@ -7,4 +7,5 @@
 export const COLORMAPS: string[] = [
   'gray', 'viridis', 'inferno', 'magma', 'plasma',
   'cividis', 'hot', 'jet', 'turbo', 'twilight',
+  'coolwarm',   // diverging — a signed map (strain, a field component)
 ]

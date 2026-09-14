@@ -51,6 +51,39 @@ class StrainField:
         return self.exx.shape
 
 
+def rotate_strain_basis(field: StrainField, angle_deg: float, *,
+                        flip: bool = False) -> StrainField:
+    """Express *field* in the SCAN's x/y instead of the detector's kx/ky.
+
+    The fit works in the diffraction pattern's frame, so εxx is strain along
+    the detector's x. The scan usually sits at some angle to the detector (and
+    sometimes with the opposite handedness), so a map that says "εxx" in scan
+    coordinates has to be turned first. The tensor turns the way a vector
+    does: ``ε' = R ε Rᵀ`` with the same clockwise ``R`` (and the same x/y swap
+    first) that ``dpc.rotate_shifts`` uses to put beam shifts into the scan
+    frame — so the angle and flip DPC finds for a scan are exactly the ones
+    to pass here. The lattice rotation ω is a scalar under a rotation; a flip
+    reverses its sense.
+    """
+    exx, eyy, exy = (np.asarray(field.exx, np.float64), np.asarray(field.eyy, np.float64),
+                     np.asarray(field.exy, np.float64))
+    omega = np.asarray(field.omega, np.float64)
+    if flip:
+        exx, eyy = eyy, exx
+        omega = -omega
+    theta = np.deg2rad(float(angle_deg))
+    c, s = np.cos(theta), np.sin(theta)
+    # R = [[c, -s], [s, c]];  ε' = R ε Rᵀ written out per component.
+    new_exx = c * c * exx - 2.0 * c * s * exy + s * s * eyy
+    new_eyy = s * s * exx + 2.0 * c * s * exy + c * c * eyy
+    new_exy = c * s * (exx - eyy) + (c * c - s * s) * exy
+    return StrainField(
+        exx=new_exx, eyy=new_eyy, exy=new_exy, omega=omega,
+        coverage=field.coverage, residual=field.residual,
+        n_matched=field.n_matched, provenance=field.provenance,
+    )
+
+
 def default_reference(vecs) -> tuple:
     """A sensible unstrained reference: the pixel with the most vectors (the
     best-determined local lattice)."""

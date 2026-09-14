@@ -111,50 +111,66 @@ def view_array(result: "_dpc.DpcResult", view: str
 
 
 def emit_dpc_histogram(window_id, result: "_dpc.DpcResult", view: str,
-                       clim: tuple[float, float] | None) -> None:
+                       clim: tuple[float, float] | None, *,
+                       colormap: str | None = None) -> None:
     """Sidebar histogram for a scalar view — the same message ``Plot`` sends, so
     the dock's contrast handles work with no special casing. The RGB view has no
-    scalar distribution, so it sends nothing."""
+    scalar distribution, so it sends nothing. A signed view says so, so the
+    dock keeps its two handles one number and zero at the middle."""
     if window_id is None or view == RGB_VIEW:
         return
     data = np.asarray(result.component(view), dtype=float)
     finite = data[np.isfinite(data)]
     if finite.size == 0:
         return
-    lo, hi = clim if clim is not None else _auto_clim(finite, view in _SIGNED)
+    signed = view in _SIGNED
+    lo, hi = clim if clim is not None else _auto_clim(finite, signed)
     try:
         counts, edges = np.histogram(finite, bins=64)
         from de_shell.ipc import emit
         emit({"type": "histogram", "window_id": int(window_id),
               "counts": counts.astype(int).tolist(),
               "edges": [float(e) for e in edges],
-              "vmin": float(lo), "vmax": float(hi), "threshold": None})
+              "vmin": float(lo), "vmax": float(hi), "threshold": None,
+              "symmetric": bool(signed),
+              "colormap": str(colormap or view_array(result, view)[2])})
     except Exception as e:                                   # pragma: no cover
         logger.debug("DPC histogram emit failed: %s", e)
 
 
 def build_dpc_figure(result: "_dpc.DpcResult", *, view: str = RGB_VIEW,
-                     title: str = "DPC"):
+                     title: str = "DPC", axes=None):
     """Build the DPC window → ``(fig, fig_id, html, plot2d, wheel_key)``.
 
     *plot2d* is returned so the controller can live-update the map without
     rebuilding the figure (a rebuild would drop the user's zoom and flash the
     window on every slider tick). *wheel_key* is the legend's handle, used only
     to show/hide it — its picture never changes.
+
+    *axes* is the scan calibration ``(x, y, units)`` from
+    ``commit.navigation_extent``: with it the map draws real-distance ticks and
+    a scale bar. A scalar view gets a colorbar labelled with its unit; the RGB
+    view has the colour wheel instead.
     """
     import anyplotlib as apl
     import anyplotlib._electron as _electron
     from spyde.drawing.plots.plot import finalize_figure_html
 
     data, clim, cmap = view_array(result, view)
-    fig, axes = apl.subplots(1, 1)
-    ax = axes[0][0] if isinstance(axes, list) else axes
+    fig, figure_axes = apl.subplots(1, 1)
+    ax = figure_axes[0][0] if isinstance(figure_axes, list) else figure_axes
     p = ax.imshow(data, cmap=None if view == RGB_VIEW else cmap)
     if clim is not None:
         try:
             p.set_clim(*clim)
         except Exception as e:                               # pragma: no cover
             logger.debug("set_clim on DPC map failed: %s", e)
+    if axes is not None:
+        try:
+            p.set_extent(axes[0], axes[1], units=axes[2])
+        except Exception as e:                               # pragma: no cover
+            logger.debug("calibrating the DPC map failed: %s", e)
+    _label_colorbar(p, result, view)
 
     wheel_key = attach_wheel_key(p, visible=(view == RGB_VIEW),
                                  scale=wheel_scale_label(result))
@@ -162,6 +178,16 @@ def build_dpc_figure(result: "_dpc.DpcResult", *, view: str = RGB_VIEW,
     fig_id = _electron.register(fig)
     html = finalize_figure_html(fig, fig_id)
     return fig, fig_id, html, p, wheel_key
+
+
+def _label_colorbar(plot2d, result: "_dpc.DpcResult", view: str) -> None:
+    """A scalar view's colorbar says what its numbers are ("Bx (mrad)"); the
+    RGB view has no colorbar (the wheel is its legend)."""
+    try:
+        plot2d.set_colorbar_label(view_titles(result.mode, result.units)[view])
+        plot2d.set_colorbar_visible(view != RGB_VIEW)
+    except Exception as e:                                   # pragma: no cover
+        logger.debug("labelling the DPC colorbar failed: %s", e)
 
 
 def wheel_scale_label(result: "_dpc.DpcResult | None") -> str | None:
@@ -240,6 +266,7 @@ def update_dpc_view(plot2d, wheel_key, result: "_dpc.DpcResult", view: str,
             plot2d.set_colormap(cmap or auto_cmap)
         except Exception as e:                               # pragma: no cover
             logger.debug("updating DPC contrast failed: %s", e)
+    _label_colorbar(plot2d, result, view)
     show_wheel_key(wheel_key, visible=(view == RGB_VIEW))
 
 
