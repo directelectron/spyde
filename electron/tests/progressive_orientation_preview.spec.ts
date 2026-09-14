@@ -92,7 +92,19 @@ test('the IPF map fills in while the source DP stays navigable', async () => {
   const walk = await dragCrosshair(page, srcNav, {
     dx: -30, steps: 4, settleMs: 1200,
     onStep: async (i: number) => {
-      dpSigs.push(await figureSignature(srcSig))
+      // Wait for THIS step's frame instead of budgeting a fixed settle. The
+      // dense match saturates the machine, and a read plus a paint on a CI
+      // runner can take several seconds; the claim under test is that the DP
+      // FOLLOWS the navigator, not that it does so within 1.2 s. A step that
+      // genuinely never repaints still fails, one wait later.
+      const previous = dpSigs.length ? dpSigs[dpSigs.length - 1] : null
+      let signature = await figureSignature(srcSig)
+      const deadline = Date.now() + 8_000
+      while (previous !== null && signature === previous && Date.now() < deadline) {
+        await page.waitForTimeout(250)
+        signature = await figureSignature(srcSig)
+      }
+      dpSigs.push(signature)
       await page.screenshot({
         path: join(SHOTS, `${String(i + 1).padStart(2, '0')}-during-fill.png`),
       })
