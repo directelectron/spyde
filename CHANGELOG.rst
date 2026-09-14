@@ -12,6 +12,44 @@ Earlier releases are described by their GitHub release notes and tags.
 
 .. towncrier release notes start
 
+0.5.1 (2026-09-14)
+==================
+
+New Features
+------------
+
+- Strain maps now read in percent strain (lattice rotation in degrees) under a labelled colorbar, over the scan's own calibrated axes with a scale bar — in the live Strain window, the ⌘-tiled comparison and the committed tree alike; the committed tree keeps its diverging colormap and a zero-centred contrast on every node (dragging one histogram handle mirrors the other), each component gets a scale of its own, and the tensor can be expressed in the scan's x/y rather than the detector's — a pink x / gold y arrow pair on the reference pattern that turns by dragging, a Rotation / Flip control in the caret, and a picker that takes the angle and handedness from any DPC result open in the session; committed DPC, orientation, fit-component and virtual-image maps carry the scan calibration too, and DPC component maps say their units on the colorbar.
+
+
+Bug Fixes
+---------
+
+- Opening a Direct Electron ``.de5`` no longer reads the whole datacube into memory (an acquisition stopped early tried to allocate its full planned scan), and its navigator now fills in about 2 s instead of 80 s on a 1 GB 128×64 scan, with a frame read in 0.1 ms. (`#164 <https://github.com/directelectron/spyde/pull/164>`_)
+- A component added from the Fit caret is placed against the spectrum on screen
+  again. Since the curves became an overlay the caret learned the spectrum only
+  from that overlay's own value, which is produced when the navigator runs and
+  not when the caret opens — so a component added before anything moved arrived
+  at the catalogue's default amplitude, five orders of magnitude below the data,
+  and drew as a flat line on the axis.
+
+  Entering a transform view — the Find Vectors detector response, and every
+  overlay that replaces the diffraction pattern with an image of its own — no
+  longer flashes the raw pattern underneath first. The navigator's own frame
+  waits for the transform to say whether it owns the display, and an overlay
+  whose function fails now clears its groups instead of leaving the window on
+  the last image it drew. (`#166 <https://github.com/directelectron/spyde/pull/166>`_)
+
+
+Performance
+-----------
+
+- Distributed batches over a compressed ``.zspy`` decode each chunk with blosc's
+  thread pool inside every dask worker process, where they used to decode
+  single-threaded; on a 4x4-chunk square of a 512x512 float32 scan the navigator
+  sum went from 693 ms to 401 ms and a Find Vectors batch from 1085 ms to 948 ms. (`#157 <https://github.com/directelectron/spyde/pull/157>`_)
+- A lazily opened ``.hspy`` or ``.zspy`` stored in small chunks is now re-blocked at load into ~64 MB dask chunks of whole frames, so a scan written one frame per chunk no longer costs a dask task per frame; the readers ignore ``chunks=``, so this happens by rebuilding the wrap of the stored dataset, which reads nothing. (`#165 <https://github.com/directelectron/spyde/pull/165>`_)
+
+
 0.5.0 (2026-09-11)
 ==================
 

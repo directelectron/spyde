@@ -1,4 +1,0 @@
-Distributed batches over a compressed ``.zspy`` decode each chunk with blosc's
-thread pool inside every dask worker process, where they used to decode
-single-threaded; on a 4x4-chunk square of a 512x512 float32 scan the navigator
-sum went from 693 ms to 401 ms and a Find Vectors batch from 1085 ms to 948 ms.
