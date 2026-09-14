@@ -293,8 +293,15 @@ def strain_map(
     tol: Optional[float] = None,
     min_dspacing: float = 0.7,
     tol_frac: float = 0.2,
+    rotation: float = 0.0,
+    flip: bool = False,
 ) -> "StrainField":
     """Whole-field strain from detected vectors — the app's Strain Mapping.
+
+    ``rotation`` (degrees) and ``flip`` express the result in the SCAN's x/y
+    instead of the detector's kx/ky — the wizard's Rotation / Flip controls,
+    and the same angle and handedness a DPC run finds for the scan
+    (``strain_mapping.rotate_strain_basis``).
 
     The reference lattice, in priority order:
 
@@ -309,7 +316,7 @@ def strain_map(
     """
     from spyde.actions.strain_mapping import (
         cif_g_families, compute_strain_field, default_reference,
-        snap_reference_to_cif, zero_beam_filtered,
+        rotate_strain_basis, snap_reference_to_cif, zero_beam_filtered,
     )
 
     if ref_vectors is None:
@@ -326,11 +333,14 @@ def strain_map(
                                             tol_frac=tol_frac)
 
     sf = compute_strain_field(vectors, ref_vectors=ref_vectors, tol=tol)
+    if rotation or flip:
+        sf = rotate_strain_basis(sf, rotation, flip=flip)
     sf.provenance = _provenance("strain_map", {
         "ref_yx": tuple(ref_yx) if ref_yx is not None else None,
         "cif": str(cif) if cif is not None else None,
         "tol": tol, "min_dspacing": min_dspacing, "tol_frac": tol_frac,
         "n_ref": int(len(ref_vectors)),
+        "rotation": float(rotation), "flip": bool(flip),
     })
     return sf
 

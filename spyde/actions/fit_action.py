@@ -1058,6 +1058,7 @@ class FitWizard(WizardController):
             views=[(n, maps[n]) for n in names[1:]],
             levels=None, cmap="viridis",
             attrs={"fit_spec": self.spec, "fit_result": self.result},
+            source_signal=self.signal,
             provenance={"action": "Fit",
                         "params": {"components": [c.kind for c in self.spec]},
                         "source_title": getattr(

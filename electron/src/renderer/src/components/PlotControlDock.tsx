@@ -248,10 +248,14 @@ function TintButton({ children, onClick, testid, title }: {
   )
 }
 
-function Histogram({ counts, edges, vmin, vmax, threshold, clipped, onClim, onAuto, onReset }:
+function Histogram({ counts, edges, vmin, vmax, threshold, clipped, symmetric, onClim, onAuto, onReset }:
   { counts: number[]; edges: number[]; vmin: number; vmax: number
     threshold?: number | null
     clipped?: boolean
+    // A signed map: the two handles are one number. Dragging either sets the
+    // magnitude and the other mirrors it, so zero stays at the middle of the
+    // diverging colormap.
+    symmetric?: boolean
     onClim: (mn: number, mx: number) => void
     onAuto: () => void
     onReset: () => void }) {
@@ -300,14 +304,17 @@ function Histogram({ counts, edges, vmin, vmax, threshold, clipped, onClim, onAu
       const rect = svgRef.current?.getBoundingClientRect()
       if (!rect) return
       const v = vOf(e.clientX - rect.left)
-      if (drag === 'min') onClim(Math.min(v, vmax), vmax)
+      if (symmetric) {
+        const m = Math.abs(v)
+        onClim(-m, m)
+      } else if (drag === 'min') onClim(Math.min(v, vmax), vmax)
       else onClim(vmin, Math.max(v, vmin))
     }
     const up = () => setDrag(null)
     window.addEventListener('pointermove', move)
     window.addEventListener('pointerup', up, { once: true })
     return () => { window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', up) }
-  }, [drag, vmin, vmax, lo, span])
+  }, [drag, vmin, vmax, lo, span, symmetric])
 
   const handle = (which: 'min' | 'max', v: number) => {
     // PIN the handle inside the widget when its value falls outside the drawn
@@ -597,6 +604,11 @@ export function PlotControlDock() {
   // 'gray' initial, persists across window switches (the backend is the source
   // of truth for what each window actually shows).
   const [cmapSel, setCmapSel] = React.useState('gray')
+  // The backend says what the figure shows with every histogram (a committed
+  // strain map opens in a diverging map the user never picked here).
+  React.useEffect(() => {
+    if (hist?.colormap) setCmapSel(hist.colormap)
+  }, [hist])
   const onColormap = (name: string) => {
     setCmapSel(name)
     if (activeId == null) return
@@ -660,7 +672,8 @@ export function PlotControlDock() {
           <div style={styles.label}>Histogram</div>
           {hist
             ? <Histogram counts={hist.counts} edges={hist.edges} vmin={vmin} vmax={vmax}
-                threshold={hist.threshold} clipped={hist.clipped} onClim={onClim}
+                threshold={hist.threshold} clipped={hist.clipped}
+                symmetric={hist.symmetric} onClim={onClim}
                 onAuto={onAuto} onReset={onReset} />
             : <div style={styles.empty} data-testid="histogram-empty">—</div>}
         </div>

@@ -16,6 +16,45 @@ STRAIN_COMPONENTS: tuple[str, ...] = ("exx", "eyy", "exy", "omega")
 STRAIN_TITLES: dict[str, str] = {
     "exx": "εxx", "eyy": "εyy", "exy": "εxy", "omega": "ω",
 }
+# What a strain map SHOWS. The fit is fractional strain and radians
+# (``StrainField``); the display multiplies by these so the colorbar, the
+# histogram handles and a committed tree all read in percent strain and
+# degrees of rotation — the numbers people quote.
+STRAIN_DISPLAY_SCALE: dict[str, float] = {
+    "exx": 100.0, "eyy": 100.0, "exy": 100.0, "omega": 180.0 / np.pi,
+}
+STRAIN_UNITS: dict[str, str] = {"exx": "%", "eyy": "%", "exy": "%", "omega": "°"}
+
+
+def strain_quantity(component: str) -> str:
+    """What a displayed strain component's numbers are — ``"εxx (%)"``,
+    ``"ω (°)"`` — the colorbar label and the committed ``Signal.quantity``."""
+    return f"{STRAIN_TITLES[component]} ({STRAIN_UNITS[component]})"
+
+
+def symmetric_range(previous, vmin, vmax) -> tuple[float, float]:
+    """Keep a signed map's display range centred on zero.
+
+    The dock's two handles arrive as an ``(vmin, vmax)`` pair; for a quantity
+    whose zero means something the two are one number. Whichever handle the
+    user moved sets the magnitude and the other follows it, so dragging the
+    lower handle inward narrows the range instead of snapping back. With no
+    *previous* range (or both ends changed at once) the larger magnitude wins.
+    """
+    vmin, vmax = float(vmin), float(vmax)
+    if previous is not None:
+        moved_min = abs(vmin - float(previous[0])) > 1e-12
+        moved_max = abs(vmax - float(previous[1])) > 1e-12
+        if moved_min and not moved_max:
+            magnitude = abs(vmin)
+        elif moved_max and not moved_min:
+            magnitude = abs(vmax)
+        else:
+            magnitude = max(abs(vmin), abs(vmax))
+    else:
+        magnitude = max(abs(vmin), abs(vmax))
+    magnitude = magnitude or 1e-9
+    return (-magnitude, magnitude)
 
 
 def robust_map_limits(array: np.ndarray, *, symmetric: bool = False

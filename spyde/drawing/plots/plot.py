@@ -284,6 +284,12 @@ class Plot:
         # marker, so re-emitting one (auto_clim) reproduces the CURRENT marker
         # state instead of silently dropping the line.
         self._last_threshold: float | None = None
+        # The colorbar label last pushed to the figure ("" = no strip). The
+        # sync runs once per painted frame and pushes only when this changes.
+        self._last_colorbar_label: str = ""
+        # The colormap the figure shows, by the dock's name for it — reported
+        # with every histogram so the dock's picker says what is on screen.
+        self._colormap_name: str = "gray"
         self.current_data: np.ndarray | object | None = None
 
         # PlotState management
@@ -990,6 +996,73 @@ class Plot:
         except Exception:
             return None, "px"
 
+    def _display_recipe(self) -> dict:
+        """How the displayed signal asked to be shown — ``metadata.Spyde.display``:
+        ``colormap`` and ``symmetric`` (a signed quantity whose zero belongs at
+        the middle of a diverging map). Stamped by ``commit_result_tree``;
+        empty for anything else."""
+        try:
+            node = self.plot_state.current_signal.metadata.get_item(
+                "Spyde.display", None)
+        except Exception:
+            return {}
+        if node is None:
+            return {}
+        try:
+            return dict(node.as_dictionary()) if hasattr(node, "as_dictionary") \
+                else dict(node)
+        except Exception:
+            return {}
+
+    def _symmetric_contrast(self) -> bool:
+        return bool(self._display_recipe().get("symmetric", False))
+
+    def _display_levels(self, data: np.ndarray) -> tuple[float, float]:
+        """The auto display range for *data* on this plot: the robust band —
+        or, for a signed quantity, a band centred on zero (the 98th percentile
+        of |value|), so a diverging map's white is zero and not the median."""
+        if self._symmetric_contrast():
+            sub = data
+            if sub.ndim == 2 and max(sub.shape) > 512:
+                sub = sub[::max(1, sub.shape[0] // 512), ::max(1, sub.shape[1] // 512)]
+            finite = np.abs(np.asarray(sub, dtype=np.float64))
+            finite = finite[np.isfinite(finite)]
+            magnitude = float(np.percentile(finite, 98)) if finite.size else 1.0
+            magnitude = magnitude or 1.0
+            return (-magnitude, magnitude)
+        return self._robust_levels(data, signal=not self.is_navigator)
+
+    def _sync_value_colorbar(self) -> None:
+        """Draw the colorbar when the displayed signal says what its values
+        are, and only then.
+
+        ``metadata.Signal.quantity`` (hyperspy's convention — "εxx (%)",
+        "Bx (mrad)") becomes the colorbar label and turns the strip on; a
+        signal without one draws no strip, because an unlabelled colorbar is
+        decoration. This runs on the paint path once per frame, so it pushes
+        only when the label actually changes (a node switch), never per frame.
+        A navigator never gets one: it is the selectors' click surface, and
+        any quantity on it is inherited from the root, not measured.
+        """
+        if self._plot2d is None or self.is_navigator:
+            return
+        label = ""
+        try:
+            quantity = self.plot_state.current_signal.metadata.get_item(
+                "Signal.quantity", default="")
+            if quantity:
+                label = _clean_units(quantity)
+        except Exception:
+            label = ""
+        if label == getattr(self, "_last_colorbar_label", ""):
+            return
+        self._last_colorbar_label = label
+        try:
+            self._plot2d.set_colorbar_label(label)
+            self._plot2d.set_colorbar_visible(bool(label))
+        except Exception as e:
+            logger.debug("syncing the value colorbar failed: %s", e)
+
     def _axes_info_1d(self, data: np.ndarray):
         """Return (x_axis, x_units, y_label) for a displayed 1-D signal so the
         anyplotlib line plot draws a calibrated x-axis + an x/y-axis label.
@@ -1201,7 +1274,7 @@ class Plot:
                         and logger.isEnabledFor(logging.DEBUG)):
                     logger.debug("[plot-paint] SIG RE-AUTO-LEVEL on navigated frame "
                                  "(was %s) — this is a contrast flash", self._last_levels)
-                vmin, vmax = self._robust_levels(data, signal=not self.is_navigator)
+                vmin, vmax = self._display_levels(data)
                 self.needs_auto_level = False
                 self._emit_histogram(data, vmin, vmax)
             elif levels is not None:
@@ -1215,7 +1288,7 @@ class Plot:
                 # look wrong as the detector ROI moved).
                 vmin, vmax = self._last_levels
             else:
-                vmin, vmax = self._robust_levels(data, signal=not self.is_navigator)
+                vmin, vmax = self._display_levels(data)
                 self._emit_histogram(data, vmin, vmax)
             self._last_levels = (vmin, vmax)
             if _NAV_PROFILE:
@@ -1233,6 +1306,7 @@ class Plot:
             # flash from a second set_clim).
             tile_mode = False if self.is_navigator else "auto"
             axes, units = self._axes_info(data)
+            self._sync_value_colorbar()
             clim = (vmin, vmax)
             _st = _time.perf_counter() if _NAV_PROFILE else 0.0
             # GPU tile backend: for a LARGE signal frame, do the overview/detail
@@ -1345,7 +1419,7 @@ class Plot:
             # over the whole tail and squashed them back into the left sliver
             # this binning exists to prevent. Stable bins mean Reset moves only
             # the handles, which is all it is asking for.
-            band = (self._robust_levels(data, signal=not self.is_navigator)
+            band = (self._display_levels(data)
                     if getattr(data, "ndim", 0) == 2 else (vmin, vmax))
             lo, hi, clipped = self._hist_range(finite, *band)
             # CLIP rather than restrict the range: np.histogram(range=…) DROPS
@@ -1367,6 +1441,10 @@ class Plot:
                 "data_min": float(np.min(finite)),
                 "data_max": float(np.max(finite)),
                 "clipped": bool(clipped),
+                # The two handles are one number on a signed map, and the
+                # dock's colormap picker follows what the figure shows.
+                "symmetric": self._symmetric_contrast(),
+                "colormap": self._colormap_name,
             }
             # threshold marker: None clears it (raw view), a value draws the line
             msg["threshold"] = None if threshold is None else float(threshold)
@@ -1449,8 +1527,11 @@ class Plot:
             vmin, vmax = float(np.min(finite)), float(np.max(finite))
             if vmax <= vmin:
                 vmax = vmin + 1.0
+            if self._symmetric_contrast():
+                magnitude = max(abs(vmin), abs(vmax)) or 1.0
+                vmin, vmax = -magnitude, magnitude
         else:
-            vmin, vmax = self._robust_levels(data, signal=not self.is_navigator)
+            vmin, vmax = self._display_levels(data)
         self.set_clim(vmin, vmax)
         self.needs_auto_level = False
         self._emit_histogram(data, vmin, vmax, threshold=self._last_threshold)
@@ -1474,6 +1555,7 @@ class Plot:
 
     def set_colormap(self, name: str) -> None:
         resolved = COLORMAPS.get(name, name)
+        self._colormap_name = str(name)
         if self._plot2d is not None:
             self._plot2d.set_colormap(resolved)
         if self.plot_state is not None:
@@ -1481,6 +1563,11 @@ class Plot:
 
     def set_clim(self, vmin: float | None, vmax: float | None) -> None:
         if self._plot2d is not None and vmin is not None and vmax is not None:
+            if self._symmetric_contrast():
+                # A signed map stays centred on zero: the handle that moved
+                # sets the magnitude, the other follows (symmetric_range).
+                from spyde.actions._common import symmetric_range
+                vmin, vmax = symmetric_range(self._last_levels, vmin, vmax)
             self._plot2d.set_clim(float(vmin), float(vmax))
             # Remember the user's contrast so navigator frames keep it (instead of
             # snapping back to the auto levels held from the first frame).
@@ -1609,6 +1696,13 @@ class Plot:
         self.plot_state = new_state
         dims = new_state.dimensions
         self._ensure_figure(dims)
+        # A node committed with a colormap of its own (a diverging map for a
+        # signed result) gets it back on every switch, unless the user has
+        # since picked another for that node.
+        recipe_colormap = self._display_recipe().get("colormap")
+        if (recipe_colormap and new_state.colormap == "gray"
+                and recipe_colormap != self._colormap_name):
+            self.set_colormap(recipe_colormap)
         new_state.show_toolbars()
         # Show the dataset name inside the panel (title strip), now that the
         # active signal is known. Re-applied on every node switch.

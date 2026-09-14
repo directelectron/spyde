@@ -263,25 +263,14 @@ def vi_commit(session, plot, payload) -> None:
     if src_sig is not None:
         src_title = src_sig.metadata.get_item("General.title", "") or ""
 
-    def _calibrate(new_tree):
-        """Copy the SOURCE's spatial nav-axis calibration onto the committed
-        image's signal axes (the VI output lives in navigation space)."""
-        if src_sig is None:
-            return
-        try:
-            nav_axes = list(src_sig.axes_manager.navigation_axes)[-2:]
-            sig_axes = list(new_tree.root.axes_manager.signal_axes)
-            for ax, ref in zip(sig_axes, nav_axes):
-                ax.scale, ax.offset = ref.scale, ref.offset
-                ax.units, ax.name = ref.units, ref.name
-        except Exception as e:
-            log.debug("calibrating committed VI axes failed: %s", e)
-
+    # The image lives in navigation space, so it takes the SOURCE's spatial
+    # scan calibration (the commit funnel picks the spatial pair even on a
+    # time-resolved scan).
     from spyde.actions.commit import commit_result_tree
     commit_result_tree(
         session, title=name or "Virtual Image", primary=data, levels=None,
         provenance={"action": "Virtual Imaging", "item": name,
                     "source_title": src_title},
-        on_tree=_calibrate,
+        source_signal=src_sig,
     )
     emit_status(f"Committed {name} to a new signal tree")

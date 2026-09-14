@@ -243,7 +243,7 @@ def _build_ipf_heatmap(session, src, result, title="Orientation (IPF-Z, live)"):
         attrs={"vector_orientation": result},
         provenance={"action": "Vector Orientation Mapping",
                     "source_title": base},
-        on_tree=_attach,
+        on_tree=_attach, source_signal=src,
     )
 
 
@@ -424,12 +424,21 @@ def _build_result_windows(session, src, result, *, smooth=False, with_ipf=True) 
     if with_ipf:
         _build_ipf_heatmap(session, src, result, title="Orientation (IPF-Z)")
 
-    strain = result.smoothed_strain() if smooth else result.strain
+    import numpy as np
+    from spyde.actions._common import (
+        STRAIN_DISPLAY_SCALE, STRAIN_TITLES, strain_quantity,
+    )
+    strain = np.asarray(result.smoothed_strain() if smooth else result.strain)
+    components = ("exx", "eyy", "exy")
+    # The fit is fractional; the maps read in percent, like the Strain window.
+    maps = {c: strain[..., i] * STRAIN_DISPLAY_SCALE[c]
+            for i, c in enumerate(components)}
     commit_result_tree(
         session, title=f"{base} — Strain",
-        primary=strain[..., 0], primary_label="εxx",
-        views=[("εyy", strain[..., 1]), ("εxy", strain[..., 2])],
-        levels="auto_sym",
+        primary=maps["exx"], primary_label=STRAIN_TITLES["exx"],
+        views=[(STRAIN_TITLES[c], maps[c]) for c in components[1:]],
+        levels="auto_sym", cmap="coolwarm", source_signal=src,
+        value_units={STRAIN_TITLES[c]: strain_quantity(c) for c in components},
         provenance={"action": "Vector Orientation Mapping",
                     "source_title": base, "params": {"smooth": bool(smooth)}},
     )

@@ -114,6 +114,8 @@ export interface Histogram {
   dataMin?: number            // full data extent; the bins may cover less of it
   dataMax?: number
   clipped?: boolean           // bins are robust quantiles — end bins are overflow
+  symmetric?: boolean         // a signed map: the handles mirror about zero
+  colormap?: string           // what the figure shows, so the picker follows
 }
 
 // LogEntry and LOG_MAX are the shell's (@de/shell-renderer/shellState) —
@@ -1069,6 +1071,8 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
               dataMin: msg.data_min,
               dataMax: msg.data_max,
               clipped: msg.clipped ?? false,
+              symmetric: msg.symmetric ?? false,
+              colormap: msg.colormap,
             },
           })
           break
@@ -1339,6 +1343,8 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
         case 'dpc_estimate':
         case 'dpc_result':
         case 'dpc_region':
+        // Strain caret — the rotation/flip taken over from a DPC run.
+        case 'strain_rotation':
         // Cluster telemetry — consumed by the StatusBar DaskMonitor HUD.
         case 'dask_stats':
         // Read-throughput readout — consumed by the StatusBar IoThroughput HUD.

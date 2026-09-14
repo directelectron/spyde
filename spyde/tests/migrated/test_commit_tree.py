@@ -55,11 +55,12 @@ class TestCommitResultTree:
 
         sp = tree.signal_plots[0]
         wid = sp.window_id
-        # Chip views registered with the symmetric locked scale.
+        # Chip views registered, each with its own zero-centred scale.
         data = views._VIEW_DATA[wid]
         assert data["order"] == ["εxx", "εyy", "εxy"]
-        lo, hi = data["levels"]
-        assert lo == -hi and hi >= float(np.abs(exx).max())
+        for label in data["order"]:
+            lo, hi = data["levels"][label]
+            assert lo == -hi and hi > 0
         # The two extra views were emitted as tagged figures.
         tagged = [m for m in window["messages"]
                   if m.get("type") == "figure" and m.get("view_label") in ("εyy", "εxy")]

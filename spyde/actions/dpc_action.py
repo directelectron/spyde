@@ -802,9 +802,12 @@ class DpcWizard(WizardController):
 
     def _open_window(self, result: _dpc.DpcResult) -> None:
         from de_shell.actions.figure_registry import keep_alive
+        from spyde.actions.commit import navigation_extent
         try:
+            scan_axes = navigation_extent(self.signal, self._nav_shape())
             fig, fig_id, html, plot, wheel = _display.build_dpc_figure(
-                result, view=str(self.params["view"]), title=self._title())
+                result, view=str(self.params["view"]), title=self._title(),
+                axes=scan_axes)
         except Exception as e:
             emit_error(f"DPC: building the result window failed: {e}")
             log.exception("DPC window build failed")
@@ -840,14 +843,27 @@ class DpcWizard(WizardController):
         if self.result is None:
             return
         _display.emit_dpc_histogram(self.window_id, self.result,
-                                    str(self.params["view"]), self.clim)
+                                    str(self.params["view"]), self.clim,
+                                    colormap=self.cmap)
 
     # ── plot-widget dock integration (session controller fallback) ───────────
 
     def set_clim(self, vmin, vmax) -> None:
+        """A signed view (a field component, divergence, curl) keeps its range
+        centred on zero: the handle that moved sets it."""
+        from spyde.actions._common import symmetric_range
         try:
-            self.clim = (float(vmin), float(vmax))
-            self.plot.set_clim(*self.clim)
+            view = str(self.params["view"])
+            if view in _display._SIGNED:
+                previous = self.clim
+                if previous is None and self.result is not None:
+                    previous = _display.view_array(self.result, view)[1]
+                self.clim = symmetric_range(previous, vmin, vmax)
+                self.plot.set_clim(*self.clim)
+                self._emit_histogram()
+            else:
+                self.clim = (float(vmin), float(vmax))
+                self.plot.set_clim(*self.clim)
         except Exception as e:                               # pragma: no cover
             log.debug("DPC set_clim failed: %s", e)
 
@@ -1341,6 +1357,11 @@ class DpcWizard(WizardController):
             views=[(titles[c], r.component(c)) for c in _dpc.COMPONENTS],
             levels=None, cmap="coolwarm",
             attrs={"dpc_result": r},
+            # Each component title already names its unit ("Bx (mrad)"), and
+            # that is exactly what its colorbar should say.
+            source_signal=self.signal,
+            value_units={titles[c]: titles[c] for c in _dpc.COMPONENTS},
+            signed={titles[c] for c in _display._SIGNED},
             provenance={
                 "action": "DPC",
                 "params": {**{k: v for k, v in r.params.items()},

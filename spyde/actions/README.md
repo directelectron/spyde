@@ -112,7 +112,14 @@ map, OM live IPF) and `commit_result_tree` (data-ready snapshot — the Commit
 action: primary map as the signal plot, extra maps as chip-selectable views,
 locked symmetric levels for signed components, `attrs` on the tree,
 provenance stamped on `tree._commit_provenance` +
-`metadata.General.spyde_provenance`).
+`metadata.General.spyde_provenance`). Pass `source_signal=` (the scan the maps
+were computed over) so every node draws the scan's calibration and scale bar,
+and `value_units=` (`"εxx (%)"`, `"Bx (mrad)"`, per label or one string) so it
+records what the numbers are — `Signal.quantity`, which the plot draws as its
+colorbar label. `signed=` (implied by `levels="auto_sym"`) marks the views whose
+zero means something: each gets its own zero-centred range, and the plot keeps
+that and the `cmap` through every later node switch and handle drag
+(`Spyde.display`). Maps in pixels with an unlabelled colour scale are a bug.
 
 **The progressive window's SIGNAL half** ([`live_signal.py`](live_signal.py)):
 an `open_result_tree` window that is a navigator **and** a signal plot only

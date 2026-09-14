@@ -24,9 +24,12 @@ from de_shell.actions.figure_registry import keep_alive
 logger = logging.getLogger(__name__)
 
 # window_id → {"images": {label: np.ndarray}, "order": [label,...],
-#              "cmap": str, "levels": (lo, hi) | None}
+#              "cmap": str, "levels": (lo, hi) | None,
+#              "axes": (x, y, units) | None, "value_labels": {label: str}}
 # The source arrays for each named view, so a tiled (multi-axis) figure can be
-# rebuilt for any selected subset without recomputing.
+# rebuilt for any selected subset without recomputing — plus the scan
+# calibration and per-view value label, so the rebuilt panels are labelled
+# the same way the single views are.
 _VIEW_DATA: dict[int, dict] = {}
 
 
@@ -100,10 +103,18 @@ def _wire_pick_widget(widget, image, pick_hook):
 
 
 def register_views(window_id: int, items, *, cmap: str = "gray", levels=None,
-                   append: bool = False, pick_hook=None) -> None:
+                   append: bool = False, pick_hook=None, axes=None,
+                   value_labels=None) -> None:
     """Stash the source arrays for a window's named views so ``tile_views`` can
     rebuild a side-by-side figure for any subset. ``items`` = list of
     ``(label, image)``.
+
+    ``axes`` is the scan calibration ``(x, y, units)`` every view shares and
+    ``value_labels`` maps a label to what its numbers mean (``"εxx (%)"``);
+    both are applied to each panel of the tiled figure by ``calibrate_view``.
+    ``levels`` is one ``(lo, hi)`` for every view, or ``{label: (lo, hi)}``
+    when each view has its own scale (εxx at ±0.5 % beside ω at ±3° would
+    otherwise flatten one of them).
 
     ``append=True`` MERGES into what the window already has instead of replacing
     it — needed when two independent attachers contribute chips to one window
@@ -113,6 +124,8 @@ def register_views(window_id: int, items, *, cmap: str = "gray", levels=None,
     prev = _VIEW_DATA.get(int(window_id)) if append else None
     images = dict(prev["images"]) if prev else {}
     order = list(prev["order"]) if prev else []
+    labels = dict(prev.get("value_labels") or {}) if prev else {}
+    labels.update(value_labels or {})
     for label, image in items:
         images[label] = np.asarray(image)
         if label not in order:
@@ -121,10 +134,39 @@ def register_views(window_id: int, items, *, cmap: str = "gray", levels=None,
         "images": images, "order": order,
         "cmap": (prev or {}).get("cmap", cmap) if append else cmap,
         "levels": (prev or {}).get("levels", levels) if append else levels,
+        "axes": axes if axes is not None else (prev or {}).get("axes"),
+        "value_labels": labels,
         # Carried so the TILED comparison figure gets the same pick behaviour
         # its single-view siblings have.
         "pick_hook": pick_hook or ((prev or {}).get("pick_hook") if append else None),
     }
+
+
+def calibrate_view(plot2d, image, axes=None, value_label: str = "") -> None:
+    """Label a view figure the way the app's own plots are labelled.
+
+    ``axes`` = ``(x, y, units)`` from ``commit.navigation_extent`` gives the map
+    calibrated ticks and a scale bar; ``value_label`` (what the numbers are —
+    ``"εxx (%)"``) turns the colorbar on with that label. Either may be absent;
+    an RGB image never gets a colorbar (it is a picture, not a measurement).
+    """
+    if plot2d is None:
+        return
+    img = np.asarray(image)
+    if axes is not None:
+        x, y, units = axes
+        if len(x) == img.shape[1] and len(y) == img.shape[0]:
+            try:
+                plot2d.set_extent(x, y, units=units)
+            except Exception as e:
+                logger.debug("calibrating a view figure failed: %s", e)
+    rgb = img.ndim == 3 and img.shape[-1] in (3, 4)
+    if value_label and not rgb:
+        try:
+            plot2d.set_colorbar_label(str(value_label))
+            plot2d.set_colorbar_visible(True)
+        except Exception as e:
+            logger.debug("labelling a view colorbar failed: %s", e)
 
 
 def _imshow_view(ax, image, cmap, levels):
@@ -143,9 +185,12 @@ def _imshow_view(ax, image, cmap, levels):
 
 def emit_view_figure(window_id: int, image, label: str, *, kind: str = "2d",
                      cmap: str = "gray", levels=None, pick_hook=None,
-                     key=None) -> str | None:
+                     key=None, axes=None, value_label: str = "") -> str | None:
     """Emit a single-axis map figure tagged as the named view ``label``. Returns
     the fig id (or None on failure).
+
+    ``axes`` and ``value_label`` label the figure — scan calibration and a
+    colorbar — see :func:`calibrate_view`.
 
     ``pick_hook(iy, ix)`` adds a white pick crosshair to this view (see
     :func:`_wire_pick`).
@@ -162,9 +207,10 @@ def emit_view_figure(window_id: int, image, label: str, *, kind: str = "2d",
         from spyde.drawing.plots.plot import finalize_figure_html
         from de_shell.ipc import emit
 
-        fig, axes = apl.subplots(1, 1)
-        ax = axes[0][0] if isinstance(axes, list) else axes
+        fig, figure_axes = apl.subplots(1, 1)
+        ax = figure_axes[0][0] if isinstance(figure_axes, list) else figure_axes
         p = _imshow_view(ax, image, cmap, levels)
+        calibrate_view(p, image, axes, value_label)
         _wire_pick(p, image, pick_hook)
         if key is not None and getattr(p, "add_key", None) is not None:
             rgba, key_labels = key
@@ -251,11 +297,14 @@ def build_tiled_figure(window_id: int, labels):
 
     cmap, levels = data.get("cmap", "gray"), data.get("levels")
     pick_hook = data.get("pick_hook")
+    scan_axes, value_labels = data.get("axes"), data.get("value_labels") or {}
     fig, axes = apl.subplots(1, len(pairs), sharex=True, sharey=True)
     arr = np.array(axes, dtype=object).ravel()
     widgets = []
     for ax, (label, image) in zip(arr, pairs):
-        p = _imshow_view(ax, image, cmap, levels)
+        own_levels = levels.get(label) if isinstance(levels, dict) else levels
+        p = _imshow_view(ax, image, cmap, own_levels)
+        calibrate_view(p, image, scan_axes, value_labels.get(label, ""))
         try:
             ax.set_title(label)
         except Exception as e:
