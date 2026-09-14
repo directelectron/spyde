@@ -10,12 +10,11 @@ process-wide lock. ``Blosc.encode``, ``Blosc.decode`` and
 ``Blosc.decode_partial`` look those names up in the module at call time, so
 every zarr read and write in THIS process goes through the wrappers.
 
-This process only. Dask's workers are separate processes, spawned by
-``LocalCluster``, and nothing in them calls ``ensure_heavy_imports``, so they
-never see this patch: they keep numcodecs' default, which off the main thread
-is the single-threaded path that never touches the global pool. They need no
-lock and decode exactly as they did. The batch numbers below were measured on
-dask's threaded scheduler, in this process, which is where the patch applies.
+Applied twice: by ``ensure_heavy_imports`` in the backend process, and by the
+worker plugin (``dask_manager._WorkerTuningPlugin.setup``) in every dask worker
+process, which is a separate spawned process with its own pool and its own
+lock. Every task in a worker runs on a worker thread, so without the plugin a
+worker decodes single-threaded and the batch's parallelism is dask's alone.
 
 ``SPYDE_BLOSC_THREADS=0`` applies nothing, which is the A/B switch. Unset uses
 :data:`DEFAULT_THREAD_COUNT`; any other number sets that thread count.
@@ -103,13 +102,14 @@ def _serialised(function):
     return call
 
 
-def apply() -> bool:
+def apply(count: int | None = None) -> bool:
     """Idempotently turn blosc's thread pool on for every thread and serialise
-    access to it. Returns True if the wrappers are in place, False if the
-    switch is off or the upstream shape changed and it was skipped."""
-    count = thread_count()
-    if count is None:
+    access to it. ``count`` sizes the pool; None takes the environment's setting.
+    Returns True if the wrappers are in place, False if the switch is off or the
+    upstream shape changed and it was skipped."""
+    if thread_count() is None:
         return False
+    count = thread_count() if count is None else max(1, int(count))
     try:
         import numcodecs.blosc as blosc
     except Exception as e:
@@ -121,18 +121,18 @@ def apply() -> bool:
             log.warning("spyde.external.numcodecs: numcodecs.blosc has no %s; "
                         "skipping the thread-pool patch", name)
             return False
-    if getattr(blosc.decompress, MARKER, False):
-        return True
-
-    blosc.compress = _serialised(blosc.compress)
-    blosc.decompress = _serialised(blosc.decompress)
-    # Blosc.decode_partial's route to the same pool. zarr 2 calls it only with
-    # partial decompression enabled, which is off by default, and older
-    # numcodecs may not have it at all.
-    if hasattr(blosc, "decompress_partial"):
-        blosc.decompress_partial = _serialised(blosc.decompress_partial)
+    # The pool settings go first, so a process whose wrappers are already in
+    # place (numcodecs resets use_threads in a forked child) still ends up with
+    # the pool on and at this count.
     blosc.use_threads = True
     blosc.set_nthreads(count)
+    for name in ("compress", "decompress", "decompress_partial"):
+        # decompress_partial is Blosc.decode_partial's route to the same pool;
+        # zarr 2 calls it only with partial decompression on, and older
+        # numcodecs may not have it at all.
+        function = getattr(blosc, name, None)
+        if function is not None and not getattr(function, MARKER, False):
+            setattr(blosc, name, _serialised(function))
     log.debug("spyde.external.numcodecs: blosc pool on with %d threads, "
               "serialised", count)
     return True
