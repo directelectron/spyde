@@ -337,6 +337,12 @@ class Plot:
         self._overlay_values: Dict = {}          # the last value drawn here
         self._overlay_curve_styles: Dict = {}    # what each curve was built with
         self._live_transform_groups: set = set()  # showing an image, so no base
+        # Transform groups that have delivered a value, live or cleared. One
+        # that has not is still deciding whether it owns the display, and the
+        # base frame waits for it -- see `_transform_awaited`.
+        self._transform_groups_answered: set = set()
+        # (id(node), group) -> node, for the transform groups registered here.
+        self._transform_groups_expected: Dict = {}
         self._transform_image: "np.ndarray | None" = None
 
         # anyplotlib figure + plot objects
@@ -587,6 +593,8 @@ class Plot:
         can be built, and a ``transform`` and a ``mask`` draw through the base
         image, so all three register the group with no handle yet."""
         key = (id(node), name)
+        if kind == "transform":
+            self._transform_groups_expected[key] = node
         if key in self._overlay_groups:
             return
         # Marker values are in image pixel coordinates, which is what the
@@ -626,6 +634,10 @@ class Plot:
         as the node goes, without waiting for a navigator move."""
         was_live = {k for k in self._live_transform_groups if k[0] == id(node)}
         self._live_transform_groups -= was_live
+        self._transform_groups_answered -= {
+            k for k in self._transform_groups_answered if k[0] == id(node)}
+        for key in [k for k in self._transform_groups_expected if k[0] == id(node)]:
+            del self._transform_groups_expected[key]
         self._overlay_values.pop(id(node), None)
         for key in [k for k in self._overlay_curve_styles if k[0] == id(node)]:
             del self._overlay_curve_styles[key]
@@ -683,7 +695,8 @@ class Plot:
             pending = self._pending_overlay_values
             self._pending_overlay_values = {}
         painted = False
-        if base is not None and not self._transform_live_after(pending):
+        if (base is not None and not self._transform_live_after(pending)
+                and not self._transform_awaited(pending)):
             self._set_array(base)
             painted = True
         if pending:
@@ -705,6 +718,26 @@ class Plot:
                 else:
                     live.add(key)
         return bool(live)
+
+    def _transform_awaited(self, pending) -> bool:
+        """Whether a transform group on this plot has yet to say whether it
+        owns the display.
+
+        `_transform_live_after` answers for a group that has delivered. A group
+        that has not is the gap this closes: a base frame reaching the painter
+        between a transform overlay being attached and its first value arriving
+        was painted raw, which is the pattern flashing under the transform on
+        the way in. The group answers either way -- an evaluation that draws
+        nothing clears it, and one that fails clears it too (see
+        `drawing.overlays.refresh_overlays`) -- so nothing waits forever.
+        """
+        answered = set(self._transform_groups_answered)
+        answered.update((id(node), name)
+                        for node, _value in pending.values()
+                        for name, (kind, _style) in node.groups.items()
+                        if kind == "transform")
+        return any(key not in answered and node.attached and node.visible
+                   for key, node in self._transform_groups_expected.items())
 
     def _apply_pending_overlays(self, pending, base_painted: bool = False) -> None:
         """Push staged overlay values to their groups. Runs on the painter
@@ -783,6 +816,7 @@ class Plot:
         elif kind == "layer":
             self._push_overlay_layer(key, declared, data, style)
         elif kind == "transform":
+            self._transform_groups_answered.add(key)
             if data is None:
                 self._live_transform_groups.discard(key)
                 self._transform_image = None

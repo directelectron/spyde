@@ -330,6 +330,7 @@ class TestPreviewTransformView:
         plot = _Plot()
         plot._overlay_groups = {(id(node), "transform"): None}
         plot._live_transform_groups = set()
+        plot._transform_groups_answered = set()
         image = np.zeros((8, 8), np.float32)
         key = (id(node), "transform")
 
@@ -338,6 +339,8 @@ class TestPreviewTransformView:
         assert painted == [((8, 8), (0.3, 1.0))]
         assert plot.needs_auto_level is False
         assert key in plot._live_transform_groups
+        # Answered, so the base frame stops waiting on it.
+        assert key in plot._transform_groups_answered
 
         # A bare array is still a transform value; it just brings no levels.
         Plot._push_overlay_group(plot, node, "transform", "transform", image)
@@ -347,6 +350,9 @@ class TestPreviewTransformView:
         Plot._push_overlay_group(plot, node, "transform", "transform", None)
         assert not bool(plot._live_transform_groups)
         assert restored == [(8, 8)]
+        # Drawing nothing is still an answer: the base must not wait on a
+        # transform that has decided it is showing nothing.
+        assert key in plot._transform_groups_answered
 
 
 class TestPreviewHistogram:

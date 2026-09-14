@@ -65,6 +65,13 @@ def refresh_overlays(plot, indices, integrating: bool = False) -> None:
                 plot.enqueue_overlay(node, reader.read_frame(at))
         except Exception as e:
             log.debug("overlay %s did not evaluate at %s: %s", node.name, at, e)
+            # Draw nothing rather than leave the groups unanswered: a transform
+            # group that never answers holds the base frame back for good
+            # (Plot._transform_awaited).
+            try:
+                plot.enqueue_overlay(node, {})
+            except Exception as clear_error:
+                log.debug("clearing overlay %s failed: %s", node.name, clear_error)
 
 
 def _runs_off_the_dispatcher(plot, node, index) -> bool:
