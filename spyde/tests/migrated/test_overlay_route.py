@@ -622,6 +622,51 @@ class TestTransformOrdering:
         finally:
             session.shutdown()
 
+    def test_a_paint_arriving_before_the_first_value_still_waits(self):
+        """The painter runs on its own thread, and `_run_update` stages the
+        base frame before it evaluates the overlays — so a pass can reach the
+        painter with nothing staged and the transform not yet live. It used to
+        paint the raw pattern there, about one move in three on this machine.
+        A transform group that has not answered holds the base back."""
+        session, plot = _open_session(_off_centre_lazy())
+        try:
+            tree = plot.signal_tree
+            response = np.ones((32, 32), np.float32)
+            node = self._transform_overlay(tree, response)
+            pushed = self._painted(plot)
+
+            # The pass the navigator would have woken, with the overlay
+            # attached and not yet evaluated: exactly the losing interleaving.
+            plot.paint_pass(np.zeros((32, 32), np.float32))
+            assert pushed == [], "the raw pattern was painted under the transform"
+
+            _move_navigator(session, tree)
+            assert _wait(lambda: pushed, 10), "nothing was painted"
+            assert all(np.array_equal(one, response) for one in pushed)
+            assert node.visible
+        finally:
+            session.shutdown()
+
+    def test_a_transform_that_cannot_evaluate_hands_the_frame_back(self):
+        """Nothing may wait on a transform for good. An overlay whose function
+        raises clears its groups, so the base frame paints instead of the
+        window staying on whatever was last up."""
+        session, plot = _open_session(_off_centre_lazy())
+        try:
+            tree = plot.signal_tree
+
+            def detector(frame, *, show):
+                raise RuntimeError("no response today")
+
+            tree.add_overlay(tree.root, detector, name="detector",
+                             groups={"response": ("transform", {})},
+                             static={"show": True})
+            pushed = self._painted(plot)
+            _move_navigator(session, tree)
+            assert _wait(lambda: pushed, 10), "the base frame never came back"
+        finally:
+            session.shutdown()
+
     def test_leaving_it_paints_the_raw_frame_once(self):
         session, plot = _open_session(_off_centre_lazy())
         try:

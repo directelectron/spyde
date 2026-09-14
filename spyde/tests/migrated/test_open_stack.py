@@ -215,9 +215,13 @@ class TestFindVectorsPreviewOnStack:
             drop_reader(plot, node.signal)
 
             value = reader_for_overlay(plot, node).read_frame((1, 4, 4))
-            # The navigator may also be drawing this overlay; take the window
-            # built for the position asked for here.
-            window, centre = next(w for w in windows if w[1] == (0, 3, 3))
+            # The navigator may also be drawing this overlay, and every
+            # interior position has the same centre -- so the window is
+            # identified by the frames in it, which are this position's alone.
+            asked_for = data[1:2, 1:8, 1:8]
+            window, centre = next(w for w in windows
+                                  if np.array_equal(w[0], asked_for))
+            assert centre == (0, 3, 3)
             assert window.shape == (1, 7, 7, 16, 16), window.shape
 
             # The same window without its (single) time axis is the 4-D call.
