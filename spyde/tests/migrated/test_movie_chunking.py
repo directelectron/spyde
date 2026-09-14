@@ -266,3 +266,77 @@ class TestLoadAligned:
         got = Session.load_aligned(str(p))
         got = got[0] if isinstance(got, list) else got
         assert got.data.chunks is not None
+
+
+class TestReblockSmallStorageChunks:
+    """A file stored in tiny whole-frame chunks is re-blocked at load.
+
+    The HDF5 and zarr readers ignore ``chunks=`` and hand dask the file's own
+    grid. A camera that writes one 128 KB frame per chunk therefore gave a 1 GB
+    scan 24,577 dask tasks and an ~80 s navigator fill. ``load_aligned`` now
+    rebuilds the ``da.from_array`` wrap of the stored dataset with ~64 MB blocks
+    of whole frames, a graph rebuild that reads nothing; the per-frame reader
+    keeps going to the dataset directly, so it still resolves afterwards.
+    """
+
+    def _scan(self, chunks, nav=(32, 32), frame=(256, 256), dtype=np.uint16):
+        arr = da.zeros(nav + frame, dtype=dtype, chunks=chunks + frame)
+        s = hs.signals.Signal2D(arr).as_lazy()
+        s.axes_manager.navigation_axes[0].name = "x"
+        return s
+
+    def test_one_frame_per_chunk_scan_is_flagged(self):
+        ch = Session._signal_spanning_chunks(self._scan((1, 1)))
+        assert ch is not None
+        assert ch[-2:] == (-1, -1) and all(c > 1 for c in ch[:2])
+
+    def test_an_eighth_of_the_target_is_left_alone(self):
+        # 8 x 8 frames of 128 KB = 8 MB, exactly the floor: not tiny.
+        assert Session._signal_spanning_chunks(self._scan((8, 8))) is None
+
+    def test_a_small_frame_movie_keeps_one_frame_per_chunk(self):
+        s = _lazy_2d_signal(200, (256, 256), dtype=np.uint16, chunks=(1, 256, 256))
+        s.axes_manager.navigation_axes[0].name = "time"
+        s.axes_manager.navigation_axes[0].units = "s"
+        assert Session._signal_spanning_chunks(s) is None
+
+    def test_a_scan_that_fits_in_one_chunk_is_left_alone(self):
+        # 6 x 6 frames of 8 KB is 288 KB: tiny, but the nav rule would propose
+        # the same single block the reader already has.
+        s = self._scan((6, 6), nav=(6, 6), frame=(64, 64))
+        assert Session._signal_spanning_chunks(s) is None
+
+    def test_block_bytes_are_capped_at_the_target(self):
+        # 32 x 32 frames of 2 MB would be a 2 GB block; halving the largest nav
+        # axis until it fits gives 64 MB, never more, never a split frame.
+        block = Session._cap_block_bytes((32, 32, -1, -1), (64, 64, 1024, 1024), 2)
+        assert block[-2:] == (1024, 1024)
+        block_bytes = np.prod(block) * 2
+        assert Session._CHUNK_TARGET_BYTES // 2 < block_bytes <= Session._CHUNK_TARGET_BYTES
+
+    def _saved(self, tmp_path, name, chunks):
+        from spyde.array_cache.readers.source_array import find_source_array
+        data = np.arange(16 * 16 * 64 * 64, dtype=np.uint16).reshape(16, 16, 64, 64)
+        path = str(tmp_path / name)
+        hs.signals.Signal2D(data).save(path, chunks=chunks)
+        got = Session.load_aligned(path)
+        got = got[0] if isinstance(got, list) else got
+        return data, got, find_source_array(got.data)
+
+    def test_hspy_stored_per_frame_is_reblocked_and_still_file_backed(self, tmp_path):
+        data, got, source = self._saved(tmp_path, "per_frame.hspy", (1, 1, 64, 64))
+        assert got.data.npartitions == 1
+        assert source is not None and not isinstance(source, np.ndarray)
+        np.testing.assert_array_equal(got.data.compute(), data)
+
+    def test_zspy_stored_per_frame_is_reblocked_too(self, tmp_path):
+        data, got, source = self._saved(tmp_path, "per_frame.zspy", (1, 1, 64, 64))
+        assert got.data.npartitions == 1
+        assert source is not None and not isinstance(source, np.ndarray)
+        np.testing.assert_array_equal(got.data.compute(), data)
+
+    def test_hspy_with_split_frames_is_rebuilt_not_left_split(self, tmp_path):
+        data, got, source = self._saved(tmp_path, "split.hspy", (4, 4, 32, 64))
+        assert all(len(c) == 1 for c in got.data.chunks[2:])
+        assert source is not None
+        np.testing.assert_array_equal(got.data.compute(), data)
