@@ -8,6 +8,15 @@ from __future__ import annotations
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def leave_this_process_alone(monkeypatch):
+    """`setup` is a WORKER's startup: it also drops the process to background
+    priority and stubs psutil's net counters, neither of which it undoes. In a
+    worker that is the point; in the test runner it slows every test that comes
+    after, which is how a timing-sensitive test elsewhere in the shard fails."""
+    monkeypatch.setenv("SPYDE_WORKER_PRIORITY", "normal")
+
+
 @pytest.fixture
 def unpatched(monkeypatch):
     """numcodecs' blosc module with the wrappers removed, restored after."""
