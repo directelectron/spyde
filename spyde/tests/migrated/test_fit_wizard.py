@@ -1421,16 +1421,62 @@ class TestFitsWhatIsOnScreen:
 
     def test_fit_current_refuses_before_a_spectrum_is_drawn(self, window,
                                                             fitted):
-        """Better a refusal than a fit against a spectrum nobody chose."""
+        """Better a refusal than a fit against a spectrum nobody chose.
+
+        Nothing drawn means BOTH: no delivery from the curves, and no frame on
+        the plot either. A window that is displaying a spectrum has one the
+        user chose, whether or not the overlay has run yet."""
         from spyde.actions.fit_action import fit_current
         session, plot, tree, _ = fitted
         fit_open(session, plot, {})
         fit_add_component(session, plot, {"kind": "Offset"})
         wiz = tree._fit_wizard
         wiz.spectrum = None
+        plot.current_data = None
         fit_current(session, plot, {})
         assert any("spectrum" in (m.get("text") or "").lower()
                    for m in _messages_of(window, "error"))
+
+
+class TestAComponentIsPlacedBeforeTheCurvesHaveRun:
+    """Adding a component must not wait on the curves overlay.
+
+    The overlay is evaluated only when the navigator runs, and opening the
+    caret does not run it - so the caret's own record of the spectrum is None
+    until something moves. A component placed against nothing arrives at the
+    catalogue's default amplitude, which against counts of 1e5 draws as a flat
+    line on the axis and reads as "the model does nothing".
+    """
+
+    def test_a_background_is_seeded_with_no_delivery(self, window, fitted):
+        session, plot, tree, _ = fitted
+        fit_open(session, plot, {})
+        wiz = tree._fit_wizard
+        wiz.spectrum = None                    # nothing has been delivered
+        fit_add_component(session, plot, {"kind": "PowerLaw"})
+        assert wiz.spec["PowerLaw"]["A"].value > 1.0
+
+    def test_a_peak_is_scaled_with_no_delivery(self, window, fitted):
+        session, plot, tree, _ = fitted
+        fit_open(session, plot, {})
+        wiz = tree._fit_wizard
+        wiz.spectrum = None
+        fit_add_component(session, plot, {"kind": "Gaussian"})
+        assert wiz.spec["Gaussian"]["A"].value > 1.0
+
+    def test_nothing_painted_either_still_places_the_component(self, window,
+                                                               fitted):
+        """The window has not drawn its first frame yet. Placement falls back
+        to the first navigation position rather than leaving the component at
+        its default."""
+        session, plot, tree, _ = fitted
+        fit_open(session, plot, {})
+        wiz = tree._fit_wizard
+        wiz.spectrum = None
+        plot.current_data = None
+        fit_add_component(session, plot, {"kind": "Offset"})
+        assert wiz.spec["Offset"]["offset"].value != pytest.approx(0.0)
+
 
 def _navigate(wiz, index, spectrum=None):
     """Stand in for one delivery of the curves overlay.
@@ -1607,6 +1653,12 @@ class TestTheDeliveryIsMarshalled:
         fit_open(session, plot, {})
         fit_add_component(session, plot, {"kind": "Offset"})
         wiz = tree._fit_wizard
+        # Take the live curves off the tree: these tests hand `_drew` one
+        # delivery and then read what it left behind, and a real delivery from
+        # the navigator lands on the same fields.
+        if wiz._curves is not None:
+            tree.remove_overlay(wiz._curves)
+            wiz._curves = None
         wiz.session = _QueueingSession(session)
         return wiz
 

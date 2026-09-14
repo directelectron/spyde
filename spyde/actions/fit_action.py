@@ -415,6 +415,50 @@ class FitWizard(WizardController):
     def axis(self) -> np.ndarray:
         return np.asarray(self.signal.axes_manager.signal_axes[0].axis, float)
 
+    def displayed_spectrum(self):
+        """The spectrum ON SCREEN, or None when nothing has been painted.
+
+        The curves' own delivery is the authority when there has been one: the
+        model was drawn against that array, so the caret and the drawing cannot
+        disagree about which spectrum is being fitted. The overlay is evaluated
+        only when the navigator runs though, and opening the caret does not run
+        it, so a caret opened on a dataset nobody has scrubbed has had no
+        delivery at all. ``plot.current_data`` is the frame the plot is
+        displaying, already resolved through whatever navigator or region path
+        produced it, and it is there from the first paint.
+        """
+        width = len(self.axis())
+        for candidate in (self.spectrum,
+                          getattr(self.plot, "current_data", None)):
+            if candidate is None:
+                continue
+            row = np.asarray(candidate, float).squeeze()
+            if row.ndim == 1 and row.size == width:
+                return row
+        return None
+
+    def placement_spectrum(self) -> np.ndarray:
+        """What a component being ADDED is placed and scaled against.
+
+        A component has to arrive at the data's order of magnitude or it draws
+        as a flat line on the axis and reads as "the model does nothing", so
+        placement always gets a spectrum. Before the first paint that is the
+        first navigation position, which is one real spectrum at the right
+        magnitude rather than a whole-scan mean nobody can afford to read.
+
+        A FIT gets no such stand-in: ``fit_current`` refuses rather than fit
+        against a spectrum nobody chose.
+        """
+        shown = self.displayed_spectrum()
+        if shown is not None:
+            return shown
+        data = self.signal.data
+        if getattr(data, "ndim", 1) > 1:
+            log.debug("nothing painted yet - placing against the first "
+                      "navigation position")
+            data = data[(0,) * (data.ndim - 1)]
+        return np.asarray(data, float).squeeze()
+
     # -- the curves, and where they were drawn ----------------------------
     def attach_curves(self) -> None:
         """Draw the model on the spectrum, at the navigator's position.
@@ -1546,8 +1590,8 @@ def fit_add_component(session, plot, payload) -> None:
     # Put it on THIS spectrum, or the component arrives five orders of
     # magnitude below the data and looks like it does nothing. A background
     # needs its shape solved through the data, not just its amplitude scaled.
-    spectrum = wiz.spectrum
-    if spectrum is not None and not seed_background(cspec, x, spectrum):
+    spectrum = wiz.placement_spectrum()
+    if not seed_background(cspec, x, spectrum):
         scale_to_data(cspec, x, spectrum)
     # Two of a kind must not start in the same place (degenerate, unfittable)
     # and no peak may wander off the data.
@@ -1717,12 +1761,13 @@ def fit_current(session, plot, payload=None) -> None:
                        f"implementation yet")
         return
 
-    if wiz.spectrum is None:
+    spectrum = wiz.displayed_spectrum()
+    if spectrum is None:
         ipc.emit_error("Fit: no spectrum on screen yet")
         return
     try:
         values, chisq, status = fit_one_spectrum(
-            wiz.spec, wiz.spectrum, wiz.axis(),
+            wiz.spec, spectrum, wiz.axis(),
             max_iter=int((payload or {}).get("max_iter", 120)))
         # Write the fitted values back into the MODEL so the caret, the handles
         # and the next fit all start from them. This is the difference between
