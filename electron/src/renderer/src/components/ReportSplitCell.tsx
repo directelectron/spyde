@@ -29,47 +29,22 @@
  * reorder ⠿ handle + the layout switch. NO slide-toggle chrome (removed in the
  * Wave B de-clutter; slide roles are re-surfaced slide-natively in Wave C).
  */
-import React, { useEffect, useLayoutEffect, useRef, useState } from 'react'
+import React, { useEffect, useRef, useState } from 'react'
 import { useSpyDE } from '../kernel/SpyDEContext'
 import { renderMarkdown } from '../kernel/markdown'
 import { reportClipboard } from '../kernel/reportClipboard'
 import type { ReportCell } from '../kernel/protocol'
-import { FIGURE_DRAG_MIME, WINDOW_DRAG_MIME, peekWindowDrag } from '../kernel/dnd'
+import { FIGURE_DRAG_MIME, WINDOW_DRAG_MIME, figurePayloadFromDrop } from '../kernel/dnd'
 import { AnchoredMenu } from './AnchoredMenu'
 import { CellChrome } from './CellChrome'
 import { AddFigureMenu } from './AddFigureMenu'
+import { MarkdownPane } from './ReportCell'
 import { SeamlessFigureFrame, FigureEditOverlay } from './ReportFigureCell'
 import { ComposeZones, ZONE_TILE, hoverZoneAt, type HoverZone } from './composeDrop'
 import { dlog, dlogOnce } from '../kernel/dragDiag'
 
 const DROP_MIMES = [FIGURE_DRAG_MIME, WINDOW_DRAG_MIME]
 const isComposeDrag = (dt: DataTransfer) => DROP_MIMES.some(m => dt.types.includes(m))
-
-/** The figure payload of a pill drop: the source window id (+ the shown figure
- *  id / view tag when the FIGURE_DRAG_MIME payload carries them).
- *
- *  Falls back to the in-process stash when `getData()` returns nothing — see
- *  ReportFigureCell's copy and dnd.ts for why that happens. */
-interface DropFigurePayload { windowId: number; figId?: string; view?: string }
-function figurePayloadFromDrop(dt: DataTransfer): DropFigurePayload | null {
-  const fig = dt.getData(FIGURE_DRAG_MIME)
-  if (fig) {
-    try {
-      const { windowId, figId, view } = JSON.parse(fig) as {
-        windowId?: number; figId?: string; view?: string
-      }
-      if (typeof windowId === 'number') return { windowId, figId, view }
-    } catch { /* malformed */ }
-  }
-  const win = dt.getData(WINDOW_DRAG_MIME)
-  if (win) {
-    const n = parseInt(win, 10)
-    if (Number.isFinite(n)) return { windowId: n }
-  }
-  const stashed = peekWindowDrag()
-  if (stashed) return stashed
-  return null
-}
 
 interface Props {
   cell: ReportCell
@@ -95,9 +70,7 @@ interface Props {
 export function ReportSplitCell({ cell, onRemove, index, dragProps, reorderActive }: Props) {
   const { state, iframeRefs, replayState, sendAction, dragKind } = useSpyDE()
   const [hover, setHover] = useState(false)
-  const [editing, setEditing] = useState(false)
   const [figEditOpen, setFigEditOpen] = useState(false)
-  const [draft, setDraft] = useState(cell.source ?? '')
   const [dropHover, setDropHover] = useState(false)
   // Which compose zone the cursor is over the FILLED figure side (null = none).
   // A split block's figure is a first-class report figure, so dropping a second
@@ -106,7 +79,6 @@ export function ReportSplitCell({ cell, onRemove, index, dragProps, reorderActiv
   const [hoverZone, setHoverZone] = useState<HoverZone | null>(null)
   // The ＋ chrome button's window picker (the click path to a subplot grid).
   const [addMenu, setAddMenu] = useState(false)
-  const taRef = useRef<HTMLTextAreaElement>(null)
   const rootRef = useRef<HTMLDivElement>(null)
 
   // Drop the stale highlight as soon as the drag ends (the shield unmounts).
@@ -129,18 +101,6 @@ export function ReportSplitCell({ cell, onRemove, index, dragProps, reorderActiv
   const fig = state.reportFigures.get(cell.id)
   const hasImage = !empty && !cell.figure && !!cell.image
   const isLive = !empty && !!cell.figure && !!fig
-
-  // Keep the text draft in sync when the backing source changes and we're not
-  // actively editing (a live report_state update from elsewhere).
-  useEffect(() => { if (!editing) setDraft(cell.source ?? '') }, [cell.source, editing])
-
-  // Autosize the textarea to its content.
-  useLayoutEffect(() => {
-    const ta = taRef.current
-    if (!ta || !editing) return
-    ta.style.height = 'auto'
-    ta.style.height = `${ta.scrollHeight}px`
-  }, [draft, editing])
 
   // Figure-side actions — available only when the figure side is a live FIGURE
   // (not a photo, not an empty drop zone). The backend admits a split's figure
@@ -180,18 +140,7 @@ export function ReportSplitCell({ cell, onRemove, index, dragProps, reorderActiv
   const [figHover, setFigHover] = useState(false)
   const removeFigure = () => sendAction('report_split_remove_figure', { cell_id: cell.id })
 
-  const commitText = () => {
-    setEditing(false)
-    if (draft !== (cell.source ?? '')) {
-      sendAction('report_update_cell', {
-        cell_id: cell.id, source: draft, html: renderMarkdown(draft),
-      })
-    }
-  }
-  const revertText = () => { setDraft(cell.source ?? ''); setEditing(false) }
-
   const rendered = React.useMemo(() => renderMarkdown(cell.source ?? ''), [cell.source])
-  const textEmpty = !(cell.source ?? '').trim()
 
   // ── Layout switch (a dropdown picker: 4 arrangements) ─────────────────────
   const setLayout = (l: Layout) => {
@@ -287,38 +236,14 @@ export function ReportSplitCell({ cell, onRemove, index, dragProps, reorderActiv
   // ── The two panes ─────────────────────────────────────────────────────────
   const textPane = (
     <div style={styles.pane} data-testid={`report-split-text-${cell.id}`}>
-      {editing ? (
-        <textarea
-          ref={taRef}
-          data-testid={`report-split-textarea-${cell.id}`}
-          style={styles.textarea}
-          value={draft}
-          autoFocus
-          spellCheck={false}
-          placeholder="Write markdown…  ($x^2$ and $$…$$ render as math)"
-          onChange={(e) => setDraft(e.target.value)}
-          onBlur={commitText}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter' && (e.ctrlKey || e.metaKey || e.shiftKey)) {
-              e.preventDefault(); (e.target as HTMLTextAreaElement).blur()
-            } else if (e.key === 'Escape') {
-              e.preventDefault(); revertText()
-            }
-          }}
-        />
-      ) : (
-        <div
-          data-testid={`report-split-rendered-${cell.id}`}
-          className="spyde-md"
-          onDoubleClick={() => { setDraft(cell.source ?? ''); setEditing(true) }}
-          title="Double-click to edit"
-          style={styles.rendered}
-        >
-          {textEmpty
-            ? <span style={styles.emptyHint}>Empty text side — double-click to edit</span>
-            : <span dangerouslySetInnerHTML={{ __html: rendered }} />}
-        </div>
-      )}
+      <MarkdownPane
+        cell={cell}
+        testidPrefix="report-split"
+        emptyHint="Empty text side — double-click to edit"
+        onCommit={(source, html) => sendAction(
+          'report_update_cell', { cell_id: cell.id, source, html })}
+        renderedStyle={styles.renderedPane}
+      />
     </div>
   )
 
@@ -616,18 +541,7 @@ const styles: Record<string, React.CSSProperties> = {
     lineHeight: 1, display: 'inline-flex', alignItems: 'center',
     height: 24, padding: '0 3px',
   },
-  rendered: {
-    cursor: 'text', minHeight: 40, padding: '4px 4px', borderRadius: 4, flex: 1,
-  },
-  emptyHint: { color: '#585b70', fontSize: 12, fontStyle: 'italic' },
-  textarea: {
-    width: '100%', boxSizing: 'border-box', resize: 'none',
-    background: '#11111b', color: '#cdd6f4',
-    border: '1px solid #313244', borderRadius: 5,
-    padding: '6px 8px', fontSize: 12.5,
-    fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
-    lineHeight: 1.5, outline: 'none', overflow: 'hidden', minHeight: 60,
-  },
+  renderedPane: { minHeight: 40, flex: 1 },
   figBox: {
     position: 'relative', width: '100%', aspectRatio: '4 / 3',
     background: '#11111b', borderRadius: 6, border: '1px solid #313244',
