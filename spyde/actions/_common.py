@@ -87,13 +87,28 @@ def robust_map_limits(array: np.ndarray, *, symmetric: bool = False
 
 
 def reciprocal_radius(signal) -> float:
-    """Max reciprocal radius from the signal-axis calibration (Å⁻¹).
+    """Max reciprocal radius from the signal-axis calibration, in Å⁻¹.
 
-    The smallest half-extent across the signal axes — i.e. the largest radius
-    that still fits inside the detector in every signal dimension.
+    The smallest half-extent across the signal axes — the largest radius that
+    still fits inside the detector in every signal dimension, and so the outer
+    radius a simulated template library should be generated to.
+
+    Always Å⁻¹, whatever the axes are labelled: diffsims reads this number as
+    Å⁻¹ and does not check, so a scan calibrated in nm⁻¹ that returned its own
+    axis units would build a library ten times too large — thousands of
+    reflections that cannot reach the detector — and still produce a map.
+    Raises when the detector has no reciprocal calibration at all, because
+    there is no defensible number to return.
     """
-    sig_axes = signal.axes_manager.signal_axes
-    return float(min(ax.scale * ax.size / 2.0 for ax in sig_axes))
+    from spyde.reciprocal_units import reciprocal_extent
+
+    extent = reciprocal_extent(signal)
+    if extent is None:
+        raise ValueError(
+            "This dataset's detector axes carry no reciprocal calibration, so "
+            "a template library cannot be sized. Set the detector scale in the "
+            "Plot Control dock (or a beam energy, for axes in mrad).")
+    return extent
 
 
 def widget_region(selector, img: np.ndarray) -> np.ndarray:

@@ -31,9 +31,12 @@ def _diffraction_4d(nav=(3, 4), sig=(32, 32)):
     rng = np.random.RandomState(0)
     s = hs.signals.Signal2D(rng.rand(*nav, *sig).astype(np.float32))
     s.set_signal_type("electron_diffraction")
+    # Calibrated in nm⁻¹ and meaning it: 1 nm⁻¹/px over 32 px is a half-extent
+    # of 16 nm⁻¹ = 1.6 Å⁻¹, which holds aluminium's {111} at 0.43 Å⁻¹. The
+    # scale was 0.1 under an nm⁻¹ label — a number that only made sense as Å⁻¹.
     for ax in s.axes_manager.signal_axes:   # calibrate reciprocal space
-        ax.scale = 0.1
-        ax.units = "1/nm"
+        ax.scale = 1.0
+        ax.units = "nm^-1"
     return s
 
 

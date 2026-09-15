@@ -2,7 +2,7 @@
  * VectorOrientationWizard.tsx — staged Vector-Orientation-Mapping caret.
  *
  * Fits orientation + STRAIN from the tree's diffraction vectors (sparse matcher):
- *   1 Load    — pick a .cif crystal + accelerating voltage.
+ *   1 Load    — pick one or more .cif crystals (multi-phase) + accelerating voltage.
  *   2 Library — angle resolution + min intensity → `vom_generate_library`.
  *   3 Refine  — strain cap + match tolerance sliders re-fit the pattern under the
  *               crosshair live (`vom_refine`); the fitted template (green) tracks
@@ -36,7 +36,7 @@ interface VomFit {
 // built template library on the tree, so we must NOT make the user regenerate it
 // (a ~1 min rebuild) just because the React caret was torn down and remounted.
 interface VomSaved {
-  tab: Tab; cif: string; voltage: number; resolution: number; minInt: number
+  tab: Tab; cifs: string[]; voltage: number; resolution: number; minInt: number
   strainCap: number; tolerance: number; gamma: number; kPow: number
   smooth: boolean; libReady: boolean
 }
@@ -45,7 +45,10 @@ const _vomStore = new Map<number, VomSaved>()
 export function VectorOrientationWizard({ caretPos, windowId, sendAction, onClose }: Props) {
   const saved = _vomStore.get(windowId)
   const [tab, setTab] = React.useState<Tab>(saved?.tab ?? 'Load')
-  const [cif, setCif] = React.useState(saved?.cif ?? '')
+  // One entry per crystal structure. A precipitate in a matrix is two phases,
+  // and the fit picks the best-matching template per pattern — so loading both
+  // answers which structure, in what orientation, under what strain, at once.
+  const [cifs, setCifs] = React.useState<string[]>(saved?.cifs ?? [])
   const [voltage, setVoltage] = React.useState(saved?.voltage ?? 200)
   const [resolution, setResolution] = React.useState(saved?.resolution ?? 1.0)
   const [minInt, setMinInt] = React.useState(saved?.minInt ?? 0.0001)
@@ -62,8 +65,8 @@ export function VectorOrientationWizard({ caretPos, windowId, sendAction, onClos
 
   // Persist the state for this window on every change so reopening restores it.
   React.useEffect(() => {
-    _vomStore.set(windowId, { tab, cif, voltage, resolution, minInt, strainCap, tolerance, gamma, kPow, smooth, libReady })
-  }, [windowId, tab, cif, voltage, resolution, minInt, strainCap, tolerance, gamma, kPow, smooth, libReady])
+    _vomStore.set(windowId, { tab, cifs, voltage, resolution, minInt, strainCap, tolerance, gamma, kPow, smooth, libReady })
+  }, [windowId, tab, cifs, voltage, resolution, minInt, strainCap, tolerance, gamma, kPow, smooth, libReady])
 
   // Debounced live refine — a pending refine is cancelled on unmount so
   // vom_refine can't fire at a torn-down preview mid-debounce.
@@ -75,18 +78,21 @@ export function VectorOrientationWizard({ caretPos, windowId, sendAction, onClos
     setFit(d as unknown as VomFit)
   })
 
-  const useCif = (path: string) => {
-    setCif(path); remember(path); setStatus('Crystal loaded — generate the library.')
+  const base = (p: string) => p.split(/[/\\]/).pop() || p
+  const addCif = (path: string) => {
+    setCifs(c => c.includes(path) ? c : [...c, path])
+    remember(path)
+    setStatus('Crystal loaded — generate the library.')
   }
   const pickCif = async () => {
     const path = await window.electron.pickFile({ name: 'Crystal (.cif)', extensions: ['cif'] })
-    if (path) useCif(path)
+    if (path) addCif(path)
   }
   const generate = () => {
-    if (!cif) { setStatus('Choose a .cif first.'); return }
+    if (!cifs.length) { setStatus('Add a .cif first.'); return }
     setStatus('Generating library… (this can take ~1 min for a full library)')
     sendAction('vom_generate_library', {
-      cif_path: cif, accelerating_voltage: voltage, resolution, minimum_intensity: minInt,
+      cif_paths: cifs, accelerating_voltage: voltage, resolution, minimum_intensity: minInt,
     }, windowId)
     setLibReady(true)
     setTab('Refine')
@@ -115,15 +121,24 @@ export function VectorOrientationWizard({ caretPos, windowId, sendAction, onClos
 
       {tab === 'Load' && (
         <div style={S.page}>
-          <label style={S.lbl}>Crystal (.cif)</label>
+          <label style={S.lbl}>Crystal phases (.cif)</label>
           <div style={{ display: 'flex', gap: 6, alignItems: 'stretch' }}>
             <button data-testid="vom-pick-cif" style={{ ...S.fileBtn, flex: 1, alignSelf: 'auto' }}
-              title={cif} onClick={pickCif}>
-              {cif ? cif.split(/[/\\]/).pop() : '＋ From file'}
-            </button>
-            <CodPicker windowId={windowId} sendAction={sendAction} onCif={useCif} />
+              onClick={pickCif}>＋ From file</button>
+            <CodPicker windowId={windowId} sendAction={sendAction} onCif={addCif} />
           </div>
-          <RecentCifs recents={recents} exclude={cif ? [cif] : []} onPick={useCif} />
+          <RecentCifs recents={recents} exclude={cifs} onPick={addCif} />
+          <div data-testid="vom-cif-list" style={S.cifList}>
+            {cifs.length === 0
+              ? <span style={S.hint}>No phases yet — add at least one.</span>
+              : cifs.map(p => (
+                <div key={p} style={S.cifRow} title={p}>
+                  <span style={S.cifName}>{base(p)}</span>
+                  <button data-testid={`vom-cif-remove-${base(p)}`} style={S.close}
+                    onClick={() => setCifs(c => c.filter(x => x !== p))}>✕</button>
+                </div>
+              ))}
+          </div>
           <Field label="Voltage (kV)"><NumInput value={voltage} onChange={setVoltage} step="1" width={60} /></Field>
         </div>
       )}

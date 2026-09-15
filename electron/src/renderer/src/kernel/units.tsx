@@ -9,6 +9,10 @@
  * commit sends the raw string on unchanged — the same value/`display` split the
  * axes table already uses for rounded scale/offset.
  *
+ * Bare `A^-1` is shown as Å⁻¹ (the reciprocal-ångström convention the plot's
+ * own axis labels already apply), so the dock and the figure beside it cannot
+ * disagree about what the same axis measures.
+ *
  * KaTeX with `output:'mathml'` — the same pipeline the report markdown uses
  * (kernel/markdown.ts). MathML renders natively in Chromium with NO KaTeX
  * stylesheet and no web fonts, so this costs the dock nothing at load and the
@@ -46,6 +50,29 @@ function stripDelimiters(raw: string): string {
   return raw.replace(/\$/g, '{}')
 }
 
+/** Brace an UNBRACED exponent so it typesets as one number.
+ *
+ *  In LaTeX `^` takes a single token, so `nm^-1` is `nm^{-}1` — a minus sign
+ *  raised, followed by a full-size 1 ("nm⁻1"). The braced forms hyperspy and
+ *  pyxem write (`nm$^{-1}$`, `$\AA^{-1}$`) were fine, but a plainly-typed
+ *  `nm^-1` or `A^-1` — which is what a file may carry and what a user types
+ *  into the dock's units cell — rendered wrong, and wrong in a way that looks
+ *  almost right. */
+function braceExponents(tex: string): string {
+  return tex.replace(/\^\s*(-?\d+)(?![\d}])/g, '^{$1}')
+}
+
+/** The reciprocal-ångström convention: a bare `A^-1` means Å⁻¹, not amperes.
+ *
+ *  The plot's own axis labels and scale bar already apply this (`_clean_units`
+ *  in drawing/plots/plot.py), so without it the dock and the figure disagree
+ *  about the same axis — the table says A⁻¹ while the plot beside it says Å⁻¹.
+ *  Only a LONE capital A is converted, so "mA", "eV/A" and the like are left
+ *  alone, and pyxem's `\AA` form already carries the right glyph. */
+function angstromConvention(tex: string): string {
+  return tex.replace(/(^|[^A-Za-z\\])A(?=\s*\^?\s*\{?-?1)/g, '$1Å')
+}
+
 // Units repeat across every row and the dock re-renders on every histogram
 // push, so memoise the (pure) render. The key space is tiny — a handful of
 // distinct unit strings per session.
@@ -62,7 +89,7 @@ export function unitsToMathML(raw: string): string | null {
   if (!raw || !isLatexUnits(raw)) return null
   const hit = cache.get(raw)
   if (hit !== undefined) return hit
-  const tex = stripDelimiters(raw)
+  const tex = angstromConvention(braceExponents(stripDelimiters(raw)))
   // Nothing left to typeset (a stray "$", "{}") — show the raw text instead of
   // an empty cell.
   if (!/[A-Za-z0-9\\]/.test(tex)) {

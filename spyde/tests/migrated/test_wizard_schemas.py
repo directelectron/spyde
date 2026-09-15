@@ -18,7 +18,11 @@ import pytest
 
 from spyde.actions import registry
 
-VALID_TYPES = {"int", "float", "bool", "enum", "file"}
+# ``file_list`` is ``file`` repeated: a parameter that takes SEVERAL paths, as
+# a multi-phase orientation library does. Its own type rather than a ``file``
+# with a list default, because a scripted host has to know whether to hand the
+# handler a string or a sequence.
+VALID_TYPES = {"int", "float", "bool", "enum", "file", "file_list"}
 
 
 class TestSchemaCompleteness:
@@ -69,6 +73,11 @@ class TestSchemaValidity:
             elif ptype == "file":
                 assert spec.get("extensions"), \
                     f"{key}.{pname}: file entry without extensions"
+            elif ptype == "file_list":
+                assert spec.get("extensions"), \
+                    f"{key}.{pname}: file_list entry without extensions"
+                assert isinstance(d, list), \
+                    f"{key}.{pname}: file_list default {d!r} is not a list"
 
 
 class TestSchemaBackendLockstep:

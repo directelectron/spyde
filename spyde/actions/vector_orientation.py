@@ -91,6 +91,12 @@ class TemplateLibrary:
     cache: dict                     # build_matching_cache output (coarse seed)
     radial_range: tuple             # (r0, r1) Å⁻¹ for the coarse grid
     r_max: float
+    #: Multiply a measured vector, in the units of the detector this library
+    #: was built for, by this to get Å⁻¹. The fit works entirely in Å⁻¹ —
+    #: the templates, the soft-assign bandwidths and the no-match sink are all
+    #: tuned there — so this is where a detector calibrated in anything else is
+    #: reconciled, once, instead of at each of the fit's several entry points.
+    inverse_angstrom_factor: float = 1.0
 
 
 def build_template_library(sim, calibration_signal, r_max: float,
@@ -113,8 +119,14 @@ def build_template_library(sim, calibration_signal, r_max: float,
     )
     from spyde.signals.orientation_map import phase_to_dict
 
-    rots = sim.rotations
-    n = rots.size if hasattr(rots, "size") else len(rots)
+    # Template COUNT comes from the flattened quaternion table, not from
+    # sim.rotations: a multi-phase simulation stores rotations as one entry PER
+    # PHASE, so counting them gives 2 for a two-phase library instead of its
+    # twelve hundred templates — a library that then silently matches almost
+    # nothing. template_tables is the authority on the flattened order, so it
+    # is the authority on the length too.
+    template_quats, template_phase = template_tables(sim)
+    n = len(template_quats)
 
     spots_xy: List[np.ndarray] = []
     spots_I: List[np.ndarray] = []
@@ -132,7 +144,6 @@ def build_template_library(sim, calibration_signal, r_max: float,
         spots_xy.append(xy[keep])
         spots_I.append(inten[keep])
 
-    template_quats, template_phase = template_tables(sim)
     phases_meta = [phase_to_dict(p) for p in sim_phases_list(sim)]
 
     cache = build_matching_cache(calibration_signal, sim)
@@ -143,19 +154,35 @@ def build_template_library(sim, calibration_signal, r_max: float,
     _sl, _f, _fs, radial_range = calibration_signal.calibration.get_slices2d(
         cache["NR"], cache["NA"]
     )
+    from spyde.actions.orientation_compute import polar_radial_range
+    from spyde.reciprocal_units import axis_unit_factor
+    r0, r1 = polar_radial_range(calibration_signal, radial_range)
 
     return TemplateLibrary(
         spots_xy=spots_xy, spots_I=spots_I,
         template_quats=template_quats, template_phase=template_phase,
         phases_meta=phases_meta, cache=cache,
-        radial_range=(float(radial_range[0]), float(radial_range[1])),
+        radial_range=(r0, r1),
         r_max=float(r_max),
+        inverse_angstrom_factor=float(axis_unit_factor(calibration_signal) or 1.0),
     )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Pose model + cost
 # ─────────────────────────────────────────────────────────────────────────────
+
+def measured_in_inverse_angstrom(rows, lib: TemplateLibrary) -> np.ndarray:
+    """One pattern's measured ``(kx, ky)`` in Å⁻¹.
+
+    Vectors are stored in the detector's own units so they draw on the pattern
+    they were found in; the fit runs in Å⁻¹ so its bandwidths mean the same
+    thing on every dataset. This is the join.
+    """
+    xy = np.asarray(rows)[:, [COL_KX, COL_KY]].astype(np.float64)
+    factor = float(getattr(lib, "inverse_angstrom_factor", 1.0))
+    return xy if factor == 1.0 else xy * factor
+
 
 def _rot(theta: float) -> np.ndarray:
     c, s = np.cos(theta), np.sin(theta)
@@ -592,7 +619,7 @@ def fit_rows_block(rows_list, lib: TemplateLibrary, params: dict,
             out.append(None)
             prev_seed = None
             continue
-        mxy = rows[:, [COL_KX, COL_KY]].astype(np.float64)
+        mxy = measured_in_inverse_angstrom(rows, lib)
         mI = rows[:, COL_INTENSITY].astype(np.float64)
         fit = None
         if warm_start and prev_seed is not None:
@@ -752,7 +779,7 @@ def compute_vector_orientation(
         if len(rows) < 4:
             prev_seed = None
             continue
-        mxy = rows[:, [COL_KX, COL_KY]].astype(np.float64)
+        mxy = measured_in_inverse_angstrom(rows, lib)
         mI = rows[:, COL_INTENSITY].astype(np.float64)
 
         fit = None

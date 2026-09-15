@@ -236,6 +236,18 @@ class Session(
         ensure_heavy_imports()
         from spyde.signal_tree import BaseSignalTree
         from spyde.drawing.plots.plot import Plot
+        from spyde.reciprocal_units import normalize_to_canonical
+
+        # Å⁻¹ is what every crystallographic library SpyDE talks to works in, so
+        # a detector calibrated in nm⁻¹ is re-expressed once, here, rather than
+        # at each of the places a template library or a CIF meets the data. It
+        # RESCALES — the geometry is untouched, only how it is written down —
+        # and the Plot Control dock's units toggle can put it back. Anything
+        # that is not a reciprocal axis (a scan in nm, an uncalibrated detector,
+        # a result map) is left exactly as it is.
+        if normalize_to_canonical(signal):
+            log.info("[units] detector axes re-expressed in Å⁻¹ for %s",
+                     source_path or "signal")
 
         client = self.dask_manager.client
         # Only a real on-disk origin enables the navigator sidecar cache

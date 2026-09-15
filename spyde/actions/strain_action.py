@@ -411,8 +411,11 @@ class StrainController(WizardController):
     def set_cif_reference(self, phase) -> None:
         """CIF mode: snap the reference pixel's vectors to the phase's ideal |g|
         families → absolute strain (no unstrained region needed)."""
-        from spyde.actions.strain_mapping import cif_g_families, snap_reference_to_cif
-        snapped = snap_reference_to_cif(self._pooled_reference(), cif_g_families(phase))
+        from spyde.actions.strain_mapping import (
+            cif_g_families_for, snap_reference_to_cif,
+        )
+        families = cif_g_families_for(phase, getattr(self.vecs, "sig_axes", ()))
+        snapped = snap_reference_to_cif(self._pooled_reference(), families)
         snapped = _zero_beam_filtered(snapped)
         if len(snapped) < 2:
             return

@@ -18,7 +18,7 @@
 import React from 'react'
 
 export function Dropdown<T extends string>({
-  value, options, onChange, testid, width, triggerText, bare, caretColor,
+  value, options, onChange, testid, width, triggerText, bare, caretColor, compact,
 }: {
   value: T
   options: readonly { value: T; label: string }[]
@@ -37,11 +37,21 @@ export function Dropdown<T extends string>({
    *  wrapper's background is. */
   bare?: boolean
   caretColor?: string
+  /** Shrink the trigger so it can sit on a SECTION HEADING row without costing
+   *  a line. The dock is budgeted to fit its pinned sections at laptop height
+   *  without scrolling (dock_compact.spec.ts), so a control placed beside a
+   *  heading has to match that heading's height. The MENU is unchanged. */
+  compact?: boolean
 }) {
   const [open, setOpen] = React.useState(false)
   // Auto drop-UP when the menu would clip the bottom of the window (e.g. the
   // status-bar monitor popover — its rows sit a few px above the viewport edge).
   const [dropUp, setDropUp] = React.useState(false)
+  // …and the same rightwards: a trigger placed in a narrow column near the
+  // dock's edge has a menu wider than itself, which left-aligned runs off the
+  // window (and gives the dock a horizontal scrollbar). Anchoring its RIGHT
+  // edge to the trigger's makes it grow back over the panel instead.
+  const [dropLeft, setDropLeft] = React.useState(false)
   const rootRef = React.useRef<HTMLDivElement>(null)
 
   const toggle = () => {
@@ -49,6 +59,13 @@ export function Dropdown<T extends string>({
       const rect = rootRef.current.getBoundingClientRect()
       const estMenuH = Math.min(260, options.length * 27 + 12)
       setDropUp(rect.bottom + estMenuH + 8 > window.innerHeight)
+      // The menu is at least as wide as the trigger, and wider whenever an
+      // option's label is longer than the current value — which is exactly the
+      // disabled "… — needs kV" case.
+      const estMenuW = Math.max(
+        rect.width,
+        ...options.map((o) => o.label.length * 6.5 + 24))
+      setDropLeft(rect.left + estMenuW + 8 > window.innerWidth)
     }
     setOpen(!open)
   }
@@ -78,6 +95,7 @@ export function Dropdown<T extends string>({
           ...S.trigger,
           ...(open && !bare ? S.triggerOpen : {}),
           ...(bare ? S.triggerBare : {}),
+          ...(compact ? S.triggerCompact : {}),
         }}
         onClick={toggle}
       >
@@ -94,7 +112,8 @@ export function Dropdown<T extends string>({
         <div role="listbox"
           style={{ ...S.menu,
                    ...(dropUp ? { bottom: 'calc(100% + 3px)' }
-                              : { top: 'calc(100% + 3px)' }) }}>
+                              : { top: 'calc(100% + 3px)' }),
+                   ...(dropLeft ? { left: 'auto', right: 0 } : {}) }}>
           {options.map((o) => (
             <button
               key={o.value} type="button" role="option"
@@ -125,6 +144,7 @@ const S: Record<string, React.CSSProperties> = {
     borderRadius: 4, padding: '3px 7px', fontSize: 11, cursor: 'pointer',
     textAlign: 'left',
   },
+  triggerCompact: { padding: '0 5px', fontSize: 10, borderRadius: 3 },
   triggerOpen: { borderColor: '#45475a', background: '#181825' },
   triggerBare: {
     background: 'transparent', border: 'none', padding: '0 5px 0 2px',

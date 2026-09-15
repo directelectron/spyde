@@ -315,7 +315,7 @@ def strain_map(
     (``strain_mapping.zero_beam_filtered``).
     """
     from spyde.actions.strain_mapping import (
-        cif_g_families, compute_strain_field, default_reference,
+        cif_g_families_for, compute_strain_field, default_reference,
         rotate_strain_basis, snap_reference_to_cif, zero_beam_filtered,
     )
 
@@ -328,7 +328,8 @@ def strain_map(
 
     if cif is not None:
         phase = _as_phases(cif)[0]
-        families = cif_g_families(phase, min_dspacing=min_dspacing)
+        families = cif_g_families_for(phase, getattr(vectors, "sig_axes", ()),
+                                      min_dspacing=min_dspacing)
         ref_vectors = snap_reference_to_cif(ref_vectors, families,
                                             tol_frac=tol_frac)
 
