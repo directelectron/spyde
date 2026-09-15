@@ -305,6 +305,38 @@ def cif_g_families(phase, *, min_dspacing: float = 0.7) -> np.ndarray:
     return np.unique(np.round(g[allowed], 4))
 
 
+def cif_g_families_for(phase, sig_axes, *, min_dspacing: float = 0.7) -> np.ndarray:
+    """:func:`cif_g_families` re-expressed in the units a DETECTOR is calibrated in.
+
+    Crystallography is done in 1/Å and measured vectors are stored in whatever
+    the detector axes say, so the two have to be brought together before their
+    magnitudes can be compared. On a scan calibrated in nm⁻¹ they differ by a
+    factor of ten, which is well outside ``snap_reference_to_cif``'s tolerance
+    — so every reflection is rejected and the caller gets an empty reference,
+    i.e. no strain map and no error. An axis whose units are unknown is taken
+    at face value, which is the pre-existing behaviour.
+
+    A detector currently DISPLAYED in mrad raises: an axis record carries no
+    beam energy, so the angle cannot be turned into a spacing here, and
+    returning the families unconverted would be the silent wrong answer this
+    exists to remove. Switching the detector units back in the Plot Control
+    dock is the fix, and the message says so.
+    """
+    from spyde.reciprocal_units import (
+        MILLIRADIAN, inverse_angstrom_factor, parse_unit,
+    )
+
+    families = cif_g_families(phase, min_dspacing=min_dspacing)
+    units = getattr(sig_axes[0], "units", "") if len(sig_axes) else ""
+    if parse_unit(units) == MILLIRADIAN:
+        raise ValueError(
+            "An absolute (CIF) strain reference needs the detector in a "
+            "reciprocal unit, not mrad — switch Detector units to Å⁻¹ or nm⁻¹ "
+            "in the Plot Control dock.")
+    factor = inverse_angstrom_factor(units)
+    return families if not factor else families / factor
+
+
 def snap_reference_to_cif(sample_g, families, *, tol_frac: float = 0.2) -> np.ndarray:
     """Build an ABSOLUTE reference lattice from a measured vector set: keep each
     vector's direction but snap its magnitude to the nearest CIF |g| family

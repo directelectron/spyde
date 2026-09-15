@@ -73,6 +73,26 @@ def generate_library_from_phases(phases, accelerating_voltage, resolution,
     )
 
 
+def polar_radial_range(signal, radial_range) -> tuple[float, float]:
+    """A pyxem radial range re-expressed in Å⁻¹.
+
+    ``calibration.get_slices2d`` measures the polar grid in the detector's own
+    axis units. Simulated templates are always in Å⁻¹, so the two only line up
+    once the range is converted — for a scan calibrated in nm⁻¹ the difference
+    is a factor of ten, which places every simulated ring on the wrong bin
+    without raising anything.
+    """
+    from spyde.reciprocal_units import axis_unit_factor
+
+    factor = axis_unit_factor(signal)
+    if factor is None:
+        raise ValueError(
+            "This dataset's detector axes carry no reciprocal calibration, so "
+            "simulated templates cannot be matched against it. Set the detector "
+            "scale in the Plot Control dock (or a beam energy, for mrad axes).")
+    return float(radial_range[0]) * factor, float(radial_range[1]) * factor
+
+
 def build_matching_cache(signal, sim) -> dict:
     """
     Pre-compute polar slices and templates (geometry- and library-dependent
@@ -87,7 +107,11 @@ def build_matching_cache(signal, sim) -> dict:
         slices, factors, factors_slice, radial_range = \
             signal.calibration.get_slices2d(NR, NA)
 
-        r0, r1 = float(radial_range[0]), float(radial_range[1])
+        # The radial range comes back in whatever unit the detector axes are
+        # labelled, and the templates below are in Å⁻¹. Convert, or every ring
+        # is placed on the wrong radial bin — silently, since both are just
+        # floats. The slices and factors are pixel geometry and need nothing.
+        r0, r1 = polar_radial_range(signal, radial_range)
         radial_axis = r0 + (r1 - r0) / NR * np.arange(NR)
         azim_axis = np.linspace(-np.pi, np.pi, NA, endpoint=False)
 

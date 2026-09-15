@@ -41,13 +41,48 @@ class DetectorPixels:
     y_offset: float
     width: int
     height: int
+    #: Multiply an axis-unit value by this to get Å⁻¹ (10 for axes in nm⁻¹).
+    #: Simulated spots arrive in Å⁻¹ whatever the detector is labelled, so the
+    #: overlay needs the factor to put them back on the displayed axes.
+    inverse_angstrom_factor: float = 1.0
 
     @classmethod
-    def from_axes(cls, signal_axes) -> "DetectorPixels":
+    def from_axes(cls, signal_axes, *, inverse_angstrom_factor=None
+                  ) -> "DetectorPixels":
+        from spyde.reciprocal_units import inverse_angstrom_factor as unit_factor
+
         x_axis, y_axis = signal_axes[0], signal_axes[1]
+        if inverse_angstrom_factor is None:
+            # Axis units alone answer this for nm⁻¹ and Å⁻¹; mrad would need
+            # the wavelength, which an axis record does not carry, so an
+            # unconvertible label falls back to 1.0 and draws where the data is.
+            inverse_angstrom_factor = unit_factor(getattr(x_axis, "units", "")) or 1.0
         return cls(float(x_axis.scale) or 1.0, float(x_axis.offset),
                    float(y_axis.scale) or 1.0, float(y_axis.offset),
-                   int(x_axis.size), int(y_axis.size))
+                   int(x_axis.size), int(y_axis.size),
+                   float(inverse_angstrom_factor))
+
+    @classmethod
+    def from_signal(cls, signal) -> "DetectorPixels":
+        """:meth:`from_axes` for a live signal, which can also resolve a
+        detector calibrated in mrad (that conversion needs the beam energy)."""
+        from spyde.reciprocal_units import axis_unit_factor
+
+        return cls.from_axes(signal.axes_manager.signal_axes,
+                             inverse_angstrom_factor=axis_unit_factor(signal) or 1.0)
+
+    def to_inverse_angstrom(self, xy) -> np.ndarray:
+        """Axis-unit ``(N, 2)`` values → Å⁻¹, the unit every simulated library
+        and every fit tolerance is expressed in."""
+        return np.asarray(xy, dtype=np.float64) * self.inverse_angstrom_factor
+
+    def inverse_angstrom_to_pixels(self, xy) -> np.ndarray:
+        """Å⁻¹ ``(N, 2)`` values → image-pixel offsets, going through whatever
+        unit the detector axes currently display."""
+        xy = np.asarray(xy, dtype=np.float64).reshape(-1, 2)
+        if xy.size == 0:
+            return np.zeros((0, 2), dtype=np.float32)
+        return self.to_pixels(xy / self.inverse_angstrom_factor)
 
     @property
     def max_scale(self) -> float:
@@ -403,11 +438,16 @@ def orientation_template_spots(frame, *, pixels: DetectorPixels, sim, cache,
     coords = best_match_spots(
         np.asarray(frame, dtype=float), sim, cache, gamma=float(gamma),
         max_radius=max_radius, normalize_templates=bool(normalize_templates),
+        # Both scales are in the DISPLAYED unit, so their ratio — all
+        # best_match_spots uses — is unit-free and needs no conversion.
         scale_override=scale_override, original_scale=pixels.x_scale,
         min_intensity=float(min_intensity))
     if coords is None or len(coords) == 0:
         return {"template": np.zeros((0, 2), dtype=np.float32)}
-    return {"template": pixels.to_pixels(coords)}
+    # `coords` and `max_radius` are Å⁻¹ (diffsims' unit), the axes may be in
+    # anything — so the placement goes through the conversion, not straight to
+    # pixels.
+    return {"template": pixels.inverse_angstrom_to_pixels(coords)}
 
 
 def attach_orientation_overlay(signal, sim, matching_cache, tree, *,
@@ -417,7 +457,10 @@ def attach_orientation_overlay(signal, sim, matching_cache, tree, *,
                                name="orientation_template", radius_px=4.0):
     """Draw the best-matching template's spots on the windows showing
     ``signal``, re-matched at every navigator position. Returns the node."""
-    pixels = DetectorPixels.from_axes(signal.axes_manager.signal_axes)
+    # From the SIGNAL, not its axes: the simulated spots are in Å⁻¹ and putting
+    # them back on a detector calibrated in mrad needs the beam energy, which
+    # only the signal carries.
+    pixels = DetectorPixels.from_signal(signal)
     style = {"radius": max(2.0, float(radius_px)), "edgecolors": color,
              "facecolors": None, "linewidths": 1.5, "alpha": 1.0}
     return _add_overlay(
@@ -697,8 +740,11 @@ def vector_orientation_fit(*, rows, pixels: DetectorPixels, lib,
     rows = np.asarray(rows)
     if rows.size == 0:
         return {"measured": None, "template": None, "fit": None}
-    measured = rows[:, [COL_KX, COL_KY]].astype(np.float64)
-    measured_px = pixels.to_pixels(measured)
+    # The vectors are in the detector's own units and everything the fit
+    # touches — the template library, the soft-assign bandwidths, the no-match
+    # sink — is in Å⁻¹, so they are converted rather than compared across units.
+    measured = pixels.to_inverse_angstrom(rows[:, [COL_KX, COL_KY]])
+    measured_px = pixels.to_pixels(rows[:, [COL_KX, COL_KY]].astype(np.float64))
     if len(rows) < 4:
         return {"measured": measured_px, "template": None, "fit": None}
 
@@ -718,7 +764,7 @@ def vector_orientation_fit(*, rows, pixels: DetectorPixels, lib,
     pose[5:7] = np.asarray(fit.translation, float)
     spots = np.asarray(lib.spots_xy[int(fit.template_idx)], np.float64)
     return {"measured": measured_px,
-            "template": pixels.to_pixels(project_spots(pose, spots)),
+            "template": pixels.inverse_angstrom_to_pixels(project_spots(pose, spots)),
             "fit": fit}
 
 
@@ -726,7 +772,13 @@ def attach_vector_orientation_overlay(vecs, lib, tree, *, params=None,
                                       radius_px=None, on_fit=None):
     """Draw the measured vectors (red) and the fitted template (green) on the
     vectors diffraction pattern. Returns the node."""
-    pixels = DetectorPixels.from_axes(vecs.sig_axes)
+    # Take the unit factor from the library rather than re-deriving it from the
+    # axis records: the library was built against the live signal and so can
+    # resolve a detector in mrad, which an axis record alone cannot. Both sides
+    # of this overlay then convert by the same number as the whole-field fit.
+    pixels = DetectorPixels.from_axes(
+        vecs.sig_axes,
+        inverse_angstrom_factor=float(getattr(lib, "inverse_angstrom_factor", 1.0)))
     if radius_px is None:
         radius_px = getattr(vecs, "kernel_radius_px", 4.0)
     style = {"radius": max(2.0, float(radius_px)), "facecolors": None,

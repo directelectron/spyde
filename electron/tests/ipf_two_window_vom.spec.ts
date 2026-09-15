@@ -92,7 +92,9 @@ test('vector-OM opens the map window AND the IPF explorer window', async () => {
   await expect(page.getByTestId('vector-orientation-wizard')).toBeVisible()
 
   await page.getByTestId('vom-pick-cif').click()
-  await expect(page.getByTestId('vom-pick-cif')).toHaveText('Silver__0011135.cif')
+  // The Load tab holds a LIST of phases now (multi-phase fits), so a pick adds
+  // a row rather than renaming the button.
+  await expect(page.getByTestId('vom-cif-list')).toContainText('Silver__0011135.cif')
   await page.getByTestId('vom-tab-Library').click()
   await page.getByTestId('vom-generate').click()
 

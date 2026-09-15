@@ -137,11 +137,15 @@ def warmup_autograd() -> None:
 # Packing
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _pack_patterns(vectors, t, device, dtype):
+def _pack_patterns(vectors, t, device, dtype, inverse_angstrom_factor=1.0):
     """All patterns → padded (P, Vmax, 2) coords + (P, Vmax) intensity + mask.
 
     P = ny*nx in scan order. Patterns with <3 vectors get an all-False mask row
     and are skipped in decode. Pure CSR slicing, then one host→GPU transfer.
+
+    Coordinates come out in **Å⁻¹**: the vectors are stored in the detector's
+    own units, and the templates they are matched against are not, so a scan
+    calibrated in nm⁻¹ is converted here rather than compared across units.
     """
     import torch
     ny, nx = vectors.nav_shape
@@ -162,8 +166,8 @@ def _pack_patterns(vectors, t, device, dtype):
     for i, rows in enumerate(rows_list):
         n = len(rows)
         if n:
-            xy[i, :n, 0] = rows[:, COL_KX]
-            xy[i, :n, 1] = rows[:, COL_KY]
+            xy[i, :n, 0] = rows[:, COL_KX] * inverse_angstrom_factor
+            xy[i, :n, 1] = rows[:, COL_KY] * inverse_angstrom_factor
             inten[i, :n] = rows[:, COL_INTENSITY]
             mask[i, :n] = True
     # Per-pattern unit-mean normalisation — the stored intensity is RAW image
@@ -470,7 +474,8 @@ def _compute_vector_orientation_batched(
     dev = select_device() or torch.device("cpu")
     dt = torch.float32
 
-    v, vI, vmask, counts = _pack_patterns(vectors, t, dev, dt)
+    v, vI, vmask, counts = _pack_patterns(
+        vectors, t, dev, dt, float(getattr(lib, "inverse_angstrom_factor", 1.0)))
     g, gI, gmask = _pack_templates(lib, dev, dt)
     P = v.shape[0]
     valid_bool = torch.as_tensor(counts >= 3, device=dev)

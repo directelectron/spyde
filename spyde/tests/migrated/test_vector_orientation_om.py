@@ -33,8 +33,17 @@ def _signal_plot(session, tree):
                  and p.plot_state is not None), None)
 
 
-def _multi_disk_4d(nav=(3, 3), sig=(48, 48), scale=0.05):
-    """Four disks per pattern (≥4 vectors → the per-pattern fit actually runs)."""
+def _multi_disk_4d(nav=(3, 3), sig=(48, 48), scale=0.5):
+    """Four disks per pattern (≥4 vectors → the per-pattern fit actually runs).
+
+    Calibrated in nm⁻¹ **and meaning it**: 0.5 nm⁻¹/px over 48 px is a
+    half-extent of 12 nm⁻¹ = 1.2 Å⁻¹, which comfortably holds silver's
+    reflections ({111} at 0.42 Å⁻¹). The fixture used to say ``1/nm`` while
+    carrying a scale that only made sense as Å⁻¹ — harmless while nothing read
+    the label, and a library ten times too small the moment something did. Kept
+    in nm⁻¹ rather than relabelled, so this wiring test also crosses the
+    conversion the way a real nm⁻¹ dataset does.
+    """
     yy, xx = np.mgrid[0:sig[0], 0:sig[1]]
     cy, cx = sig[0] / 2, sig[1] / 2
     spots = [(cx, cy), (cx + 10, cy + 4), (cx - 8, cy + 9), (cx + 3, cy - 11)]

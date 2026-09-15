@@ -20,11 +20,15 @@ log = logging.getLogger(__name__)
 class AxesEditorMixin:
     def _emit_axes(self, tree) -> None:
         try:
-            from spyde.metadata_extract import build_axes_list
+            from spyde.metadata_extract import build_axes_list, build_units_toggle
             ipc.emit({
                 "type": "axes_info",
                 "window_ids": self._tree_window_ids(tree),
                 "axes": build_axes_list(tree),
+                # Present only for a detector that HAS a reciprocal calibration
+                # — the dock shows the units toggle when it is, and leaves the
+                # plain editable cell when it is not.
+                "units_toggle": build_units_toggle(tree),
             })
         except Exception as e:
             log.warning("axes emit failed: %s", e)
@@ -113,6 +117,11 @@ class AxesEditorMixin:
             return
 
         self._emit_metadata(tree)
+        # The axes table travels with the detector-units control, and WHICH
+        # units are reachable depends on metadata: mrad is a scattering angle,
+        # so it needs the beam energy. Typing one in has to re-offer it, or the
+        # option stays greyed out on a signal that can now reach it.
+        self._emit_axes(tree)
 
     def _set_axis(self, plot, payload: dict) -> None:
         """Edit one axis property of the active window's root signal and
@@ -155,17 +164,27 @@ class AxesEditorMixin:
                 except (TypeError, ValueError):
                     return  # ignore non-numeric input mid-typing
             else:
+                # A units edit RELABELS and leaves the scale alone — deliberately,
+                # and not the same operation as the dock's Detector-units control,
+                # which converts. Both are needed: "show me this in nm⁻¹" converts,
+                # while "this axis says 1/nm but the numbers are Å⁻¹" is a repair
+                # that must NOT touch them. Only the cell can do the second.
                 setattr(ax, field, str(value))
         except Exception as e:
             log.warning("set_axis failed: %s", e)
             return
 
-        # Recalibrate: re-push every plot in the tree (re-reads the axes →
-        # updated scale bar / extent) and re-emit the table + metadata. A
-        # navigator plot reads the ROOT's navigation axes directly on repaint
-        # (Plot._axes_info / _axes_info_1d branch on is_navigator), so editing a
-        # navigation axis here reaches the navigator panel via this same re-push
-        # — no separate mirror onto the derived navigator signal is needed.
+        self._recalibrate(tree)
+
+    def _recalibrate(self, tree) -> None:
+        """Re-push every plot in *tree* (re-reads the axes → updated scale bar /
+        extent) and re-emit the table + metadata.
+
+        A navigator plot reads the ROOT's navigation axes directly on repaint
+        (``Plot._axes_info`` / ``_axes_info_1d`` branch on ``is_navigator``), so
+        editing a navigation axis reaches the navigator panel through this same
+        re-push — no separate mirror onto the derived navigator signal is needed.
+        """
         for p in list(self._plots):
             if getattr(p, "signal_tree", None) is tree:
                 try:
@@ -174,6 +193,36 @@ class AxesEditorMixin:
                     log.debug("re-emitting plot update failed: %s", e)
         self._emit_axes(tree)
         self._emit_metadata(tree)
+
+    def _set_reciprocal_units(self, plot, payload: dict) -> None:
+        """Re-express the detector axes in another unit — px, mrad, nm⁻¹, Å⁻¹.
+
+        This RESCALES. The dock's units cell can also be typed into, and that
+        only relabels, which is how a calibration becomes a lie; this is the
+        control to reach for when the unit is what you mean to change.
+
+        Nothing downstream depends on which unit is showing: the
+        crystallographic paths ask :mod:`spyde.reciprocal_units` what a pixel is
+        worth in Å⁻¹ rather than reading the axis scale. So this is a display
+        choice, and a scan indexes identically in any of the four.
+        """
+        if plot is None:
+            return
+        tree = getattr(plot, "signal_tree", None)
+        if tree is None:
+            return
+        from spyde.reciprocal_units import convert_signal_axes, available_units
+
+        unit = str(payload.get("units", "")).strip()
+        reason = available_units(tree.root).get(unit)
+        if reason:
+            ipc.emit_error(f"Cannot show the detector in {unit}: it {reason}.")
+            return
+        if not convert_signal_axes(tree.root, unit):
+            ipc.emit_error(f"Could not express the detector axes in {unit}.")
+            return
+        self._recalibrate(tree)
+        ipc.emit_status(f"Detector axes now in {unit}")
 
     def _set_title(self, plot, payload: dict) -> None:
         """Rename the dataset (the breadcrumb's [Name] segment). Writes the root

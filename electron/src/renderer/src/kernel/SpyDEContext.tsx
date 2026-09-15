@@ -206,6 +206,16 @@ export interface AxisRow {
   navigate: boolean
 }
 
+/** What the detector-units control offers, when the signal HAS a detector to
+ *  re-express. Absent for a spectrum, a scan-space result map, an image.
+ *  `reasons[unit]` is "" when the unit is available and names what is missing
+ *  otherwise ("needs a beam energy"), so a disabled option can say why. */
+export interface UnitsToggle {
+  current: string
+  order: string[]
+  reasons: Record<string, string>
+}
+
 // Extends the shell's chrome slice (status / logs / env setup / backend
 // death / computing overlays / toolbar action state) — see
 // @de/shell-renderer's shellState.ts. Only SpyDE's own fields are listed here.
@@ -237,6 +247,7 @@ interface State extends ShellState {
   signalTreeActive: Map<number, number>   // windowId → active node signal_id
   navigatorOptions: Map<number, NavigatorOptions>   // navigator windowId → named navigators
   axes: Map<number, AxisRow[]>
+  unitsToggle: Map<number, UnitsToggle | null>
   // windowId → the Axes table "+" origin-pick is live on that window's plot.
   // BACKEND-OWNED (the `offset_pick` message): it owns the crosshair widget, so
   // it owns the toggle. A renderer-local boolean drifted — switching windows
@@ -281,7 +292,7 @@ type Action =
       editable?: Record<string, Record<string, string>>; info?: MetadataInfo
       chunking?: ChunkInfo | null }
   | { type: 'COMPOSITION'; windowIds: number[]; composition: Composition }
-  | { type: 'AXES'; windowIds: number[]; axes: AxisRow[] }
+  | { type: 'AXES'; windowIds: number[]; axes: AxisRow[]; unitsToggle: UnitsToggle | null }
   | { type: 'OFFSET_PICK'; windowId: number; on: boolean }
   | { type: 'HISTOGRAM'; windowId: number; histogram: Histogram }
   | { type: 'NAV_SHAPE_PROMPT'; prompt: NavShapePrompt | null }
@@ -434,6 +445,7 @@ function spydeReducer(state: State, action: Action): State {
         metadataEditable: drop(state.metadataEditable),
         chunking: drop(state.chunking),
         axes: drop(state.axes),
+        unitsToggle: drop(state.unitsToggle),
         offsetPick: drop(state.offsetPick),
         composition: drop(state.composition),
         signalTrees: drop(state.signalTrees),
@@ -472,8 +484,12 @@ function spydeReducer(state: State, action: Action): State {
 
     case 'AXES': {
       const axes = new Map(state.axes)
-      for (const wid of action.windowIds) axes.set(wid, action.axes)
-      return { ...state, axes }
+      const unitsToggle = new Map(state.unitsToggle)
+      for (const wid of action.windowIds) {
+        axes.set(wid, action.axes)
+        unitsToggle.set(wid, action.unitsToggle)
+      }
+      return { ...state, axes, unitsToggle }
     }
 
     case 'OFFSET_PICK': {
@@ -678,6 +694,7 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
     signalTreeActive: new Map(),
     navigatorOptions: new Map(),
     axes: new Map(),
+    unitsToggle: new Map(),
     offsetPick: new Map(),
     activeActions: new Map(),
     subItems: new Map(),
@@ -1025,6 +1042,7 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
             type: 'AXES',
             windowIds: msg.window_ids ?? [],
             axes: msg.axes ?? [],
+            unitsToggle: (msg.units_toggle as UnitsToggle | undefined) ?? null,
           })
           break
 
