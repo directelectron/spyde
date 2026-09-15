@@ -215,7 +215,8 @@ test('the SAME file+search row + COD popout work in the VECTOR OM wizard', async
   const calls = (await sent()) as Array<{ action: string; payload: Record<string, unknown> }>
   expect(calls.find(c => c.action === 'cod_pick')?.payload.cod_id).toBe('1100136')
 
-  // The vector wizard is single-phase → the picked .cif becomes the chosen file.
+  // The vector wizard takes SEVERAL phases now, so the picked .cif joins the
+  // list rather than renaming the button.
   await inject({ type: 'cod_cif_ready', window_id: 1, cod_id: '1100136', path: '/tmp/cod_1100136.cif', label: 'Silver' })
-  await expect(page.getByTestId('vom-pick-cif')).toHaveText('cod_1100136.cif')
+  await expect(page.getByTestId('vom-cif-list')).toContainText('cod_1100136.cif')
 })

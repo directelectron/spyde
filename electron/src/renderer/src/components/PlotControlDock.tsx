@@ -155,14 +155,14 @@ function DetectorUnits({ toggle, onPick }:
                                 : label(unit),
   }))
   return (
-    <div style={{ ...styles.toggleRow, justifyContent: 'space-between',
-                  marginBottom: 4 }}>
-      <span style={{ ...styles.label, margin: 0 }}>Detector units</span>
+    <div title="What the detector axes are calibrated in — this CONVERTS them">
       <Dropdown
         testid="detector-units"
         value={toggle.current}
         options={options}
-        width={124}
+        // The trigger shows the unit; the column it heads says what it is.
+        triggerText={label(toggle.current)}
+        compact
         onChange={(unit) => {
           // A disabled option is still clickable in the themed menu, so the
           // guard lives here as well as in the backend — which is also what
@@ -178,9 +178,11 @@ function DetectorUnits({ toggle, onPick }:
 // to the dataset's axes_manager (which re-pushes every plot → the change shows in
 // the plot immediately). The dataset SHAPE lives in the Metadata panel now, so
 // there's no size column here.
-function AxesTable({ axes, onEdit, offsetPick, onToggleOffsetPick }:
+function AxesTable({ axes, onEdit, offsetPick, onToggleOffsetPick,
+                    unitsToggle, onReciprocalUnits }:
   { axes: AxisRow[]; onEdit: (index: number, field: string, value: string) => void
-    offsetPick: boolean; onToggleOffsetPick: () => void }) {
+    offsetPick: boolean; onToggleOffsetPick: () => void
+    unitsToggle?: UnitsToggle | null; onReciprocalUnits: (units: string) => void }) {
   const txt = (ax: AxisRow, field: keyof AxisRow) => {
     const v = ax[field]
     return v == null ? '' : String(v)
@@ -232,7 +234,16 @@ function AxesTable({ axes, onEdit, offsetPick, onToggleOffsetPick }:
                 )}
               </span>
             </th>
-            <th style={styles.axTh}>units</th>
+            {/* The detector-units control heads the column it governs, rather
+                than costing a row of its own: the dock is budgeted to fit its
+                pinned sections at laptop height without scrolling
+                (dock_compact.spec.ts). Signals with no reciprocal detector —
+                a spectrum, a result map — get the plain heading. */}
+            <th style={styles.axTh}>
+              {unitsToggle
+                ? <DetectorUnits toggle={unitsToggle} onPick={onReciprocalUnits} />
+                : 'units'}
+            </th>
           </tr>
         </thead>
         <tbody>
@@ -795,11 +806,9 @@ export function PlotControlDock() {
       {win && axes && axes.length > 0 && (
         <div style={styles.section} data-testid="axes-section">
           <div style={styles.label}>Axes</div>
-          {unitsToggle && (
-            <DetectorUnits toggle={unitsToggle} onPick={onReciprocalUnits} />
-          )}
           <AxesTable axes={axes} onEdit={onAxisEdit}
-            offsetPick={offsetPick} onToggleOffsetPick={onToggleOffsetPick} />
+            offsetPick={offsetPick} onToggleOffsetPick={onToggleOffsetPick}
+            unitsToggle={unitsToggle} onReciprocalUnits={onReciprocalUnits} />
         </div>
       )}
 

@@ -485,8 +485,10 @@ test('Vector Orientation Mapping opens the staged wizard and drives Generate→C
   await expect(page.getByTestId('vector-orientation-wizard')).toBeVisible()
   await expect(page.getByTestId('vom-tab-Run')).toBeDisabled()
 
+  // The Load tab holds a LIST of phases now (multi-phase fits), so a pick adds
+  // a row rather than renaming the button.
   await page.getByTestId('vom-pick-cif').click()
-  await expect(page.getByTestId('vom-pick-cif')).toHaveText('Ag.cif')
+  await expect(page.getByTestId('vom-cif-list')).toContainText('Ag.cif')
   await page.getByTestId('vom-tab-Library').click()
   await page.getByTestId('vom-generate').click()
   await expect(page.getByTestId('vom-tab-Run')).toBeEnabled()
