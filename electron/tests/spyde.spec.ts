@@ -501,12 +501,13 @@ test('Vector Orientation Mapping opens the staged wizard and drives Generate→C
   // The Load tab is a door onto the SAMPLE's phases: the button adds a row when
   // there is none, and the (mocked) file picker gives it a structure.
   await page.getByTestId('vom-add-phase').click()
-  await expect(page.getByTestId('phases-editor')).toBeVisible()
+  await expect(page.getByTestId('periodic-table')).toBeVisible()
   await phaseEcho([{}])                                   // add_phase landed
+  await expect(page.getByTestId('phase-row-0')).toBeVisible()
   await page.getByTestId('phase-0-cif').click()
   await phaseEcho([{ cif_path: '/tmp/Ag.cif', label: 'Ag' }])   // …and the pick
   await expect(page.getByTestId('phase-0-structure')).toContainText('Ag')
-  await page.getByTestId('phases-done').click()
+  await page.getByTestId('ptable-apply').click()
   await expect(page.getByTestId('vom-cif-list')).toContainText('Ag')
   await page.getByTestId('vom-tab-Library').click()
   await page.getByTestId('vom-generate').click()
@@ -625,12 +626,13 @@ test('Orientation Mapping opens the staged wizard and drives the staged actions'
   // The Load tab is a door onto the SAMPLE's phases: the button adds a row when
   // there is none, and the (mocked) file picker gives it a structure.
   await page.getByTestId('om-add-phase').click()
-  await expect(page.getByTestId('phases-editor')).toBeVisible()
+  await expect(page.getByTestId('periodic-table')).toBeVisible()
   await phaseEcho([{}])                                   // add_phase landed
+  await expect(page.getByTestId('phase-row-0')).toBeVisible()
   await page.getByTestId('phase-0-cif').click()
   await phaseEcho([{ cif_path: '/tmp/Ag.cif', label: 'Ag' }])   // …and the pick
   await expect(page.getByTestId('phase-0-structure')).toContainText('Ag')
-  await page.getByTestId('phases-done').click()
+  await page.getByTestId('ptable-apply').click()
   await expect(page.getByTestId('om-cif-list')).toContainText('Ag')
   // 2 Library → Generate Library → dispatches om_generate_library + unlocks Refine.
   await page.getByTestId('om-tab-Library').click()
@@ -677,12 +679,13 @@ test('a phase belongs to the sample, so it survives closing the wizard', async (
   // The Load tab is a door onto the SAMPLE's phases: the button adds a row when
   // there is none, and the (mocked) file picker gives it a structure.
   await page.getByTestId('om-add-phase').click()
-  await expect(page.getByTestId('phases-editor')).toBeVisible()
+  await expect(page.getByTestId('periodic-table')).toBeVisible()
   await phaseEcho([{}])                                   // add_phase landed
+  await expect(page.getByTestId('phase-row-0')).toBeVisible()
   await page.getByTestId('phase-0-cif').click()
   await phaseEcho([{ cif_path: '/tmp/Quartz.cif', label: 'Quartz' }])   // …and the pick
   await expect(page.getByTestId('phase-0-structure')).toContainText('Quartz')
-  await page.getByTestId('phases-done').click()
+  await page.getByTestId('ptable-apply').click()
   await expect(page.getByTestId('om-cif-list')).toContainText('Quartz')
 
   // Close + reopen → the phase is still there. Nothing is "remembered" for
@@ -697,7 +700,7 @@ test('a phase belongs to the sample, so it survives closing the wizard', async (
   await page.getByTestId('om-add-phase').click()
   await page.getByTestId('phase-0-remove').click()
   await phaseEcho([])
-  await page.getByTestId('phases-done').click()
+  await page.getByTestId('ptable-apply').click()
   await expect(page.getByTestId('om-cif-list')).toContainText('No phases yet')
   await expect(page.getByTestId('composition-empty')).toBeVisible()
 })

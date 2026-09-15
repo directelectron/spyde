@@ -59,7 +59,7 @@ async function aSignalWindow() {
   await expect(page.getByTestId('plot-control-dock')).toBeVisible()
 }
 
-test('periodic-table picker writes the composition (set_phase)', async () => {
+test('periodic-table picker writes the composition (set_composition)', async () => {
   await trackActions()
   await aSignalWindow()
 
@@ -79,13 +79,12 @@ test('periodic-table picker writes the composition (set_phase)', async () => {
   await page.getByTestId('ptable-apply').click()
   await expect(page.getByTestId('periodic-table')).toBeHidden()
 
-  // The dock edits ONE phase — index 0 for a sample that has just the one.
-  // (The flat `set_composition` stays for scripted callers; the dock is
-  // phase-aware because composition and structure are one thing now.)
+  // Every element click writes through, so take the LAST one — the composition
+  // as committed. (Clicking with a phase selected also sends `set_phase` as you
+  // go: a phase is a subset of this list.)
   const calls = (await sent()) as Array<{ action: string; payload: Record<string, unknown> }>
-  const setc = calls.find(c => c.action === 'set_phase')
+  const setc = calls.filter(c => c.action === 'set_composition').pop()
   expect(setc).toBeTruthy()
-  expect(setc!.payload.index).toBe(0)
   expect(setc!.payload.elements).toEqual(['Fe', 'Ni'])
   expect((setc!.payload.percentages as Record<string, number>).Fe).toBe(70)
 })
@@ -144,9 +143,10 @@ test('the COD search is scoped to ONE phase, and its pick is recorded there', as
   await expect(page.getByTestId('composition-section')).toContainText('&')
 
   await page.getByTestId('composition-edit').click()
-  await expect(page.getByTestId('phases-editor')).toBeVisible()
+  await expect(page.getByTestId('periodic-table')).toBeVisible()
 
   // Searching row 1 asks for THAT row's elements, and says so.
+  await page.getByTestId('phase-btn-1').click()
   await page.getByTestId('phase-1-cod').click()
   const calls = (await sent()) as Array<{ action: string; payload: Record<string, unknown> }>
   expect(calls.find(c => c.action === 'cod_search')?.payload.phase).toBe(1)

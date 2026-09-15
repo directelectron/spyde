@@ -331,3 +331,37 @@ class TestElementsFromCif:
         phase = comp.read_phases(t)[0]
         assert phase["elements"] == ["Ag", "Cu"]
         assert phase["percentages"] == {"Ag": 90.0}
+
+
+class TestSampleElementsOutsideAnyPhase:
+    """An element can belong to the sample without belonging to a phase — the
+    extra oxygen that is in neither structure being indexed against."""
+
+    def test_an_extra_element_survives_a_phase_edit(self, monkeypatch):
+        t = _Tree(_sig())
+        comp.write_composition(t, ["Ti", "O", "C"], {})      # C is in no phase
+        comp.write_phases(t, [{"elements": ["Ti", "O"]}])
+        assert comp.read_composition(t)[0] == ["Ti", "O", "C"]
+
+        monkeypatch.setattr(comp, "_src_plot_tree", lambda s, p: (None, t))
+        comp.set_phase(None, None, {"index": 0, "elements": ["Ti"]})
+        # Rebuilding the sample from the phases alone would have dropped C.
+        assert comp.read_composition(t)[0] == ["Ti", "O", "C"]
+
+    def test_a_phase_element_joins_the_sample(self, monkeypatch):
+        t = _Tree(_sig())
+        comp.write_composition(t, ["Ti"], {})
+        monkeypatch.setattr(comp, "_src_plot_tree", lambda s, p: (None, t))
+        comp.set_phase(None, None, {"index": 0, "elements": ["Ti", "O"]})
+        assert comp.read_composition(t)[0] == ["Ti", "O"]
+
+    def test_unticking_an_element_removes_it_from_the_phases_too(self, monkeypatch):
+        # A phase is a SUBSET of the sample, so an element the sample no longer
+        # has cannot stay in one — and if it did, the next phase write would put
+        # it back and the removal would look broken.
+        t = _Tree(_sig())
+        comp.write_phases(t, [{"elements": ["Ti", "O"]}, {"elements": ["O"]}])
+        monkeypatch.setattr(comp, "_src_plot_tree", lambda s, p: (None, t))
+        comp.set_composition(None, None, {"elements": ["Ti"], "percentages": {}})
+        assert comp.read_composition(t)[0] == ["Ti"]
+        assert [p["elements"] for p in comp.read_phases(t)] == [["Ti"], []]

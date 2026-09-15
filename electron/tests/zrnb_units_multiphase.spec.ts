@@ -228,13 +228,14 @@ test('two-phase vector orientation reaches phase + strain windows', async () => 
 
   // Two phases, each given a structure from the (queued) file picker.
   await page.getByTestId('vom-add-phase').click()
-  await expect(page.getByTestId('phases-editor')).toBeVisible()
+  await expect(page.getByTestId('periodic-table')).toBeVisible()
+  await expect(page.getByTestId('phase-row-0')).toBeVisible()
   await page.getByTestId('phase-0-cif').click()
   await expect(page.getByTestId('phase-0-structure')).toContainText('alpha_Zr')
-  await page.getByTestId('phases-add').click()
+  await page.getByTestId('ptable-add-phase').click()
   await page.getByTestId('phase-1-cif').click()
   await expect(page.getByTestId('phase-1-structure')).toContainText('beta_Nb')
-  await page.getByTestId('phases-done').click()
+  await page.getByTestId('ptable-apply').click()
   const list = await page.getByTestId('vom-cif-list').innerText()
   console.log('[phase list]\n' + list)
   expect(list).toContain('Zr')

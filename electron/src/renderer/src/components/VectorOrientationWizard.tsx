@@ -14,7 +14,7 @@
 import React from 'react'
 import { WizardShell, TabRow, Field, NumInput, Slider, Check, S } from './WizardShell'
 import { useDebouncedAction, useWizardEvent } from './wizardHooks'
-import { PhasesEditor, PHASE_STYLE } from './PhasesEditor'
+import { PeriodicTable, PHASE_STYLE } from './PeriodicTable'
 import { useSpyDE } from '../kernel/SpyDEContext'
 
 const TABS = ['Load', 'Library', 'Refine', 'Run'] as const
@@ -50,7 +50,8 @@ export function VectorOrientationWizard({ caretPos, windowId, sendAction, onClos
   // structure are one thing, so the dock and the wizard read the same list and
   // a structure chosen here is recorded on the dataset.
   const { state } = useSpyDE()
-  const phases = state.composition.get(windowId)?.phases ?? []
+  const composition = state.composition.get(windowId)
+  const phases = composition?.phases ?? []
   const [phasesOpen, setPhasesOpen] = React.useState(false)
   const [voltage, setVoltage] = React.useState(saved?.voltage ?? 200)
   const [resolution, setResolution] = React.useState(saved?.resolution ?? 1.0)
@@ -151,8 +152,20 @@ export function VectorOrientationWizard({ caretPos, windowId, sendAction, onClos
           </div>
           <Field label="Voltage (kV)"><NumInput value={voltage} onChange={setVoltage} step="1" width={60} /></Field>
           {phasesOpen && (
-            <PhasesEditor windowId={windowId} phases={phases} sendAction={sendAction}
-              onClose={() => setPhasesOpen(false)} />
+            // The SAME popout the dock opens: a phase's elements and its
+            // structure belong together, and the sample owns both.
+            <PeriodicTable
+              initial={composition?.elements ?? []}
+              initialPct={composition?.percentages ?? {}}
+              phases={phases}
+              windowId={windowId}
+              sendAction={sendAction}
+              onApply={(els, percentages) => {
+                sendAction('set_composition', { elements: els, percentages }, windowId)
+                setPhasesOpen(false)
+              }}
+              onClose={() => setPhasesOpen(false)}
+            />
           )}
         </div>
       )}

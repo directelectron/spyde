@@ -9,14 +9,18 @@
  * with `&` between them, and each phase shows the structure that indexes it
  * once one is chosen.
  *
+ * Editing happens in ONE popout (PeriodicTable): clicking elements builds the
+ * sample, and selecting a phase first makes those clicks build that phase, so a
+ * phase is a SUBSET of the composition rather than a second thing to type in.
+ *
  * The flat `Sample.elements` / `Sample.composition` metadata is unchanged
- * underneath — it is the union across phases, and it is what EELS edge
- * suggestion and EDS quantification read.
+ * underneath — it is the union across phases, plus any element that belongs to
+ * the sample without belonging to one, and it is what EELS edge suggestion and
+ * EDS quantification read.
  */
 import React from 'react'
 import type { Composition, SamplePhase } from '../kernel/SpyDEContext'
 import { PeriodicTable } from './PeriodicTable'
-import { PhasesEditor } from './PhasesEditor'
 
 interface Props {
   activeId: number | null
@@ -27,11 +31,7 @@ interface Props {
 const base = (p: string) => p.split(/[/\\]/).pop() || p
 
 export function CompositionPanel({ activeId, composition, sendAction }: Props) {
-  // Two ways in. The periodic table edits ONE phase's elements (the common
-  // case, and what "Edit" meant before phases existed); the phases editor is
-  // the whole picture, including each phase's structure.
-  const [editing, setEditing] = React.useState<number | null>(null)
-  const [phasesOpen, setPhasesOpen] = React.useState(false)
+  const [editing, setEditing] = React.useState(false)
   const elements = composition?.elements ?? []
   const phases: SamplePhase[] = composition?.phases?.length
     ? composition.phases
@@ -40,6 +40,9 @@ export function CompositionPanel({ activeId, composition, sendAction }: Props) {
       ? [{ elements, percentages: composition?.percentages ?? {},
            cifPath: null, label: null, codId: null }]
       : [])
+  const pct = composition?.percentages ?? {}
+  const claimed = new Set(phases.flatMap(p => p.elements))
+  const unassigned = elements.filter(el => !claimed.has(el))
 
   return (
     <div style={S.section} data-testid="composition-section">
@@ -51,16 +54,13 @@ export function CompositionPanel({ activeId, composition, sendAction }: Props) {
           <span style={{ ...S.empty, flex: 1, marginLeft: 6 }}
             data-testid="composition-empty">No elements set</span>
         )}
-        {phases.length > 0 && (
-          <button data-testid="composition-add-phase" style={S.ampBtn}
-            title="Add another phase — this sample contains more than one"
-            onClick={() => { if (activeId != null) sendAction('add_phase', {}, activeId) }}>
-            &amp;
-          </button>
-        )}
+        {/* One door. Elements and phases are edited in the same popout, because
+            a phase is a SUBSET of the composition — telling them to two
+            different modals is what made a two-phase sample impossible to
+            describe in the first place. */}
         <button data-testid="composition-edit" style={S.editBtn}
-          onClick={() => (phases.length > 1 ? setPhasesOpen(true) : setEditing(0))}>
-          {phases.length ? 'Edit' : '＋ Elements'}
+          onClick={() => setEditing(true)}>
+          {phases.length ? 'Edit' : '＋ Elements and Phase'}
         </button>
       </div>
 
@@ -88,22 +88,39 @@ export function CompositionPanel({ activeId, composition, sendAction }: Props) {
         </div>
       ))}
 
-      {phasesOpen && activeId != null && (
-        <PhasesEditor windowId={activeId} phases={phases} sendAction={sendAction}
-          onClose={() => setPhasesOpen(false)} />
+      {/* Elements the sample has that no phase claims — the extra oxygen. They
+          are real composition and would otherwise be recorded but invisible. */}
+      {unassigned.length > 0 && (
+        <div style={S.phaseRow} data-testid="composition-unassigned">
+          <span style={S.amp} title="in the sample, in no phase">+</span>
+          <div style={S.chips}>
+            {unassigned.map(el => (
+              <span key={el} style={S.chip} data-testid={`composition-extra-${el}`}>
+                <span style={S.sym}>{el}</span>
+                {pct[el] != null && <span style={S.pct}>{pct[el]}%</span>}
+              </span>
+            ))}
+          </div>
+        </div>
       )}
 
-      {editing != null && (
+      {editing && (
         <PeriodicTable
-          initial={phases[editing]?.elements ?? []}
-          initialPct={phases[editing]?.percentages ?? {}}
+          // The SAMPLE's elements — the union across phases plus anything that
+          // belongs to the sample without belonging to a phase (the extra
+          // oxygen that is in neither structure you are indexing against).
+          initial={elements}
+          initialPct={composition?.percentages ?? {}}
+          phases={phases}
+          windowId={activeId}
+          sendAction={sendAction}
           onApply={(els, percentages) => {
             if (activeId != null) {
-              sendAction('set_phase', { index: editing, elements: els, percentages }, activeId)
+              sendAction('set_composition', { elements: els, percentages }, activeId)
             }
-            setEditing(null)
+            setEditing(false)
           }}
-          onClose={() => setEditing(null)}
+          onClose={() => setEditing(false)}
         />
       )}
     </div>
@@ -121,10 +138,6 @@ const S: Record<string, React.CSSProperties> = {
   editBtn: {
     background: 'none', border: '1px solid #313244', color: '#89b4fa', cursor: 'pointer',
     fontSize: 10, fontWeight: 600, padding: '1px 8px', borderRadius: 4,
-  },
-  ampBtn: {
-    background: 'none', border: '1px solid #313244', color: '#cba6f7', cursor: 'pointer',
-    fontSize: 11, fontWeight: 700, padding: '1px 7px', borderRadius: 4,
   },
   empty: { fontSize: 10, color: '#6c7086' },
   phaseRow: { display: 'flex', alignItems: 'center', gap: 4, marginTop: 2 },

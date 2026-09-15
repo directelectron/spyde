@@ -92,12 +92,13 @@ test('Vector Orientation Mapping: Generate → Compute opens IPF + strain window
   // The Load tab is a door onto the SAMPLE's phases now: add a phase, give it a
   // structure through the (mocked) file picker, and the row shows what it got.
   await page.getByTestId('vom-add-phase').click()
-  await expect(page.getByTestId('phases-editor')).toBeVisible()
-  await page.getByTestId('phases-add').click()
+  await expect(page.getByTestId('periodic-table')).toBeVisible()
+  // The wizard's button already added the phase, and a lone phase is selected
+  // for you — so its row is open without a second "Add phase".
   await expect(page.getByTestId('phase-row-0')).toBeVisible()
   await page.getByTestId('phase-0-cif').click()
   await expect(page.getByTestId('phase-0-structure')).toContainText('Silver__0011135')
-  await page.getByTestId('phases-done').click()
+  await page.getByTestId('ptable-apply').click()
   await expect(page.getByTestId('vom-cif-list')).toContainText('Silver__0011135')
 
   // 2 Library → Generate (real diffsims library).

@@ -127,23 +127,29 @@ def read_phases(tree) -> list[dict]:
 
 
 def write_phases(tree, phases) -> None:
-    """Store *phases* and re-derive the canonical flat fields from them.
+    """Store *phases* and fold their elements into the canonical flat fields.
 
-    The union is taken in phase order and deduped, so ``Sample.elements`` reads
-    the way a person would list the sample ("Cu, Nb") whatever the grouping.
+    The sample's own element list is KEPT and added to, never replaced by the
+    union across phases. An element can belong to the sample without belonging
+    to any phase — the extra oxygen that is in neither structure being indexed
+    against — and rebuilding ``Sample.elements`` from the phases alone would
+    silently drop it the next time any phase was edited.
+
+    Order is the sample's first, then anything a phase introduced, so the list
+    reads the way the person building it added things.
     """
     cleaned = [_clean_phase(p) for p in phases]
-    union: list[str] = []
-    percentages: dict[str, float] = {}
+    elements, percentages = read_composition(tree)
+    elements = list(elements)
     for phase in cleaned:
         for symbol in phase["elements"]:
-            if symbol not in union:
-                union.append(symbol)
-            if symbol in phase["percentages"]:
-                percentages.setdefault(symbol, phase["percentages"][symbol])
+            if symbol not in elements:
+                elements.append(symbol)
+            percentages.setdefault(symbol, phase["percentages"].get(symbol))
+    percentages = {k: v for k, v in percentages.items() if v is not None}
     md = tree.root.metadata
     md.set_item(_PHASES_KEY, cleaned)
-    write_composition(tree, union, percentages)
+    write_composition(tree, elements, percentages)
 
 
 def phase_label(phase) -> str:
@@ -187,6 +193,15 @@ def set_composition(session, plot, payload) -> None:
     percentages = payload.get("percentages") or {}
     try:
         write_composition(tree, elements, percentages)
+        # Un-ticking an element in the periodic table has to remove it from the
+        # phases too. A phase is a SUBSET of the sample, so leaving it behind
+        # would both contradict that and quietly put the element back the next
+        # time any phase was written.
+        phases = read_phases(tree)
+        kept = [dict(p, elements=[e for e in p["elements"] if e in elements])
+                for p in phases]
+        if kept != phases:
+            write_phases(tree, kept)
     except Exception as e:
         emit_error(f"Could not set composition: {e}")
         return
