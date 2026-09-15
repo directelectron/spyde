@@ -104,7 +104,26 @@ export interface ChunkInfo {
   /** A chunk does NOT hold whole signal frames — the navigator-killer. */
   signal_split: boolean
 }
-export interface Composition { elements: string[]; percentages: Record<string, number> }
+/** One phase of the sample: what it is made of, and the structure that indexes
+ *  it. `cifPath` is null until one is chosen — a phase whose composition is
+ *  known but whose structure is not is a normal state, and it is the state you
+ *  search COD from. */
+export interface SamplePhase {
+  elements: string[]
+  percentages: Record<string, number>
+  cifPath: string | null
+  label: string | null
+  codId: string | null
+}
+
+/** `elements`/`percentages` are the flat union across phases — the
+ *  HyperSpy-canonical fields that EELS edge suggestion and EDS quantification
+ *  read. `phases` is how the sample is actually divided up. */
+export interface Composition {
+  elements: string[]
+  percentages: Record<string, number>
+  phases: SamplePhase[]
+}
 export interface Histogram {
   counts: number[]
   edges: number[]
@@ -1022,6 +1041,13 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
             composition: {
               elements: msg.elements ?? [],
               percentages: msg.percentages ?? {},
+              phases: ((msg.phases ?? []) as Record<string, unknown>[]).map((p) => ({
+                elements: (p.elements ?? []) as string[],
+                percentages: (p.percentages ?? {}) as Record<string, number>,
+                cifPath: (p.cif_path ?? null) as string | null,
+                label: (p.label ?? null) as string | null,
+                codId: (p.cod_id ?? null) as string | null,
+              })),
             },
           })
           break
