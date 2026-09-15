@@ -226,11 +226,15 @@ test('two-phase vector orientation reaches phase + strain windows', async () => 
   await vecWin.getByTestId('action-btn-Vector Orientation Mapping').click()
   await expect(page.getByTestId('vector-orientation-wizard')).toBeVisible({ timeout: 30_000 })
 
-  // Two picks → two phases in the list.
-  await page.getByTestId('vom-pick-cif').click()
-  await page.waitForTimeout(400)
-  await page.getByTestId('vom-pick-cif').click()
-  await page.waitForTimeout(400)
+  // Two phases, each given a structure from the (queued) file picker.
+  await page.getByTestId('vom-add-phase').click()
+  await expect(page.getByTestId('phases-editor')).toBeVisible()
+  await page.getByTestId('phase-0-cif').click()
+  await expect(page.getByTestId('phase-0-structure')).toContainText('alpha_Zr')
+  await page.getByTestId('phases-add').click()
+  await page.getByTestId('phase-1-cif').click()
+  await expect(page.getByTestId('phase-1-structure')).toContainText('beta_Nb')
+  await page.getByTestId('phases-done').click()
   const list = await page.getByTestId('vom-cif-list').innerText()
   console.log('[phase list]\n' + list)
   expect(list).toContain('Zr')

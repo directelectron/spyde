@@ -59,7 +59,7 @@ async function aSignalWindow() {
   await expect(page.getByTestId('plot-control-dock')).toBeVisible()
 }
 
-test('periodic-table picker writes the composition (set_composition)', async () => {
+test('periodic-table picker writes the composition (set_phase)', async () => {
   await trackActions()
   await aSignalWindow()
 
@@ -79,10 +79,13 @@ test('periodic-table picker writes the composition (set_composition)', async () 
   await page.getByTestId('ptable-apply').click()
   await expect(page.getByTestId('periodic-table')).toBeHidden()
 
-  // It dispatched set_composition with the chosen elements + percentage.
+  // The dock edits ONE phase — index 0 for a sample that has just the one.
+  // (The flat `set_composition` stays for scripted callers; the dock is
+  // phase-aware because composition and structure are one thing now.)
   const calls = (await sent()) as Array<{ action: string; payload: Record<string, unknown> }>
-  const setc = calls.find(c => c.action === 'set_composition')
+  const setc = calls.find(c => c.action === 'set_phase')
   expect(setc).toBeTruthy()
+  expect(setc!.payload.index).toBe(0)
   expect(setc!.payload.elements).toEqual(['Fe', 'Ni'])
   expect((setc!.payload.percentages as Record<string, number>).Fe).toBe(70)
 })
@@ -121,101 +124,92 @@ test('dock shows composition chips from the backend echo', async () => {
   await expect(page.getByTestId('composition-chip-O')).toContainText('67%')
 })
 
-test('COD picker lists structures (a/b/c/α/β/γ) and picks one', async () => {
+test('the COD search is scoped to ONE phase, and its pick is recorded there', async () => {
+  // COD matches the elements EXACTLY, so the query has to be one phase's
+  // elements. A Cu/Nb sample asked as a single composition asks for a Cu-Nb
+  // compound and gets nothing back; asked a phase at a time it finds both.
   await trackActions()
-  // A DP window with the Orientation Mapping action so the wizard can open.
+  await aSignalWindow()
+
   await inject({
-    type: 'toolbar_config', window_id: 1, plot_id: 1,
-    toolbar_actions: [{
-      name: 'Orientation Mapping', icon: '', side: 'left', toggle: false, subfunctions: [],
-      parameters: { gamma: { name: 'Gamma', type: 'float', default: 1.0 } },
-    }],
-  })
-  await inject({
-    type: 'figure', window_id: 1, fig_id: 'sig',
-    html: '<html><body>s</body></html>', title: 'Diffraction', is_navigator: false,
+    type: 'composition', window_ids: [1], elements: ['Cu', 'Nb'],
+    percentages: {},
+    phases: [{ elements: ['Cu'], percentages: {}, cif_path: null, label: null, cod_id: null },
+             { elements: ['Nb'], percentages: {}, cif_path: null, label: null, cod_id: null }],
   })
 
-  // Open the wizard (toolbar reveals on hover).
-  await page.getByTestId('subwindow').first().getByTestId('subwindow-titlebar').hover()
-  await page.getByTestId('action-btn-Orientation Mapping').click()
-  await expect(page.getByTestId('orientation-wizard')).toBeVisible()
+  // The dock shows one group per phase, with & between them.
+  await expect(page.getByTestId('composition-phase-0')).toContainText('Cu')
+  await expect(page.getByTestId('composition-phase-1')).toContainText('Nb')
+  await expect(page.getByTestId('composition-section')).toContainText('&')
 
-  // "From file" and "Search" sit side by side in one row.
-  await expect(page.getByTestId('om-pick-cif')).toBeVisible()
-  await expect(page.getByTestId('cod-search')).toBeVisible()
-  expect(await sameRow('om-pick-cif', 'cod-search')).toBeTruthy()
-  await page.screenshot({ path: join(__dirname, '..', 'cif_row.png') })
+  await page.getByTestId('composition-edit').click()
+  await expect(page.getByTestId('phases-editor')).toBeVisible()
 
-  // Search COD by composition → dispatches cod_search + opens a POPOUT.
-  await page.getByTestId('cod-search').click()
-  const c1 = (await sent()) as Array<{ action: string }>
-  expect(c1.some(c => c.action === 'cod_search')).toBeTruthy()
-  await expect(page.getByTestId('cod-popout')).toBeVisible()
+  // Searching row 1 asks for THAT row's elements, and says so.
+  await page.getByTestId('phase-1-cod').click()
+  const calls = (await sent()) as Array<{ action: string; payload: Record<string, unknown> }>
+  expect(calls.find(c => c.action === 'cod_search')?.payload.phase).toBe(1)
 
-  // Backend (mocked here) returns candidate structures with cell parameters,
-  // shown in the popout (not expanding the wizard downward).
+  // Results arrive tagged with the phase and open INLINE in its row — the
+  // question "which phase am I filling?" should not need remembering.
   await inject({
-    type: 'cod_results', window_id: 1, elements: ['Si', 'O'],
-    results: [{
-      id: '1011200', formula: 'O2 Si', phase: 'Quartz', sg: 'P 31 2 1',
-      a: 4.913, b: 4.913, c: 5.405, alpha: 90, beta: 90, gamma: 120, volume: 113,
-    }],
+    type: 'cod_results', window_id: 1, phase: 1, elements: ['Nb'],
+    results: [{ id: '1100136', formula: 'Nb', phase: '', sg: 'I m -3 m',
+      a: 3.301, b: 3.301, c: 3.301, alpha: 90, beta: 90, gamma: 90, volume: 36 }],
   })
-  await expect(page.getByTestId('cod-list')).toBeVisible()
-  await expect(page.getByTestId('cod-row-1011200')).toContainText('Quartz')
-  await expect(page.getByTestId('cod-row-1011200')).toContainText('4.913')
-  await page.screenshot({ path: join(__dirname, '..', 'composition_cod.png') })
+  const row = page.getByTestId('phase-1-cod-results')
+  await expect(row).toBeVisible()
+  await expect(row).toContainText('I m -3 m')
+  await expect(row).toContainText('3.301')
 
-  // Pick it → dispatches cod_pick, the popout closes, and the returned .cif path
-  // is added as a phase.
-  await page.getByTestId('cod-row-1011200').click()
-  await expect(page.getByTestId('cod-popout')).toBeHidden()
-  const c2 = (await sent()) as Array<{ action: string; payload: Record<string, unknown> }>
-  expect(c2.find(c => c.action === 'cod_pick')?.payload.cod_id).toBe('1011200')
-
-  await inject({ type: 'cod_cif_ready', window_id: 1, cod_id: '1011200', path: '/tmp/cod_1011200.cif', label: 'Quartz' })
-  await expect(page.getByTestId('om-cif-list')).toContainText('cod_1011200.cif')
+  await page.getByTestId('cod-row-1100136').click()
+  const after = (await sent()) as Array<{ action: string; payload: Record<string, unknown> }>
+  const pick = after.find(c => c.action === 'cod_pick')
+  expect(pick?.payload.cod_id).toBe('1100136')
+  // The download is BOUND to its phase — that is what lets the sample remember
+  // its own structures instead of the wizard keeping a private list.
+  expect(pick?.payload.phase).toBe(1)
 })
 
-test('the SAME file+search row + COD popout work in the VECTOR OM wizard', async () => {
-  await trackActions()
+test('a phase carries its structure, and the dock shows it beside the chips', async () => {
+  await aSignalWindow()
+  await inject({
+    type: 'composition', window_ids: [1], elements: ['Cu', 'Nb'], percentages: {},
+    phases: [
+      { elements: ['Cu'], percentages: {}, cif_path: '/tmp/Cu.cif',
+        label: 'Cu Fm-3m', cod_id: '9008468' },
+      { elements: ['Nb'], percentages: {}, cif_path: null, label: null, cod_id: null },
+    ],
+  })
+  // Previously a picked .cif was visible nowhere outside the wizard.
+  await expect(page.getByTestId('composition-structure-0')).toContainText('Cu Fm-3m')
+  await expect(page.getByTestId('composition-phase-1')).toContainText('Nb')
+})
+
+test('both orientation wizards read the sample phases, not a private list', async () => {
   await inject({
     type: 'toolbar_config', window_id: 1, plot_id: 1,
-    toolbar_actions: [{
-      name: 'Vector Orientation Mapping', icon: '', side: 'left', toggle: false, subfunctions: [],
-      parameters: { strain_cap: { name: 'Strain cap', type: 'float', default: 0.05 } },
-    }],
+    toolbar_actions: [
+      { name: 'Orientation Mapping', icon: '', side: 'left', toggle: false,
+        subfunctions: [], parameters: {} },
+      { name: 'Vector Orientation Mapping', icon: '', side: 'left', toggle: false,
+        subfunctions: [], parameters: {} },
+    ],
   })
+  await aSignalWindow()
   await inject({
-    type: 'figure', window_id: 1, fig_id: 'vec',
-    html: '<html><body>v</body></html>', title: 'Vectors', is_navigator: false,
+    type: 'composition', window_ids: [1], elements: ['Ag'], percentages: {},
+    phases: [{ elements: ['Ag'], percentages: {}, cif_path: '/tmp/Ag.cif',
+               label: 'Ag Fm-3m', cod_id: null }],
   })
-
-  await page.getByTestId('subwindow').first().getByTestId('subwindow-titlebar').hover()
-  await page.getByTestId('action-btn-Vector Orientation Mapping').click()
-  await expect(page.getByTestId('vector-orientation-wizard')).toBeVisible()
-
-  // File + Search share a row here too.
-  await expect(page.getByTestId('vom-pick-cif')).toBeVisible()
-  await expect(page.getByTestId('cod-search')).toBeVisible()
-  expect(await sameRow('vom-pick-cif', 'cod-search')).toBeTruthy()
-
-  // Search → popout list → pick downloads + loads the structure.
-  await page.getByTestId('cod-search').click()
-  await expect(page.getByTestId('cod-popout')).toBeVisible()
-  await inject({
-    type: 'cod_results', window_id: 1, elements: ['Ag'],
-    results: [{ id: '1100136', formula: 'Ag', phase: 'Silver', sg: 'F m -3 m',
-      a: 4.0855, b: 4.0855, c: 4.0855, alpha: 90, beta: 90, gamma: 90, volume: 68 }],
-  })
-  await expect(page.getByTestId('cod-row-1100136')).toContainText('Silver')
-  await page.getByTestId('cod-row-1100136').click()
-  await expect(page.getByTestId('cod-popout')).toBeHidden()
-  const calls = (await sent()) as Array<{ action: string; payload: Record<string, unknown> }>
-  expect(calls.find(c => c.action === 'cod_pick')?.payload.cod_id).toBe('1100136')
-
-  // The vector wizard is single-phase → the picked .cif becomes the chosen file.
-  await inject({ type: 'cod_cif_ready', window_id: 1, cod_id: '1100136', path: '/tmp/cod_1100136.cif', label: 'Silver' })
-  await expect(page.getByTestId('vom-pick-cif')).toHaveText('cod_1100136.cif')
+  for (const [action, prefix] of [
+    ['Orientation Mapping', 'om'],
+    ['Vector Orientation Mapping', 'vom'],
+  ] as Array<[string, string]>) {
+    await page.getByTestId('subwindow').first().getByTestId('subwindow-titlebar').hover()
+    await page.getByTestId(`action-btn-${action}`).click()
+    await expect(page.getByTestId(`${prefix}-cif-list`)).toContainText('Ag Fm-3m')
+    await page.getByTestId(`${prefix}-close`).click()
+  }
 })

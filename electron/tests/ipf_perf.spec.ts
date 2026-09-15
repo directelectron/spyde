@@ -146,8 +146,14 @@ test('IPF raster/GPU render paths render correctly in the real app', async () =>
   await sig.getByTestId('action-btn-Orientation Mapping').click()
   await expect(page.getByTestId('orientation-wizard')).toBeVisible()
 
-  await page.getByTestId('om-pick-cif').click()
-  await expect(page.getByTestId('om-cif-list')).toContainText('Silver__0011135.cif')
+  // The Load tab is a door onto the SAMPLE's phases: the button adds a row when
+  // there is none, and the (mocked) file picker gives it a structure.
+  await page.getByTestId('om-add-phase').click()
+  await expect(page.getByTestId('phases-editor')).toBeVisible()
+  await page.getByTestId('phase-0-cif').click()
+  await expect(page.getByTestId('phase-0-structure')).toContainText('Silver__0011135')
+  await page.getByTestId('phases-done').click()
+  await expect(page.getByTestId('om-cif-list')).toContainText('Silver__0011135')
 
   await page.getByTestId('om-tab-Library').click()
   await page.getByTestId('om-generate').click()

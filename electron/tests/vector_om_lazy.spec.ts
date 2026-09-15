@@ -89,10 +89,16 @@ test('Vector Orientation Mapping: Generate → Compute opens IPF + strain window
   await expect(page.getByTestId('vector-orientation-wizard')).toBeVisible()
 
   // 1 Load → pick the real cif (mocked); wait for the async picker to resolve.
-  await page.getByTestId('vom-pick-cif').click()
-  // The Load tab holds a LIST of phases now (multi-phase fits), so a pick adds
-  // a row rather than renaming the button.
-  await expect(page.getByTestId('vom-cif-list')).toContainText('Silver__0011135.cif')
+  // The Load tab is a door onto the SAMPLE's phases now: add a phase, give it a
+  // structure through the (mocked) file picker, and the row shows what it got.
+  await page.getByTestId('vom-add-phase').click()
+  await expect(page.getByTestId('phases-editor')).toBeVisible()
+  await page.getByTestId('phases-add').click()
+  await expect(page.getByTestId('phase-row-0')).toBeVisible()
+  await page.getByTestId('phase-0-cif').click()
+  await expect(page.getByTestId('phase-0-structure')).toContainText('Silver__0011135')
+  await page.getByTestId('phases-done').click()
+  await expect(page.getByTestId('vom-cif-list')).toContainText('Silver__0011135')
 
   // 2 Library → Generate (real diffsims library).
   await page.getByTestId('vom-tab-Library').click()

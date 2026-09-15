@@ -2,7 +2,8 @@
  * VectorOrientationWizard.tsx — staged Vector-Orientation-Mapping caret.
  *
  * Fits orientation + STRAIN from the tree's diffraction vectors (sparse matcher):
- *   1 Load    — pick one or more .cif crystals (multi-phase) + accelerating voltage.
+ *   1 Load    — the SAMPLE's phases (composition + structure, shared with the
+ *               dock) + accelerating voltage.
  *   2 Library — angle resolution + min intensity → `vom_generate_library`.
  *   3 Refine  — strain cap + match tolerance sliders re-fit the pattern under the
  *               crosshair live (`vom_refine`); the fitted template (green) tracks
@@ -13,8 +14,8 @@
 import React from 'react'
 import { WizardShell, TabRow, Field, NumInput, Slider, Check, S } from './WizardShell'
 import { useDebouncedAction, useWizardEvent } from './wizardHooks'
-import { useCifRecents, RecentCifs } from './CifRecents'
-import { CodPicker } from './CodPicker'
+import { PhasesEditor, PHASE_STYLE } from './PhasesEditor'
+import { useSpyDE } from '../kernel/SpyDEContext'
 
 const TABS = ['Load', 'Library', 'Refine', 'Run'] as const
 type Tab = typeof TABS[number]
@@ -36,7 +37,7 @@ interface VomFit {
 // built template library on the tree, so we must NOT make the user regenerate it
 // (a ~1 min rebuild) just because the React caret was torn down and remounted.
 interface VomSaved {
-  tab: Tab; cifs: string[]; voltage: number; resolution: number; minInt: number
+  tab: Tab; voltage: number; resolution: number; minInt: number
   strainCap: number; tolerance: number; gamma: number; kPow: number
   smooth: boolean; libReady: boolean
 }
@@ -45,10 +46,12 @@ const _vomStore = new Map<number, VomSaved>()
 export function VectorOrientationWizard({ caretPos, windowId, sendAction, onClose }: Props) {
   const saved = _vomStore.get(windowId)
   const [tab, setTab] = React.useState<Tab>(saved?.tab ?? 'Load')
-  // One entry per crystal structure. A precipitate in a matrix is two phases,
-  // and the fit picks the best-matching template per pattern — so loading both
-  // answers which structure, in what orientation, under what strain, at once.
-  const [cifs, setCifs] = React.useState<string[]>(saved?.cifs ?? [])
+  // The phases come from the SAMPLE, not from this caret: composition and
+  // structure are one thing, so the dock and the wizard read the same list and
+  // a structure chosen here is recorded on the dataset.
+  const { state } = useSpyDE()
+  const phases = state.composition.get(windowId)?.phases ?? []
+  const [phasesOpen, setPhasesOpen] = React.useState(false)
   const [voltage, setVoltage] = React.useState(saved?.voltage ?? 200)
   const [resolution, setResolution] = React.useState(saved?.resolution ?? 1.0)
   const [minInt, setMinInt] = React.useState(saved?.minInt ?? 0.0001)
@@ -61,17 +64,16 @@ export function VectorOrientationWizard({ caretPos, windowId, sendAction, onClos
   const [fit, setFit] = React.useState<VomFit | null>(null)
   const [status, setStatus] = React.useState(
     saved?.libReady ? 'Library ready — move the crosshair to refine, or Compute Maps.'
-                    : 'Load a .cif crystal to begin.')
+                    : 'Add a phase to begin.')
 
   // Persist the state for this window on every change so reopening restores it.
   React.useEffect(() => {
-    _vomStore.set(windowId, { tab, cifs, voltage, resolution, minInt, strainCap, tolerance, gamma, kPow, smooth, libReady })
-  }, [windowId, tab, cifs, voltage, resolution, minInt, strainCap, tolerance, gamma, kPow, smooth, libReady])
+    _vomStore.set(windowId, { tab, voltage, resolution, minInt, strainCap, tolerance, gamma, kPow, smooth, libReady })
+  }, [windowId, tab, voltage, resolution, minInt, strainCap, tolerance, gamma, kPow, smooth, libReady])
 
   // Debounced live refine — a pending refine is cancelled on unmount so
   // vom_refine can't fire at a torn-down preview mid-debounce.
   const sendRefine = useDebouncedAction(sendAction, 'vom_refine', windowId)
-  const { recents, remember } = useCifRecents()
 
   // Live single-pattern fit readout streamed from the backend overlay.
   useWizardEvent('spyde:vom_fit', windowId, (d) => {
@@ -79,20 +81,19 @@ export function VectorOrientationWizard({ caretPos, windowId, sendAction, onClos
   })
 
   const base = (p: string) => p.split(/[/\\]/).pop() || p
-  const addCif = (path: string) => {
-    setCifs(c => c.includes(path) ? c : [...c, path])
-    remember(path)
-    setStatus('Crystal loaded — generate the library.')
-  }
-  const pickCif = async () => {
-    const path = await window.electron.pickFile({ name: 'Crystal (.cif)', extensions: ['cif'] })
-    if (path) addCif(path)
-  }
   const generate = () => {
-    if (!cifs.length) { setStatus('Add a .cif first.'); return }
-    setStatus('Generating library… (this can take ~1 min for a full library)')
+    // A phase with no structure yet cannot contribute templates; say which one
+    // rather than silently building a library that is missing it.
+    const missing = phases.filter(p => !p.cifPath)
+    const paths = phases.map(p => p.cifPath).filter(Boolean) as string[]
+    if (!paths.length) { setStatus('Give at least one phase a structure first.'); return }
+    if (missing.length) {
+      setStatus(`Generating without ${missing.map(p => p.elements.join('-') || 'a phase').join(', ')} — no structure set.`)
+    } else {
+      setStatus('Generating library… (this can take ~1 min for a full library)')
+    }
     sendAction('vom_generate_library', {
-      cif_paths: cifs, accelerating_voltage: voltage, resolution, minimum_intensity: minInt,
+      cif_paths: paths, accelerating_voltage: voltage, resolution, minimum_intensity: minInt,
     }, windowId)
     setLibReady(true)
     setTab('Refine')
@@ -121,25 +122,38 @@ export function VectorOrientationWizard({ caretPos, windowId, sendAction, onClos
 
       {tab === 'Load' && (
         <div style={S.page}>
-          <label style={S.lbl}>Crystal phases (.cif)</label>
-          <div style={{ display: 'flex', gap: 6, alignItems: 'stretch' }}>
-            <button data-testid="vom-pick-cif" style={{ ...S.fileBtn, flex: 1, alignSelf: 'auto' }}
-              onClick={pickCif}>＋ From file</button>
-            <CodPicker windowId={windowId} sendAction={sendAction} onCif={addCif} />
-          </div>
-          <RecentCifs recents={recents} exclude={cifs} onPick={addCif} />
+          <label style={S.lbl}>Sample phases</label>
+          {/* The phases belong to the SAMPLE, not to this caret — composition
+              and structure are one thing, and the dock shows the same list. So
+              this is a door onto that widget rather than a private .cif list
+              the rest of the app cannot see. */}
+          <button data-testid="vom-add-phase" style={S.primary}
+            onClick={() => {
+              // Clicking "Add phase" with none yet should land on a usable
+              // row, not on an empty editor with a second Add phase in it.
+              if (!phases.length) sendAction('add_phase', {}, windowId)
+              setPhasesOpen(true)
+            }}>{phases.length ? 'Phases' : '＋ Add phase'}</button>
           <div data-testid="vom-cif-list" style={S.cifList}>
-            {cifs.length === 0
+            {phases.length === 0
               ? <span style={S.hint}>No phases yet — add at least one.</span>
-              : cifs.map(p => (
-                <div key={p} style={S.cifRow} title={p}>
-                  <span style={S.cifName}>{base(p)}</span>
-                  <button data-testid={`vom-cif-remove-${base(p)}`} style={S.close}
-                    onClick={() => setCifs(c => c.filter(x => x !== p))}>✕</button>
+              : phases.map((phase, index) => (
+                <div key={index} style={S.cifRow}
+                  title={phase.cifPath ?? phase.elements.join('-')}>
+                  <span style={S.cifName}>
+                    {phase.elements.join('-') || `phase ${index + 1}`}
+                  </span>
+                  <span style={phase.cifPath ? PHASE_STYLE.set : PHASE_STYLE.unset}>
+                    {phase.label ?? (phase.cifPath ? base(phase.cifPath) : 'no structure')}
+                  </span>
                 </div>
               ))}
           </div>
           <Field label="Voltage (kV)"><NumInput value={voltage} onChange={setVoltage} step="1" width={60} /></Field>
+          {phasesOpen && (
+            <PhasesEditor windowId={windowId} phases={phases} sendAction={sendAction}
+              onClose={() => setPhasesOpen(false)} />
+          )}
         </div>
       )}
 

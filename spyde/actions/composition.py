@@ -62,6 +62,96 @@ def write_composition(tree, elements, percentages=None) -> None:
     md.set_item("Sample.composition", comp)
 
 
+# ── phases ────────────────────────────────────────────────────────────────────
+# A sample is made of PHASES, and a phase is two things that were previously
+# kept apart: what it is made of, and the structure that indexes it. Keeping
+# them apart is why a two-phase sample could not be described at all — the
+# composition was one flat element list, so Cu-and-Nb read as "a compound of Cu
+# and Nb" and COD was asked for a structure containing both (it returns
+# nothing; the two elemental phases it should have found are one query each).
+#
+# ``Sample.elements`` / ``Sample.composition`` stay exactly as they were — the
+# HyperSpy-canonical flat union that EELS edge suggestion and EDS quantification
+# read (``spyde/spectroscopy/edges.py``, ``composition.py``). The phase list
+# lives beside them, so nothing that already reads the canonical fields changes
+# behaviour and a file written by an older SpyDE still opens.
+_PHASES_KEY = "Sample.spyde_phases"
+
+
+def _clean_phase(raw) -> dict:
+    """One stored phase, normalised. Unknown keys are dropped rather than kept:
+    this dict round-trips through file metadata, so it stays a fixed shape."""
+    if hasattr(raw, "as_dictionary"):
+        raw = raw.as_dictionary()
+    raw = dict(raw or {})
+    percentages = raw.get("percentages") or {}
+    if hasattr(percentages, "as_dictionary"):
+        percentages = percentages.as_dictionary()
+    clean_pct = {}
+    for symbol, value in dict(percentages).items():
+        try:
+            clean_pct[str(symbol)] = float(value)
+        except (TypeError, ValueError):
+            continue
+    return {
+        "elements": [str(e) for e in (raw.get("elements") or []) if e],
+        "percentages": clean_pct,
+        # The structure that indexes this phase, once one is chosen. None until
+        # then — a phase whose composition is known but whose structure is not
+        # is a normal, useful state (it is what you search COD from).
+        "cif_path": str(raw["cif_path"]) if raw.get("cif_path") else None,
+        "label": str(raw["label"]) if raw.get("label") else None,
+        "cod_id": str(raw["cod_id"]) if raw.get("cod_id") else None,
+    }
+
+
+def read_phases(tree) -> list[dict]:
+    """The sample's phases, outermost-first.
+
+    A signal that predates phases — or one whose composition was set through the
+    flat path — reports its composition as a SINGLE phase, so every caller can
+    be written against the list and none needs to know which era the file is
+    from.
+    """
+    try:
+        stored = tree.root.metadata.get_item(_PHASES_KEY, None)
+    except Exception as e:
+        log.debug("reading phases failed: %s", e)
+        stored = None
+    if stored:
+        return [_clean_phase(p) for p in stored]
+    elements, percentages = read_composition(tree)
+    if not elements:
+        return []
+    return [_clean_phase({"elements": elements, "percentages": percentages})]
+
+
+def write_phases(tree, phases) -> None:
+    """Store *phases* and re-derive the canonical flat fields from them.
+
+    The union is taken in phase order and deduped, so ``Sample.elements`` reads
+    the way a person would list the sample ("Cu, Nb") whatever the grouping.
+    """
+    cleaned = [_clean_phase(p) for p in phases]
+    union: list[str] = []
+    percentages: dict[str, float] = {}
+    for phase in cleaned:
+        for symbol in phase["elements"]:
+            if symbol not in union:
+                union.append(symbol)
+            if symbol in phase["percentages"]:
+                percentages.setdefault(symbol, phase["percentages"][symbol])
+    md = tree.root.metadata
+    md.set_item(_PHASES_KEY, cleaned)
+    write_composition(tree, union, percentages)
+
+
+def phase_label(phase) -> str:
+    """How a phase reads in a status line: its structure if it has one, else
+    just what it is made of."""
+    return phase.get("label") or "-".join(phase.get("elements") or []) or "phase"
+
+
 def emit_composition(tree, window_ids) -> None:
     """Push the current composition to the dock for the given windows."""
     elements, percentages = read_composition(tree)
@@ -70,6 +160,10 @@ def emit_composition(tree, window_ids) -> None:
         "window_ids": list(window_ids),
         "elements": elements,
         "percentages": percentages,
+        # The dock renders one group per phase and shows its structure beside
+        # the chips; the flat fields above stay for anything that only wants
+        # "what is this sample made of".
+        "phases": read_phases(tree),
     })
 
 
@@ -102,6 +196,122 @@ def set_composition(session, plot, payload) -> None:
         for el in elements
     )
     emit_status(f"Composition: {pretty}" if elements else "Composition cleared")
+
+
+def _phases_and_tree(session, plot):
+    """``(phases, tree)`` for a staged phase handler, or ``(None, None)``."""
+    _src, tree = _src_plot_tree(session, plot)
+    if tree is None:
+        return None, None
+    return read_phases(tree), tree
+
+
+def _push_phases(tree, phases, status=None) -> None:
+    write_phases(tree, phases)
+    emit_composition(tree, _window_ids_for(tree))
+    if status:
+        emit_status(status)
+
+
+def add_phase(session, plot, payload) -> None:
+    """The ``&`` button: append a phase. ``payload`` may carry ``elements``
+    (and ``percentages``) for it; an empty one is fine — the widget opens the
+    periodic table on it next."""
+    phases, tree = _phases_and_tree(session, plot)
+    if tree is None:
+        return
+    phases.append(_clean_phase({
+        "elements": payload.get("elements") or [],
+        "percentages": payload.get("percentages") or {},
+        "cif_path": payload.get("cif_path"),
+        "label": payload.get("label"),
+    }))
+    _push_phases(tree, phases, f"Added phase {len(phases)}")
+
+
+def remove_phase(session, plot, payload) -> None:
+    """Drop one phase. Removing the last one clears the composition rather than
+    leaving an empty list that reads as "no phases known"."""
+    phases, tree = _phases_and_tree(session, plot)
+    if tree is None:
+        return
+    index = int(payload.get("index", -1))
+    if not (0 <= index < len(phases)):
+        return
+    dropped = phases.pop(index)
+    _push_phases(tree, phases, f"Removed {phase_label(dropped)}")
+
+
+def set_phase(session, plot, payload) -> None:
+    """Set one phase's composition — the periodic table, scoped to a phase.
+
+    Its structure is left alone: changing what a phase is made of does not by
+    itself invalidate the .cif you chose for it, and silently dropping one
+    would be worse than letting you see that they disagree.
+    """
+    phases, tree = _phases_and_tree(session, plot)
+    if tree is None:
+        return
+    index = int(payload.get("index", -1))
+    while index >= len(phases):        # setting phase N creates it
+        phases.append(_clean_phase({}))
+    if index < 0:
+        return
+    phases[index]["elements"] = [str(e) for e in (payload.get("elements") or [])]
+    phases[index]["percentages"] = _clean_phase(
+        {"percentages": payload.get("percentages") or {}})["percentages"]
+    _push_phases(tree, phases, f"Phase {index + 1}: {phase_label(phases[index])}")
+
+
+def elements_from_cif(path) -> list[str]:
+    """The element symbols a ``.cif`` contains, or ``[]`` if it cannot be read.
+
+    A structure file already knows what it is made of, so a phase added from one
+    should not also have to be told. Failure is not an error: the phase keeps
+    its structure and simply has no composition, which is the state it would
+    have been left in anyway.
+    """
+    try:
+        from orix.crystal_map import Phase
+        phase = Phase.from_cif(str(path))
+        symbols: list[str] = []
+        for atom in phase.structure:
+            symbol = str(getattr(atom, "element", "") or "").strip()
+            # diffpy writes isotopes and oxidation states ("Fe2+", "O2-").
+            symbol = "".join(ch for ch in symbol if ch.isalpha()).capitalize()
+            if symbol and symbol not in symbols:
+                symbols.append(symbol)
+        return symbols
+    except Exception as e:
+        log.debug("reading elements from %s failed: %s", path, e)
+        return []
+
+
+def set_phase_structure(session, plot, payload) -> None:
+    """Bind a ``.cif`` to a phase — the file route into the phase widget. The
+    COD route lands here too, through :func:`cod_pick`."""
+    phases, tree = _phases_and_tree(session, plot)
+    if tree is None:
+        return
+    index = int(payload.get("index", -1))
+    while index >= len(phases):
+        phases.append(_clean_phase({}))
+    if index < 0:
+        return
+    path = payload.get("cif_path")
+    phases[index]["cif_path"] = str(path) if path else None
+    phases[index]["label"] = str(payload["label"]) if payload.get("label") else (
+        os.path.splitext(os.path.basename(str(path)))[0] if path else None)
+    phases[index]["cod_id"] = str(payload["cod_id"]) if payload.get("cod_id") else None
+    # Take the composition from the file when the phase has none — it is in
+    # there, and a phase that knows its structure but claims no elements reads
+    # as a mistake. An existing composition is never overwritten: the user may
+    # have said something the file cannot (a solid solution, a measured
+    # percentage), and the file does not get to argue with that.
+    if path and not phases[index]["elements"]:
+        phases[index]["elements"] = elements_from_cif(path)
+    _push_phases(tree, phases,
+                 f"Phase {index + 1}: {phase_label(phases[index])}")
 
 
 # ── COD structure search ───────────────────────────────────────────────────────
@@ -163,12 +373,26 @@ def _tidy_results(raw) -> list[dict]:
 
 
 def cod_search(session, plot, payload) -> None:
-    """Staged handler: search the COD for structures matching the composition.
-    ``payload['elements']`` overrides the stored composition. Runs off-thread
-    (network) and emits ``cod_results``."""
+    """Staged handler: search the COD for structures matching ONE phase.
+
+    Scoped to a phase (``payload['phase']``, an index) rather than to the whole
+    sample, because the query asks for a structure containing EXACTLY these
+    elements. A two-phase Cu/Nb sample searched as one composition asks for a
+    Cu-Nb compound and gets nothing back; searched a phase at a time it finds
+    fcc Cu and bcc Nb, which is what the sample actually contains.
+
+    ``payload['elements']`` still overrides everything, and with neither the
+    whole composition is used — the pre-phase behaviour, for a sample that
+    really is one phase.
+    """
     src, tree = _src_plot_tree(session, plot)
     window_id = getattr(src, "window_id", None) if src is not None else None
+    phase_index = payload.get("phase")
     elements = [str(e) for e in (payload.get("elements") or [])]
+    if not elements and tree is not None and phase_index is not None:
+        phases = read_phases(tree)
+        if 0 <= int(phase_index) < len(phases):
+            elements = phases[int(phase_index)]["elements"]
     if not elements and tree is not None:
         elements, _ = read_composition(tree)
     if not elements:
@@ -182,12 +406,12 @@ def cod_search(session, plot, payload) -> None:
         except Exception as e:
             log.debug("COD search failed: %s", e)
             emit({"type": "cod_results", "window_id": window_id,
-                  "elements": elements, "results": [],
+                  "phase": phase_index, "elements": elements, "results": [],
                   "error": "COD search failed (offline?)"})
             emit_status("COD search failed — check your connection")
             return
         emit({"type": "cod_results", "window_id": window_id,
-              "elements": elements, "results": results})
+              "phase": phase_index, "elements": elements, "results": results})
         emit_status(f"COD: {len(results)} structure(s) for {'-'.join(elements)}")
 
     from spyde.actions.lifecycle import run_on_worker
@@ -215,10 +439,11 @@ def cod_pick(session, plot, payload) -> None:
     """Staged handler: download the chosen COD structure's CIF and tell the
     frontend its local path (the OM wizard adds it as a phase). ``payload`` =
     ``{cod_id, label}``. Runs off-thread (network)."""
-    src, _ = _src_plot_tree(session, plot)
+    src, tree = _src_plot_tree(session, plot)
     window_id = getattr(src, "window_id", None) if src is not None else None
     cod_id = payload.get("cod_id")
     label = payload.get("label") or f"COD {cod_id}"
+    phase_index = payload.get("phase")
     if not cod_id:
         return
 
@@ -228,8 +453,18 @@ def cod_pick(session, plot, payload) -> None:
         except Exception as e:
             emit_error(f"Could not download COD {cod_id}: {e}")
             return
+        # The download is BOUND to its phase, not just handed to whoever asked.
+        # That is what makes the sample remember its own structures: the dock
+        # can show them, and a wizard reads them off the sample instead of
+        # keeping a private list that nothing else can see.
+        if tree is not None and phase_index is not None:
+            set_phase_structure(session, plot, {
+                "index": int(phase_index), "cif_path": path,
+                "label": label, "cod_id": str(cod_id),
+            })
         emit({"type": "cod_cif_ready", "window_id": window_id,
-              "cod_id": str(cod_id), "path": path, "label": label})
+              "phase": phase_index, "cod_id": str(cod_id),
+              "path": path, "label": label})
         emit_status(f"Loaded structure {label}")
 
     from spyde.actions.lifecycle import run_on_worker
