@@ -24,10 +24,27 @@
 ;     carries uv and a vendored git -- so the path-prefix match can catch a
 ;     helper the app is mid-way through running.
 ;   * Re-checking with no delay counts processes that are already exiting.
+;   * MATCHING ON THE EXECUTABLE PATH MISSES THE PYTHON SIDECAR ENTIRELY. Its
+;     interpreter lives in the managed env under $APPDATA, not in $INSTDIR --
+;     only its working directory was in the install dir. A working directory is
+;     an open handle, so an orphaned sidecar (and everything it spawned, which
+;     inherits that directory) blocks the install dir from being removed while
+;     staying invisible to any scan keyed on image path. That is why this pass
+;     also sweeps $APPDATA\*\python-env\*, and why the sidecar no longer runs
+;     from the install dir at all (de-shell's pythonEnv.ts).
 ;
-; So: kill whole process TREES by pid, wait between rounds, give the app several
-; seconds to go before asking the user for anything, and make Retry actually
-; retry the kill rather than just the question.
+; So: kill whole process TREES by pid, look outside $INSTDIR for the processes
+; that hold it, wait between rounds, give the app several seconds to go before
+; asking the user for anything, and make Retry actually retry the kill rather
+; than just the question.
+;
+; THIS MACRO IS NOT THE ONLY SOURCE OF THAT DIALOG. electron-builder's
+; uninstallOldVersion (app-builder-lib templates/nsis/include/installUtil.nsh)
+; runs the PREVIOUS version's uninstaller and, if it returns non-zero five
+; times, shows the very same "$(appCannotBeClosed)" -- with a Retry that only
+; re-runs the uninstaller and never kills anything. There is no hook to override
+; that loop, so the only way to stay out of it is to leave nothing holding the
+; install directory by the time it runs. Hence the sweep above.
 ;
 ; The app side of the same race is in packages/shell-main/src/updater.ts -- it
 ; tears the sidecar down and force-exits rather than trusting Electron's
@@ -52,13 +69,16 @@ Var spydeSetupPid
   spydeCloseRetry:
     DetailPrint "Closing ${PRODUCT_NAME}..."
 
-    ; One PowerShell pass: up to 12 rounds of "find everything running out of
-    ; the install directory, kill each one's whole tree, wait". Exits 0 the
-    ; moment nothing is left, 1 if the directory is still busy after ~6 s.
+    ; One PowerShell pass: up to 12 rounds of "find everything holding the
+    ; install directory, kill each one's whole tree, wait". Exits 0 the moment
+    ; nothing is left, 1 if the directory is still busy after ~6 s. Two things
+    ; count as holding it: a process running out of $INSTDIR, and one running
+    ; out of the managed Python env ($APPDATA\...\python-env\...), which is the
+    ; sidecar -- see the header for why it needs naming separately.
     ; The trailing backslash on the directory keeps a sibling install (...\spyde
     ; vs ...\spyde-old) from matching. `$$` is NSIS's escape for a literal `$`,
     ; so `$$_` reaches PowerShell as `$_`.
-    nsExec::Exec `"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -Command "$$dir='$INSTDIR\'; $$self=$spydeSetupPid; for($$round=0; $$round -lt 12; $$round++){ $$busy=@(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $$_.Path -and $$_.Path.StartsWith($$dir,'CurrentCultureIgnoreCase') -and $$_.ProcessId -ne $$self }); if($$busy.Count -eq 0){ exit 0 }; foreach($$victim in $$busy){ $$null = & taskkill.exe /PID $$victim.ProcessId /T /F 2>&1 }; Start-Sleep -Milliseconds 500 }; exit 1"`
+    nsExec::Exec `"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -Command "$$dir='$INSTDIR\'; $$roam='$APPDATA\'; $$self=$spydeSetupPid; for($$round=0; $$round -lt 12; $$round++){ $$busy=@(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $$p=$$_.Path; $$p -and $$_.ProcessId -ne $$self -and ($$p.StartsWith($$dir,'CurrentCultureIgnoreCase') -or ($$p.StartsWith($$roam,'CurrentCultureIgnoreCase') -and $$p -like '*\python-env\*')) }); if($$busy.Count -eq 0){ exit 0 }; foreach($$victim in $$busy){ $$null = & taskkill.exe /PID $$victim.ProcessId /T /F 2>&1 }; Start-Sleep -Milliseconds 500 }; exit 1"`
     Pop $R0
 
     ; nsExec pushes "error" when the program could not be started at all -- a
