@@ -274,6 +274,11 @@ export function MenuBar({ onStartGuide, onShowInfo }: {
       { label: 'GPU & CUDA', onClick: () => openGpuHelpDialog() },
       { label: 'GPU Status…', onClick: () => openGpuStatusDialog() },
       { separator: true },
+      // Toggles the ScreenRecorderGate. Dispatched from HERE rather than the
+      // native menu because getDisplayMedia needs a real click to count as user
+      // activation.
+      { label: 'Record Screen', onClick: () => window.dispatchEvent(new CustomEvent('spyde:toggle_record')) },
+      { separator: true },
       { label: 'Report a Problem…', onClick: () => openReportDialog() },
     ],
   }
