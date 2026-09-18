@@ -45,10 +45,31 @@ log = logging.getLogger(__name__)
 
 # ── the page skeleton + article CSS ───────────────────────────────────────────
 
+# The figure rules both page skeletons share verbatim. Colours differ between the
+# light article and the dark deck and stay in each skeleton below; these do not.
+_SHARED_FIGURE_CSS = """
+/* height:100% because an embed that does not post a measured height (the
+   explorer pages, the blender) is emitted with only a width, and the box clips
+   whatever it gets: without this the browser's default 150 px shows a sliver of
+   the page. The fit script reads the INLINE width/height, so a figure carrying
+   its natural size is untouched by this rule. */
+figure.report-figure .fig-box iframe { display: block; border: none;
+  height: 100%; transform-origin: top left; }
+/* A movie exported as its poster still: the badge is what tells the reader this
+   is one frame of a movie and not a static figure. */
+.report-movie .movie-still { position: relative; display: inline-block;
+  max-width: 100%; }
+.report-movie .movie-badge { position: absolute; left: 50%; top: 50%;
+  transform: translate(-50%, -50%); width: 3rem; height: 3rem;
+  display: flex; align-items: center; justify-content: center;
+  border-radius: 50%; background: rgba(0, 0, 0, 0.55); color: #fff;
+  font-size: 1.2rem; line-height: 1; pointer-events: none; }
+"""
+
 # A clean neutral article stylesheet: readable column, works when printed. The
 # print block forces black-on-white (this exact file is what Electron
 # printToPDF consumes) so a dark UI theme never bleeds into the PDF.
-_ARTICLE_CSS = """
+_ARTICLE_CSS = _SHARED_FIGURE_CSS + """
 :root { color-scheme: light; }
 * { box-sizing: border-box; }
 body {
@@ -88,10 +109,27 @@ body {
 figure.report-figure { margin: 1.75rem 0; text-align: center; }
 figure.report-figure img { max-width: 100%; height: auto;
   border: 1px solid #e2e2e6; border-radius: 6px; }
-figure.report-figure iframe { width: 100%; border: 1px solid #e2e2e6;
-  border-radius: 6px; }
+/* The figure box owns the SHAPE (width 100% of the column, height from an
+   aspect-ratio matching the sidebar cell) and the figure is SCALED to fill it.
+   Scaling rather than resizing because a saved figure cannot be resized: the
+   renderer lays out from `layout_json`, which carries fig_width/fig_height and
+   every panel's size, and only the Python side recomputes that. So the iframe
+   keeps its natural pixel size, nothing inside is ever clipped, and CSS maps it
+   onto the box, which stays responsive with no JS relayout. */
+figure.report-figure .fig-box { position: relative; line-height: 0;
+  overflow: hidden; border: 1px solid #e2e2e6; border-radius: 6px;
+  /* The figure's own background, so a letterbox left by a box whose aspect
+     differs from the figure's reads as part of the figure. */
+  background: #1e1e2e; }
 figure.report-figure figcaption { margin-top: 0.6rem; font-size: 0.9rem;
   color: #555; font-style: italic; }
+figure.report-figure video { max-width: 100%; height: auto;
+  border: 1px solid #e2e2e6; border-radius: 6px; }
+.report-movie .movie-note { margin-top: 0.4rem; font-size: 0.8rem;
+  color: #8a8a92; }
+.report-figure--missing .missing-box { border: 1px dashed #c8c8ce;
+  border-radius: 6px; padding: 2.5rem 1rem; color: #8a8a92;
+  font-size: 0.9rem; background: #fafafb; }
 /* Split block (Wave A): a text side BESIDE a figure/photo side. The two columns
    are vertically centered against each other; stacks to one column on a narrow
    viewport so a phone still reads it. The figure column's own figure sizes to its
@@ -113,10 +151,46 @@ figure.report-figure figcaption { margin-top: 0.6rem; font-size: 0.9rem;
 }
 """
 
-# Aspect box for an interactive figure iframe — a self-contained figure sizes
-# itself, but the srcdoc iframe needs an explicit height. A 4:3-ish default keeps
-# a diffraction-pattern square figure fully visible without scroll.
-_IFRAME_HEIGHT_PX = 480
+# The exported figure box is sized the SAME way the sidebar cell is: width 100%
+# of the column, height from a CSS aspect-ratio derived from the panel grid.
+#
+# These MIRROR ReportFigureCell.tsx (PANEL_ASPECT / figureAspectRatio) and are
+# pinned against it by test_report_export, because a silent drift between two
+# copies is won by whichever one the reader happens to be looking at.
+_PANEL_ASPECT = 4 / 3
+_DEFAULT_ASPECT = 16 / 10
+_VECTORS_ASPECT = 3 / 2
+# A tall grid (many rows, one column) would otherwise produce a box metres long.
+_MAX_IFRAME_HEIGHT_PX = 720
+
+EMBED_BUDGET_BYTES = 100 * 2**20
+"""The ceiling on anything one export inlines, so a self-contained report stays
+an openable document rather than a blob no browser will parse. A cell whose
+asset is over it exports as its still plus a note naming both the size and the
+budget, so the reader knows a bigger original exists."""
+
+
+def _megabytes(size_bytes: int) -> str:
+    """``size_bytes`` as the ``"12.5 MB"`` string the over-budget note prints."""
+    return f"{size_bytes / 2**20:.1f} MB"
+
+
+def _figure_aspect(spec) -> float:
+    """The width:height ratio for a cell's figure box, the mirror of
+    ``figureAspectRatio`` in ReportFigureCell.tsx."""
+    try:
+        mode = str(getattr(spec, "vectors_mode", "") or "")
+        if mode not in ("", "image"):
+            return _VECTORS_ASPECT       # the 2-panel explorer plus its chrome
+        layout = getattr(spec, "layout", None) or {}
+        if str(layout.get("kind", "")) != "grid":
+            return _DEFAULT_ASPECT
+        rows = max(1, int(layout.get("rows") or 1))
+        cols = max(1, int(layout.get("cols") or 1))
+        return (_PANEL_ASPECT * cols) / rows
+    except Exception as e:
+        log.debug("figure aspect from spec failed: %s", e)
+        return _DEFAULT_ASPECT
 
 
 def _page(title: str, body_html: str) -> str:
@@ -130,8 +204,76 @@ def _page(title: str, body_html: str) -> str:
         f"<style>{_ARTICLE_CSS}</style>\n"
         "</head>\n<body>\n"
         f"<article class=\"report-article\">\n<h1>{esc_title}</h1>\n"
-        f"{body_html}\n</article>\n</body>\n</html>\n"
+        f"{body_html}\n</article>\n{_IFRAME_AUTOSIZE_JS}</body>\n</html>\n"
     )
+
+
+# An embed that knows its own height says so, because it knows about controls
+# below the figure that no outside measurement can account for. Sandboxed srcdoc
+# iframes are cross-origin, so the frame is identified by matching event.source
+# against each contentWindow.
+_IFRAME_AUTOSIZE_JS = """<script>
+(function () {
+  var frames = function () {
+    return document.querySelectorAll('figure.report-figure iframe');
+  };
+
+  // An embed that measures itself wins over the box.
+  window.addEventListener('message', function (event) {
+    var message = event.data || {};
+    var height = message.spydeEmbedHeight || message.vxHeight;
+    if (!height || !isFinite(height)) return;
+    var candidates = frames();
+    for (var i = 0; i < candidates.length; i++) {
+      if (candidates[i].contentWindow === event.source) {
+        candidates[i].dataset.selfSized = '1';
+        candidates[i].style.height = Math.max(120, Math.round(height)) + 'px';
+        return;
+      }
+    }
+  });
+
+  // Everything else is SCALED to its box. The iframe carries the figure at its
+  // natural pixel size, so nothing inside is ever clipped, and a CSS transform
+  // maps it onto the shaped box. Not a resize: the renderer lays out from
+  // `layout_json`, which carries fig_width/fig_height AND every panel's size,
+  // and only the Python side recomputes it.
+  function fit() {
+    var boxes = document.querySelectorAll('figure.report-figure .fig-box');
+    for (var i = 0; i < boxes.length; i++) {
+      var box = boxes[i];
+      var frame = box.querySelector('iframe');
+      if (!frame || frame.dataset.selfSized === '1') continue;
+      var naturalWidth = parseFloat(frame.style.width);
+      var naturalHeight = parseFloat(frame.style.height);
+      if (!naturalWidth || !naturalHeight) continue;   // sized by the box's CSS
+      var boxRect = box.getBoundingClientRect();
+      if (boxRect.width < 40) continue;
+      // Contain, so a box whose aspect differs from the figure's letterboxes
+      // rather than distorting or cropping it.
+      var scale = Math.min(boxRect.width / naturalWidth,
+                           boxRect.height / naturalHeight);
+      frame.style.transform = 'scale(' + scale.toFixed(4) + ')';
+      frame.style.marginLeft =
+        Math.max(0, (boxRect.width - naturalWidth * scale) / 2).toFixed(1) + 'px';
+      frame.style.marginTop =
+        Math.max(0, (boxRect.height - naturalHeight * scale) / 2).toFixed(1) + 'px';
+    }
+  }
+  window.addEventListener('load', fit);
+  if (document.readyState === 'complete') fit();
+  // Follow the container, not just the window: an aspect-ratio box changes
+  // height whenever the column width does.
+  if (typeof ResizeObserver !== 'undefined') {
+    var observer = new ResizeObserver(fit);
+    document.querySelectorAll('figure.report-figure .fig-box')
+      .forEach(function (box) { observer.observe(box); });
+  } else {
+    window.addEventListener('resize', fit);
+  }
+})();
+</script>
+"""
 
 
 # ── cell → HTML fragment ──────────────────────────────────────────────────────
@@ -153,9 +295,20 @@ def _markdown_cell_html(cell: Cell) -> str:
 
 def _figure_img_html(caption: str, png: "bytes | None") -> str:
     """A static ``<figure><img data:image/png;…></figure>`` for a figure cell.
-    Returns ``""`` when there are no pixels (placeholder / unbaked)."""
+
+    With no pixels (a scene3d cell nobody harvested, an offline figure that never
+    baked) the CAPTION still renders, above an empty framed box; ``""`` only when
+    there is no caption either. A silent hole reads as "the author wrote
+    nothing", which is worse than a visibly missing image."""
     if not png:
-        return ""
+        cap = _html.escape(caption or "")
+        if not cap:
+            return ""
+        return (
+            "<figure class=\"report-figure report-figure--missing\">"
+            "<div class=\"missing-box\">image unavailable</div>"
+            f"<figcaption>{cap}</figcaption></figure>"
+        )
     b64 = base64.b64encode(png).decode("ascii")
     cap = _html.escape(caption or "")
     figcap = f"<figcaption>{cap}</figcaption>" if cap else ""
@@ -185,41 +338,133 @@ def _image_cell_html(cell: Cell, data: "bytes | None") -> str:
     )
 
 
-def _figure_iframe_html(caption: str, figure_html: str) -> str:
-    """A sandboxed ``<iframe srcdoc>`` embedding a cell's self-contained
-    interactive figure HTML (pixels already inlined). The srcdoc content is
-    HTML-escaped so the attribute can't be broken out of."""
-    srcdoc = _html.escape(figure_html, quote=True)
-    cap = _html.escape(caption or "")
+def _movie_cell_html(mgr, cell: Cell, poster: "bytes | None", *,
+                     interactive: bool) -> str:
+    """A MOVIE cell's fragment.
+
+    Every export mode gets at least the poster still plus the caption, badged so
+    a reader can tell it is a frame OF a movie rather than a static figure. An
+    interactive export upgrades to a real ``<video>`` when the movie was rendered
+    to a file this session and that file is inside
+    :data:`EMBED_BUDGET_BYTES`; a report stays self-contained, so a path
+    reference, which would not travel with the HTML, is never emitted."""
+    cap = _html.escape(cell.caption or "")
     figcap = f"<figcaption>{cap}</figcaption>" if cap else ""
+    src, mime, note = (_inline_movie_src(mgr, cell) if interactive
+                       else ("", "", ""))
+    if src:
+        # An animated GIF plays in an <img>; <video> does not accept one.
+        element = (f"<img src=\"{src}\" alt=\"{cap}\">" if mime == "image/gif" else
+                   f"<video controls loop playsinline preload=\"metadata\" "
+                   f"src=\"{src}\"></video>")
+        return (
+            "<figure class=\"report-figure report-movie\">"
+            f"{element}{figcap}</figure>"
+        )
+    note_html = f"<div class=\"movie-note\">{_html.escape(note)}</div>" if note else ""
+    if not poster:
+        if not cap and not note_html:
+            return ""
+        return (
+            "<figure class=\"report-figure report-movie report-figure--missing\">"
+            "<div class=\"missing-box\">movie not yet rendered</div>"
+            f"{note_html}{figcap}</figure>"
+        )
+    b64 = base64.b64encode(poster).decode("ascii")
     return (
-        "<figure class=\"report-figure\">"
-        f"<iframe sandbox=\"allow-scripts\" srcdoc=\"{srcdoc}\" "
-        f"style=\"height:{_IFRAME_HEIGHT_PX}px;\" loading=\"lazy\"></iframe>"
-        f"{figcap}</figure>"
+        "<figure class=\"report-figure report-movie\">"
+        "<div class=\"movie-still\">"
+        f"<img src=\"data:image/png;base64,{b64}\" alt=\"{cap}\">"
+        "<span class=\"movie-badge\" aria-label=\"movie\">&#9654;</span>"
+        "</div>"
+        f"{note_html}{figcap}</figure>"
     )
 
 
-def _build_interactive_figure_html(mgr, cell: Cell) -> "str | None":
-    """Rebuild a figure cell's LIVE anyplotlib figure and return its
-    self-contained standalone HTML (pixels materialised via ``build_cell_figure``
-    → ``_resolve_pixels_for_standalone`` so no binary tokens leak), or None when
-    the cell has no snapshot to rebuild (offline)."""
+def _inline_movie_src(mgr, cell: Cell) -> "tuple[str, str, str]":
+    """``(data URL, mime, note)`` for the file this cell's movie was rendered to.
+
+    The data URL is ``""`` when there is no such file, when it has since been
+    moved or deleted, or when it is over :data:`EMBED_BUDGET_BYTES`. In that last
+    case the note is the sentence the export prints under the poster still,
+    naming the size and the budget; it is ``""`` otherwise."""
+    path = getattr(mgr, "_movie_files", {}).get(cell.id)
+    if not path:
+        return "", "", ""
+    try:
+        size = os.path.getsize(path)
+        if size > EMBED_BUDGET_BYTES:
+            return "", "", (f"Movie not embedded: {_megabytes(size)} is over the "
+                            f"{_megabytes(EMBED_BUDGET_BYTES)} export budget.")
+        with open(path, "rb") as fh:
+            raw = fh.read()
+    except OSError as e:
+        log.debug("movie file for cell %s unreadable: %s", cell.id, e)
+        return "", "", ""
+    mime = "image/gif" if str(path).lower().endswith(".gif") else "video/mp4"
+    return (f"data:{mime};base64," + base64.b64encode(raw).decode("ascii"),
+            mime, "")
+
+
+def _figure_iframe_html(caption: str, figure_html: str, *,
+                        aspect: float = _DEFAULT_ASPECT,
+                        natural_width: int = 0,
+                        natural_height: int = 0) -> str:
+    """A sandboxed ``<iframe srcdoc>`` embedding a cell's self-contained
+    interactive figure HTML (pixels already inlined). The srcdoc content is
+    HTML-escaped so the attribute can't be broken out of.
+
+    Sized by ``aspect-ratio`` like the sidebar cell, not a fixed height, so the
+    box matches the figure's shape. ``max-height`` catches a tall grid; an embed
+    that measures itself overrides both by posting its height (see
+    ``_IFRAME_AUTOSIZE_JS``).
+
+    ``natural_width``/``natural_height`` are the figure's own laid-out size. The
+    iframe is given exactly that and the page's fit script scales it onto the
+    box, so nothing inside is ever clipped and the mapping follows the column at
+    any window width."""
+    srcdoc = _html.escape(figure_html, quote=True)
+    cap = _html.escape(caption or "")
+    figcap = f"<figcaption>{cap}</figcaption>" if cap else ""
+    natural = (f"width:{int(natural_width)}px;height:{int(natural_height)}px;"
+               if natural_width and natural_height else "width:100%;")
+    return (
+        "<figure class=\"report-figure\">"
+        f"<div class=\"fig-box\" style=\"aspect-ratio:{aspect:.4f};"
+        f"max-height:{_MAX_IFRAME_HEIGHT_PX}px;\">"
+        f"<iframe sandbox=\"allow-scripts\" srcdoc=\"{srcdoc}\" "
+        f"style=\"{natural}\" loading=\"lazy\"></iframe>"
+        f"</div>{figcap}</figure>"
+    )
+
+
+def _build_interactive_figure_html(mgr, cell: Cell) -> "tuple[str | None, tuple]":
+    """``(standalone HTML, natural size)`` for a figure cell's LIVE anyplotlib
+    figure, with its pixels materialised by ``build_cell_figure`` so no binary
+    tokens leak. ``(None, (0, 0))`` when the cell has no snapshot to rebuild
+    (offline).
+
+    The natural size is the figure's own laid-out pixel size, which is what lets
+    the export's box fit the figure exactly instead of letterboxing it."""
     if cell.spec is None:
-        return None
+        return None, (0, 0)
     snap_map = mgr.snapshot_map(cell.id)
     if not snap_map:
-        return None
+        return None, (0, 0)
     try:
         from spyde.actions.report.figure_builder import build_cell_figure
         # standalone=True → the JS bundle is INLINED (no machine-local file:// ESM
         # reference), so the sandboxed srcdoc iframe renders on any machine/browser.
-        _fig, _fig_id, html_str = build_cell_figure(
+        fig, _fig_id, html_str = build_cell_figure(
             cell.spec, snap_map, standalone=True)
-        return html_str
+        # Plus the grid padding the renderer adds around the panels.
+        width = int(getattr(fig, "fig_width", 0) or 0)
+        height = int(getattr(fig, "fig_height", 0) or 0)
+        size = (width + 16, height + 16) if (width and height) else (0, 0)
+        return html_str, size
     except Exception as e:
         log.debug("interactive figure rebuild failed for cell %s: %s", cell.id, e)
-        return None
+        return None, (0, 0)
 
 
 def _render_figure_side_html(mgr, cell: Cell, assets: dict, *, interactive: bool,
@@ -234,6 +479,7 @@ def _render_figure_side_html(mgr, cell: Cell, assets: dict, *, interactive: bool
     # A photo side (no FigureSpec) — always the inlined <img>, in every mode.
     if cell.spec is None:
         return _image_cell_html(cell, assets.get(cell.id))
+    aspect = _figure_aspect(cell.spec)
     html_frag = ""
     if interactive:
         # Drop-time choice: vectors_mode == "image" pins the static
@@ -247,7 +493,8 @@ def _render_figure_side_html(mgr, cell: Cell, assets: dict, *, interactive: bool
                 if vecs is not None:
                     vx_html = vectors_explorer_html(vecs, caption=cell.caption)
                     if vx_html is not None:
-                        html_frag = _figure_iframe_html(cell.caption, vx_html)
+                        html_frag = _figure_iframe_html(cell.caption, vx_html,
+                                                        aspect=aspect)
             except Exception as e:
                 log.debug("vectors embed for cell %s failed: %s", cell.id, e)
         # ORIENTATION explorer — the same swap for a tree carrying an
@@ -265,7 +512,8 @@ def _render_figure_side_html(mgr, cell: Cell, assets: dict, *, interactive: bool
                     ox_html = orientation_explorer_html(result,
                                                         caption=cell.caption)
                     if ox_html is not None:
-                        html_frag = _figure_iframe_html(cell.caption, ox_html)
+                        html_frag = _figure_iframe_html(cell.caption, ox_html,
+                                                        aspect=aspect)
             except Exception as e:
                 log.debug("orientation embed for cell %s failed: %s", cell.id, e)
         # Tinted-overlay blender (vectors swap above wins when both
@@ -277,14 +525,21 @@ def _render_figure_side_html(mgr, cell: Cell, assets: dict, *, interactive: bool
                 )
                 ov_html = overlay_blender_html(mgr, cell, caption=cell.caption)
                 if ov_html is not None:
-                    html_frag = _figure_iframe_html(cell.caption, ov_html)
+                    html_frag = _figure_iframe_html(cell.caption, ov_html,
+                                                    aspect=aspect)
             except Exception as e:
                 log.debug("overlay blender embed for cell %s failed: %s",
                           cell.id, e)
         if not html_frag:
-            fig_html = _build_interactive_figure_html(mgr, cell)
+            fig_html, natural = _build_interactive_figure_html(mgr, cell)
             if fig_html is not None:
-                html_frag = _figure_iframe_html(cell.caption, fig_html)
+                # The figure's OWN shape when we know it, so the box fits it with
+                # no letterbox; the grid-derived ratio is the fallback for an
+                # embed whose natural size we cannot read.
+                shape = (natural[0] / natural[1]) if all(natural) else aspect
+                html_frag = _figure_iframe_html(
+                    cell.caption, fig_html, aspect=shape,
+                    natural_width=natural[0], natural_height=natural[1])
     if not html_frag:
         # Static path (also the interactive OFFLINE fallback).
         html_frag = _figure_img_html(cell.caption, assets.get(cell.id))
@@ -318,9 +573,11 @@ def _split_cell_html(mgr, cell: Cell, assets: dict, *, interactive: bool,
 
 def _render_cell_html(mgr, cell: Cell, assets: dict, *, interactive: bool,
                       session=None) -> str:
-    """The HTML fragment for ONE cell (markdown, figure, image, or split), shared
-    by the article body AND the slides shell. A placeholder figure → ``""``
-    (skipped).
+    """The HTML fragment for ONE cell (markdown, figure, image, split or movie),
+    shared by the article body AND the slides shell. Every cell type the document
+    model can hold has a branch here: an unhandled type exports as nothing,
+    caption and all, which a reader cannot tell from an empty report. A
+    placeholder figure → ``""`` (skipped).
 
     Figure handling mirrors :func:`_render_body`'s per-cell logic (see
     :func:`_render_figure_side_html`). A SPLIT cell renders as a 2-column
@@ -333,6 +590,9 @@ def _render_cell_html(mgr, cell: Cell, assets: dict, *, interactive: bool,
     if cell.cell_type == "split":
         return _split_cell_html(mgr, cell, assets, interactive=interactive,
                                 session=session)
+    if cell.cell_type == "movie":
+        return _movie_cell_html(mgr, cell, assets.get(cell.id),
+                                interactive=interactive)
     if cell.cell_type != "figure" or cell.placeholder:
         return ""
     return _render_figure_side_html(mgr, cell, assets, interactive=interactive,
@@ -375,7 +635,7 @@ def _render_body(mgr, assets: dict, *, interactive: bool, session=None) -> str:
 # SAME self-contained srcdoc iframes the interactive HTML export emits, so they
 # work here too with zero runtime Python. Print falls back to showing every slide
 # stacked (so a browser "Print to PDF" of the deck yields one slide per page-ish).
-_SLIDES_CSS = """
+_SLIDES_CSS = _SHARED_FIGURE_CSS + """
 :root { color-scheme: dark; }
 * { box-sizing: border-box; }
 html, body { margin: 0; padding: 0; height: 100%; }
@@ -412,8 +672,19 @@ body {
 figure.report-figure { margin: 1rem 0; text-align: center; }
 figure.report-figure img { max-width: 100%; max-height: 62vh; height: auto;
   border-radius: 6px; }
-figure.report-figure iframe { width: 100%; height: 62vh; border: 1px solid #313244;
-  border-radius: 6px; }
+/* Same shaped box as the article page: an interactive figure carries its own
+   natural pixel size, so without a box to scale it into a big one overruns the
+   slide. */
+figure.report-figure .fig-box { position: relative; line-height: 0;
+  overflow: hidden; border: 1px solid #313244; border-radius: 6px;
+  max-height: 62vh; background: #1e1e2e; }
+figure.report-figure video { max-width: 100%; max-height: 62vh; height: auto;
+  border: 1px solid #313244; border-radius: 6px; }
+.report-movie .movie-note { margin-top: 0.4rem; font-size: 0.8rem;
+  color: #a6adc8; }
+.report-figure--missing .missing-box { border: 1px dashed #45475a;
+  border-radius: 6px; padding: 2.5rem 1rem; color: #a6adc8;
+  font-size: 0.85rem; background: #1c1c28; }
 figure.report-figure figcaption { margin-top: 0.5rem; font-size: 0.85rem;
   color: #a6adc8; font-style: italic; }
 /* Split block (Wave A) — the self-contained text-beside-figure cell. A 2-col
@@ -427,7 +698,6 @@ figure.report-figure figcaption { margin-top: 0.5rem; font-size: 0.85rem;
 .split-col { min-width: 0; }
 .split-fig figure.report-figure { margin: 0.5rem 0; }
 .split-fig figure.report-figure img { max-height: 74vh; }
-.split-fig figure.report-figure iframe { height: 56vh; }
 @media (max-width: 720px), (orientation: portrait) {
   .split-block { grid-template-columns: 1fr; }
 }
@@ -528,6 +798,7 @@ def _slides_page(title: str, slides_html: str) -> str:
         f"<div id=\"deck\">\n{slides_html}\n</div>\n"
         "<div id=\"deck-counter\"></div>\n"
         "<div id=\"deck-hint\">← → / Space to navigate</div>\n"
+        f"{_IFRAME_AUTOSIZE_JS}"
         f"<script>{_SLIDES_JS}</script>\n"
         "</body>\n</html>\n"
     )

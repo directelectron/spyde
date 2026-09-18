@@ -71,3 +71,31 @@ export function stashWindowDrag(payload: WindowDragPayload | null): void {
 export function peekWindowDrag(): WindowDragPayload | null {
   return _dragStash
 }
+
+/**
+ * The dragged window behind a drop: its id, plus the shown figure id and view
+ * tag when the FIGURE_DRAG_MIME payload carries them (view:'3d' while the 3-D
+ * IPF explorer is up, which `report_add_figure` branches on). `null` when the
+ * drop carries no window at all.
+ *
+ * THE one reader for every report drop target: the stash fallback above is what
+ * makes a drop whose payload arrives unreadable still resolve a window, and a
+ * target that skips it is a silent no-op on a real drag.
+ */
+export function figurePayloadFromDrop(dt: DataTransfer): WindowDragPayload | null {
+  const figure = dt.getData(FIGURE_DRAG_MIME)
+  if (figure) {
+    try {
+      const { windowId, figId, view } = JSON.parse(figure) as {
+        windowId?: number; figId?: string; view?: string
+      }
+      if (typeof windowId === 'number') return { windowId, figId, view }
+    } catch { /* malformed */ }
+  }
+  const dragged = dt.getData(WINDOW_DRAG_MIME)
+  if (dragged) {
+    const windowId = parseInt(dragged, 10)
+    if (Number.isFinite(windowId)) return { windowId }
+  }
+  return peekWindowDrag()
+}

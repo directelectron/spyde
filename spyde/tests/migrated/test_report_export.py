@@ -507,3 +507,315 @@ class TestExportToken:
         ex.report_export_markdown(session, None, {"path": out})
         exp = _exported(messages, session)
         assert exp and "token" not in exp[0]
+
+
+# ── every cell kind survives every export mode ────────────────────────────────
+
+
+def _tiny_png() -> bytes:
+    """A 2x2 PNG standing in for a baked poster or snapshot."""
+    import io
+
+    from PIL import Image
+    buf = io.BytesIO()
+    Image.new("RGB", (2, 2), (10, 120, 200)).save(buf, format="PNG")
+    return buf.getvalue()
+
+
+class TestCellKindCoverage:
+    """Export dispatch must be TOTAL over the document model's cell types.
+
+    Movie cells shipped for a release exporting as nothing at all, image and
+    caption both, in static HTML, interactive HTML, the slides deck and the PDF
+    that renders from the static file. An unhandled type is indistinguishable
+    from an empty report, so the dispatch is pinned against ``model.CELL_TYPES``
+    rather than a list copied into the test."""
+
+    def test_every_cell_type_has_an_export_branch(self, window):
+        from spyde.actions.report.model import CELL_TYPES, Cell
+
+        session = window["window"]
+        h.report_new(session, None, {})
+        mgr = session._report
+        # One cell of every declared type, each with a distinctive caption/source.
+        for kind in CELL_TYPES:
+            if kind == "markdown":
+                mgr.doc.cells.append(Cell(cell_type="markdown",
+                                          source=f"body-{kind}"))
+            else:
+                mgr.doc.cells.append(Cell(cell_type=kind, caption=f"cap-{kind}"))
+        assets = {c.id: _tiny_png() for c in mgr.doc.cells}
+
+        for interactive in (False, True):
+            for c in mgr.doc.cells:
+                frag = ex._render_cell_html(mgr, c, assets,
+                                            interactive=interactive)
+                needle = (f"body-{c.cell_type}" if c.cell_type == "markdown"
+                          else f"cap-{c.cell_type}")
+                assert needle in frag, (
+                    f"{c.cell_type} cell exported nothing "
+                    f"(interactive={interactive}): dispatch is not total")
+
+    def test_movie_cell_exports_poster_and_caption(self, window, tmp_path):
+        from spyde.actions.report.model import Cell
+
+        session = window["window"]
+        h.report_new(session, None, {})
+        mgr = session._report
+        cell = Cell(cell_type="movie", caption="Growth at 400 C")
+        mgr.doc.cells.append(cell)
+        mgr._baked[cell.id] = _tiny_png()
+
+        path = str(tmp_path / "movie_report.html")
+        ex.report_export_html(session, None, {"mode": "static", "path": path})
+        html = open(path, encoding="utf-8").read()
+
+        assert "<figcaption>Growth at 400 C</figcaption>" in html
+        assert '<img src="data:image/png;base64,' in html
+        # Badged so a still of a movie doesn't read as a static figure.
+        assert "movie-badge" in html
+
+    def test_movie_without_a_poster_still_keeps_its_caption(self, window,
+                                                            tmp_path):
+        from spyde.actions.report.model import Cell
+
+        session = window["window"]
+        h.report_new(session, None, {})
+        mgr = session._report
+        mgr.doc.cells.append(Cell(cell_type="movie", caption="Never rendered"))
+
+        path = str(tmp_path / "unrendered.html")
+        ex.report_export_html(session, None, {"mode": "static", "path": path})
+        html = open(path, encoding="utf-8").read()
+        assert "Never rendered" in html
+
+    def test_unrendered_movie_is_reported_as_a_dropped_asset(self, window):
+        from spyde.actions.report.model import Cell
+
+        session = window["window"]
+        h.report_new(session, None, {})
+        mgr = session._report
+        cell = Cell(cell_type="movie", caption="Never rendered")
+        mgr.doc.cells.append(cell)
+
+        mgr.assemble_assets({})
+        # write_report still writes this cell's image ref, so a poster-less movie
+        # is the same dangling-ref hazard a pixel-less figure is: the save must
+        # warn rather than report clean.
+        assert [c.id for c in mgr._dropped_assets] == [cell.id]
+
+    def test_a_placeholder_movie_cell_is_not_a_dropped_asset(self, window):
+        from spyde.actions.report.model import Cell
+
+        session = window["window"]
+        h.report_new(session, None, {})
+        mgr = session._report
+        # The card a user gets from "Add movie" before picking a signal: nothing
+        # was ever rendered, so there is nothing to warn about on save.
+        mgr.doc.cells.append(Cell(cell_type="movie", placeholder=True))
+
+        mgr.assemble_assets({})
+        assert mgr._dropped_assets == []
+
+    def test_a_rendered_movie_is_inlined_in_an_interactive_export(self, window,
+                                                                  tmp_path):
+        from spyde.actions.report.model import Cell
+
+        session = window["window"]
+        h.report_new(session, None, {})
+        mgr = session._report
+        cell = Cell(cell_type="movie", caption="Growth")
+        mgr.doc.cells.append(cell)
+        mgr._baked[cell.id] = _tiny_png()
+        gif = tmp_path / "growth.gif"
+        gif.write_bytes(b"GIF89a stands in for the rendered animation")
+        mgr._movie_files[cell.id] = str(gif)
+
+        path = str(tmp_path / "inlined.html")
+        ex.report_export_html(session, None,
+                              {"mode": "interactive", "path": path})
+        html = open(path, encoding="utf-8").read()
+        assert "data:image/gif;base64," in html
+
+    def test_a_movie_over_the_budget_exports_its_still_and_says_so(
+            self, window, tmp_path, monkeypatch):
+        from spyde.actions.report.model import Cell
+
+        session = window["window"]
+        h.report_new(session, None, {})
+        mgr = session._report
+        cell = Cell(cell_type="movie", caption="Long run")
+        mgr.doc.cells.append(cell)
+        mgr._baked[cell.id] = _tiny_png()
+        movie = tmp_path / "long.mp4"
+        movie.write_bytes(b"x" * (3 * 2 ** 20))
+        mgr._movie_files[cell.id] = str(movie)
+        monkeypatch.setattr(ex, "EMBED_BUDGET_BYTES", 2 ** 20)
+
+        path = str(tmp_path / "oversize.html")
+        ex.report_export_html(session, None,
+                              {"mode": "interactive", "path": path})
+        html = open(path, encoding="utf-8").read()
+
+        assert "movie-badge" in html, "the still should stand in for the video"
+        assert "data:video/mp4" not in html
+        # Both numbers, so the reader can judge how far over it is.
+        assert "3.0 MB" in html and "1.0 MB" in html
+
+    def test_figure_without_pixels_keeps_its_caption(self):
+        # A scene3d cell nobody harvested, or an offline figure that never baked.
+        # Dropping the whole <figure> deleted the caption with it, so the reader
+        # saw no trace that anything was meant to be there.
+        frag = ex._figure_img_html("Orientation, IPF-Z", None)
+        assert "Orientation, IPF-Z" in frag
+        assert "report-figure--missing" in frag
+
+    def test_no_caption_and_no_pixels_still_renders_nothing(self):
+        assert ex._figure_img_html("", None) == ""
+
+
+
+def _figure_cell_tsx() -> str:
+    """The renderer's ReportFigureCell.tsx source, for the aspect-ratio guard."""
+    from pathlib import Path
+
+    return (Path(__file__).resolve().parents[3] / "electron" / "src" / "renderer"
+            / "src" / "components" / "ReportFigureCell.tsx").read_text(
+                encoding="utf-8")
+
+
+def _ratio_in(source: str, pattern: str) -> float:
+    """The ``a / b`` ratio the first match of *pattern* captures."""
+    import re
+
+    match = re.search(pattern, source)
+    assert match, f"could not find {pattern!r} in ReportFigureCell.tsx"
+    return int(match.group(1)) / int(match.group(2))
+
+
+# Each pattern is anchored on the CODE around its ratio, not on where that code
+# happens to sit, so reflowing the component does not fail the guard and only a
+# changed number does.
+_TSX_RATIOS = {
+    r"PANEL_ASPECT\s*=\s*(\d+)\s*/\s*(\d+)": ex._PANEL_ASPECT,
+    r"vectors_mode\)\s*!==\s*'image'\)\s*\{\s*return\s+(\d+)\s*/\s*(\d+)":
+        ex._VECTORS_ASPECT,
+    r"layout\.kind\s*!==\s*'grid'\)\s*return\s+(\d+)\s*/\s*(\d+)":
+        ex._DEFAULT_ASPECT,
+}
+
+
+def _fig_box_iframe_rule(css: str) -> str:
+    """The ``.fig-box iframe`` declaration block of a page stylesheet."""
+    import re
+
+    match = re.search(r"\.fig-box iframe \{([^}]*)\}", css)
+    assert match, "no .fig-box iframe rule in the stylesheet"
+    return match.group(1)
+
+
+class TestAnEmbedWithNoHeightOfItsOwnFillsItsBox:
+    """The bespoke explorer pages carry no height, so the BOX must give them one.
+
+    The orientation explorer and the overlay blender are emitted with only
+    ``width:100%``: nothing posts a measured height and the fit script skips
+    them. Inside an ``overflow:hidden`` box with no height rule they collapse to
+    the browser's default 150 px and the reader sees a sliver of the page.
+    """
+
+    def test_the_stylesheet_gives_such_an_iframe_the_full_box(self):
+        for css in (ex._ARTICLE_CSS, ex._SLIDES_CSS):
+            assert "height: 100%" in _fig_box_iframe_rule(css)
+
+    def test_a_blender_cell_carries_no_pixel_height_of_its_own(
+            self, tem_2d_dataset, tmp_path, monkeypatch):
+        session = tem_2d_dataset["window"]
+        messages = tem_2d_dataset["messages"]
+        _prime_plot_data(session)
+        monkeypatch.setattr(
+            "spyde.actions.report.overlay_embed.overlay_blender_html",
+            lambda mgr, cell, caption="": "<html><body>blended</body></html>")
+
+        h.report_new(session, None, {})
+        h.report_add_figure(session, None,
+                            {"source_window_id": _signal_window_id(session)})
+        path = str(tmp_path / "blender.html")
+        messages.clear()
+        ex.report_export_html(session, None, {"mode": "interactive", "path": path})
+        assert _exported(messages, session)
+        html = open(path, encoding="utf-8").read()
+
+        assert 'srcdoc="&lt;html&gt;' in html, "the blender page was not embedded"
+        # No inline height, so the stylesheet above is the only thing sizing it.
+        assert 'style="width:100%;"' in html
+
+class TestFigureBoxMatchesTheSidebar:
+    """The exported figure box is sized the way the sidebar cell is.
+
+    A fixed pixel height gave every exported figure the same tall box whatever
+    its shape: a wide 1x3 row was letterboxed and a square pattern stretched.
+    Reading a report and reading its export should not be two experiences.
+    """
+
+    def test_a_single_panel_uses_the_default_ratio(self):
+        from spyde.actions.report.model import FigureSpec
+
+        assert ex._figure_aspect(FigureSpec()) == ex._DEFAULT_ASPECT
+
+    def test_a_grid_scales_by_cols_over_rows(self):
+        from spyde.actions.report.model import FigureSpec
+
+        wide = FigureSpec(layout={"kind": "grid", "rows": 1, "cols": 3})
+        tall = FigureSpec(layout={"kind": "grid", "rows": 3, "cols": 1})
+        assert ex._figure_aspect(wide) == ex._PANEL_ASPECT * 3
+        assert ex._figure_aspect(tall) == ex._PANEL_ASPECT / 3
+
+    def test_a_vectors_explorer_gets_room_for_its_chrome(self):
+        from spyde.actions.report.model import FigureSpec
+
+        spec = FigureSpec()
+        spec.vectors_mode = "viewer"
+        assert ex._figure_aspect(spec) == ex._VECTORS_ASPECT
+
+    def test_the_export_sizes_by_aspect_not_a_fixed_height(self, tem_2d_dataset,
+                                                           tmp_path):
+        session = tem_2d_dataset["window"]
+        messages = tem_2d_dataset["messages"]
+        _prime_plot_data(session)
+        h.report_new(session, None, {})
+        h.report_add_figure(session, None,
+                            {"source_window_id": _signal_window_id(session)})
+
+        path = str(tmp_path / "aspect.html")
+        messages.clear()
+        ex.report_export_html(session, None, {"mode": "interactive", "path": path})
+        assert _exported(messages, session)
+        html = open(path, encoding="utf-8").read()
+        import re
+
+        box = re.search(r'<div class="fig-box" style="aspect-ratio:([\d.]+);', html)
+        assert box, "the figure has no aspect-shaped box"
+        # The box is shaped BY THIS FIGURE, not by a page-wide constant: its
+        # ratio is the figure's own laid-out width over its height.
+        iframe = re.search(r'<iframe [^>]*style="width:(\d+)px;height:(\d+)px;',
+                           html)
+        assert iframe, "the iframe does not carry the figure's natural size"
+        natural = int(iframe.group(1)) / int(iframe.group(2))
+        assert abs(float(box.group(1)) - natural) < 0.001
+
+    def test_the_ratios_match_the_sidebar_component(self):
+        # The renderer has its own copy (ReportFigureCell.tsx) and the two must
+        # agree, or the export silently disagrees with the thing it is a copy of.
+        # PARSE the TSX rather than trust a comment: the caret-defaults trap was
+        # exactly a TSX value drifting from its Python twin and winning silently.
+        source = _figure_cell_tsx()
+        for pattern, expected in _TSX_RATIOS.items():
+            assert _ratio_in(source, pattern) == expected
+
+    def test_the_guard_would_catch_a_drift(self):
+        # The check above is only worth having if it fails on a changed value, so
+        # run the REAL patterns over a TSX with one ratio edited.
+        source = _figure_cell_tsx().replace("const PANEL_ASPECT = 4 / 3",
+                                            "const PANEL_ASPECT = 5 / 3")
+        drifted = {pattern: _ratio_in(source, pattern) for pattern in _TSX_RATIOS}
+        assert drifted != _TSX_RATIOS
