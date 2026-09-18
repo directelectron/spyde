@@ -6,7 +6,7 @@
  */
 import React from 'react'
 import { useSpyDE } from '../kernel/SpyDEContext'
-import type { TreeNode, AxisRow } from '../kernel/SpyDEContext'
+import type { TreeNode, AxisRow, UnitsToggle } from '../kernel/SpyDEContext'
 import type { LayerState, LayersStateMessage } from '../kernel/protocol'
 import { WORKFLOW_NODE_DRAG_MIME } from '../kernel/dnd'
 import { COLORMAPS } from '../kernel/colormaps'
@@ -127,13 +127,62 @@ function EditableCell({ value, display, editable, onCommit, testid }:
   )
 }
 
+/** What the detector is calibrated in — px, mrad, nm⁻¹ or Å⁻¹ — as a control
+ *  that CONVERTS.
+ *
+ *  The units cell below can also be typed into, and that only relabels; a
+ *  calibration whose label stops matching its scale is worse than one in an
+ *  inconvenient unit, so the unit belongs here. Nothing computed changes: the
+ *  crystallographic paths ask what one pixel is worth in Å⁻¹ rather than
+ *  reading the axis scale, so a scan indexes the same in all four.
+ *
+ *  A unit that cannot be reached (mrad without a beam energy) stays in the
+ *  list, disabled, saying what is missing — an option that is simply absent
+ *  tells the reader nothing. */
+function DetectorUnits({ toggle, onPick }:
+  { toggle: UnitsToggle; onPick: (units: string) => void }) {
+  const label = (unit: string) =>
+    unit === 'A^-1' ? 'Å⁻¹' : unit === 'nm^-1' ? 'nm⁻¹' : unit
+  // The backend's reason is a sentence, for the error toast; the menu row is
+  // ~110 px, so it gets the missing FIELD's name — which is also where the
+  // reader has to go to supply it.
+  const missing = (reason: string) =>
+    reason.includes('beam energy') ? 'needs kV'
+      : reason.includes('scale') ? 'needs a scale' : reason
+  const options = toggle.order.map((unit) => ({
+    value: unit,
+    label: toggle.reasons[unit] ? `${label(unit)} — ${missing(toggle.reasons[unit])}`
+                                : label(unit),
+  }))
+  return (
+    <div title="What the detector axes are calibrated in — this CONVERTS them">
+      <Dropdown
+        testid="detector-units"
+        value={toggle.current}
+        options={options}
+        // The trigger shows the unit; the column it heads says what it is.
+        triggerText={label(toggle.current)}
+        compact
+        onChange={(unit) => {
+          // A disabled option is still clickable in the themed menu, so the
+          // guard lives here as well as in the backend — which is also what
+          // produces the sentence saying what to do about it.
+          if (!toggle.reasons[unit] && unit !== toggle.current) onPick(unit)
+        }}
+      />
+    </div>
+  )
+}
+
 // Editable axes calibration table. Name / scale / offset / units commit straight
 // to the dataset's axes_manager (which re-pushes every plot → the change shows in
 // the plot immediately). The dataset SHAPE lives in the Metadata panel now, so
 // there's no size column here.
-function AxesTable({ axes, onEdit, offsetPick, onToggleOffsetPick }:
+function AxesTable({ axes, onEdit, offsetPick, onToggleOffsetPick,
+                    unitsToggle, onReciprocalUnits }:
   { axes: AxisRow[]; onEdit: (index: number, field: string, value: string) => void
-    offsetPick: boolean; onToggleOffsetPick: () => void }) {
+    offsetPick: boolean; onToggleOffsetPick: () => void
+    unitsToggle?: UnitsToggle | null; onReciprocalUnits: (units: string) => void }) {
   const txt = (ax: AxisRow, field: keyof AxisRow) => {
     const v = ax[field]
     return v == null ? '' : String(v)
@@ -185,7 +234,16 @@ function AxesTable({ axes, onEdit, offsetPick, onToggleOffsetPick }:
                 )}
               </span>
             </th>
-            <th style={styles.axTh}>units</th>
+            {/* The detector-units control heads the column it governs, rather
+                than costing a row of its own: the dock is budgeted to fit its
+                pinned sections at laptop height without scrolling
+                (dock_compact.spec.ts). Signals with no reciprocal detector —
+                a spectrum, a result map — get the plain heading. */}
+            <th style={styles.axTh}>
+              {unitsToggle
+                ? <DetectorUnits toggle={unitsToggle} onPick={onReciprocalUnits} />
+                : 'units'}
+            </th>
           </tr>
         </thead>
         <tbody>
@@ -565,9 +623,19 @@ export function PlotControlDock() {
   const axes = activeId != null ? state.axes.get(activeId) : undefined
   const sigType = activeId != null ? state.signalTypes.get(activeId) : undefined
 
+  const unitsToggle = activeId != null ? state.unitsToggle.get(activeId) : undefined
+
   const onAxisEdit = (index: number, field: string, value: string) => {
     if (activeId == null) return
     sendAction('set_axis', { index, field, value }, activeId)
+  }
+
+  // Distinct from typing into the units CELL, which only relabels. This
+  // converts: the scale and offset move with the unit, so the calibration
+  // cannot come to disagree with its own label.
+  const onReciprocalUnits = (units: string) => {
+    if (activeId == null) return
+    sendAction('set_reciprocal_units', { units }, activeId)
   }
 
   // Instrument-metadata cell edit — same click-to-edit idiom as the axes
@@ -739,7 +807,8 @@ export function PlotControlDock() {
         <div style={styles.section} data-testid="axes-section">
           <div style={styles.label}>Axes</div>
           <AxesTable axes={axes} onEdit={onAxisEdit}
-            offsetPick={offsetPick} onToggleOffsetPick={onToggleOffsetPick} />
+            offsetPick={offsetPick} onToggleOffsetPick={onToggleOffsetPick}
+            unitsToggle={unitsToggle} onReciprocalUnits={onReciprocalUnits} />
         </div>
       )}
 

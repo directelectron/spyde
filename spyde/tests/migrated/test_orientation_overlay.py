@@ -34,14 +34,18 @@ def _make_phase():
     return Phase(name="Al", space_group=225, structure=structure)
 
 
-def _centered_diffraction_4d(nav=(3, 4), sig=(32, 32), scale=0.1):
+def _centered_diffraction_4d(nav=(3, 4), sig=(32, 32), scale=1.0):
+    """Calibrated in nm⁻¹ and meaning it: 1 nm⁻¹/px over 32 px is a half-extent
+    of 16 nm⁻¹ = 1.6 Å⁻¹, which holds aluminium's {111} at 0.43 Å⁻¹. The scale
+    was 0.1 under an nm⁻¹ label — a number that only made sense as Å⁻¹, and a
+    library with no reflections in it once the label is read."""
     rng = np.random.RandomState(0)
     s = hs.signals.Signal2D(rng.rand(*nav, *sig).astype(np.float32))
     s.set_signal_type("electron_diffraction")
     for ax in s.axes_manager.signal_axes:
         ax.scale = scale
         ax.offset = -(ax.size / 2.0) * scale     # beam at calibrated 0 (centre)
-        ax.units = "1/nm"
+        ax.units = "nm^-1"
     return s
 
 

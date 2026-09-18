@@ -149,7 +149,12 @@ class TestStagedHandlers:
 # Static: the parameter schema (the three-host parity contract)
 # ─────────────────────────────────────────────────────────────────────────────
 
-VALID_TYPES = {"int", "float", "bool", "enum", "file"}
+# ``file_list`` is ``file`` repeated: a parameter that takes SEVERAL paths, as
+# a multi-phase orientation library does. It is its own type rather than a
+# ``file`` with a list default because a scripted host has to know whether to
+# hand the handler a string or a sequence — that is the whole point of the
+# schema being the parity contract.
+VALID_TYPES = {"int", "float", "bool", "enum", "file", "file_list"}
 
 
 class TestSchemas:
@@ -177,6 +182,10 @@ class TestSchemas:
                     f"{key}.{pname}: default {d!r} not in {choices}"
             elif ptype == "file":
                 assert spec.get("extensions"), f"{key}.{pname}: no extensions"
+            elif ptype == "file_list":
+                assert spec.get("extensions"), f"{key}.{pname}: no extensions"
+                assert isinstance(d, list), \
+                    f"{key}.{pname}: file_list default {d!r} is not a list"
 
     @pytest.mark.parametrize("key", SCHEMA_KEYS)
     def test_schema_matches_the_module_defaults(self, key):

@@ -91,8 +91,17 @@ test('vector-OM opens the map window AND the IPF explorer window', async () => {
   await vsig.getByTestId('action-btn-Vector Orientation Mapping').click()
   await expect(page.getByTestId('vector-orientation-wizard')).toBeVisible()
 
-  await page.getByTestId('vom-pick-cif').click()
-  await expect(page.getByTestId('vom-pick-cif')).toHaveText('Silver__0011135.cif')
+  // The Load tab is a door onto the SAMPLE's phases now: add a phase, give it a
+  // structure through the (mocked) file picker, and the row shows what it got.
+  await page.getByTestId('vom-add-phase').click()
+  await expect(page.getByTestId('periodic-table')).toBeVisible()
+  // The wizard's button already added the phase, and a lone phase is selected
+  // for you — so its row is open without a second "Add phase".
+  await expect(page.getByTestId('phase-row-0')).toBeVisible()
+  await page.getByTestId('phase-0-cif').click()
+  await expect(page.getByTestId('phase-0-structure')).toContainText('Silver__0011135')
+  await page.getByTestId('ptable-apply').click()
+  await expect(page.getByTestId('vom-cif-list')).toContainText('Silver__0011135')
   await page.getByTestId('vom-tab-Library').click()
   await page.getByTestId('vom-generate').click()
 

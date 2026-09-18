@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import logging
 
+import numpy as np
+
 from de_shell.ipc import emit, emit_status, emit_error
 from spyde.actions.context import src_plot_tree as _src_plot_tree
 from spyde.actions._common import reciprocal_radius as _reciprocal_radius
@@ -38,9 +40,15 @@ from de_shell.actions.wizard import WizardController
 
 
 class VomWizard(WizardController):
-    """Owns the Vector-Orientation wizard state: the .cif phase, the diffsims
+    """Owns the Vector-Orientation wizard state: the .cif phases, the diffsims
     simulation + per-template g-vector library, the live refine overlay on the
-    source DP, the Refine-tab weights, and the Generate-time field cache."""
+    source DP, the Refine-tab weights, and the Generate-time field cache.
+
+    Several phases may be loaded at once. The fit picks the best-matching
+    template per pattern and every template already knows which phase it came
+    from, so a two-phase library answers "which crystal structure is this, in
+    what orientation, under what strain" in ONE pass — which is the question a
+    precipitate in a matrix actually poses."""
 
     key = "vom"
 
@@ -49,8 +57,8 @@ class VomWizard(WizardController):
     # shows strain_cap/sink_bw/gamma as PERCENT sliders but dispatches the
     # fractional values declared here). Same dict spec as toolbars.yaml.
     parameters = {
-        "cif_path": {
-            "name": "Crystal (.cif)", "type": "file", "default": "",
+        "cif_paths": {
+            "name": "Crystal phases (.cif)", "type": "file_list", "default": [],
             "extensions": [".cif"], "tab": "Library",
         },
         "accelerating_voltage": {
@@ -87,10 +95,10 @@ class VomWizard(WizardController):
         },
     }
 
-    def __init__(self, session, tree, *, phase, sim, lib, overlay,
+    def __init__(self, session, tree, *, phases, sim, lib, overlay,
                  voltage, recip_r, strain_cap, sink_bw=None):
         super().__init__(session, tree)
-        self.phase = phase
+        self.phases = list(phases)
         self.sim = sim
         self.lib = lib
         self.overlay = overlay
@@ -137,8 +145,12 @@ def vom_generate_library(session, plot, payload) -> None:
             return
         emit_error("Vector Orientation: run Find Diffraction Vectors first")
         return
-    cif_path = payload.get("cif_path")
-    if not cif_path:
+    # One .cif (`cif_path`) or several (`cif_paths`) for a multi-phase fit,
+    # the same shape the dense `om_generate_library` accepts.
+    cif_paths = [p for p in (payload.get("cif_paths") or []) if p]
+    if not cif_paths and payload.get("cif_path"):
+        cif_paths = [payload["cif_path"]]
+    if not cif_paths:
         emit_error("Vector Orientation: choose a .cif crystal first")
         return
     voltage = float(payload.get("accelerating_voltage", DEFAULTS["accelerating_voltage"]))
@@ -160,10 +172,10 @@ def vom_generate_library(session, plot, payload) -> None:
             from spyde.actions.vector_orientation import build_template_library
             root = tree.root
             vecs = tree.diffraction_vectors
-            phase = Phase.from_cif(cif_path)
+            phases = [Phase.from_cif(p) for p in cif_paths]
             recip_r = _reciprocal_radius(root)
             sim = generate_library_from_phases(
-                [phase], accelerating_voltage=voltage, resolution=resolution,
+                phases, accelerating_voltage=voltage, resolution=resolution,
                 minimum_intensity=min_int, reciprocal_radius=recip_r,
             )
             lib = build_template_library(sim, root, r_max=recip_r)
@@ -191,16 +203,18 @@ def vom_generate_library(session, plot, payload) -> None:
                 logging.getLogger(__name__).debug("vom overlay attach failed: %s", e)
 
             wiz = VomWizard(
-                session, tree, phase=phase, sim=sim, lib=lib, overlay=overlay,
+                session, tree, phases=phases, sim=sim, lib=lib, overlay=overlay,
                 voltage=voltage, recip_r=recip_r,
                 strain_cap=DEFAULTS["strain_cap"], sink_bw=None,
             )
             tree._vom_wizard = wiz
-            emit_status(f"Vector Orientation: library ready ({n_templates} templates) "
-                        f"— computing live IPF map…")
+            phase_names = ", ".join(str(p.name) for p in phases)
+            emit_status(f"Vector Orientation: library ready ({n_templates} templates, "
+                        f"{phase_names}) — computing live IPF map…")
             emit({"type": "vom_library_ready",
                   "window_id": getattr(src, "window_id", None),
-                  "n_templates": n_templates})
+                  "n_templates": n_templates,
+                  "phases": [str(p.name) for p in phases]})
 
             # LIVE IPF heatmap (Qt parity, "super nice"): fit the WHOLE field on
             # the GPU right away — it's seconds on a real scan — and show the
@@ -414,9 +428,62 @@ def _fit_field(vecs, lib, params, *, tree=None):
             tree.unregister_cancel(flag=stopped_flag)
 
 
+#: Phase colours, in library order. Chosen to stay distinguishable in both
+#: themes and under the common forms of colour blindness — a phase map is read
+#: as a set of regions, so the only thing the colours must do is separate.
+_PHASE_COLORS = (
+    (0x4C, 0x9B, 0xE8),   # blue
+    (0xE8, 0x7D, 0x3C),   # orange
+    (0x5C, 0xC8, 0x6E),   # green
+    (0xC6, 0x6B, 0xD8),   # purple
+    (0xE8, 0xC8, 0x4C),   # yellow
+)
+#: Where no template fit at all. Neutral grey rather than a sixth phase colour,
+#: so an unindexed region cannot be mistaken for a structure.
+_UNFIT_COLOR = (0x55, 0x58, 0x60)
+
+
+def phase_map_rgb(result) -> np.ndarray:
+    """``(ny, nx, 3)`` uint8 — which crystal structure best explains each pattern.
+
+    A position whose fit did not converge is grey, not phase 0: the phase index
+    defaults to zero everywhere, so colouring it by index alone would paint
+    every unindexed pixel as the first phase and invent a region that is not
+    there.
+    """
+
+    phase_idx = np.asarray(result.phase_idx, dtype=int)
+    rgb = np.empty(phase_idx.shape + (3,), dtype=np.uint8)
+    rgb[...] = _UNFIT_COLOR
+    fitted = np.isfinite(np.asarray(result.residual, dtype=float))
+    for index in range(len(getattr(result, "phases_meta", None) or [1])):
+        selected = fitted & (phase_idx == index)
+        if selected.any():
+            rgb[selected] = _PHASE_COLORS[index % len(_PHASE_COLORS)]
+    return rgb
+
+
+def _phase_legend(result) -> list[dict]:
+    """``[{name, color, fraction}]`` — what each phase colour means and how much
+    of the scan it claims, for the status line and the window's provenance."""
+
+    phase_idx = np.asarray(result.phase_idx, dtype=int)
+    fitted = np.isfinite(np.asarray(result.residual, dtype=float))
+    total = max(int(fitted.sum()), 1)
+    legend = []
+    for index, meta in enumerate(getattr(result, "phases_meta", None) or []):
+        count = int((fitted & (phase_idx == index)).sum())
+        red, green, blue = _PHASE_COLORS[index % len(_PHASE_COLORS)]
+        legend.append({"name": str(meta.get("name", f"phase {index}")),
+                       "color": f"#{red:02x}{green:02x}{blue:02x}",
+                       "fraction": count / total})
+    return legend
+
+
 def _build_result_windows(session, src, result, *, smooth=False, with_ipf=True) -> None:
     """Commit the fitted field: a strain window (εxx signal plot + εyy/εxy as
-    chip-selectable views) and — unless the live IPF heatmap already exists
+    chip-selectable views), a phase map when more than one structure was in the
+    library, and — unless the live IPF heatmap already exists
     (``with_ipf=False``) — an IPF-Z orientation window (RGB)."""
     from spyde.actions.commit import commit_result_tree
     base = src.metadata.get_item("General.title", "Signal")
@@ -424,7 +491,19 @@ def _build_result_windows(session, src, result, *, smooth=False, with_ipf=True) 
     if with_ipf:
         _build_ipf_heatmap(session, src, result, title="Orientation (IPF-Z)")
 
-    import numpy as np
+    # One phase is the whole scan by construction, so a map of it says nothing.
+    if len(getattr(result, "phases_meta", None) or []) > 1:
+        legend = _phase_legend(result)
+        commit_result_tree(
+            session, title=f"{base} — Phase",
+            primary=phase_map_rgb(result), primary_label="Phase",
+            source_signal=src,
+            provenance={"action": "Vector Orientation Mapping",
+                        "source_title": base, "params": {"phases": legend}},
+        )
+        emit_status("Phase: " + ", ".join(
+            f"{entry['name']} {entry['fraction']:.0%}" for entry in legend))
+
     from spyde.actions._common import (
         STRAIN_DISPLAY_SCALE, STRAIN_TITLES, strain_quantity,
     )

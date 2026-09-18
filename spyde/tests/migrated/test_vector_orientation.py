@@ -508,3 +508,73 @@ class TestIntegrationAg:
         # must be small and the recovered strain physical
         assert fit.residual < 0.02, fit.residual
         assert np.abs(fit.strain).max() <= 0.05 + 1e-3
+
+
+class TestMultiPhaseLibrary:
+    """A library built from two phases must hold BOTH phases' templates.
+
+    A multi-phase ``Simulation2D`` stores ``rotations`` as one entry per PHASE,
+    so counting them gives the number of phases — two — rather than the twelve
+    hundred templates the library actually contains. The result was not an
+    error: ``build_template_library`` returned a two-template library that
+    matched almost nothing, and every position in a two-phase scan indexed as
+    whichever of the two survived. The count and the per-template phase table
+    have to agree, which is what this asserts.
+    """
+
+    @staticmethod
+    def _phase(name, space_group, lattice, element):
+        from diffpy.structure import Atom, Lattice, Structure
+        from orix.crystal_map import Phase
+        structure = Structure(atoms=[Atom(element, [0, 0, 0])],
+                              lattice=Lattice(*lattice))
+        return Phase(name=name, space_group=space_group, structure=structure)
+
+    def _library(self, phases):
+        import hyperspy.api as hs
+        from spyde.actions.orientation_compute import generate_library_from_phases
+
+        # Coarse angular sampling: this is about bookkeeping, not accuracy.
+        sim = generate_library_from_phases(
+            phases, accelerating_voltage=200.0, resolution=10.0,
+            minimum_intensity=1e-3, reciprocal_radius=0.75)
+        cal = hs.signals.Signal2D(np.zeros((128, 128), np.float32))
+        for ax in cal.axes_manager.signal_axes:
+            ax.scale, ax.offset, ax.units = 0.0117, -0.75, "A^-1"
+        cal.set_signal_type("electron_diffraction")
+        for ax in cal.axes_manager.signal_axes:
+            ax.units = "A^-1"
+        return vo.build_template_library(sim, cal, r_max=0.75)
+
+    def test_two_phases_keep_every_template(self):
+        # alpha-Zr (hcp) and beta-Nb (bcc) — the pair the ZrNb precipitate scan
+        # poses, and the pair that exposed the collapse.
+        zirconium = self._phase("Zr", 194, (3.232, 3.232, 5.147, 90, 90, 120), "Zr")
+        niobium = self._phase("Nb", 229, (3.301, 3.301, 3.301, 90, 90, 90), "Nb")
+
+        single = [len(self._library([p]).spots_xy) for p in (zirconium, niobium)]
+        combined = self._library([zirconium, niobium])
+
+        assert len(combined.spots_xy) == sum(single), (
+            f"two-phase library has {len(combined.spots_xy)} templates, "
+            f"expected {sum(single)} = {single[0]} + {single[1]}")
+        assert len(combined.spots_I) == len(combined.spots_xy)
+        assert len(combined.template_quats) == len(combined.spots_xy)
+        assert len(combined.template_phase) == len(combined.spots_xy)
+        assert len(combined.phases_meta) == 2
+
+    def test_every_template_index_resolves_to_a_phase(self):
+        # fit_pattern indexes spots_xy by the template the coarse seed picked,
+        # which is drawn from the phase table — so an index the table knows
+        # about but the spot list does not is an IndexError at fit time.
+        zirconium = self._phase("Zr", 194, (3.232, 3.232, 5.147, 90, 90, 120), "Zr")
+        niobium = self._phase("Nb", 229, (3.301, 3.301, 3.301, 90, 90, 90), "Nb")
+        lib = self._library([zirconium, niobium])
+
+        phases_seen = set(np.asarray(lib.template_phase).tolist())
+        assert phases_seen == {0, 1}, phases_seen
+        assert int(np.max(lib.template_phase)) < len(lib.phases_meta)
+        # Phase-major order: every phase-0 template precedes every phase-1 one.
+        boundary = int(np.argmax(np.asarray(lib.template_phase) == 1))
+        assert set(np.asarray(lib.template_phase)[:boundary].tolist()) == {0}
+        assert set(np.asarray(lib.template_phase)[boundary:].tolist()) == {1}

@@ -69,6 +69,39 @@ def build_axes_list(signal_tree: "BaseSignalTree") -> list[dict]:
     return rows
 
 
+def build_units_toggle(signal_tree: "BaseSignalTree") -> dict | None:
+    """What the dock's detector-units control should offer, or ``None``.
+
+    ``None`` means this signal has no reciprocal detector to re-express — a
+    spectrum, a result map, an image — and the dock leaves the units cell as
+    plain editable text. Otherwise: the unit the axes are currently read as,
+    the four on offer, and for each the reason it is unavailable ("" when it
+    is), so a greyed option can say what is missing instead of just being
+    absent.
+    """
+    from spyde import reciprocal_units
+
+    try:
+        axes = signal_tree.root.axes_manager.signal_axes
+    except Exception:
+        return None
+    if len(axes) != 2:
+        return None
+    # Only for axes that NAME one of the four. An unlabelled detector is read
+    # as Å⁻¹ by the physics, but offering to convert something we cannot
+    # identify is how a scan axis ends up relabelled as a detector.
+    if reciprocal_units.parse_unit(getattr(axes[0], "units", "")) is None:
+        return None
+    current = reciprocal_units.current_unit(signal_tree.root)
+    if current is None:
+        return None
+    return {
+        "current": current,
+        "order": list(reciprocal_units.TOGGLE_ORDER),
+        "reasons": reciprocal_units.available_units(signal_tree.root),
+    }
+
+
 def build_metadata_editable(signal_tree: "BaseSignalTree") -> dict[str, dict[str, str]]:
     """Return ``{group: {prop: raw}}`` for the config-declared cells that are
     writable — i.e. have a ``key`` (a real ``metadata.set_item`` path), as

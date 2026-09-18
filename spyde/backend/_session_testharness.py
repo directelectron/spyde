@@ -157,10 +157,15 @@ class TestHarnessMixin:
         # widgets report PIXEL coords, so the detector mask must be built in pixel
         # space, not physical units. A scale=1 dataset hides that class of bug, so
         # the lazy test data is deliberately calibrated to guard against it.
+        #
+        # 1 nm⁻¹/px over 32 px is a half-extent of 16 nm⁻¹ = 1.6 Å⁻¹, which holds
+        # silver's reflections ({111} at 0.42 Å⁻¹) — the orientation specs build
+        # a library against this fixture. The scale was 0.1 under an nm⁻¹ label,
+        # a number that only made sense read as Å⁻¹.
         for ax in s.axes_manager.signal_axes:
-            ax.scale = 0.1
-            ax.offset = -(ax.size / 2.0) * 0.1
-            ax.units = "1/nm"
+            ax.scale = 1.0
+            ax.offset = -(ax.size / 2.0) * 1.0
+            ax.units = "nm^-1"
         self._add_signal(s, source_path="test_data_lazy")
 
     def _load_test_data_lazy_chunked(self) -> None:
@@ -878,10 +883,16 @@ class TestHarnessMixin:
             s.set_signal_type("electron_diffraction")
         except Exception as e:
             log.debug("set_signal_type(electron_diffraction) on synthetic data failed: %s", e)
+        # Calibrated in nm⁻¹ **and meaning it**: 1 nm⁻¹/px over 32 px is a
+        # half-extent of 16 nm⁻¹ = 1.6 Å⁻¹, which holds silver's reflections
+        # ({111} at 0.42 Å⁻¹) — the .cif the orientation specs build against.
+        # The scale used to be 0.1 under an nm⁻¹ label, a number that only made
+        # sense as Å⁻¹; harmless while nothing read the label, and a library
+        # ten times too small the moment something did.
         for ax in s.axes_manager.signal_axes:
-            ax.scale = 0.1
-            ax.offset = -(ax.size / 2.0) * 0.1
-            ax.units = "1/nm"
+            ax.scale = 1.0
+            ax.offset = -(ax.size / 2.0) * 1.0
+            ax.units = "nm^-1"
         # A calibrated scan, so every map computed over it (strain, orientation)
         # is checked for a scale bar, not just for pixels.
         for ax, name in zip(s.axes_manager.navigation_axes, ("x", "y")):

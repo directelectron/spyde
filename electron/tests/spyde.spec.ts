@@ -42,6 +42,19 @@ async function inject(msg: Record<string, unknown>) {
 // Capture outgoing actions in the MAIN process. The renderer's
 // window.electron is a contextBridge object (immutable — can't be wrapped),
 // so we observe the ipcMain 'spyde:action' channel instead.
+// The backend is mocked here, so `add_phase` / `set_phase_structure` reach a
+// stub and nothing comes back. These echo what the real handler emits, which is
+// what the wizards and the dock actually render from.
+const phaseEcho = (phases: Array<{ elements?: string[]; cif_path?: string | null; label?: string | null }>) =>
+  inject({
+    type: 'composition', window_ids: [1],
+    elements: phases.flatMap(p => p.elements ?? []), percentages: {},
+    phases: phases.map(p => ({
+      elements: p.elements ?? [], percentages: {},
+      cif_path: p.cif_path ?? null, label: p.label ?? null, cod_id: null,
+    })),
+  })
+
 async function trackActions() {
   await app.evaluate(({ ipcMain }) => {
     ;(globalThis as any).__sent = []
@@ -485,8 +498,17 @@ test('Vector Orientation Mapping opens the staged wizard and drives Generate→C
   await expect(page.getByTestId('vector-orientation-wizard')).toBeVisible()
   await expect(page.getByTestId('vom-tab-Run')).toBeDisabled()
 
-  await page.getByTestId('vom-pick-cif').click()
-  await expect(page.getByTestId('vom-pick-cif')).toHaveText('Ag.cif')
+  // The Load tab is a door onto the SAMPLE's phases: the button adds a row when
+  // there is none, and the (mocked) file picker gives it a structure.
+  await page.getByTestId('vom-add-phase').click()
+  await expect(page.getByTestId('periodic-table')).toBeVisible()
+  await phaseEcho([{}])                                   // add_phase landed
+  await expect(page.getByTestId('phase-row-0')).toBeVisible()
+  await page.getByTestId('phase-0-cif').click()
+  await phaseEcho([{ cif_path: '/tmp/Ag.cif', label: 'Ag' }])   // …and the pick
+  await expect(page.getByTestId('phase-0-structure')).toContainText('Ag')
+  await page.getByTestId('ptable-apply').click()
+  await expect(page.getByTestId('vom-cif-list')).toContainText('Ag')
   await page.getByTestId('vom-tab-Library').click()
   await page.getByTestId('vom-generate').click()
   await expect(page.getByTestId('vom-tab-Run')).toBeEnabled()
@@ -601,8 +623,17 @@ test('Orientation Mapping opens the staged wizard and drives the staged actions'
 
   // 1 Load → pick a .cif (mocked). Wait for the async picker to resolve (the
   // button label becomes the filename) before generating.
-  await page.getByTestId('om-pick-cif').click()
-  await expect(page.getByTestId('om-cif-list')).toContainText('Ag.cif')
+  // The Load tab is a door onto the SAMPLE's phases: the button adds a row when
+  // there is none, and the (mocked) file picker gives it a structure.
+  await page.getByTestId('om-add-phase').click()
+  await expect(page.getByTestId('periodic-table')).toBeVisible()
+  await phaseEcho([{}])                                   // add_phase landed
+  await expect(page.getByTestId('phase-row-0')).toBeVisible()
+  await page.getByTestId('phase-0-cif').click()
+  await phaseEcho([{ cif_path: '/tmp/Ag.cif', label: 'Ag' }])   // …and the pick
+  await expect(page.getByTestId('phase-0-structure')).toContainText('Ag')
+  await page.getByTestId('ptable-apply').click()
+  await expect(page.getByTestId('om-cif-list')).toContainText('Ag')
   // 2 Library → Generate Library → dispatches om_generate_library + unlocks Refine.
   await page.getByTestId('om-tab-Library').click()
   await page.getByTestId('om-generate').click()
@@ -626,8 +657,7 @@ test('Orientation Mapping opens the staged wizard and drives the staged actions'
   }).toEqual(['om_generate_library', 'om_refine', 'om_run'])
 })
 
-test('CIF picker remembers recents and re-selects them across reopen', async () => {
-  await page.evaluate(() => localStorage.removeItem('spyde:cif-recents'))
+test('a phase belongs to the sample, so it survives closing the wizard', async () => {
   await app.evaluate(({ ipcMain }) => {
     ipcMain.removeHandler('spyde:pick-file')
     ipcMain.handle('spyde:pick-file', async () => '/tmp/Quartz.cif')
@@ -646,23 +676,33 @@ test('CIF picker remembers recents and re-selects them across reopen', async () 
   await reveal()
   await page.getByTestId('action-btn-Orientation Mapping').click()
   await expect(page.getByTestId('orientation-wizard')).toBeVisible()
-  await page.getByTestId('om-pick-cif').click()
-  await expect(page.getByTestId('om-cif-list')).toContainText('Quartz.cif')
+  // The Load tab is a door onto the SAMPLE's phases: the button adds a row when
+  // there is none, and the (mocked) file picker gives it a structure.
+  await page.getByTestId('om-add-phase').click()
+  await expect(page.getByTestId('periodic-table')).toBeVisible()
+  await phaseEcho([{}])                                   // add_phase landed
+  await expect(page.getByTestId('phase-row-0')).toBeVisible()
+  await page.getByTestId('phase-0-cif').click()
+  await phaseEcho([{ cif_path: '/tmp/Quartz.cif', label: 'Quartz' }])   // …and the pick
+  await expect(page.getByTestId('phase-0-structure')).toContainText('Quartz')
+  await page.getByTestId('ptable-apply').click()
+  await expect(page.getByTestId('om-cif-list')).toContainText('Quartz')
 
-  // Close + reopen → the wizard persists its loaded phases, so Quartz is still in
-  // the list (and correctly NOT offered as a "recent" chip while it's loaded).
+  // Close + reopen → the phase is still there. Nothing is "remembered" for
+  // this: it is on the sample, which is also why the dock can show it.
   await page.getByTestId('om-close').click()
   await page.getByTestId('action-btn-Orientation Mapping').click()
   await expect(page.getByTestId('orientation-wizard')).toBeVisible()
-  await expect(page.getByTestId('om-cif-list')).toContainText('Quartz.cif')
+  await expect(page.getByTestId('om-cif-list')).toContainText('Quartz')
+  await expect(page.getByTestId('composition-structure-0')).toContainText('Quartz')
 
-  // Remove it → now it's remembered but not loaded, so the quick-select "Recent"
-  // chip appears; clicking it re-selects the crystal without a file dialog.
-  await page.getByTestId('om-cif-remove-Quartz.cif').click()
-  const chip = page.getByTestId('cif-recent-Quartz.cif')
-  await expect(chip).toBeVisible()
-  await chip.click()
-  await expect(page.getByTestId('om-cif-list')).toContainText('Quartz.cif')
+  // Removing the phase removes it from both, because there is only one list.
+  await page.getByTestId('om-add-phase').click()
+  await page.getByTestId('phase-0-remove').click()
+  await phaseEcho([])
+  await page.getByTestId('ptable-apply').click()
+  await expect(page.getByTestId('om-cif-list')).toContainText('No phases yet')
+  await expect(page.getByTestId('composition-empty')).toBeVisible()
 })
 
 test('an active action highlights, and clicking it deselects to hide output', async () => {
