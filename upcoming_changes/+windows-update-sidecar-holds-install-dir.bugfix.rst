@@ -1,0 +1,1 @@
+Updating on Windows no longer dead-ends in "SpyDE cannot be closed. Please close it manually and click Retry" when an analysis backend from an earlier session is still running: the installer now finds and stops one wherever it is running from, not only inside the installation directory.
