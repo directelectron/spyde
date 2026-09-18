@@ -208,6 +208,12 @@ tests = [
     "playwright>=1.40.0",
     "sphinx_gallery",
     "tifffile",
+    # spyde/external/quantem/diffraction/crystal.py — structure factors from a
+    # cif (ase) and the space-group operations behind its zone-axis wedge
+    # (spglib). A tests extra, not a dependency, because only the benchmark
+    # comparing that matcher to ours imports it; promote both if it ships.
+    "ase",
+    "spglib",
 ]
 doc = [
     "sphinx",
