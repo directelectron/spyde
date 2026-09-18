@@ -19,6 +19,7 @@ import { DownloadToasts } from './components/DownloadToasts'
 import { PresentGate } from './components/PresentGate'
 import { MovieGate } from './components/MovieGate'
 import { FirstRunGate } from './components/FirstRunGate'
+import { ScreenRecorderGate } from './components/ScreenRecorderGate'
 import { GuideInfoDialog } from './components/GuideInfoDialog'
 import { GUIDES, getGuide, type Guide } from '@guides/index'
 
@@ -111,6 +112,8 @@ export function App() {
           "First Steps" tour exactly once, tracked by the tutorial_seen settings
           flag. Always re-launchable afterwards from Help → First Steps. */}
       <FirstRunGate onAutoOpen={(g) => setTour((cur) => cur ?? g)} />
+      {/* Help → Record Screen: MediaRecorder over this window's own contents. */}
+      <ScreenRecorderGate />
     </SpyDEProvider>
   )
 }

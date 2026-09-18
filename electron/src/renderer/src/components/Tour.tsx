@@ -196,6 +196,12 @@ export function Tour({ guide, onClose }: { guide: Guide; onClose: () => void }) 
       // loaded AND anything the walkthrough derived from it, so the user is left
       // with a clean workspace.
       if (didAutoloadRef.current) sendRef.current('tutorial_close_all', {})
+      // ...and let a remount load it again. StrictMode runs this cleanup in dev
+      // on a mount it immediately repeats; without clearing the guard above,
+      // the close lands and the second mount refuses to reload, so the dataset
+      // opens and vanishes. (Production mounts once: load here, close on exit.)
+      autoloadStartedRef.current = false
+      didAutoloadRef.current = false
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [guide.id])

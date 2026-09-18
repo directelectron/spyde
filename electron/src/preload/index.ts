@@ -92,6 +92,14 @@ contextBridge.exposeInMainWorld('electron', {
   reportExportPdf: (htmlPath: string, pdfPath: string): Promise<{ ok: boolean; error?: string }> =>
     ipcRenderer.invoke('report:export-pdf', htmlPath, pdfPath),
 
+  /** Name a screen recording and open its file; RETURNS the path, or null if
+   *  the user cancelled. */
+  startRecording: (ext: 'mp4' | 'webm'): Promise<string | null> =>
+    ipcRenderer.invoke('record:start', ext),
+
+  /** Append one chunk of the in-progress recording. */
+  recordChunk: (bytes: Uint8Array): Promise<void> => ipcRenderer.invoke('record:chunk', bytes),
+
   /** Write a PNG data URL to the OS clipboard as an image. */
   clipboardWritePng: (dataUrl: string): Promise<{ ok: boolean; error?: string }> =>
     ipcRenderer.invoke('clipboard:write-png', dataUrl),
