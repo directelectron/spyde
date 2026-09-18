@@ -10,11 +10,17 @@
  * The dataset matters. What capture has to prove is that the FIGURE iframes
  * come through: they are a separate `spyde-fig://` origin in their own
  * processes, so if tab capture missed out-of-process frames the recording would
- * be app chrome around an empty hole. Hence load data, wait for plots, and
- * assert the video frame is not just the dark shell.
+ * be app chrome around an empty hole.
+ *
+ * Proving that means DECODING the file, which needs ffmpeg — present on a dev
+ * box, absent on the CI runners. So the checks are tiered: the capture itself,
+ * and that the bytes are a real container, are asserted everywhere from the
+ * file header alone; the frame-level assertions run where ffmpeg exists and
+ * skip loudly where it doesn't. Do NOT collapse this back to one tier — a
+ * recording that is merely non-empty is not evidence the figures are in it.
  */
 import { test, expect } from '@playwright/test'
-import { existsSync, statSync, mkdtempSync, mkdirSync } from 'fs'
+import { existsSync, statSync, mkdtempSync, mkdirSync, openSync, readSync, closeSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { execFileSync } from 'child_process'
@@ -22,6 +28,25 @@ import { execFileSync } from 'child_process'
 const {
   launchApp, backendAction, waitForSubwindowCount,
 } = require('./_harness.cjs')
+
+/** ffmpeg/ffprobe are a dev-box convenience, not a CI dependency. */
+const HAS_FFMPEG = (() => {
+  try {
+    execFileSync('ffprobe', ['-version'], { stdio: 'ignore' })
+    execFileSync('ffmpeg', ['-version'], { stdio: 'ignore' })
+    return true
+  } catch { return false }
+})()
+
+/** mp4 ('....ftyp') or Matroska/WebM (0x1A45DFA3) — read from the header, no decoder. */
+function containerOf(path: string): 'mp4' | 'webm' | 'unknown' {
+  const head = Buffer.alloc(12)
+  const fd = openSync(path, 'r')
+  try { readSync(fd, head, 0, 12, 0) } finally { closeSync(fd) }
+  if (head.subarray(4, 8).toString('latin1') === 'ftyp') return 'mp4'
+  if (head[0] === 0x1a && head[1] === 0x45 && head[2] === 0xdf && head[3] === 0xa3) return 'webm'
+  return 'unknown'
+}
 
 let ctx: Awaited<ReturnType<typeof launchApp>>
 const shots = join(__dirname, '..', 'screen_record_shots')
@@ -35,7 +60,7 @@ test.beforeAll(async () => {
 })
 test.afterAll(async () => { await ctx?.app.close() })
 
-test('records the window, figures included', async () => {
+test('records the window to a real video file', async () => {
   const page = ctx.page
   await ctx.app.evaluate(({ dialog }, filePath) => {
     dialog.showSaveDialog = async () => ({ canceled: false, filePath })
@@ -60,15 +85,25 @@ test('records the window, figures included', async () => {
   await page.screenshot({ path: join(shots, '02-saved.png') })
 
   expect(existsSync(outPath)).toBe(true)
-  console.log(`[screen-record] ${outPath} — ${statSync(outPath).size} bytes`)
+  const bytes = statSync(outPath).size
+  const container = containerOf(outPath)
+  console.log(`[screen-record] ${outPath} — ${bytes} bytes, container=${container}`)
+  // A real muxed container, not a stub or a truncated first chunk.
+  expect(container).not.toBe('unknown')
+  expect(bytes).toBeGreaterThan(10_000)
 
-  // A file on disk is not a video. Decode it and pull a frame back out.
+  await ctx.assertNoJsErrors()
+})
+
+test('the recording contains the figures', async () => {
+  test.skip(!HAS_FFMPEG, 'needs ffmpeg to decode the recording written by the previous test')
+
   const probe = execFileSync('ffprobe', [
     '-v', 'error', '-show_entries', 'format=duration:stream=codec_name,width,height',
     '-of', 'default=noprint_wrappers=1', outPath,
   ]).toString()
   console.log(`[screen-record] ${probe.replace(/\n/g, ' ')}`)
-  expect(probe).toMatch(/codec_name=(h264|vp9|vp8)/)
+  expect(probe).toMatch(/codec_name=(h264|vp9|vp8|av1)/)
   expect(Number(probe.match(/duration=([\d.]+)/)![1])).toBeGreaterThan(3)
 
   execFileSync('ffmpeg', ['-v', 'error', '-y', '-ss', '3', '-i', outPath,
@@ -78,6 +113,7 @@ test('records the window, figures included', async () => {
 })
 
 test('the recording is live, not a still', async () => {
+  test.skip(!HAS_FFMPEG, 'needs ffmpeg to pull frames back out of the recording')
   const page = ctx.page
   await ctx.app.evaluate(({ dialog }, filePath) => {
     dialog.showSaveDialog = async () => ({ canceled: false, filePath })
