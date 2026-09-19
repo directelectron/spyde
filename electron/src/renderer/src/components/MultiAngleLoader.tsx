@@ -98,6 +98,9 @@ export interface MapedSolve {
   corners: Record<string, MapedCorners>
 }
 
+/** A square search region on the detector, by its centre and half-width. */
+export interface BeamRoi { cy: number; cx: number; half: number }
+
 export interface MapedState {
   members: MapedMember[]
   reference: number | null
@@ -110,6 +113,10 @@ export interface MapedState {
   virtual_image: string | null
   /** Names every member carries, so one can be chosen for all of them. */
   available_virtual_images: string[]
+  /** Where the reciprocal stage looks for the zero beam, in DETECTOR pixels,
+   *  or null for the whole pattern. One region for the acquisition: the
+   *  members are the same detector at the same camera length. */
+  beam_roi: BeamRoi | null
   real: MapedSolve
   reciprocal: MapedSolve
   busy: boolean
@@ -123,7 +130,7 @@ const EMPTY_SOLVE: MapedSolve = {
 
 export const EMPTY_MAPED_STATE: MapedState = {
   members: [], reference: null, shells: [], scan_shape: null,
-  virtual_image: null, available_virtual_images: [],
+  virtual_image: null, available_virtual_images: [], beam_roi: null,
   real: EMPTY_SOLVE, reciprocal: EMPTY_SOLVE,
   busy: false, message: '', can_commit: false,
 }
@@ -208,12 +215,22 @@ export function parseMapedState(detail: Record<string, unknown>): MapedState {
     scan_shape: numList(detail.scan_shape),
     virtual_image: detail.virtual_image == null ? null : String(detail.virtual_image),
     available_virtual_images: strList(detail.available_virtual_images),
+    beam_roi: parseBeamRoi(detail.beam_roi),
     real: parseSolve(detail.real),
     reciprocal: parseSolve(detail.reciprocal),
     busy: Boolean(detail.busy),
     message: String(detail.message ?? ''),
     can_commit: Boolean(detail.can_commit),
   }
+}
+
+/** The search region, or null — including when it is there but unreadable. */
+function parseBeamRoi(raw: unknown): BeamRoi | null {
+  if (!raw || typeof raw !== 'object') return null
+  const roi = raw as Record<string, unknown>
+  const cy = Number(roi.cy), cx = Number(roi.cx), half = Number(roi.half)
+  if (![cy, cx, half].every(Number.isFinite) || half <= 0) return null
+  return { cy, cx, half }
 }
 
 /** "1.0°", "0.5°", "1.25°" — always at least one decimal, so a whole-degree
@@ -463,7 +480,11 @@ const FILE_FILTER = {
  */
 type ZoomTarget =
   | { kind: 'member'; index: number }
-  | { kind: 'panel'; src: string | null; caption: string }
+  /** `detector` is set for a DIFFRACTION panel, which is what makes the
+   *  enlarged view able to carry the zero-beam region: on a tableau tile one
+   *  screen pixel is about five detector pixels, so a drag there is far too
+   *  coarse to place a 24 px region on a disk. */
+  | { kind: 'panel'; src: string | null; caption: string; detector?: number[] | null }
 
 /** The drag type an internal slot-to-slot move carries — a member index, as
  *  opposed to a file coming in from the desktop. */
@@ -644,7 +665,11 @@ export function MultiAngleLoader({ sendAction, onClose }: {
   const zoomed = ((): React.ReactNode => {
     if (!zoom) return null
     if (zoom.kind === 'panel') {
-      return <PanelZoom src={zoom.src} caption={zoom.caption} onClose={() => setZoom(null)} />
+      return <PanelZoom src={zoom.src} caption={zoom.caption}
+        roi={zoom.detector ? state.beam_roi : null} detector={zoom.detector}
+        onRoi={(roi) => debounce('beam-roi',
+          () => sendAction('maped_set_beam_roi', { beam_roi: roi }))}
+        onClose={() => setZoom(null)} />
     }
     const member = byIndex.get(zoom.index)
     // The member it was opened on is gone — so is the panel.
@@ -826,6 +851,8 @@ export function MultiAngleLoader({ sendAction, onClose }: {
                   `corner-${member ?? 'all'}-${corner}`,
                   () => sendAction('maped_set_corner_extent', { member, corner, extent }))}
                 onZoom={setZoom}
+                onBeamRoi={(roi) => debounce('beam-roi',
+                  () => sendAction('maped_set_beam_roi', { beam_roi: roi }))}
               />
 
               <RunButton
@@ -1161,10 +1188,99 @@ function ProblemList({ members }: { members: MapedMember[] }) {
  * panels are here before anything has run, with the previews filling in
  * afterwards.
  */
-function CornerTableau({ state, onExtent, onZoom }: {
+/**
+ * The zero-beam search region, drawn on a corner panel and draggable on it.
+ *
+ * The region is what stops the beam finder reading a reflection instead of the
+ * beam: it is a centre of mass, so over a whole pattern it goes wherever the
+ * excited reflections are. Placing it is therefore a measurement decision, and
+ * a measurement decision belongs on the picture rather than in a number field —
+ * though the field is there too, because "24" is easier to repeat than a drag.
+ *
+ * Drag the middle to move it, a corner to resize it. The panel maps the whole
+ * detector onto a square, so panel fractions convert straight to detector
+ * pixels. One region for the acquisition, so dragging it on any member's panel
+ * moves the one every member is searched with.
+ */
+function BeamRegionBox({ roi, detector, onChange }: {
+  roi: BeamRoi
+  detector: number[] | null
+  onChange: (roi: BeamRoi) => void
+}) {
+  const host = React.useRef<HTMLDivElement | null>(null)
+  const height = detector?.[0] ?? 0
+  const width = detector?.[1] ?? 0
+  if (!height || !width) return null
+
+  const left = ((roi.cx - roi.half) / width) * 100
+  const top = ((roi.cy - roi.half) / height) * 100
+  const size = ((roi.half * 2) / Math.max(width, height)) * 100
+
+  /** Drag in panel pixels, applied in detector pixels.
+   *
+   * No `preventDefault` and no pointer capture on the way in: both stop the
+   * browser synthesising the click, and a DOUBLE-click on the region is how
+   * the panel under it gets enlarged — which is the only place the region can
+   * be aimed properly. The listeners go on the window instead, so a fast drag
+   * that leaves the box still tracks, and a two-pixel dead zone keeps the
+   * jitter of a double-click from moving anything.
+   */
+  const drag = (event: React.PointerEvent, mode: 'move' | 'size') => {
+    event.stopPropagation()
+    const panel = host.current?.parentElement
+    if (!panel) return
+    const box = panel.getBoundingClientRect()
+    const perPixelX = width / box.width
+    const perPixelY = height / box.height
+    const startX = event.clientX, startY = event.clientY
+    const start = { ...roi }
+
+    const clamp = (next: BeamRoi): BeamRoi => {
+      const half = Math.max(3, Math.min(next.half, Math.min(width, height) / 2))
+      return {
+        half,
+        cx: Math.max(half, Math.min(width - half, next.cx)),
+        cy: Math.max(half, Math.min(height - half, next.cy)),
+      }
+    }
+    const onMove = (move: PointerEvent) => {
+      if (Math.abs(move.clientX - startX) < 2 && Math.abs(move.clientY - startY) < 2) return
+      const dx = (move.clientX - startX) * perPixelX
+      const dy = (move.clientY - startY) * perPixelY
+      onChange(clamp(mode === 'move'
+        ? { ...start, cx: start.cx + dx, cy: start.cy + dy }
+        : { ...start, half: start.half + (dx + dy) / 2 }))
+    }
+    const onUp = () => {
+      window.removeEventListener('pointermove', onMove)
+      window.removeEventListener('pointerup', onUp)
+    }
+    window.addEventListener('pointermove', onMove)
+    window.addEventListener('pointerup', onUp)
+  }
+
+  return (
+    <div ref={host} data-testid="maped-beam-roi"
+      onPointerDown={(e) => drag(e, 'move')}
+      /* The double-click is deliberately NOT swallowed: it enlarges the panel,
+         and the region sits over the middle of it — exactly where someone
+         double-clicks to get a closer look at the beam they are aiming at.
+         A drag only moves the region once the pointer moves, so the two
+         gestures do not collide. */
+      style={{ ...styles.beamRoi, left: `${left}%`, top: `${top}%`,
+               width: `${size}%`, height: `${size}%` }}
+    >
+      <div data-testid="maped-beam-roi-handle" style={styles.beamRoiHandle}
+        onPointerDown={(e) => drag(e, 'size')} />
+    </div>
+  )
+}
+
+function CornerTableau({ state, onExtent, onZoom, onBeamRoi }: {
   state: MapedState
   onExtent: (member: number | null, corner: number, extent: number) => void
   onZoom: (target: ZoomTarget) => void
+  onBeamRoi: (roi: BeamRoi) => void
 }) {
   const members = state.members.filter((m) => !m.error)
   const corners = state.reciprocal.corners
@@ -1197,6 +1313,25 @@ function CornerTableau({ state, onExtent, onZoom }: {
             />
           </label>
         ))}
+        {state.beam_roi && (
+          <label style={styles.cornerAllField}
+            title="The zero beam is looked for inside this square. Drag the
+ green box on any panel to place it.">
+            <span style={styles.cornerAllLabel}>Zero-beam search ±px</span>
+            <input
+              data-testid="maped-beam-roi-half"
+              type="number" min={3} step={1}
+              value={Math.round(state.beam_roi.half)}
+              onChange={(e) => {
+                const half = Number(e.target.value)
+                if (Number.isFinite(half) && half >= 3 && state.beam_roi) {
+                  onBeamRoi({ ...state.beam_roi, half })
+                }
+              }}
+              style={{ ...styles.extentInput, width: 56 }}
+            />
+          </label>
+        )}
       </div>
 
       <div style={styles.cornerCards}>
@@ -1223,12 +1358,18 @@ function CornerTableau({ state, onExtent, onZoom }: {
                         onDoubleClick={() => onZoom({
                           kind: 'panel', src,
                           caption: `${member.name} — ${label} corner`,
+                          detector: member.detector_shape,
                         })}
                         style={{ ...styles.cornerPanel, ...(src ? null : styles.cornerPanelEmpty) }}
                       >
                         {src
                           ? <img src={src} alt="" style={styles.cornerImage} draggable={false} />
                           : <span style={styles.cornerGlyph}>{CORNER_SHORT[corner]}</span>}
+                        {src && state.beam_roi && (
+                          <BeamRegionBox roi={state.beam_roi}
+                            detector={member.detector_shape}
+                            onChange={onBeamRoi} />
+                        )}
                       </div>
                       <ExtentInput
                         testid={`maped-corner-extent-${member.index}-${corner}`}
@@ -1287,10 +1428,13 @@ function ExtentInput({ value, onChange, testid, width }: {
  * double-clicks into this. Escape or a click anywhere dismisses it; the detail
  * box swallows its own clicks so the controls inside it stay usable.
  */
-function PanelZoom({ src, caption, detail, onClose }: {
+function PanelZoom({ src, caption, detail, roi, detector, onRoi, onClose }: {
   src: string | null
   caption: string
   detail?: React.ReactNode
+  roi?: BeamRoi | null
+  detector?: number[] | null
+  onRoi?: (roi: BeamRoi) => void
   onClose: () => void
 }) {
   return (
@@ -1298,8 +1442,13 @@ function PanelZoom({ src, caption, detail, onClose }: {
       <div style={styles.zoomBox}>
         <div data-testid="maped-zoom-caption" style={styles.zoomCaption}>{caption}</div>
         {src
-          ? <img data-testid="maped-zoom-image" src={src} alt=""
-              style={styles.zoomImage} draggable={false} />
+          ? <div style={styles.zoomImageBox} onClick={(e) => e.stopPropagation()}>
+              <img data-testid="maped-zoom-image" src={src} alt=""
+                style={styles.zoomImage} draggable={false} />
+              {roi && detector && onRoi && (
+                <BeamRegionBox roi={roi} detector={detector} onChange={onRoi} />
+              )}
+            </div>
           : <div data-testid="maped-zoom-blank" style={styles.zoomBlank}>
               Nothing rendered for this panel yet.
             </div>}
@@ -1716,6 +1865,17 @@ const styles: Record<string, React.CSSProperties> = {
     overflow: 'hidden', cursor: 'zoom-in',
   },
   cornerPanelEmpty: { borderStyle: 'dashed', borderColor: '#45475a' },
+  beamRoi: {
+    position: 'absolute', boxSizing: 'border-box',
+    border: '1.5px solid #a6e3a1', borderRadius: 3,
+    background: 'rgba(166, 227, 161, 0.10)',
+    cursor: 'move', touchAction: 'none',
+  },
+  beamRoiHandle: {
+    position: 'absolute', right: -4, bottom: -4, width: 8, height: 8,
+    background: '#a6e3a1', borderRadius: 2, cursor: 'nwse-resize',
+    touchAction: 'none',
+  },
   cornerImage: { width: '100%', height: '100%', objectFit: 'cover', display: 'block' },
   cornerGlyph: { fontSize: 11, color: '#585b70', letterSpacing: 1 },
   extentInput: {
@@ -1737,6 +1897,7 @@ const styles: Record<string, React.CSSProperties> = {
     maxWidth: '100%', maxHeight: '100%',
   },
   zoomCaption: { fontSize: 13, color: '#cdd6f4', fontWeight: 600 },
+  zoomImageBox: { position: 'relative', lineHeight: 0 },
   zoomImage: {
     // A WIDTH, not just a cap: these are thumbnails, so a max-size rule alone
     // leaves a 28-pixel preview drawn at 28 pixels and "enlarge" does nothing.
