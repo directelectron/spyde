@@ -52,6 +52,10 @@ export interface ToolbarAction {
   toggle: boolean
   parameters: Record<string, ParamSpec>
   subfunctions?: SubAction[]
+  /** `beta:` in the toolbar schema — the action works and is offered normally,
+   *  but its results or controls may still change. Drawn as a badge on the
+   *  button and a ribbon across its caret. */
+  beta?: boolean
 }
 
 export interface SpyDEWindow {
