@@ -480,7 +480,11 @@ const FILE_FILTER = {
  */
 type ZoomTarget =
   | { kind: 'member'; index: number }
-  | { kind: 'panel'; src: string | null; caption: string }
+  /** `detector` is set for a DIFFRACTION panel, which is what makes the
+   *  enlarged view able to carry the zero-beam region: on a tableau tile one
+   *  screen pixel is about five detector pixels, so a drag there is far too
+   *  coarse to place a 24 px region on a disk. */
+  | { kind: 'panel'; src: string | null; caption: string; detector?: number[] | null }
 
 /** The drag type an internal slot-to-slot move carries — a member index, as
  *  opposed to a file coming in from the desktop. */
@@ -661,7 +665,11 @@ export function MultiAngleLoader({ sendAction, onClose }: {
   const zoomed = ((): React.ReactNode => {
     if (!zoom) return null
     if (zoom.kind === 'panel') {
-      return <PanelZoom src={zoom.src} caption={zoom.caption} onClose={() => setZoom(null)} />
+      return <PanelZoom src={zoom.src} caption={zoom.caption}
+        roi={zoom.detector ? state.beam_roi : null} detector={zoom.detector}
+        onRoi={(roi) => debounce('beam-roi',
+          () => sendAction('maped_set_beam_roi', { beam_roi: roi }))}
+        onClose={() => setZoom(null)} />
     }
     const member = byIndex.get(zoom.index)
     // The member it was opened on is gone — so is the panel.
@@ -1341,6 +1349,7 @@ function CornerTableau({ state, onExtent, onZoom, onBeamRoi }: {
                         onDoubleClick={() => onZoom({
                           kind: 'panel', src,
                           caption: `${member.name} — ${label} corner`,
+                          detector: member.detector_shape,
                         })}
                         style={{ ...styles.cornerPanel, ...(src ? null : styles.cornerPanelEmpty) }}
                       >
@@ -1414,6 +1423,9 @@ function PanelZoom({ src, caption, detail, onClose }: {
   src: string | null
   caption: string
   detail?: React.ReactNode
+  roi?: BeamRoi | null
+  detector?: number[] | null
+  onRoi?: (roi: BeamRoi) => void
   onClose: () => void
 }) {
   return (
@@ -1421,8 +1433,13 @@ function PanelZoom({ src, caption, detail, onClose }: {
       <div style={styles.zoomBox}>
         <div data-testid="maped-zoom-caption" style={styles.zoomCaption}>{caption}</div>
         {src
-          ? <img data-testid="maped-zoom-image" src={src} alt=""
-              style={styles.zoomImage} draggable={false} />
+          ? <div style={styles.zoomImageBox} onClick={(e) => e.stopPropagation()}>
+              <img data-testid="maped-zoom-image" src={src} alt=""
+                style={styles.zoomImage} draggable={false} />
+              {roi && detector && onRoi && (
+                <BeamRegionBox roi={roi} detector={detector} onChange={onRoi} />
+              )}
+            </div>
           : <div data-testid="maped-zoom-blank" style={styles.zoomBlank}>
               Nothing rendered for this panel yet.
             </div>}
@@ -1871,6 +1888,7 @@ const styles: Record<string, React.CSSProperties> = {
     maxWidth: '100%', maxHeight: '100%',
   },
   zoomCaption: { fontSize: 13, color: '#cdd6f4', fontWeight: 600 },
+  zoomImageBox: { position: 'relative', lineHeight: 0 },
   zoomImage: {
     // A WIDTH, not just a cap: these are thumbnails, so a max-size rule alone
     // leaves a 28-pixel preview drawn at 28 pixels and "enlarge" does nothing.
