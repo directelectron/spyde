@@ -277,3 +277,57 @@ class TestAxisNames:
             "nm", "nm", "1/A", "1/A"]
         assert summed.axes_manager._axes[0].scale == SCAN_SCALE
         assert summed.axes_manager._axes[2].scale == DETECTOR_SCALE
+
+
+class TestTheMembersMetadataIsCarried:
+    """What the reference member knew, the composition has to know too.
+
+    This was silently empty: the carry assigned over ``signal.metadata``, which
+    is a read-only property, and the bare ``except`` around it turned the
+    AttributeError into "no metadata at all". Nothing failed — the acquisition
+    opened, looked right, and had no signal type, so every diffraction action
+    was gated off it and the dataset could not be analysed.
+    """
+
+    def _reference(self, members):
+        reference = members[0]
+        reference.set_signal_type("electron_diffraction")
+        reference.metadata.set_item(
+            "Acquisition_instrument.TEM.beam_energy", 200.0)
+        reference.metadata.set_item("Preprocessing.note", "carried")
+        return reference
+
+    def test_the_summed_node_keeps_the_signal_type(self, acquisition):
+        aligned, members, model = acquisition
+        self._reference(members)
+        summed = build_summed_signal(aligned, members, model)
+        assert summed.metadata.Signal.signal_type == "electron_diffraction"
+
+    def test_the_stack_keeps_the_signal_type(self, acquisition):
+        aligned, members, model = acquisition
+        self._reference(members)
+        stack = build_stack_signal(aligned, members, model)
+        assert stack.metadata.Signal.signal_type == "electron_diffraction"
+
+    def test_the_instrument_and_provenance_come_across(self, acquisition):
+        aligned, members, model = acquisition
+        self._reference(members)
+        summed = build_summed_signal(aligned, members, model)
+        assert summed.metadata.get_item(
+            "Acquisition_instrument.TEM.beam_energy") == 200.0
+        assert summed.metadata.get_item("Preprocessing.note") == "carried"
+
+    def test_the_title_is_still_the_compositions_own(self, acquisition):
+        aligned, members, model = acquisition
+        reference = self._reference(members)
+        reference.metadata.set_item("General.title", "one member")
+        summed = build_summed_signal(aligned, members, model)
+        assert summed.metadata.General.title == "Summed"
+
+    def test_the_acquisition_record_survives_the_carry(self, acquisition):
+        aligned, members, model = acquisition
+        self._reference(members)
+        summed = build_summed_signal(aligned, members, model)
+        record = summed.metadata.get_item("Acquisition.multiangle")
+        assert record["n_members"] == N_MEMBERS
+        assert record["n_shells"] == 2

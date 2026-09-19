@@ -1672,9 +1672,13 @@ def maped_add_files(session, plot, payload) -> None:
     if complaint:
         emit_error(complaint)
 
+    # Sized on the worker, not here. A directory store is measured by walking
+    # every file in it, and a frame-chunked .zspy is one file per frame —
+    # 65,579 of them per member, about 35 s each on a real acquisition. Doing
+    # that before the first snapshot froze the whole backend for over two
+    # minutes with the dialog still reading "No datasets".
     pending = [LoaderMember(path=path,
-                            name=os.path.basename(path.rstrip(os.sep)),
-                            size_bytes=int(_dataset_size_bytes(path)))
+                            name=os.path.basename(path.rstrip(os.sep)))
                for path in paths]
     for member, placed_at in zip(pending, angles):
         _place_member(member, placed_at)
@@ -1704,6 +1708,11 @@ def maped_add_files(session, plot, payload) -> None:
                 # fills a row dropped without an angle, and the drop wins on
                 # one that has it.
                 _place_member(member, placed_at)
+            # Last, because it is the slowest thing here and the least worth
+            # waiting for: the shape and dtype decide whether a member can be
+            # used at all, its size only labels the row.
+            for member in pending:
+                member.size_bytes = int(_dataset_size_bytes(member.path))
 
     def _done(_result):
         if not is_current(state, "_probe_generation", generation):

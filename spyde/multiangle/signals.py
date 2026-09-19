@@ -39,12 +39,16 @@ small enough to look plausible and wrong in every g-vector derived from it.
 """
 from __future__ import annotations
 
+import logging
+
 import numpy as np
 
 from spyde.multiangle.compose import (
     composed_axis_offsets, stack_aligned, sum_aligned,
 )
 from spyde.multiangle.recipe import MultiAngleRecipe, attach_recipe
+
+log = logging.getLogger(__name__)
 
 #: Name given to the leading axis of the stack node.
 ANGLE_AXIS_NAME = "angle"
@@ -115,14 +119,21 @@ def _carry_metadata(signal, members, model):
     metadata = getattr(reference, "metadata", None)
     if metadata is not None:
         try:
-            signal.metadata = metadata.deepcopy()
+            # Merged into the signal's own tree rather than assigned over it:
+            # `metadata` is a read-only property, so assigning raised and the
+            # except below swallowed it — which cost the composition EVERY
+            # inherited field, the signal type among them. Losing that gates
+            # off the whole diffraction toolchain, so the acquisition opened
+            # and then could not be analysed.
+            signal.metadata.add_dictionary(metadata.deepcopy().as_dictionary())
             signal_type = metadata.get_item("Signal.signal_type", "")
             if signal_type:
                 signal.set_signal_type(signal_type)
-        except Exception:
+        except Exception as e:
             # Metadata is a convenience here; a member with an odd tree must not
-            # stop the acquisition opening.
-            pass
+            # stop the acquisition opening. It must not fail SILENTLY either.
+            log.warning("the multi-angle members' metadata was not carried "
+                        "over to the composition: %s", e)
     try:
         signal.metadata.set_item("Acquisition.multiangle", {
             "n_members": int(model.n_members),
