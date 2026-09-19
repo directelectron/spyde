@@ -1,0 +1,5 @@
+Opening a ``.zspy`` or ``.zarr`` no longer stalls before the "Reading…"
+message appears. The size behind that message was measured by walking every
+file in the store, which on a frame-chunked scan is one file per frame —
+65,579 of them, and 35.6 s of stat calls, on a real 256 x 256 acquisition. A
+directory store is now taken as large without being measured.
