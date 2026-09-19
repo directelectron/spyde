@@ -98,7 +98,7 @@ export function MenuBar({ onStartGuide, onShowInfo }: {
   /** Help → <technique> → Info… — opens GuideInfoDialog for that technique. */
   onShowInfo: (g: Guide) => void
 }) {
-  const { sendAction, openStackDialog, openUpdateDialog, openGpuStatusDialog, openGpuHelpDialog, openReportDialog, state } = useSpyDE()
+  const { sendAction, openStackDialog, openMultiAngleLoader, openUpdateDialog, openGpuStatusDialog, openGpuHelpDialog, openReportDialog, state } = useSpyDE()
   const [open, setOpen] = useState<string | null>(null)
   const barRef = useRef<HTMLDivElement>(null)
   const [exampleGroups, setExampleGroups] = useState<ExampleGroup[]>([])
@@ -176,6 +176,11 @@ export function MenuBar({ onStartGuide, onShowInfo }: {
       { label: 'Open…', onClick: () => window.electron.openFile() },
       { label: 'Open Zarr Folder (.zspy)…', onClick: () => window.electron.openZarrFolder() },
       { label: 'Load Stack…', onClick: () => openStackDialog() },
+      {
+        label: 'Load Multi-Angle 4D STEM…',
+        testId: 'menu-load-multiangle',
+        onClick: () => openMultiAngleLoader(),
+      },
       { separator: true },
       { label: 'Save Signal…', onClick: () => window.electron.saveDialog() },
       { separator: true },
@@ -273,6 +278,11 @@ export function MenuBar({ onStartGuide, onShowInfo }: {
       { label: 'Check for Updates…', onClick: () => openUpdateDialog() },
       { label: 'GPU & CUDA', onClick: () => openGpuHelpDialog() },
       { label: 'GPU Status…', onClick: () => openGpuStatusDialog() },
+      { separator: true },
+      // Toggles the ScreenRecorderGate. Dispatched from HERE rather than the
+      // native menu because getDisplayMedia needs a real click to count as user
+      // activation.
+      { label: 'Record Screen', onClick: () => window.dispatchEvent(new CustomEvent('spyde:toggle_record')) },
       { separator: true },
       { label: 'Report a Problem…', onClick: () => openReportDialog() },
     ],

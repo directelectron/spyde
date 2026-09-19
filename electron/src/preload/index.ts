@@ -32,6 +32,10 @@ contextBridge.exposeInMainWorld('electron', {
   /** Open the in-app Load Stack dialog (from the File menu). Returns an unsubscribe fn. */
   onOpenStackDialog: (cb: () => void) => onEvent('spyde:open_stack_dialog', cb),
 
+  /** Open the in-app Multi-Angle 4D STEM loader (from the File menu). Returns
+   *  an unsubscribe fn. */
+  onOpenMultiAngleLoader: (cb: () => void) => onEvent('spyde:open_multiangle_loader', cb),
+
   /** Open the "Check for Updates" dialog (from the Help menu). Returns an unsubscribe fn. */
   onOpenUpdateDialog: (cb: () => void) => onEvent('spyde:open_update_dialog', cb),
 
@@ -91,6 +95,14 @@ contextBridge.exposeInMainWorld('electron', {
   /** Render an exported report HTML file to PDF via a hidden BrowserWindow. */
   reportExportPdf: (htmlPath: string, pdfPath: string): Promise<{ ok: boolean; error?: string }> =>
     ipcRenderer.invoke('report:export-pdf', htmlPath, pdfPath),
+
+  /** Name a screen recording and open its file; RETURNS the path, or null if
+   *  the user cancelled. */
+  startRecording: (ext: 'mp4' | 'webm'): Promise<string | null> =>
+    ipcRenderer.invoke('record:start', ext),
+
+  /** Append one chunk of the in-progress recording. */
+  recordChunk: (bytes: Uint8Array): Promise<void> => ipcRenderer.invoke('record:chunk', bytes),
 
   /** Write a PNG data URL to the OS clipboard as an image. */
   clipboardWritePng: (dataUrl: string): Promise<{ ok: boolean; error?: string }> =>

@@ -49,6 +49,11 @@ def _materialise_signal(signal: BaseSignal, array: np.ndarray) -> None:
                      signal, e)
 
 
+#: Tree attributes holding a BARE figure window — one with no Plot, and so not
+#: collected by the window_ids teardown. Closing a tree must close these too.
+_BARE_FIGURE_WINDOW_ATTRIBUTES = ("_ipf_window", "_multiangle_navigator")
+
+
 class BaseSignalTree:
     """
     A class to manage the signal tree — the DAG of signal transformations.
@@ -1466,21 +1471,25 @@ class BaseSignalTree:
         self.signal_plots = []
         self.navigator_signals = {}
         self.navigator_plot_manager = None
-        # The IPF EXPLORER window (window 2) is a BARE figure window — it has no
-        # Plot, so it is not in the window_ids _close_tree collected and would be
-        # left orphaned on screen. Route it through the real teardown
+        # BARE figure windows (the IPF explorer, the multi-angle ring) have no
+        # Plot, so they are not among the window_ids _close_tree collected and
+        # would be left orphaned on screen. Route each through the real teardown
         # (controller close + figure eviction + window_closed to the renderer).
-        ipf_win = getattr(self, "_ipf_window", None)
-        if ipf_win is not None:
+        # Listed rather than hard-coded one at a time: the failure is a window
+        # that outlives its data, which nothing else catches.
+        for attribute in _BARE_FIGURE_WINDOW_ATTRIBUTES:
+            window = getattr(self, attribute, None)
+            if window is None:
+                continue
             try:
-                self.session._forget_window(getattr(ipf_win, "window_id", None))
+                self.session._forget_window(getattr(window, "window_id", None))
             except Exception as e:
-                logger.debug("closing the IPF explorer window on tree close "
-                             "failed: %s", e)
+                logger.debug("closing %s on tree close failed: %s",
+                             attribute, e)
                 try:
-                    ipf_win.close()
+                    window.close()
                 except Exception as e2:
-                    logger.debug("IPF window fallback close failed: %s", e2)
+                    logger.debug("%s fallback close failed: %s", attribute, e2)
         # `source_node` / `source_tree` are the reason this list matters as much
         # as the teardown above: a particle tree holds a back-reference to the
         # movie it was segmented FROM, so leaving them set keeps the source
@@ -1488,7 +1497,7 @@ class BaseSignalTree:
         # is referenced anywhere. Closing the source would then free nothing.
         for attr in ("diffraction_vectors", "orientation_map", "vector_orientation",
                      "_vom_field", "_ipf_result", "_ipf_p3d", "_ipf_picker",
-                     "_ipf_window", "_ipf_pick_fn",
+                     "_ipf_window", "_ipf_pick_fn", "_multiangle_navigator",
                      "particles", "_seg_pending_particles", "particle_events",
                      "particle_edits", "nav_traces", "drift",
                      "source_node", "source_tree", "nav_map"):

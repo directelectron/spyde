@@ -230,6 +230,14 @@ function createWindow(): BrowserWindow {
     },
   })
 
+  // Screen recording (Help → Record Screen) captures THIS window's own web
+  // contents rather than a display: answering with the requesting frame means no
+  // source picker, nothing outside SpyDE in the file, and no macOS Screen
+  // Recording permission.
+  win.webContents.session.setDisplayMediaRequestHandler((request, callback) =>
+    callback({ video: request.frame ?? win!.webContents.mainFrame }),
+  )
+
   // Once the renderer frame has loaded (and its ipcRenderer listener is live),
   // flush any messages the backend emitted during startup. A fresh reload resets
   // the gate so buffered messages aren't sent to a frame that's tearing down.
@@ -696,6 +704,13 @@ function buildMenu(): void {
           // than the native picker — the user adds/reorders there, then confirms.
           click: () => win?.webContents.send('spyde:open_stack_dialog'),
         },
+        {
+          label: 'Load Multi-Angle 4D STEM…',
+          // One 4-D dataset per (tilt, azimuth): the in-app loader is where the
+          // angles are assigned and the two alignments are solved before the
+          // acquisition is opened.
+          click: () => win?.webContents.send('spyde:open_multiangle_loader'),
+        },
         { type: 'separator' },
         {
           label: 'Save Signal…',
@@ -1018,6 +1033,31 @@ ipcMain.handle('clipboard:write-png', async (_e, dataUrl: string) => {
   } catch (err) {
     return { ok: false, error: (err as Error)?.message ?? String(err) }
   }
+})
+
+// Where the in-progress screen recording is being appended (Help → Record
+// Screen). Kept in main rather than taken from the renderer per chunk so the
+// bytes can only ever land in the file the user named in the dialog.
+let recordingPath: string | null = null
+
+/** Name the recording BEFORE it starts, so its chunks can stream straight to
+ *  disk — a few minutes of video is hundreds of MB and must never cross IPC as
+ *  one message. RETURNS the path, or null if the user cancelled. */
+ipcMain.handle('record:start', async (_e, ext: 'mp4' | 'webm') => {
+  const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')
+  const result = await dialog.showSaveDialog(win!, {
+    defaultPath: join(app.getPath('videos'), `spyde-${stamp}.${ext}`),
+    filters: [{ name: 'Video', extensions: [ext] }],
+  })
+  recordingPath = result.canceled ? null : result.filePath ?? null
+  if (recordingPath) writeFileSync(recordingPath, Buffer.alloc(0))
+  return recordingPath
+})
+
+/** Append one MediaRecorder chunk. Awaited by the renderer, which chains the
+ *  chunks, so the file is written in recording order. */
+ipcMain.handle('record:chunk', (_e, bytes: Uint8Array) => {
+  if (recordingPath) appendFileSync(recordingPath, Buffer.from(bytes))
 })
 
 /** Forward figure interaction events to Python. */

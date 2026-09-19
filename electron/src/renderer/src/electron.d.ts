@@ -10,6 +10,7 @@ declare global {
       onOpenDashboard: (cb: () => void) => () => void
       onStartGuide: (cb: (id: string) => void) => () => void
       onOpenStackDialog: (cb: () => void) => () => void
+      onOpenMultiAngleLoader?: (cb: () => void) => () => void
       onOpenUpdateDialog: (cb: () => void) => () => void
       onOpenGpuStatusDialog: (cb: () => void) => () => void
       onOpenGpuHelpDialog: (cb: () => void) => () => void
@@ -28,6 +29,8 @@ declare global {
       reportExportDialog: (kind: 'html' | 'pdf' | 'folder' | 'mp4', defaultName?: string) => Promise<string | null>
       reportExportPdf: (htmlPath: string, pdfPath: string) => Promise<{ ok: boolean; error?: string }>
       clipboardWritePng: (dataUrl: string) => Promise<{ ok: boolean; error?: string }>
+      startRecording: (ext: 'mp4' | 'webm') => Promise<string | null>
+      recordChunk: (bytes: Uint8Array) => Promise<void>
       pathForFile?: (file: File) => string | null
       figureEvent: (figId: string, eventJson: string) => void
       resizeFigure: (figId: string, width: number, height: number) => void
