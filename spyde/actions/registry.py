@@ -68,6 +68,27 @@ _SPYDE_STAGED_HANDLERS: dict[str, str] = {
     "ipf_set_direction":   "spyde.actions.ipf_view.ipf_set_direction",
     "tile_views":          "spyde.actions.views.tile_views",
     "select_navigator":    "spyde.actions.navigator_views.select_navigator",
+    # Multi-angle 4-D STEM — the polar angle navigator (a bare-figure window,
+    # so it has no _open/_close caret pair: teardown is _forget_window →
+    # controller.close(), as for the IPF explorer).
+    "multiangle_show_angles": "spyde.actions.multiangle_navigator.multiangle_show_angles",
+    "multiangle_pick_angle":  "spyde.actions.multiangle_navigator.multiangle_pick_angle",
+    # Multi-angle 4-D STEM — the STAGED loader dialog (Load datasets → Align
+    # real space → Align reciprocal space → Commit). Not a caret wizard: it is
+    # a popout with no source plot, so `plot` is always None and the state
+    # lives on the Session (see _session_multiangle_loader).
+    "maped_open_loader":      "spyde.backend._session_multiangle_loader.maped_open_loader",
+    "maped_close_loader":     "spyde.backend._session_multiangle_loader.maped_close_loader",
+    "maped_add_files":        "spyde.backend._session_multiangle_loader.maped_add_files",
+    "maped_set_scan_shape":   "spyde.backend._session_multiangle_loader.maped_set_scan_shape",
+    "maped_remove_member":    "spyde.backend._session_multiangle_loader.maped_remove_member",
+    "maped_set_member":       "spyde.backend._session_multiangle_loader.maped_set_member",
+    "maped_set_reference":    "spyde.backend._session_multiangle_loader.maped_set_reference",
+    "maped_set_virtual_image": "spyde.backend._session_multiangle_loader.maped_set_virtual_image",
+    "maped_set_corner_extent": "spyde.backend._session_multiangle_loader.maped_set_corner_extent",
+    "maped_align_real":       "spyde.backend._session_multiangle_loader.maped_align_real",
+    "maped_align_reciprocal": "spyde.backend._session_multiangle_loader.maped_align_reciprocal",
+    "maped_commit":           "spyde.backend._session_multiangle_loader.maped_commit",
     "add_navigator_from_window": "spyde.actions.navigator_views.add_navigator_from_window",
     "extract_navigator":   "spyde.actions.navigator_views.extract_navigator",
     "set_composition":     "spyde.actions.composition.set_composition",

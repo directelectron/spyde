@@ -139,20 +139,30 @@ def _is_nav_signal_pair(session, cell, source_plot, target_panel_id=None):
 
 
 def _region_from_selector(sel):
-    """The integrating ``(x, y, w, h)`` nav region of one selector, or None when
-    it's a crosshair (non-integrating) or its indices can't be read."""
+    """The integrating ``(x, y, w, h)`` spatial nav region of one selector, or
+    None when it's a crosshair (non-integrating), its indices can't be read, or
+    its navigation space has no spatial ``(x, y)`` pair.
+
+    A composed navigation index carries the OUTER navigation axes FIRST and the
+    spatial ones LAST — a 5-D dataset's selector chain reports ``(time, x, y)``,
+    a 4-D one ``(x, y)`` — so the spatial pair is the LAST TWO columns at any
+    navigation depth. A 1-D (time-only) navigation has a single column and so no
+    region at all: the only consumer is the callout connector rectangle, which is
+    drawn on a 2-D navigator image that such a dataset does not have."""
     if not getattr(sel, "is_integrating", False):
         return None
     try:
-        idx = np.asarray(sel.get_selected_indices())
+        navigation_index = np.asarray(sel.get_selected_indices())
     except Exception as e:
         log.debug("reading selector indices failed: %s", e)
         return None
-    if idx.ndim == 2 and idx.shape[0] >= 1 and idx.shape[1] >= 2:
-        xs, ys = idx[:, 0], idx[:, 1]
-        x0, y0 = int(xs.min()), int(ys.min())
-        return (x0, y0, int(xs.max() - x0 + 1), int(ys.max() - y0 + 1))
-    return None
+    if (navigation_index.ndim != 2 or navigation_index.shape[0] < 1
+            or navigation_index.shape[1] < 2):
+        return None
+    x_indices, y_indices = navigation_index[:, -2], navigation_index[:, -1]
+    x0, y0 = int(x_indices.min()), int(y_indices.min())
+    return (x0, y0,
+            int(x_indices.max() - x0 + 1), int(y_indices.max() - y0 + 1))
 
 
 def _selectors_for_source(mm, source_plot):

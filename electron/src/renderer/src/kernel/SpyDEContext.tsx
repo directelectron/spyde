@@ -667,6 +667,12 @@ interface SpyDEContextValue {
   stackDialogOpen: boolean
   openStackDialog: () => void
   closeStackDialog: () => void
+  // Multi-Angle 4D STEM loader (renderer-only UI state, opened from the File
+  // menu). Only whether the dialog is UP lives here — the acquisition itself
+  // is the backend's `maped_state` snapshot, which the dialog consumes direct.
+  multiAngleLoaderOpen: boolean
+  openMultiAngleLoader: () => void
+  closeMultiAngleLoader: () => void
   // Check for Updates / GPU Status dialogs (renderer-only UI state, opened
   // from the Help menu — both the native menu and MenuBar.tsx's HTML one).
   updateDialogOpen: boolean
@@ -765,6 +771,7 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
   reportRef.current = state.report
   const tileWindowsRef = useRef<(() => void) | null>(null)
   const [stackDialogOpen, setStackDialogOpen] = useState(false)
+  const [multiAngleLoaderOpen, setMultiAngleLoaderOpen] = useState(false)
   const [updateDialogOpen, setUpdateDialogOpen] = useState(false)
   const [gpuStatusDialogOpen, setGpuStatusDialogOpen] = useState(false)
   const [gpuHelpDialogOpen, setGpuHelpDialogOpen] = useState(false)
@@ -1389,6 +1396,11 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
         case 'dpc_region':
         // Strain caret — the rotation/flip taken over from a DPC run.
         case 'strain_rotation':
+        // Multi-Angle 4D STEM loader — ONE snapshot of the whole acquisition
+        // (members, shells, reference, both alignment solves, can_commit),
+        // re-sent after every maped_* action. Consumed by MultiAngleLoader,
+        // which renders from it rather than keeping a copy of its own.
+        case 'maped_state':
         // Cluster telemetry — consumed by the StatusBar DaskMonitor HUD.
         case 'dask_stats':
         // Read-throughput readout — consumed by the StatusBar IoThroughput HUD.
@@ -1505,6 +1517,11 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
       setStackDialogOpen(true),
     )
 
+    // File → Load Multi-Angle 4D STEM… opens the tabbed MultiAngleLoader.
+    const disposeMultiAngleLoader = window.electron.onOpenMultiAngleLoader?.(() =>
+      setMultiAngleLoaderOpen(true),
+    )
+
     // Help → Check for Updates… / GPU Status… (native menu; MenuBar.tsx's HTML
     // dropdown on Windows/Linux calls openUpdateDialog/openGpuStatusDialog directly).
     const disposeUpdateDialog = window.electron.onOpenUpdateDialog(() =>
@@ -1551,6 +1568,7 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
       pendingLogs.current = []
       disposeStackDialog?.()
       disposeUpdateDialog?.()
+      disposeMultiAngleLoader?.()
       disposeGpuStatusDialog?.()
       disposeGpuHelpDialog?.()
       disposeReportDialog?.()
@@ -1720,6 +1738,8 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
   const clearNavShapePrompt = () => dispatch({ type: 'NAV_SHAPE_PROMPT', prompt: null })
   const openStackDialog = () => setStackDialogOpen(true)
   const closeStackDialog = () => setStackDialogOpen(false)
+  const openMultiAngleLoader = () => setMultiAngleLoaderOpen(true)
+  const closeMultiAngleLoader = () => setMultiAngleLoaderOpen(false)
   const openUpdateDialog = () => setUpdateDialogOpen(true)
   const closeUpdateDialog = () => setUpdateDialogOpen(false)
   const openGpuStatusDialog = () => setGpuStatusDialogOpen(true)
@@ -1734,6 +1754,7 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
       state, iframeRefs, latestStates, sendAction, setActiveWindow, replayState,
       requestFigurePng, clearNavShapePrompt,
       stackDialogOpen, openStackDialog, closeStackDialog,
+      multiAngleLoaderOpen, openMultiAngleLoader, closeMultiAngleLoader,
       updateDialogOpen, openUpdateDialog, closeUpdateDialog,
       gpuStatusDialogOpen, openGpuStatusDialog, closeGpuStatusDialog,
       gpuHelpDialogOpen, openGpuHelpDialog, closeGpuHelpDialog,

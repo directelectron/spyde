@@ -10,6 +10,7 @@ declare global {
       onOpenDashboard: (cb: () => void) => () => void
       onStartGuide: (cb: (id: string) => void) => () => void
       onOpenStackDialog: (cb: () => void) => () => void
+      onOpenMultiAngleLoader?: (cb: () => void) => () => void
       onOpenUpdateDialog: (cb: () => void) => () => void
       onOpenGpuStatusDialog: (cb: () => void) => () => void
       onOpenGpuHelpDialog: (cb: () => void) => () => void

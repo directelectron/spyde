@@ -1029,17 +1029,57 @@ def _nav_readable_data(signal, data) -> bool:
     return int(ndim) >= nav_dim
 
 
+def _selects_several_positions(indices) -> bool:
+    """Does this composed selector index name MORE THAN ONE navigation position?
+
+    A selector reports its own MODE (``is_integrating``), but the index it
+    composes carries several positions in two cases where that mode is off:
+
+      * an integrating span on an OUTER navigator of a chain — the innermost
+        selector composes the cartesian product of every selector above it, so
+        a crosshair on a 5-D stack whose angle span covers N angles reports N
+        rows while calling itself a point;
+      * a point selector given a width (``sum_frames``) — one pointer, n index
+        rows, which is exactly what a region selector emits.
+
+    Both mean "read these positions and integrate them". Reducing them to their
+    mean index instead TRUNCATES (``int(0.5) == 0``) and silently displays one
+    of the selected positions — a 2-angle span showing only its first angle.
+    """
+    idx = np.asarray(indices)
+    return idx.ndim > 1 and idx.shape[0] > 1
+
+
 def _prepare_nav_indices(current_signal, indices, integrating: bool, data=None):
     """Transform RAW selector indices into DATA-ORDER, clamped array indices — the
     shared index-prep for the navigator read.
 
     Does exactly what ``update_from_navigation_selection`` does before it reads:
+      * trim the composed index to the displayed signal's navigation dimension,
+        keeping its LAST columns (see the contract below),
       * swap the innermost spatial (x, y) widget pair → (y, x) data order (for a
         2-D-signal navigator; the outer stack coords in a 5-D chain stay put),
-      * mean-reduce a crosshair's point cloud to one integer nav point when NOT
-        integrating (a region keeps all its points),
+      * mean-reduce a point cloud to one integer nav point when NOT integrating
+        (a region keeps all its points — a caller that passes ``integrating=False``
+        for a multi-point index is asking for that region's centre),
       * clamp every coordinate to the leading (navigation) data-axis sizes so a
         stale/larger-grid selector position can't IndexError.
+
+    **Keeping the LAST columns is a CONTRACT, not a general rule.** The navigator
+    chain is built once from the tree ROOT's navigation dimension and nothing
+    rebuilds it when the displayed node changes, so a child node with fewer
+    navigation axes is handed the root's wider index. Dropping the LEADING
+    columns is right only because such a child dropped LEADING navigation axes —
+    a multi-angle stack ``(angle, y, x | ky, kx)`` summed over its angle axis
+    into ``(y, x | ky, kx)``. A child that summed a MIDDLE navigation axis away
+    would need a different rule: which column to drop is then a property of the
+    transformation, not of the index, and this slice would silently read the
+    wrong position. Do not generalise it to that case.
+
+    The trim has to happen here and not at the read, because it is index
+    preparation: every frame reader in :mod:`spyde.array_cache` keeps the FIRST
+    columns of whatever index it is handed, so an untrimmed index reaches them
+    as ``(angle, y)`` read as ``(y, x)``.
 
     ``data`` (optional) is the caller's already-captured ``current_signal.data``
     binding — pass it so the clamp bounds and the eventual read use the SAME
@@ -1049,6 +1089,18 @@ def _prepare_nav_indices(current_signal, indices, integrating: bool, data=None):
     the SAME nav position as the base frame from the same raw selector indices.
     Returns the prepared ndarray (or None on failure)."""
     indices = np.asarray(indices)
+
+    try:
+        navigation_dimension = int(current_signal.axes_manager.navigation_dimension)
+    except Exception:
+        navigation_dimension = None
+    if navigation_dimension is not None and indices.ndim >= 1:
+        column_count = indices.shape[-1]
+        if column_count > navigation_dimension:
+            # NOT ``[..., -navigation_dimension:]``: that keeps every column at
+            # navigation_dimension == 0, where none of them may survive.
+            indices = indices[..., column_count - navigation_dimension:]
+
     _has_spatial_nav = False
     try:
         _has_spatial_nav = current_signal.axes_manager.signal_dimension == 2
@@ -1178,6 +1230,12 @@ def update_from_navigation_selection(
 
     current_signal = child.plot_state.current_signal
 
+    # The selector's own mode is not the whole answer: an integrating span on an
+    # OUTER navigator, or a point selector with a width, hands a crosshair an
+    # index naming several positions. See _selects_several_positions.
+    integrates_index = (selector.is_integrating
+                        or _selects_several_positions(indices))
+
     # A node whose frames are not in its own array answers through a reader
     # pinned on the tree: disks rendered from vectors, a progressive result
     # that has only the blocks that have landed, one window of an event
@@ -1195,7 +1253,7 @@ def update_from_navigation_selection(
         result = _read_through_override(
             override,
             _prepare_nav_indices(current_signal, indices,
-                                 selector.is_integrating,
+                                 integrates_index,
                                  data=_NAVIGATION_AXES))
         _prof.done("reader override")
         return result
@@ -1306,7 +1364,7 @@ def update_from_navigation_selection(
     # (spyde.actions.overlay) so a layer resolves the SAME nav position from the
     # same raw selector indices — see _prepare_nav_indices.
     indices = _prepare_nav_indices(current_signal, indices,
-                                   selector.is_integrating, data=data_now)
+                                   integrates_index, data=data_now)
 
     if current_signal._lazy:
         if is_future_like(data_now[0]):
