@@ -359,3 +359,96 @@ class SpyDEOrientationMap:
             nav_axes=nav_axes,
             params=meta.get("params", {}) or {},
         )
+
+# ─────────────────────────────────────────────────────────────────────────
+# Vector orientation mapping
+# ─────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class VectorOrientationResult:
+    """Per-position orientation + strain maps from a vector-OM run."""
+    quats: np.ndarray           # (ny, nx, 4) float32
+    phase_idx: np.ndarray       # (ny, nx) int16
+    theta: np.ndarray           # (ny, nx) float32 (rad)
+    strain: np.ndarray          # (ny, nx, 3) float32 [exx, eyy, exy]
+    residual: np.ndarray        # (ny, nx) float32
+    friedel_asym: np.ndarray    # (ny, nx) float32
+    n_matched: np.ndarray       # (ny, nx) int16
+    coarse_score: np.ndarray    # (ny, nx) float32
+    phases_meta: list
+    nav_shape: tuple
+    params: dict = field(default_factory=dict)
+    # Provenance record ({"action", "params", "spyde_version"}) — same dict
+    # convention as commit._stamp_provenance (script/app interchangeable).
+    provenance: Optional[dict] = None
+
+    def strain_map(self, component: str = "exx") -> np.ndarray:
+        idx = {"exx": 0, "eyy": 1, "exy": 2}[component]
+        return self.strain[..., idx]
+
+    def dilatation_map(self) -> np.ndarray:
+        return self.strain[..., 0] + self.strain[..., 1]
+
+    def shear_map(self) -> np.ndarray:
+        return self.strain[..., 2]
+
+    def smoothed_strain(self, method: str = "tv", weight: float = 0.03,
+                        size: int = 3) -> np.ndarray:
+        """(ny, nx, 3) edge-preserving denoised strain field.
+
+        The per-pattern strain has a ~0.02 noise floor (peak-finding limited).
+        Neighbouring positions share the true strain, so field-level denoising
+        recovers it. Benchmarked (harness: ``spyde/tests/benchmark_vector_orientation.py``):
+
+          - ``method="tv"`` (default) — total-variation (Chambolle). Most robust;
+            the gap over the raw fit *widens* with noise/dropout (6x better at
+            high noise) because its piecewise-constant prior matches grains.
+            ``weight`` ≈ λ, higher = smoother.
+          - ``method="median"`` — median filter of ``size``. Good at low noise,
+            plateaus as noise rises. No skimage dependency.
+
+        Per-pattern re-fitting with smoothed seeds (iterated / joint) was tried
+        and is WORSE — the affine re-absorbs noise, undoing the smoothing. So
+        this is strictly a post-process; the raw ``strain`` is always kept.
+        NaNs (unfit positions) are preserved.
+        """
+        comp_nan = [np.isnan(self.strain[..., c]) for c in range(3)]
+        if method == "tv":
+            try:
+                from skimage.restoration import denoise_tv_chambolle
+                out = np.empty_like(self.strain)
+                for c in range(self.strain.shape[-1]):
+                    comp = self.strain[..., c].astype(float)
+                    fill = np.nanmedian(comp) if np.isnan(comp).any() else 0.0
+                    filled = np.where(np.isnan(comp), fill, comp)
+                    out[..., c] = denoise_tv_chambolle(filled, weight=weight)
+                    out[..., c][comp_nan[c]] = np.nan
+                return out
+            except Exception:
+                method = "median"  # skimage missing → fall back
+        from scipy.ndimage import median_filter
+        out = np.empty_like(self.strain)
+        for c in range(self.strain.shape[-1]):
+            comp = self.strain[..., c]
+            filled = np.where(np.isnan(comp), np.nanmedian(comp), comp)
+            out[..., c] = median_filter(filled, size=size)
+            out[..., c][comp_nan[c]] = np.nan
+        return out
+
+    def to_orientation_map(self):
+        """Wrap as a SpyDEOrientationMap (n_best=1) for IPF/correlation maps,
+        save/load, and the existing orientation-map machinery. The vector path's
+        strain stays on this result object; the OM container handles orientation."""
+        ny, nx = self.nav_shape
+        return SpyDEOrientationMap(
+            quats=self.quats[:, :, np.newaxis, :],
+            corr=self.coarse_score[:, :, np.newaxis].astype(np.float32),
+            phase_idx=self.phase_idx[:, :, np.newaxis].astype(np.int16),
+            mirror=np.ones((ny, nx, 1), np.int8),
+            phases=self.phases_meta,
+            params=dict(self.params),
+        )
+
+    def ipf_color_map(self, direction: str = "z") -> np.ndarray:
+        """(ny, nx, 3) uint8 IPF color map of the best orientation per position."""
+        return self.to_orientation_map().ipf_color_map(direction)

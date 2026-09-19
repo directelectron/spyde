@@ -57,7 +57,9 @@ dependencies = [
     "imageio-ffmpeg",
     "imagecodecs",
     "psygnal>=0.10.0",
-    "anyplotlib>=0.10.0",
+    # 0.10.1: a figure keeps its raster through a zoom (the IPF refine heatmap),
+    # and a host that saves exported PNGs itself can say so — SpyDE does both.
+    "anyplotlib>=0.10.1",
     "pyyaml",
     # NOT numexpr. HyperSpy warns "Numexpr is not installed ... which is slower
     # to calculate model" on every model build, but that advice is wrong at

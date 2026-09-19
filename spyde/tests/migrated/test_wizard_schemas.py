@@ -94,15 +94,17 @@ class TestSchemaBackendLockstep:
         from spyde.actions import vector_orientation_om as vom
         schema = registry.wizard_parameters("vom")
         for k in ("accelerating_voltage", "resolution", "minimum_intensity",
-                  "strain_cap", "smooth"):
+                  "smooth"):
             assert schema[k]["default"] == vom.DEFAULTS[k], \
                 f"vom schema/{k} drifted from vector_orientation_om.DEFAULTS"
 
-    def test_vom_fit_defaults(self):
-        from spyde.actions.vector_orientation import DEFAULTS as FIT
+    def test_vom_refine_defaults_match_the_matcher(self):
+        """The Refine tab's two knobs are the matcher's own refinement
+        arguments, so the schema must offer what it actually defaults to."""
+        from spyde.actions import vector_orientation_quantem as quantem
         schema = registry.wizard_parameters("vom")
-        assert schema["strain_cap"]["default"] == FIT["strain_cap"]
-        assert schema["sink_bw"]["default"] == FIT["sink_bw"]
+        assert schema["pair_distance"]["default"] == quantem.PAIR_DISTANCE
+        assert schema["sigma_excitation"]["default"] == 0.04
 
     def test_dpc_defaults(self):
         from spyde.actions.dpc_action import DEFAULTS

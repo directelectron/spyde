@@ -367,6 +367,7 @@ functions:
     function: spyde.actions.vector_orientation_om.vector_orientation_mapping
     signal_types: [spyde_diffraction_vectors_image]
     requires_vectors: True
+    beta: True
     plot_dim: [2]
     toolbar_side: bottom
     navigation: False

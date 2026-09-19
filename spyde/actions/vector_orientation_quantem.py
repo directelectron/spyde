@@ -7,25 +7,47 @@ mechanical copy of upstream: this module converts an orix ``Phase`` into the
 container their matcher reads, and decodes the result into the same
 ``VectorOrientationResult`` our own fit returns.
 
-Nothing here is wired into an action yet. It exists to be measured against
-``vector_orientation_gpu`` on real data — see
-``spyde/tests/benchmark_quantem_orientation.py``.
+The live preview under the crosshair is driven from here
+(:class:`SinglePatternFitter`, via ``vector_overlay``) and so is the whole-field
+fit (:func:`compute_vector_orientation_quantem`).
+``spyde/tests/benchmark_quantem_orientation.py`` times it on real data.
 """
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
 
-from spyde.actions.vector_orientation import VectorOrientationResult
+from spyde.device_lock import accelerator_lock
+from spyde.signals.orientation_map import VectorOrientationResult
 from spyde.signals.diffraction_vectors import COL_KX, COL_KY, COL_INTENSITY
+
+# Re-exported rather than copied, so they cannot drift from the matcher they
+# describe. (The defaults module imports nothing, so this costs no torch.)
+#: How near a simulated reflection has to be to count as the same peak, Å⁻¹.
+#: How weak a reflection may be, relative to the strongest, and still be one a
+#: detector would register.
+from spyde.external.quantem.diffraction.defaults import (  # noqa: E402
+    MIN_SIM_INTENSITY_REL, PAIR_DISTANCE,
+)
 
 log = logging.getLogger(__name__)
 
 #: Their matcher reads these three columns by name; the order is the order of
 #: the columns in the arrays :class:`PeaksAdapter` hands back.
 PEAK_FIELDS = ("qx", "qy", "intensity")
+
+#: Upstream's ``match_orientations(min_detector_fraction=...)`` default. A zone
+#: axis whose template has less than this fraction of its weight on the detector
+#: scores zero, because most of what would confirm it was never measured.
+#:
+#: Unlike the two above, upstream keeps this one in a signature rather than in
+#: its defaults module, so this IS a copy and can drift. It is passed
+#: explicitly for that reason, and ``test_quantem_adapter`` reads the signature
+#: and fails if the two stop agreeing.
+MIN_DETECTOR_FRACTION = 0.3
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -152,6 +174,157 @@ class PeaksAdapter:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Strain
+# ─────────────────────────────────────────────────────────────────────────────
+
+def reciprocal_affine(orientation_map, match: int = 0,
+                      pair_distance: Optional[float] = None,
+                      sigma_excitation: Optional[float] = None,
+                      min_pairs: int = 4, device: str = "cpu",
+                      chunk: int = 2048):
+    """Per-position ``A`` mapping simulated to measured peaks, in reciprocal
+    space — ``(ny, nx, 2, 2)`` and the pair count, NaN where too few paired.
+
+    Separate from :func:`strain_from_orientation_map` because the overlay wants
+    the map itself, to draw the simulated pattern where the fit actually puts
+    it rather than where an unstrained crystal would.
+    """
+    import torch
+
+    from spyde.external.quantem.diffraction.rotations import quat_to_matrix
+
+    plan = orientation_map.metadata.get("plan", {}) or {}
+    refine = orientation_map.metadata.get("refine", {}) or {}
+    delta = float(pair_distance if pair_distance is not None
+                  else refine.get("pair_distance", plan.get("pair_distance", 0.05)))
+    sigma = float(sigma_excitation if sigma_excitation is not None
+                  else refine.get("sigma_excitation", plan.get("sigma_excitation", 0.04)))
+
+    device = torch.device(device)
+    dtype = torch.float64
+    peaks = orientation_map.peaks
+    rows, columns = orientation_map.quats.shape[:2]
+    field_index = [peaks.fields.index(f) for f in PEAK_FIELDS]
+
+    cells = [peaks[r, c].array for r, c in np.ndindex(rows, columns)]
+    counts = np.array([cell.shape[0] for cell in cells])
+    max_peaks = max(1, int(counts.max()))
+    measured = np.full((len(cells), max_peaks, 2), 1e6)
+    weights = np.zeros((len(cells), max_peaks))
+    for i, cell in enumerate(cells):
+        n = cell.shape[0]
+        if n == 0:
+            continue
+        measured[i, :n] = cell[:, field_index[:2]]
+        weights[i, :n] = np.clip(cell[:, field_index[2]], 0.0, None)
+    measured = torch.as_tensor(measured, dtype=dtype, device=device)
+    weights = torch.as_tensor(weights, dtype=dtype, device=device)
+
+    reflections = orientation_map.crystal.g_vec.to(device=device, dtype=dtype)
+    wavelength = orientation_map.wavelength
+    quats = orientation_map.quats[..., match, :].reshape(-1, 4).to(
+        device=device, dtype=dtype)
+    eye = torch.eye(2, dtype=dtype, device=device)
+
+    affine = torch.full((quats.shape[0], 2, 2), float("nan"), dtype=dtype, device=device)
+    pair_count = torch.zeros(quats.shape[0], dtype=torch.long, device=device)
+
+    for start in range(0, quats.shape[0], chunk):
+        stop = min(start + chunk, quats.shape[0])
+        g = torch.einsum("bij,gj->bgi", quat_to_matrix(quats[start:stop]), reflections)
+        gz, g2 = g[..., 2], (g ** 2).sum(dim=-1)
+        excitation = (2 * gz - wavelength * g2) / (2 - 2 * wavelength * gz)
+        simulated = g[..., :2]
+        distance = torch.cdist(simulated, measured[start:stop])
+        nearest_distance, nearest = distance.min(dim=-1)
+        paired = (torch.abs(excitation) < 2 * sigma) & (nearest_distance < delta)
+        weight = torch.gather(weights[start:stop], 1, nearest) * (
+            1 - nearest_distance / delta).clamp_min(0) * paired
+        target = torch.gather(
+            measured[start:stop], 1, nearest[..., None].expand(-1, -1, 2))
+
+        # A = (sum w q_meas q_simᵀ)(sum w q_sim q_simᵀ)⁻¹
+        m1 = torch.einsum("bp,bpi,bpj->bij", weight, target, simulated)
+        m2 = torch.einsum("bp,bpi,bpj->bij", weight, simulated, simulated)
+        solved = m1 @ torch.linalg.inv(m2 + 1e-12 * eye)
+        enough = paired.sum(dim=1) >= min_pairs
+        affine[start:stop][enough] = solved[enough]
+        pair_count[start:stop] = paired.sum(dim=1)
+
+    return (affine.reshape(rows, columns, 2, 2),
+            pair_count.reshape(rows, columns))
+
+
+def strain_from_orientation_map(orientation_map, match: int = 0,
+                                pair_distance: Optional[float] = None,
+                                sigma_excitation: Optional[float] = None,
+                                min_pairs: int = 4, device: str = "cpu",
+                                chunk: int = 2048, reciprocal: bool = False):
+    """Per-position strain, from measured against simulated peak positions.
+
+    Their orientation refinement deliberately does not fit strain: peak
+    positions carry almost no out-of-plane information, so the pose is refined
+    first and the deformation solved afterwards, on the pairing the refined
+    orientation implies. This is that solve —
+    ``A = (sum w q_meas q_simᵀ)(sum w q_sim q_simᵀ)⁻¹`` — batched over the scan
+    rather than looped per position as upstream's ``calculate_strain`` does.
+
+    The strain is referenced to the crystal's own ideal lattice, so unlike
+    lattice-vector strain mapping it is absolute, with no reference region to
+    pick.
+
+    ``A`` maps simulated to measured in RECIPROCAL space. Real space is its
+    inverse transpose, so an expanded lattice reads as positive strain the way
+    a microscopist expects; ``reciprocal=True`` returns the uninverted quantity
+    instead, which is what our own pose fit reports and is therefore what a
+    comparison against it needs.
+
+    Returns ``(strain, pair_count)`` with strain ``(ny, nx, 3)`` holding
+    ``[exx, eyy, exy]`` and NaN wherever too few peaks paired.
+    """
+    import torch
+
+    affine, pair_count = reciprocal_affine(
+        orientation_map, match=match, pair_distance=pair_distance,
+        sigma_excitation=sigma_excitation, min_pairs=min_pairs, device=device,
+        chunk=chunk)
+    rows, columns = affine.shape[:2]
+    affine = affine.reshape(-1, 2, 2)
+    if not reciprocal:
+        # real space is the inverse transpose of the reciprocal-space map
+        affine = torch.linalg.inv(affine).transpose(-1, -2)
+    strain = _symmetric_strain(affine).reshape(rows, columns, 3).cpu().numpy()
+    return strain.astype(np.float32), pair_count.cpu().numpy()
+
+
+def _symmetric_strain(affine):
+    """``(B, 2, 2)`` deformation → ``(B, 3)`` ``[exx, eyy, exy]``.
+
+    Polar-decomposed rather than symmetrised: a fit is free to split the total
+    transform between rotation and stretch, so ``0.5(A + Aᵀ) − I`` still holds
+    whatever rotation the fit parked in ``A``. Taking the stretch factor of
+    ``A = R S`` leaves the rotation with the orientation, where it belongs, and
+    only the physical deformation in the strain — the same reasoning as our own
+    ``vector_orientation.strain_from_pose``.
+    """
+    import torch
+
+    finite = torch.isfinite(affine).all(dim=(-2, -1))
+    out = torch.full(affine.shape[:-2] + (3,), float("nan"),
+                     dtype=affine.dtype, device=affine.device)
+    if not bool(finite.any()):
+        return out
+    good = affine[finite]
+    _u, singular, vh = torch.linalg.svd(good)
+    stretch = (vh.transpose(-1, -2) * singular[..., None, :]) @ vh
+    identity = torch.eye(2, dtype=affine.dtype, device=affine.device)
+    strain = stretch - identity
+    out[finite] = torch.stack(
+        (strain[..., 0, 0], strain[..., 1, 1], strain[..., 0, 1]), dim=-1)
+    return out
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Orientation convention
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -181,6 +354,57 @@ def quantem_quats_to_orix(quats: np.ndarray, convention: str = "conjugate"
         raise ValueError(f"unknown convention {convention!r}; "
                          f"expected one of {QUAT_CONVENTIONS}")
     return out.astype(np.float32)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Zone-angle table cache
+# ─────────────────────────────────────────────────────────────────────────────
+
+#: (zone axes, symmetry ops) → their pairwise symmetry-reduced angles, keyed by
+#: identity. The tensors themselves are held so an id can never be recycled
+#: onto a different object, and only a couple of plans are ever live at once.
+_ZONE_ANGLE_CACHE: dict = {}
+_ZONE_ANGLE_CACHE_LIMIT = 4
+_zone_angle_cache_installed = False
+
+
+def install_zone_angle_cache() -> None:
+    """Stop the matcher rebuilding its zone-angle table on every call.
+
+    ``match_orientations`` computes the pairwise symmetry-reduced angle between
+    every pair of zone axes each time it runs, to place the exclusion ball for
+    the second-best match. The table depends only on the plan's zone axes and
+    the crystal's symmetry, so for a scan matched in one call it is a rounding
+    error — but it dominates a per-pattern fit, which is what a live refine
+    under the crosshair is. Measured on a 1127-zone Ag plan: a single-pattern
+    match plus refine goes from 184.5 ms to 44.6 ms, i.e. 5.4 to 22.4 fits per
+    second, which is the difference between unusable and interactive.
+
+    Patching rather than editing, because ``spyde/external/quantem`` is a
+    mechanical copy of upstream — the same shape as
+    ``heavy_imports._patch_cached_dask_client``. Delete this the day upstream
+    caches the table itself; nothing else depends on it.
+    """
+    global _zone_angle_cache_installed
+    if _zone_angle_cache_installed:
+        return
+    from spyde.external.quantem.diffraction import orientation as _orientation
+
+    original = _orientation.symmetry_reduced_zone_angles
+
+    def cached(zone_axes, symmetry_ops):
+        key = (id(zone_axes), id(symmetry_ops))
+        hit = _ZONE_ANGLE_CACHE.get(key)
+        if hit is None:
+            # Hold the inputs so their ids stay meaningful for the entry's life.
+            hit = (zone_axes, symmetry_ops, original(zone_axes, symmetry_ops))
+            if len(_ZONE_ANGLE_CACHE) >= _ZONE_ANGLE_CACHE_LIMIT:
+                _ZONE_ANGLE_CACHE.pop(next(iter(_ZONE_ANGLE_CACHE)))
+            _ZONE_ANGLE_CACHE[key] = hit
+        return hit[2]
+
+    _orientation.symmetry_reduced_zone_angles = cached
+    _zone_angle_cache_installed = True
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -598,6 +822,7 @@ def build_orientation_map(peaks: PeaksAdapter, crystal, energy_ev: float,
     own library build calls ``reciprocal_radius`` / ``r_max``. Reflections
     beyond it cannot be measured, so generating them only costs plan size.
     """
+    install_zone_angle_cache()
     if crystal.g_vec is None:
         crystal.calculate_structure_factors(k_max=k_max)
     map_class = orientation_map_class(refine_device, refine_chunk, refine_dtype)
@@ -609,48 +834,469 @@ def build_orientation_map(peaks: PeaksAdapter, crystal, energy_ev: float,
     return orientation_map
 
 
-def to_result(orientation_map, phases_meta: list,
-              convention: str = "conjugate",
-              params: Optional[dict] = None) -> VectorOrientationResult:
-    """Decode a matched ``OrientationMap`` into our result container.
+def combine_phases(orientation_maps, phases_meta: list,
+                   convention: str = "conjugate",
+                   strains: Optional[list] = None,
+                   params: Optional[dict] = None) -> VectorOrientationResult:
+    """Pick, at each position, the phase whose pattern the peaks best support.
 
-    Two fields have no counterpart on their side and stay NaN:
+    Every phase needs its own plan — the polar shells ARE that crystal's
+    reciprocal lattice radii, so nothing about a plan is shareable and the
+    maps are matched independently. What makes combining them afterwards
+    meaningful is that their correlation is a normalised cosine similarity:
+    the library slices are unit vectors and the pattern is divided by its own
+    norm, so a score is comparable across crystals and not only across
+    patterns. A larger-cell phase does not win by having more reflections.
 
-    ``strain``
-        Their orientation refinement deliberately does not fit strain — peak
-        positions carry almost no out-of-plane information, so they refine the
-        pose and solve the deformation afterwards in ``calculate_strain``,
-        which is not vendored.
-    ``friedel_asym``
-        Our own diagnostic, computed from the pose residual of ±g pairs.
-
-    ``coarse_score`` carries their correlation, which unlike ours is a
-    normalised cosine similarity in [0, 1] and so is comparable across
-    patterns. Their ``reliability`` (best minus best-outside-an-exclusion-ball)
-    has no field on this container and is returned separately by the caller.
+    ``strains`` is one array per map, in the same order, or None.
     """
-    quats = quantem_quats_to_orix(
-        orientation_map.quats[..., 0, :].cpu().numpy(), convention)
-    ny, nx = quats.shape[:2]
-    corr = orientation_map.corr[..., 0].cpu().numpy().astype(np.float32)
-    theta = np.deg2rad(
-        orientation_map.in_plane_angle_deg().cpu().numpy()).astype(np.float32)
-    valid = corr > 0
+    maps = list(orientation_maps)
+    if not maps:
+        raise ValueError("combine_phases needs at least one orientation map")
 
-    n_matched = np.zeros((ny, nx), np.int16)
-    counts = orientation_map.peaks.peak_counts.reshape(ny, nx)
-    n_matched[:] = np.clip(counts, 0, np.iinfo(np.int16).max)
+    correlation = np.stack(
+        [np.asarray(m.corr[..., 0].cpu().numpy(), float) for m in maps])
+    winner = correlation.argmax(axis=0)                     # (ny, nx)
+    best_correlation = np.take_along_axis(
+        correlation, winner[None], axis=0)[0].astype(np.float32)
+    ny, nx = winner.shape
 
-    return VectorOrientationResult(
-        quats=quats,
-        phase_idx=np.zeros((ny, nx), np.int16),
-        theta=theta,
-        strain=np.full((ny, nx, 3), np.nan, np.float32),
+    quats = np.stack([
+        quantem_quats_to_orix(m.quats[..., 0, :].cpu().numpy(), convention)
+        for m in maps])                                     # (P, ny, nx, 4)
+    chosen_quats = np.take_along_axis(
+        quats, winner[None, ..., None], axis=0)[0].astype(np.float32)
+
+    theta = np.stack([
+        np.deg2rad(m.in_plane_angle_deg().cpu().numpy()) for m in maps])
+    chosen_theta = np.take_along_axis(theta, winner[None], axis=0)[0].astype(np.float32)
+
+    if strains is None:
+        chosen_strain = np.full((ny, nx, 3), np.nan, np.float32)
+    else:
+        stacked = np.stack([np.asarray(s, np.float32) for s in strains])
+        chosen_strain = np.take_along_axis(
+            stacked, winner[None, ..., None], axis=0)[0].astype(np.float32)
+
+    valid = best_correlation > 0
+    counts = maps[0].peaks.peak_counts.reshape(ny, nx)
+    n_matched = np.clip(counts, 0, np.iinfo(np.int16).max).astype(np.int16)
+
+    result = VectorOrientationResult(
+        quats=chosen_quats,
+        phase_idx=np.where(valid, winner, 0).astype(np.int16),
+        theta=chosen_theta,
+        strain=np.where(valid[..., None], chosen_strain, np.nan).astype(np.float32),
         residual=np.full((ny, nx), np.nan, np.float32),
         friedel_asym=np.full((ny, nx), np.nan, np.float32),
         n_matched=n_matched,
-        coarse_score=np.where(valid, corr, 0.0).astype(np.float32),
+        coarse_score=np.where(valid, best_correlation, 0.0).astype(np.float32),
         phases_meta=phases_meta,
         nav_shape=(ny, nx),
         params=dict(params or {}),
     )
+    # Their discriminability metric, which our own path has no field for: how
+    # far the best orientation beat the best one well away from it. This is
+    # what a grain-boundary or amorphous mask is thresholded on.
+    reliability = np.stack(
+        [np.asarray(m.reliability.cpu().numpy(), float) for m in maps])
+    result.reliability = np.take_along_axis(
+        reliability, winner[None], axis=0)[0].astype(np.float32)
+    return result
+
+
+def to_result(orientation_map, phases_meta: list,
+              convention: str = "conjugate",
+              params: Optional[dict] = None,
+              strain: Optional[np.ndarray] = None) -> VectorOrientationResult:
+    """Decode a matched ``OrientationMap`` into our result container.
+
+    ``strain`` comes from :func:`strain_from_orientation_map`, which is a
+    separate pass because their refinement deliberately does not fit it; pass
+    it in, or leave it None to get a NaN strain field. ``friedel_asym`` stays
+    NaN — it is our own diagnostic, computed from the pose residual of ±g
+    pairs, and has no counterpart on their side.
+
+    ``coarse_score`` carries their correlation, which unlike ours is a
+    normalised cosine similarity in [0, 1] and so is comparable across
+    patterns. ``reliability`` (best minus best-outside-an-exclusion-ball) is
+    attached as an attribute — the container has no field for it, and it is
+    the discriminability metric our own path lacks entirely.
+    """
+    return combine_phases(
+        [orientation_map], phases_meta, convention=convention,
+        strains=None if strain is None else [strain], params=params)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# The whole field
+# ─────────────────────────────────────────────────────────────────────────────
+
+def compute_vector_orientation_quantem(
+        vectors, phases, energy_ev: float, k_max: float,
+        inverse_angstrom_factor: float = 1.0,
+        angle_step_zone_axis_deg: float = 1.0,
+        angle_step_in_plane_deg: float = 5.0,
+        device: str = "cuda", t: Optional[int] = None,
+        progress=None, stopped_flag=None,
+        params: Optional[dict] = None) -> Optional[VectorOrientationResult]:
+    """Orientation, phase and strain for every position, by correlation match.
+
+    One plan per phase, each matched and refined over the whole scan and then
+    combined per position on the correlation — see :func:`combine_phases` for
+    why comparing them is legitimate.
+
+    The correlation runs on ``device`` and the refinement on the same one
+    through the override in this module; both are worth accelerating at scan
+    scale, which is the opposite of the single-pattern case, where a batch of
+    one is launch-overhead bound and the CPU wins.
+
+    ``progress(done, total)`` is called between stages, and ``stopped_flag`` is
+    polled at each, so closing the tree stops the run rather than leaving a
+    scan's compute to finish into nothing.
+    """
+    import torch
+
+    peaks = PeaksAdapter(vectors, inverse_angstrom_factor=inverse_angstrom_factor,
+                         t=t)
+    rows, columns = peaks.shape
+    total = rows * columns
+    stages = max(1, len(phases)) * 3
+    done = [0]
+
+    def _advance():
+        done[0] += 1
+        if progress is not None:
+            progress(int(total * done[0] / stages), total)
+
+    def _stopped() -> bool:
+        return bool(stopped_flag is not None and stopped_flag[0])
+
+    maps, strains = [], []
+    for phase in phases:
+        if _stopped():
+            return None
+        crystal = phase_to_crystal(phase)
+        with accelerator_lock(torch.device(device)):
+            orientation_map = build_orientation_map(
+            peaks, crystal, energy_ev=energy_ev, k_max=k_max,
+            angle_step_zone_axis_deg=angle_step_zone_axis_deg,
+            angle_step_in_plane_deg=angle_step_in_plane_deg,
+                device=device, refine_device=device)
+        _advance()
+
+        if _stopped():
+            return None
+        with accelerator_lock(torch.device(device)):
+            orientation_map.match_orientations(progress_bar=False)
+        _advance()
+
+        if _stopped():
+            return None
+        # The Refine tab's settings, so the map is of what the preview showed.
+        settings = dict(params or {})
+        pair_distance = settings.get("pair_distance")
+        sigma_excitation = settings.get("sigma_excitation")
+        with accelerator_lock(torch.device(device)):
+            orientation_map.refine_orientations(
+                progress_bar=False, pair_distance=pair_distance,
+                sigma_excitation=sigma_excitation)
+            strain, _pairs = strain_from_orientation_map(
+                orientation_map, device=device, pair_distance=pair_distance,
+                sigma_excitation=sigma_excitation)
+        _advance()
+
+        maps.append(orientation_map)
+        strains.append(strain)
+
+    if _stopped() or not maps:
+        return None
+    from spyde.signals.orientation_map import phase_to_dict
+
+    result = combine_phases(maps, [phase_to_dict(p) for p in phases],
+                            strains=strains, params=dict(params or {}))
+    if progress is not None:
+        progress(total, total)
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# One pattern at a time
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class SinglePatternFit:
+    """What one pattern's fit gives the overlay and the caret readout."""
+
+    quat: np.ndarray            #: (4,) orientation, orix convention
+    phase_index: int
+    #: Cosine similarity against the matched template. Normalised to about
+    #: [0, 1] and comparable across patterns and crystals, but not bounded by
+    #: 1: the square-detector correction divides by a per-rotation template
+    #: norm that is clamped away from zero, so a pattern fitting its template
+    #: almost exactly can land slightly over (1.02 measured on clean silver).
+    correlation: float
+    reliability: float          #: best minus best outside the exclusion ball
+    strain: np.ndarray          #: (3,) [exx, eyy, exy], NaN if too few pairs
+    spots: np.ndarray           #: (M, 2) simulated peaks in Å⁻¹, as fitted
+    intensities: np.ndarray     #: (M,) their relative intensity
+    #: Median distance, Å⁻¹, from each MEASURED peak to the nearest drawn spot.
+    #: Measured in that direction because a simulated pattern always carries
+    #: reflections the peak finder did not detect, so scoring the spots instead
+    #: would penalise a good fit for being complete.
+    residual: float
+    n_matched: int              #: measured peaks with a drawn spot on them
+
+
+class SinglePatternFitter:
+    """Fit one pattern against a plan built once, as the crosshair moves.
+
+    The whole-field fit takes tens of seconds, so it cannot follow a navigator;
+    one pattern against an existing plan takes about 40 ms, which can. This is
+    the unit the live overlay and the Refine readout consume — the plan, the
+    structure factors and the zone-angle table are all built in ``__init__``
+    and reused for every position.
+
+    Runs on the CPU by default, and that is measured rather than conservative:
+    at a batch of one the GPU is launch-overhead bound, and the refinement is
+    12 ms on the CPU against 39 ms on CUDA. The whole-field path wants CUDA;
+    this one does not.
+
+    One map per phase, each with its own plan, picked per pattern on the
+    correlation — the same comparison :func:`combine_phases` makes for a scan.
+
+    ``peaks`` is the WHOLE scan's adapter, and it is required even though only
+    one position is ever fitted: the plan measures the detector footprint from
+    the peaks (``detector_q_max="auto"``) so it can renormalise by the template
+    norm actually on the detector at each in-plane angle. Built from a single
+    position — or worse, none — that measurement is wrong or silently skipped,
+    and every correlation comes out low and not comparable with the batch
+    path's. Measured on sped_ag: median correlation 0.425 against 0.944.
+    """
+
+    def __init__(self, crystals, peaks, energy_ev: float, k_max: float,
+                 angle_step_zone_axis_deg: float = 1.0,
+                 angle_step_in_plane_deg: float = 5.0,
+                 device: str = "cpu", min_peaks: int = 5,
+                 convention: str = "conjugate",
+                 inverse_angstrom_factor: float = 1.0, **plan_kwargs):
+        self.min_peaks = int(min_peaks)
+        self.convention = convention
+        self.device = device
+        #: Remembered so the overlay can hand over raw rows and not restate the
+        #: detector's units at every position.
+        self.inverse_angstrom_factor = float(inverse_angstrom_factor)
+        #: The two knobs worth exposing live. Both are arguments of the
+        #: REFINEMENT, not of the plan, so changing them re-fits the pattern
+        #: under the crosshair without the ~2 s plan rebuild that the zone and
+        #: in-plane steps would force. None means "whatever the plan was built
+        #: with".
+        #:
+        #: ``pair_distance`` — how near a simulated reflection has to be to
+        #: count as the same peak, Å⁻¹. Too small and real peaks go unpaired;
+        #: too large and neighbouring reflections are claimed by one spot.
+        #: ``sigma_excitation`` — how far off the Ewald sphere a reflection may
+        #: sit and still be treated as excited, Å⁻¹.
+        self.pair_distance: Optional[float] = None
+        self.sigma_excitation: Optional[float] = None
+        self._plan_pair_distance = float(
+            plan_kwargs.get('corr_kernel_size', PAIR_DISTANCE))
+        self._metadata = dict(getattr(peaks, "metadata", {}) or {})
+        self._maps = [
+            build_orientation_map(
+                    peaks, crystal, energy_ev=energy_ev,
+                k_max=k_max, angle_step_zone_axis_deg=angle_step_zone_axis_deg,
+                angle_step_in_plane_deg=angle_step_in_plane_deg,
+                device=device, **plan_kwargs)
+            for crystal in crystals
+        ]
+    def zone_correlations(self, rows, inverse_angstrom_factor: Optional[float] = None
+                          ) -> Optional[list]:
+        """How well every sampled orientation explains this pattern.
+
+        One array of correlations per phase, in that phase's zone-axis order —
+        the surface the matcher picks its answer off, rather than the single
+        number it picked. That is what makes an IPF heat map worth looking at:
+        a confident position is one bright spot, an ambiguous one has several,
+        and a wrong phase is uniformly dim.
+
+        This mirrors the correlation inside ``match_orientations``, which
+        computes exactly this and then keeps only the best. Upstream has no
+        entry point that returns it, and re-running the matcher would not help;
+        so the contraction is repeated here, against the same plan.
+        """
+        import torch
+
+        if inverse_angstrom_factor is None:
+            inverse_angstrom_factor = self.inverse_angstrom_factor
+        peaks = _OnePosition(_rows_to_peaks(rows, inverse_angstrom_factor),
+                             metadata=self._metadata)
+        if peaks.peak_counts[0] < self.min_peaks:
+            return None
+
+        out = []
+        for orientation_map in self._maps:
+            # NOT `orientation_map.peaks = peaks`. This runs inline on the
+            # navigator thread while `fit` may be running on the overlay lane
+            # against the SAME plans, and `fit` re-reads `self.peaks` at every
+            # stage (match, refine, strain) — so assigning it here rebinds the
+            # pattern out from under a fit in progress. Nothing here needs it:
+            # `_polar_images` takes its arrays as an argument.
+            # Every torch submission on this device is serialised, or none of
+            # them are — see spyde.device_lock. A null context off MPS.
+            with accelerator_lock(orientation_map.device):
+                image = orientation_map._polar_images(
+                    [peaks[0, 0].array], [0, 1, 2]
+                ).to(orientation_map.dtype).to(orientation_map.device)
+                norm = torch.linalg.norm(
+                    image.reshape(1, -1), dim=1).clamp_min(1e-12)
+                spectrum = torch.fft.fft(image, dim=-1)
+                channels = [torch.einsum(
+                    "zsg,bsg->bzg", orientation_map.plan_fft, spectrum)]
+                channels.append(torch.einsum(
+                    "zsg,bsg->bzg", orientation_map.plan_fft, torch.conj(spectrum)))
+                correlation = torch.fft.ifft(
+                    torch.stack(channels, dim=1), dim=-1
+                ).real / norm[:, None, None, None]
+                if orientation_map.plan_norm_shift is not None:
+                    channels_n = correlation.shape[1]
+                    correlation = correlation / orientation_map.plan_norm_shift[
+                        None, :channels_n].clamp_min(1e-3)
+                    # The same suppression match_orientations applies, so the
+                    # triangle shows the surface the matcher actually chooses
+                    # off — including any zone the user has masked out, which
+                    # is set to zero weight on the detector.
+                    correlation = correlation.masked_fill(
+                        orientation_map.plan_frac_shift[None, :channels_n]
+                        < MIN_DETECTOR_FRACTION, 0.0)
+                # best over the mirror channel and the in-plane angle: what is
+                # left is one number per zone axis, which the triangle shows.
+                out.append(
+                    correlation.amax(dim=(1, 3))[0].detach().cpu().numpy())
+        return out
+
+    def fit(self, rows, inverse_angstrom_factor: Optional[float] = None
+            ) -> Optional[SinglePatternFit]:
+        """Fit one position's vector rows, or None if there are too few peaks.
+
+        ``rows`` is the ``(N, 6)`` flat-buffer slice the overlay already holds,
+        in the detector's own units; the conversion to Å⁻¹ happens here.
+        """
+        import torch
+
+        if inverse_angstrom_factor is None:
+            inverse_angstrom_factor = self.inverse_angstrom_factor
+        peaks = _OnePosition(_rows_to_peaks(rows, inverse_angstrom_factor),
+                             metadata=self._metadata)
+        if peaks.peak_counts[0] < self.min_peaks:
+            return None
+
+        best = None
+        for index, orientation_map in enumerate(self._maps):
+            orientation_map.peaks = peaks
+            # This runs on the overlay lane, concurrently with whatever else is
+            # submitting to the device, so it is serialised like every other
+            # torch call site — see spyde.device_lock. Null context off MPS.
+            with accelerator_lock(orientation_map.device):
+                # Passed rather than left to default so this preview and
+                # the whole-field run suppress the same zones.
+                orientation_map.match_orientations(
+                    progress_bar=False, min_number_peaks=self.min_peaks,
+                    min_detector_fraction=MIN_DETECTOR_FRACTION)
+                orientation_map.refine_orientations(
+                    progress_bar=False, neighbor_rescue=False,
+                    pair_distance=self.pair_distance,
+                    sigma_excitation=self.sigma_excitation)
+            correlation = float(orientation_map.corr[0, 0, 0])
+            if best is None or correlation > best[0]:
+                best = (correlation, index, orientation_map)
+        correlation, phase_index, orientation_map = best
+        if not np.isfinite(correlation) or correlation <= 0:
+            return None
+
+        with accelerator_lock(orientation_map.device):
+            affine, pairs = reciprocal_affine(
+                orientation_map, device=self.device,
+                pair_distance=self.pair_distance,
+                sigma_excitation=self.sigma_excitation)
+            deformation = affine[0, 0]
+            strain = _symmetric_strain(
+                torch.linalg.inv(deformation[None]).transpose(-1, -2)
+            )[0].cpu().numpy() if bool(torch.isfinite(deformation).all()) else \
+                np.full(3, np.nan, np.float32)
+            pattern = orientation_map.generate_pattern(0, 0)
+
+        spots = torch.stack((pattern["qx"], pattern["qy"]), dim=1).to(torch.float64)
+        intensity = pattern["intensity"]
+        # A simulated pattern carries every reflection inside its excitation
+        # tolerance, including ones no detector would register. Drawn unfiltered
+        # they bury the ones that matter — upstream's own threshold for what is
+        # observable is a fraction of the strongest reflection.
+        if intensity.numel():
+            observable = intensity >= MIN_SIM_INTENSITY_REL * intensity.max()
+            spots, intensity = spots[observable], intensity[observable]
+        if bool(torch.isfinite(deformation).all()):
+            # Draw the simulated pattern where the FIT puts it, not where an
+            # unstrained crystal would: the overlay is how a user judges the
+            # fit, so its spots have to be the fit's own prediction.
+            spots = spots @ deformation.to(spots.dtype).T
+
+        drawn = spots.cpu().numpy().astype(np.float32)
+        measured = peaks[0, 0].array[:, :2]
+        if drawn.size and measured.size:
+            nearest = np.linalg.norm(
+                drawn[:, None, :] - measured[None, :, :], axis=-1).min(axis=0)
+            residual = float(np.median(nearest))
+            n_matched = int((nearest < (self.pair_distance
+                                        or self._plan_pair_distance)).sum())
+        else:
+            residual, n_matched = float("nan"), 0
+
+        return SinglePatternFit(
+            quat=quantem_quats_to_orix(
+                orientation_map.quats[0, 0, 0].cpu().numpy(), self.convention),
+            phase_index=phase_index,
+            correlation=correlation,
+            reliability=float(orientation_map.reliability[0, 0]),
+            strain=np.asarray(strain, np.float32),
+            spots=drawn,
+            intensities=intensity.cpu().numpy().astype(np.float32),
+            residual=residual,
+            n_matched=n_matched,
+        )
+
+
+def _rows_to_peaks(rows, inverse_angstrom_factor: float) -> np.ndarray:
+    """``(N, 6)`` vector rows → the ``(N, 3)`` qx/qy/intensity their matcher
+    reads, in Å⁻¹."""
+    rows = np.asarray(rows)
+    out = np.empty((len(rows), 3), dtype=np.float64)
+    if len(rows):
+        out[:, 0] = rows[:, COL_KX] * float(inverse_angstrom_factor)
+        out[:, 1] = rows[:, COL_KY] * float(inverse_angstrom_factor)
+        out[:, 2] = rows[:, COL_INTENSITY]
+    return out
+
+
+class _OnePosition:
+    """The peak protocol over a single pattern — a scan of one position."""
+
+    fields = list(PEAK_FIELDS)
+    shape = (1, 1)
+
+    def __init__(self, array: np.ndarray, metadata: Optional[dict] = None):
+        self.metadata: dict = dict(metadata or {})
+        self._cell = _Cell(np.asarray(array, dtype=np.float64))
+
+    def __getitem__(self, index) -> _Cell:
+        return self._cell
+
+    def select_fields(self, *names) -> "_OnePosition":
+        return self
+
+    def flatten(self) -> np.ndarray:
+        return self._cell.array
+
+    @property
+    def peak_counts(self) -> np.ndarray:
+        return np.array([self._cell.array.shape[0]], dtype=int)

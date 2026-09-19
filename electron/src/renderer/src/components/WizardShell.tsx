@@ -23,10 +23,20 @@ interface ShellProps {
   width?: number          // override the default box width (e.g. 2-column wizards)
 }
 
+/** Whether the caret currently open belongs to a `beta:` action.
+ *
+ *  FloatingToolbar provides this for whichever action it opened, so a wizard
+ *  never declares its own beta status — that would be a second copy of a fact
+ *  the toolbar schema already states, free to drift from it. Every caret built
+ *  on WizardShell therefore gets the ribbon with no change of its own.
+ */
+export const BetaContext = React.createContext(false)
+
 export function WizardShell({
   testid, title, posStyle, onClose, closeTestid, status, statusTestid, children,
   width,
 }: ShellProps) {
+  const beta = React.useContext(BetaContext)
   return (
     <div data-testid={testid}
       style={{ ...posStyle, ...S.box, ...(width ? { width } : {}) }}>
@@ -34,6 +44,11 @@ export function WizardShell({
         <span style={S.title}>{title}</span>
         <button data-testid={closeTestid} style={S.close} onClick={onClose}>✕</button>
       </div>
+      {beta && (
+        <div data-testid={`${testid}-beta`} style={S.betaRibbon}>
+          BETA · still under development, may change
+        </div>
+      )}
       {children}
       <div data-testid={statusTestid} style={S.status}>{status}</div>
     </div>
@@ -151,6 +166,11 @@ export const S: Record<string, React.CSSProperties> = {
     display: 'flex', flexDirection: 'column', gap: 6,
   },
   head: { display: 'flex', justifyContent: 'space-between', alignItems: 'center' },
+  betaRibbon: {
+    background: '#fab387', color: '#11111b', textAlign: 'center' as const,
+    fontSize: 9, fontWeight: 700, letterSpacing: 0.3,
+    padding: '2px 6px', borderRadius: 4,
+  },
   title: { fontSize: 11, fontWeight: 600, color: '#cdd6f4' },
   close: { background: 'none', border: 'none', color: '#6c7086', cursor: 'pointer', fontSize: 12 },
   tabRow: { display: 'flex', gap: 2, borderBottom: '1px solid #313244', paddingBottom: 4 },

@@ -352,5 +352,9 @@ def get_toolbar_config_for_plot(plot_state: "PlotState") -> list[dict]:
             "toggle": meta.get("toggle", False),
             "parameters": meta.get("parameters", {}),
             "subfunctions": sub_actions,
+            # ``beta:`` is not a gate — the action is offered as usual. It only
+            # tells the renderer to mark it as still under development, so the
+            # promise a user reads matches what we are willing to keep stable.
+            "beta": bool(meta.get("beta", False)),
         })
     return actions
