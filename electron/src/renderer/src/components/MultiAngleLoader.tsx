@@ -98,6 +98,9 @@ export interface MapedSolve {
   corners: Record<string, MapedCorners>
 }
 
+/** A square search region on the detector, by its centre and half-width. */
+export interface BeamRoi { cy: number; cx: number; half: number }
+
 export interface MapedState {
   members: MapedMember[]
   reference: number | null
@@ -110,6 +113,10 @@ export interface MapedState {
   virtual_image: string | null
   /** Names every member carries, so one can be chosen for all of them. */
   available_virtual_images: string[]
+  /** Where the reciprocal stage looks for the zero beam, in DETECTOR pixels,
+   *  or null for the whole pattern. One region for the acquisition: the
+   *  members are the same detector at the same camera length. */
+  beam_roi: BeamRoi | null
   real: MapedSolve
   reciprocal: MapedSolve
   busy: boolean
@@ -208,12 +215,22 @@ export function parseMapedState(detail: Record<string, unknown>): MapedState {
     scan_shape: numList(detail.scan_shape),
     virtual_image: detail.virtual_image == null ? null : String(detail.virtual_image),
     available_virtual_images: strList(detail.available_virtual_images),
+    beam_roi: parseBeamRoi(detail.beam_roi),
     real: parseSolve(detail.real),
     reciprocal: parseSolve(detail.reciprocal),
     busy: Boolean(detail.busy),
     message: String(detail.message ?? ''),
     can_commit: Boolean(detail.can_commit),
   }
+}
+
+/** The search region, or null — including when it is there but unreadable. */
+function parseBeamRoi(raw: unknown): BeamRoi | null {
+  if (!raw || typeof raw !== 'object') return null
+  const roi = raw as Record<string, unknown>
+  const cy = Number(roi.cy), cx = Number(roi.cx), half = Number(roi.half)
+  if (![cy, cx, half].every(Number.isFinite) || half <= 0) return null
+  return { cy, cx, half }
 }
 
 /** "1.0°", "0.5°", "1.25°" — always at least one decimal, so a whole-degree
@@ -826,6 +843,8 @@ export function MultiAngleLoader({ sendAction, onClose }: {
                   `corner-${member ?? 'all'}-${corner}`,
                   () => sendAction('maped_set_corner_extent', { member, corner, extent }))}
                 onZoom={setZoom}
+                onBeamRoi={(roi) => debounce('beam-roi',
+                  () => sendAction('maped_set_beam_roi', { beam_roi: roi }))}
               />
 
               <RunButton
@@ -1161,10 +1180,90 @@ function ProblemList({ members }: { members: MapedMember[] }) {
  * panels are here before anything has run, with the previews filling in
  * afterwards.
  */
-function CornerTableau({ state, onExtent, onZoom }: {
+/**
+ * The zero-beam search region, drawn on a corner panel and draggable on it.
+ *
+ * The region is what stops the beam finder reading a reflection instead of the
+ * beam: it is a centre of mass, so over a whole pattern it goes wherever the
+ * excited reflections are. Placing it is therefore a measurement decision, and
+ * a measurement decision belongs on the picture rather than in a number field —
+ * though the field is there too, because "24" is easier to repeat than a drag.
+ *
+ * Drag the middle to move it, a corner to resize it. The panel maps the whole
+ * detector onto a square, so panel fractions convert straight to detector
+ * pixels. One region for the acquisition, so dragging it on any member's panel
+ * moves the one every member is searched with.
+ */
+function BeamRegionBox({ roi, detector, onChange }: {
+  roi: BeamRoi
+  detector: number[] | null
+  onChange: (roi: BeamRoi) => void
+}) {
+  const host = React.useRef<HTMLDivElement | null>(null)
+  const height = detector?.[0] ?? 0
+  const width = detector?.[1] ?? 0
+  if (!height || !width) return null
+
+  const left = ((roi.cx - roi.half) / width) * 100
+  const top = ((roi.cy - roi.half) / height) * 100
+  const size = ((roi.half * 2) / Math.max(width, height)) * 100
+
+  /** Drag in panel pixels, applied in detector pixels. */
+  const drag = (event: React.PointerEvent, mode: 'move' | 'size') => {
+    event.preventDefault()
+    event.stopPropagation()
+    const panel = host.current?.parentElement
+    if (!panel) return
+    const box = panel.getBoundingClientRect()
+    const perPixelX = width / box.width
+    const perPixelY = height / box.height
+    const startX = event.clientX, startY = event.clientY
+    const start = { ...roi }
+    const target = event.currentTarget as HTMLElement
+    target.setPointerCapture(event.pointerId)
+
+    const clamp = (next: BeamRoi): BeamRoi => {
+      const half = Math.max(3, Math.min(next.half, Math.min(width, height) / 2))
+      return {
+        half,
+        cx: Math.max(half, Math.min(width - half, next.cx)),
+        cy: Math.max(half, Math.min(height - half, next.cy)),
+      }
+    }
+    const onMove = (move: PointerEvent) => {
+      const dx = (move.clientX - startX) * perPixelX
+      const dy = (move.clientY - startY) * perPixelY
+      onChange(clamp(mode === 'move'
+        ? { ...start, cx: start.cx + dx, cy: start.cy + dy }
+        : { ...start, half: start.half + (dx + dy) / 2 }))
+    }
+    const onUp = () => {
+      target.releasePointerCapture(event.pointerId)
+      target.removeEventListener('pointermove', onMove as EventListener)
+      target.removeEventListener('pointerup', onUp)
+    }
+    target.addEventListener('pointermove', onMove as EventListener)
+    target.addEventListener('pointerup', onUp)
+  }
+
+  return (
+    <div ref={host} data-testid="maped-beam-roi"
+      onPointerDown={(e) => drag(e, 'move')}
+      onDoubleClick={(e) => e.stopPropagation()}
+      style={{ ...styles.beamRoi, left: `${left}%`, top: `${top}%`,
+               width: `${size}%`, height: `${size}%` }}
+    >
+      <div data-testid="maped-beam-roi-handle" style={styles.beamRoiHandle}
+        onPointerDown={(e) => drag(e, 'size')} />
+    </div>
+  )
+}
+
+function CornerTableau({ state, onExtent, onZoom, onBeamRoi }: {
   state: MapedState
   onExtent: (member: number | null, corner: number, extent: number) => void
   onZoom: (target: ZoomTarget) => void
+  onBeamRoi: (roi: BeamRoi) => void
 }) {
   const members = state.members.filter((m) => !m.error)
   const corners = state.reciprocal.corners
@@ -1197,6 +1296,25 @@ function CornerTableau({ state, onExtent, onZoom }: {
             />
           </label>
         ))}
+        {state.beam_roi && (
+          <label style={styles.cornerAllField}
+            title="The zero beam is looked for inside this square. Drag the
+ green box on any panel to place it.">
+            <span style={styles.cornerAllLabel}>Zero-beam search ±px</span>
+            <input
+              data-testid="maped-beam-roi-half"
+              type="number" min={3} step={1}
+              value={Math.round(state.beam_roi.half)}
+              onChange={(e) => {
+                const half = Number(e.target.value)
+                if (Number.isFinite(half) && half >= 3 && state.beam_roi) {
+                  onBeamRoi({ ...state.beam_roi, half })
+                }
+              }}
+              style={{ ...styles.extentInput, width: 56 }}
+            />
+          </label>
+        )}
       </div>
 
       <div style={styles.cornerCards}>
@@ -1229,6 +1347,11 @@ function CornerTableau({ state, onExtent, onZoom }: {
                         {src
                           ? <img src={src} alt="" style={styles.cornerImage} draggable={false} />
                           : <span style={styles.cornerGlyph}>{CORNER_SHORT[corner]}</span>}
+                        {src && state.beam_roi && (
+                          <BeamRegionBox roi={state.beam_roi}
+                            detector={member.detector_shape}
+                            onChange={onBeamRoi} />
+                        )}
                       </div>
                       <ExtentInput
                         testid={`maped-corner-extent-${member.index}-${corner}`}
@@ -1716,6 +1839,17 @@ const styles: Record<string, React.CSSProperties> = {
     overflow: 'hidden', cursor: 'zoom-in',
   },
   cornerPanelEmpty: { borderStyle: 'dashed', borderColor: '#45475a' },
+  beamRoi: {
+    position: 'absolute', boxSizing: 'border-box',
+    border: '1.5px solid #a6e3a1', borderRadius: 3,
+    background: 'rgba(166, 227, 161, 0.10)',
+    cursor: 'move', touchAction: 'none',
+  },
+  beamRoiHandle: {
+    position: 'absolute', right: -4, bottom: -4, width: 8, height: 8,
+    background: '#a6e3a1', borderRadius: 2, cursor: 'nwse-resize',
+    touchAction: 'none',
+  },
   cornerImage: { width: '100%', height: '100%', objectFit: 'cover', display: 'block' },
   cornerGlyph: { fontSize: 11, color: '#585b70', letterSpacing: 1 },
   extentInput: {
