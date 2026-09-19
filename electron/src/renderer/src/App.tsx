@@ -9,6 +9,7 @@ import { LogPanel } from './components/LogPanel'
 import { Tour } from './components/Tour'
 import { NavShapeGate } from './components/NavShapeGate'
 import { StackGate } from './components/StackGate'
+import { MultiAngleGate } from './components/MultiAngleGate'
 import { UpdateGate } from './components/UpdateGate'
 import { GpuStatusGate } from './components/GpuStatusGate'
 import { GpuHelpGate } from './components/GpuHelpGate'
@@ -103,6 +104,10 @@ export function App() {
       {/* Load Stack dialog — reorderable list of datasets to combine into one
           5D stack; opened from File → Load Stack…. */}
       <StackGate />
+      {/* Multi-Angle 4D STEM loader — one 4-D dataset per (tilt, azimuth),
+          grouped into tilt shells; tabbed load → real-space align → reciprocal
+          align. Opened from File → Load Multi-Angle 4D STEM…. */}
+      <MultiAngleGate />
       {/* Help → Check for Updates… / GPU Status… / GPU & CUDA */}
       <UpdateGate />
       <GpuStatusGate />

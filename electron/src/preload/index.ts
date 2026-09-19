@@ -32,6 +32,10 @@ contextBridge.exposeInMainWorld('electron', {
   /** Open the in-app Load Stack dialog (from the File menu). Returns an unsubscribe fn. */
   onOpenStackDialog: (cb: () => void) => onEvent('spyde:open_stack_dialog', cb),
 
+  /** Open the in-app Multi-Angle 4D STEM loader (from the File menu). Returns
+   *  an unsubscribe fn. */
+  onOpenMultiAngleLoader: (cb: () => void) => onEvent('spyde:open_multiangle_loader', cb),
+
   /** Open the "Check for Updates" dialog (from the Help menu). Returns an unsubscribe fn. */
   onOpenUpdateDialog: (cb: () => void) => onEvent('spyde:open_update_dialog', cb),
 

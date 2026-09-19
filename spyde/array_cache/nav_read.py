@@ -65,7 +65,8 @@ def _reader_for(plot, signal, data):
         # is an index. Reached as the PARENT of a derived view.
         reader = EagerReader(data, signal.axes_manager.navigation_dimension)
     else:
-        reader = (_try_per_frame_reader(plot, signal, data)
+        reader = (_try_multiangle_reader(plot, signal, data)
+                  or _try_per_frame_reader(plot, signal, data)
                   or _try_recipe_reader(plot, signal, data)
                   or resolve_reader(signal, data,
                                     block_cache=getattr(plot, "_block_cache", None)))
@@ -170,6 +171,30 @@ def _try_recipe_reader(plot, signal, data):
         return RecipeReader(signal, data, parent_signal, parent_reader)
     except Exception as e:
         log.debug("recipe reader resolve failed, using the dask view: %s", e)
+        return None
+
+
+def _try_multiangle_reader(plot, signal, data):
+    """A MultiAngleReader for a composed multi-angle node, or None.
+
+    A composed node's frame is one frame from each of N separately-stored
+    members, added (or, on the 5-D stack node, one member's frame). Asking dask
+    for it pulls a navigation chunk out of every member to keep one frame from
+    each — the trap the per-frame and recipe readers exist to avoid, multiplied
+    by the number of members. Reading through the members' own readers instead
+    lets each decode through the shared block cache.
+
+    Tried FIRST because the recipe is recorded on the signal itself, so this is
+    an attribute lookup rather than a tree walk, and because a composed node
+    must never fall through to a reader that would answer from the wrong place.
+    """
+    try:
+        from .readers.multiangle import build_multiangle_reader
+
+        return build_multiangle_reader(
+            signal, data, block_cache=getattr(plot, "_block_cache", None))
+    except Exception as e:
+        log.debug("multi-angle reader resolve failed, using the dask view: %s", e)
         return None
 
 

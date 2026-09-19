@@ -704,6 +704,13 @@ function buildMenu(): void {
           // than the native picker — the user adds/reorders there, then confirms.
           click: () => win?.webContents.send('spyde:open_stack_dialog'),
         },
+        {
+          label: 'Load Multi-Angle 4D STEM…',
+          // One 4-D dataset per (tilt, azimuth): the in-app loader is where the
+          // angles are assigned and the two alignments are solved before the
+          // acquisition is opened.
+          click: () => win?.webContents.send('spyde:open_multiangle_loader'),
+        },
         { type: 'separator' },
         {
           label: 'Save Signal…',

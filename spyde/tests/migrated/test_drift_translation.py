@@ -243,6 +243,75 @@ class TestSolveTranslationAccuracy:
         assert np.abs(model.shifts - truth).max() < GATE_PX
 
 
+class TestFixedReference:
+    """``reference='fixed:<i>'`` for ``i != 0`` — every OTHER frame is solved.
+
+    Frame 0 is only the origin when it is also the reference. Declaring it
+    ``(0, 0)`` in this mode is the one failure that hides: the returned curve
+    looks perfectly ordinary, and is wrong by exactly the reference frame's own
+    displacement.
+    """
+
+    # Frame 2 is displaced from frame 0 by well over the 0.1 px gate, so a
+    # frame 0 that was merely declared the origin cannot pass by accident.
+    TRUTH = np.array([[0, 0], [3, -4], [-6, 2], [1, 7]], dtype=float)
+    CHOSEN = 2
+
+    def _solve(self, **kwargs):
+        return solve_translation(_shifted_stack(self.TRUTH), device="numpy",
+                                 upsample=8, reference=f"fixed:{self.CHOSEN}",
+                                 **kwargs)
+
+    def test_frame_zero_is_registered_against_a_later_reference(self):
+        expected = self.TRUTH - self.TRUTH[self.CHOSEN]
+        model = self._solve()
+        assert np.abs(model.shifts[0] - expected[0]).max() < GATE_PX, (
+            f"frame 0 came back {model.shifts[0]}, expected {expected[0]} — it "
+            "was declared the origin instead of being solved")
+        assert np.allclose(model.shifts, expected, atol=GATE_PX), model.shifts
+
+    def test_the_chosen_frame_is_the_origin(self):
+        model = self._solve()
+        assert tuple(model.shifts[self.CHOSEN]) == (0.0, 0.0)
+        assert np.isinf(model.residuals[self.CHOSEN])
+
+    def test_on_shift_reports_every_frame_exactly_once(self):
+        seen = []
+        model = self._solve(on_shift=lambda i, dy, dx, s: seen.append((i, dy, dx)))
+        assert sorted(i for i, _, _ in seen) == list(range(len(self.TRUTH)))
+        for i, dy, dx in seen:
+            assert (dy, dx) == pytest.approx(tuple(model.shifts[i])), (
+                f"frame {i} streamed {(dy, dx)} but the array holds "
+                f"{tuple(model.shifts[i])}")
+
+    def test_progress_counts_every_frame_once(self):
+        seen = []
+        self._solve(progress=lambda done, total: seen.append((done, total)))
+        assert seen == [(n, len(self.TRUTH)) for n in
+                        range(1, len(self.TRUTH) + 1)]
+
+    def test_cancel_leaves_the_unreached_frames_nan(self):
+        calls = {"n": 0}
+
+        def cancel():
+            calls["n"] += 1
+            return calls["n"] > 1
+
+        model = self._solve(cancel=cancel)
+        assert np.isnan(model.shifts[-1]).all(), (
+            "a cancelled fixed-reference solve must be detectable")
+        assert tuple(model.shifts[self.CHOSEN]) == (0.0, 0.0)
+
+    def test_fixed_zero_matches_first(self):
+        """``fixed:0`` and ``first`` are the same solve, so they must agree."""
+        stack = _shifted_stack(self.TRUTH)
+        as_first = solve_translation(stack, device="numpy", upsample=8,
+                                     reference="first")
+        as_fixed = solve_translation(stack, device="numpy", upsample=8,
+                                     reference="fixed:0")
+        assert np.array_equal(as_first.shifts, as_fixed.shifts)
+
+
 class TestSolveTranslationGuards:
     def test_max_shift_rejects_far_peak(self):
         """A shift beyond max_shift is clamped out of the search, not returned."""
