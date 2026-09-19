@@ -69,13 +69,29 @@ class VectorRefineIpfController:
     without the refinement or the strain solve that make the matched-pattern
     overlay expensive.
 
+    Double-clicking a triangle adds or removes a circle that RESTRICTS the
+    match to the orientations inside it, the same gesture and the same meaning
+    as the dense heat map's. It is how a user resolves an ambiguous pattern:
+    the surface shows several bright spots, and confining the match to one of
+    them says which is the right one.
+
+    The restriction is on the LIVE fit — this heat map and the matched-pattern
+    overlay, which share one matcher — and not on Compute Maps, which builds
+    its own plans per run. That is the dense heat map's scope too. It is a
+    thing you do while looking at one pattern, not a setting the scan is
+    indexed under.
     """
 
-    def __init__(self, vectors, fitter, infos, panels):
+    def __init__(self, vectors, fitter, infos, panels, fit_overlay=None):
         self.vectors = vectors
         self.fitter = fitter
         self.infos = infos
         self.panels = panels
+        #: The matched-pattern overlay, which fits through the SAME matcher and
+        #: so answers under the same restriction. It has its own cached reader,
+        #: so a mask change has to invalidate it too or the green pattern keeps
+        #: showing the orientation the user just ruled out.
+        self.fit_overlay = fit_overlay
         self.circles = {info["phase_index"]: [] for info in infos}
         self.tree = None
         self.node = None
@@ -92,7 +108,85 @@ class VectorRefineIpfController:
             static={"fitter": self.fitter},
             on_value=self.draw,
         )
+        for panel in self.panels:
+            self._wire_double_click(panel)
         return self
+
+    # ── restricting the match to part of the triangle ────────────────────────
+    def toggle_circle(self, phase_index: int, x: float, y: float) -> None:
+        """Remove the circle the click lands in, else add one centred there.
+
+        Then push the resulting restriction into the matcher, so the live
+        overlay's fit and this heat map agree about which orientations are in
+        play.
+        """
+        info = next((i for i in self.infos
+                     if i["phase_index"] == phase_index), None)
+        if info is None:
+            return
+        circles = self.circles[phase_index]
+        for index, (cx, cy, radius) in enumerate(circles):
+            if (x - cx) ** 2 + (y - cy) ** 2 <= radius * radius:
+                circles.pop(index)
+                break
+        else:
+            circles.append((float(x), float(y),
+                            0.09 * float((info["maxs"] - info["mins"]).mean())))
+        self.apply_mask()
+
+    def apply_mask(self) -> None:
+        """Hand the circles to the matcher as one keep-mask per phase."""
+        from spyde.actions.ipf_refine import rot_mask_from_circles
+
+        counts = self.fitter.zone_counts
+        mask = rot_mask_from_circles(self.infos, self.circles, int(sum(counts)))
+        if mask is None:
+            self.fitter.set_zone_mask(None)
+        else:
+            # build_zone_ipf stacks the phases' zone axes in order, so each
+            # phase's block is the contiguous run the mask has to be cut into.
+            offsets = np.cumsum([0] + list(counts))
+            self.fitter.set_zone_mask(
+                [mask[offsets[i]:offsets[i + 1]] for i in range(len(counts))])
+        self.refresh()
+
+    def refresh(self) -> None:
+        """Re-evaluate the current position, so a mask change shows at once
+        rather than at the next navigator move.
+
+        The mask lives on the matcher's plans, not in the overlay's recipe —
+        it has to, because the matched-pattern overlay fits through the same
+        matcher and must honour the same restriction. So the statics being
+        re-declared here are unchanged by identity; what they buy is the tree's
+        "this overlay's inputs moved, drop the cached reader and re-run" path,
+        once per node that reads the matcher.
+        """
+        self._reevaluate(self.node)
+        self._reevaluate(self.fit_overlay)
+
+    def _reevaluate(self, node) -> None:
+        if self.tree is None or node is None:
+            return
+        try:
+            self.tree.replace_overlay_static(node, fitter=self.fitter)
+        except Exception as e:
+            log.debug("re-evaluating a vector refine overlay failed: %s", e)
+
+    def _wire_double_click(self, panel):
+        phase_index = panel["info"]["phase_index"]
+
+        def _on_double_click(event=None):
+            x = getattr(event, "xdata", None)
+            y = getattr(event, "ydata", None)
+            if x is None and isinstance(event, dict):
+                x, y = event.get("xdata"), event.get("ydata")
+            if x is not None and y is not None:
+                self.toggle_circle(phase_index, float(x), float(y))
+
+        try:
+            panel["xy"].add_event_handler(_on_double_click, "double_click")
+        except Exception as e:
+            log.debug("wiring a vector refine panel double-click failed: %s", e)
 
     def draw(self, value) -> None:
         """Recolour every phase panel from one position's correlations."""
@@ -116,6 +210,23 @@ class VectorRefineIpfController:
         self._closed = True
         from spyde.actions.vector_overlay import remove_overlay_node
 
+        # The restriction outlives this window otherwise: it lives on the
+        # matcher, which the matched-pattern overlay goes on using, and the
+        # circles that would lift it are going away with the panels. A mask
+        # nobody can see and nobody can undo is worse than none.
+        if any(self.circles.values()):
+            self.circles = {key: [] for key in self.circles}
+            try:
+                self.fitter.set_zone_mask(None)
+            except Exception as e:
+                log.debug("clearing the zone mask on close failed: %s", e)
+            # Only when the tree is staying: this same close runs on tree
+            # teardown, where re-evaluating would spend a fit on a navigator
+            # that is going away. Only the pattern overlay, too — this
+            # window's own overlay is about to be removed.
+            if not getattr(self.tree, "_spyde_closed", False):
+                self._reevaluate(self.fit_overlay)
+
         try:
             remove_overlay_node(self.tree, self.node)
         except Exception as e:
@@ -123,8 +234,12 @@ class VectorRefineIpfController:
         self.node = None
 
 
-def open_refine_ipf(session, signal, fitter, phases, vectors, tree):
+def open_refine_ipf(session, signal, fitter, phases, vectors, tree,
+                    fit_overlay=None):
     """Open the heat-map window and wire it to the navigator.
+
+    ``fit_overlay`` is the matched-pattern overlay node, so a mask drawn here
+    also redraws the pattern it restricts.
 
     Returns the controller, or None — a failure here costs the heat map and
     must not cost the library that was just built.
@@ -142,7 +257,7 @@ def open_refine_ipf(session, signal, fitter, phases, vectors, tree):
         window_id = emit_refine_window(session, figure, figure_id, html,
                                        title=f"{base} — IPF Refine")
         controller = VectorRefineIpfController(
-            vectors, fitter, infos, panels).attach(tree)
+            vectors, fitter, infos, panels, fit_overlay=fit_overlay).attach(tree)
         # Give the bare-figure window a teardown identity, so closing it with ✕
         # unhooks the navigator overlay instead of leaving it evaluating.
         if controller is not None:

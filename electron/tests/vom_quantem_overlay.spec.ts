@@ -165,13 +165,52 @@ test('the matched pattern lands on the measured peaks and follows the crosshair'
   console.log('readout after move:',
     await page.getByTestId('vom-strain-readout').textContent())
 
-  // ── the heat map toggles with the action ─────────────────────────────────
-  // Closing its window used to retire it until the library was rebuilt, which
-  // is a minute of work to undo a click.
   const heatMap = () => page.getByTestId('subwindow').filter({
     has: page.getByTestId('window-breadcrumb').filter({ hasText: 'IPF Refine' }),
   })
+
+  // ── double-clicking a triangle restricts the match ───────────────────────
+  // The gesture the dense refine heat map has: a circle says "the answer is
+  // one of THESE orientations". Only pixels can show it landed — the circle
+  // has to appear where the click was, and the matched pattern has to be
+  // redrawn from the restricted match rather than left where it was.
   await expect(heatMap()).toHaveCount(1)
+  await heatMap().getByTestId('subwindow-titlebar').click()
+  await page.waitForTimeout(300)
+  await page.screenshot({ path: join(SHOTS, '05-heat-map-before-mask.png') })
+
+  const greenBefore = await green()
+  const triangle = await heatMap().locator('iframe').first().boundingBox()
+  // Off-centre, so the click lands inside the triangle but away from the
+  // best match — a circle over the answer would change nothing visible.
+  await page.mouse.dblclick(triangle!.x + triangle!.width * 0.42,
+                            triangle!.y + triangle!.height * 0.58)
+  await page.waitForTimeout(4000)
+  await page.screenshot({ path: join(SHOTS, '06-heat-map-masked.png') })
+
+  // The restricted match still produces a pattern (the overlay must not go
+  // blank), and the readout still reports a fit.
+  await expect.poll(green, {
+    timeout: 60_000, message: 'the restricted match drew no pattern at all',
+  }).toBeGreaterThan(0)
+  console.log('green before mask:', greenBefore, 'after:', await green())
+  console.log('readout under mask:',
+    await page.getByTestId('vom-strain-readout').textContent())
+  await raise()
+  await page.screenshot({ path: join(SHOTS, '07-overlay-under-mask.png') })
+
+  // Double-clicking the same spot removes the circle and lifts the
+  // restriction — a mask you cannot undo is a trap.
+  await heatMap().getByTestId('subwindow-titlebar').click()
+  await page.waitForTimeout(300)
+  await page.mouse.dblclick(triangle!.x + triangle!.width * 0.42,
+                            triangle!.y + triangle!.height * 0.58)
+  await page.waitForTimeout(4000)
+  await page.screenshot({ path: join(SHOTS, '08-mask-cleared.png') })
+
+  // ── the heat map toggles with the action ─────────────────────────────────
+  // Closing its window used to retire it until the library was rebuilt, which
+  // is a minute of work to undo a click.
   await heatMap().getByTestId('close-btn').click()
   await expect(heatMap()).toHaveCount(0)
   await page.screenshot({ path: join(SHOTS, '05-heat-map-closed.png') })

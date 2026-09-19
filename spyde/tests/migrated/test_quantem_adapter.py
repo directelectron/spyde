@@ -512,6 +512,126 @@ class TestZoneAngleCache:
             "re-installing must not wrap the wrapper"
 
 
+class TestZoneMask:
+    """Restricting the match to part of the IPF triangle.
+
+    Double-clicking a triangle is how a user resolves an ambiguous pattern:
+    the correlation surface shows several bright spots and the circle says
+    which one is meant. That has to reach the MATCH, not just the picture —
+    otherwise the overlay keeps drawing the orientation the user just ruled
+    out.
+
+    It works by riding upstream's own suppression rather than reimplementing
+    its 240-line matcher: ``match_orientations`` already zeroes any zone whose
+    template mostly falls off the detector, so a masked zone is declared to
+    have no template weight on the detector at all.
+    """
+
+    @pytest.fixture(scope="class")
+    def ag(self):
+        fitter, rows = _ag_fitter(np.zeros((2, 2)))
+        return fitter, rows
+
+    @staticmethod
+    def _correlations(fitter, rows):
+        return np.asarray(fitter.zone_correlations(rows)[0], float)
+
+    def test_a_masked_zone_scores_zero_and_the_others_do_not_move(self, ag):
+        fitter, rows = ag
+        before = self._correlations(fitter, rows)
+        winner = int(np.argmax(before))
+        keep = np.ones(fitter.zone_counts[0], bool)
+        keep[winner] = False
+        try:
+            fitter.set_zone_mask([keep])
+            after = self._correlations(fitter, rows)
+        finally:
+            fitter.set_zone_mask(None)
+
+        assert after[winner] == 0.0
+        # Masking must take options away, not rescale what is left: a mask that
+        # moved the other scores would change which of THEM wins too.
+        np.testing.assert_allclose(after[keep], before[keep], rtol=0, atol=0)
+        assert int(np.argmax(after)) != winner
+
+    def test_clearing_the_mask_restores_the_surface_exactly(self, ag):
+        fitter, rows = ag
+        before = self._correlations(fitter, rows)
+        keep = np.ones(fitter.zone_counts[0], bool)
+        keep[int(np.argmax(before))] = False
+        fitter.set_zone_mask([keep])
+        fitter.set_zone_mask(None)
+        np.testing.assert_allclose(self._correlations(fitter, rows), before,
+                                   rtol=0, atol=0)
+
+    def test_keeping_one_zone_leaves_only_that_zone_scoring(self, ag):
+        fitter, rows = ag
+        keep = np.zeros(fitter.zone_counts[0], bool)
+        keep[3] = True
+        try:
+            fitter.set_zone_mask([keep])
+            after = self._correlations(fitter, rows)
+        finally:
+            fitter.set_zone_mask(None)
+        assert after[3] > 0.0
+        assert not np.any(after[~keep])
+
+    def test_an_empty_mask_is_ignored_rather_than_answered_arbitrarily(self, ag):
+        """Every zone masked out would leave the matcher choosing among equal
+        zeros — an arbitrary orientation presented as a match, which is worse
+        than declining the restriction."""
+        fitter, rows = ag
+        before = self._correlations(fitter, rows)
+        try:
+            fitter.set_zone_mask([np.zeros(fitter.zone_counts[0], bool)])
+            after = self._correlations(fitter, rows)
+        finally:
+            fitter.set_zone_mask(None)
+        np.testing.assert_allclose(after, before, rtol=0, atol=0)
+
+    def test_the_fit_honours_the_mask(self, ag):
+        """The whole point: the matched orientation, not only the heat map,
+        obeys the restriction."""
+        fitter, rows = ag
+        unmasked = fitter.fit(rows)
+        assert unmasked is not None
+
+        winner = int(np.argmax(self._correlations(fitter, rows)))
+        keep = np.ones(fitter.zone_counts[0], bool)
+        keep[winner] = False
+        try:
+            fitter.set_zone_mask([keep])
+            masked = fitter.fit(rows)
+        finally:
+            fitter.set_zone_mask(None)
+
+        assert masked is not None, "a restricted match must still produce one"
+        # Strictly worse, not merely no better: "no better" would also hold if
+        # the mask never reached the match at all, which is the bug this is
+        # here to catch. On this pattern the drop is 1.02 -> 0.82.
+        assert masked.correlation < unmasked.correlation - 0.05
+        assert not np.allclose(masked.quat, unmasked.quat, atol=1e-3), \
+            "the match returned the orientation that was masked out"
+
+    def test_a_plan_without_an_aperture_correction_says_so(self, ag, caplog):
+        """The mask rides the detector-aperture correction, so a plan built
+        without one cannot carry it. That must be a warning, not a mask which
+        silently does nothing."""
+        import logging
+
+        fitter, _rows = ag
+        saved = fitter._full_frac_shift[0]
+        try:
+            fitter._full_frac_shift[0] = None
+            with caplog.at_level(logging.WARNING,
+                                 logger="spyde.actions.vector_orientation_quantem"):
+                fitter.set_zone_mask([np.zeros(fitter.zone_counts[0], bool)])
+            assert "zone mask ignored" in caplog.text
+        finally:
+            fitter._full_frac_shift[0] = saved
+            fitter.set_zone_mask(None)
+
+
 class TestConstantsTrackUpstream:
     """The adapter restates three of upstream's numbers. Two are re-exported
     and cannot drift; the third is copied out of a signature and can."""

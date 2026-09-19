@@ -44,9 +44,11 @@ PEAK_FIELDS = ("qx", "qy", "intensity")
 #: scores zero, because most of what would confirm it was never measured.
 #:
 #: Unlike the two above, upstream keeps this one in a signature rather than in
-#: its defaults module, so this IS a copy and can drift. It is passed
-#: explicitly for that reason, and ``test_quantem_adapter`` reads the signature
-#: and fails if the two stop agreeing.
+#: its defaults module, so this IS a copy and can drift. It has to be passed
+#: explicitly and it has to stay non-zero, because it is the seam the zone mask
+#: rides (:meth:`SinglePatternFitter.set_zone_mask`) — at zero, every mask
+#: would silently do nothing. ``test_quantem_adapter`` reads the signature and
+#: fails if the two stop agreeing.
 MIN_DETECTOR_FRACTION = 0.3
 
 
@@ -1110,6 +1112,72 @@ class SinglePatternFitter:
                 device=device, **plan_kwargs)
             for crystal in crystals
         ]
+        #: The untouched on-detector template fraction per plan, kept so a zone
+        #: mask can be recomputed from scratch each time rather than composed
+        #: onto an already-masked tensor.
+        self._full_frac_shift = [
+            None if m.plan_frac_shift is None else m.plan_frac_shift.clone()
+            for m in self._maps
+        ]
+
+    def set_zone_mask(self, keep_per_phase) -> None:
+        """Restrict the match to a subset of each phase's zone axes.
+
+        ``keep_per_phase`` is one ``(Z,)`` boolean per phase, or None for a
+        phase where every zone competes; ``None`` for the whole argument clears
+        the restriction.
+
+        This rides upstream's OWN suppression rather than reimplementing the
+        match: ``match_orientations`` already zeroes the correlation of any
+        (zone, in-plane angle) whose template mostly falls off the detector,
+        by comparing ``plan_frac_shift`` against ``min_detector_fraction``. A
+        masked-out zone is simply one with no template weight on the detector,
+        so setting its fraction to zero makes the matcher skip it — exact, and
+        it leaves the 240-line method alone.
+        """
+        import torch
+
+        keep_per_phase = list(keep_per_phase or [None] * len(self._maps))
+        for index, orientation_map in enumerate(self._maps):
+            full = self._full_frac_shift[index]
+            keep = keep_per_phase[index] if index < len(keep_per_phase) else None
+            if full is None:
+                # No detector aperture was measured, so upstream never consults
+                # plan_frac_shift and there is nothing to ride.
+                if keep is not None and not bool(np.all(keep)):
+                    log.warning(
+                        "zone mask ignored for phase %d: the plan has no "
+                        "detector aperture correction to suppress through",
+                        index)
+                continue
+            if keep is not None:
+                keep = np.asarray(keep, bool).reshape(-1)
+                if not keep.any():
+                    # Every zone masked out leaves the argmax to pick
+                    # arbitrarily among equal zeros, which would read as a
+                    # random orientation rather than as "nothing selected".
+                    log.debug("empty zone mask for phase %d ignored", index)
+                    keep = None
+                elif bool(keep.all()):
+                    keep = None
+
+            # A double-click arrives on its own thread while the navigator may
+            # be correlating on this device — see spyde.device_lock. A null
+            # context off MPS.
+            with accelerator_lock(orientation_map.device):
+                if keep is None:
+                    orientation_map.plan_frac_shift = full.clone()
+                else:
+                    allowed = torch.as_tensor(
+                        keep, device=full.device).to(full.dtype)      # (Z,)
+                    orientation_map.plan_frac_shift = \
+                        full * allowed[None, :, None]
+
+    @property
+    def zone_counts(self) -> list:
+        """How many zone axes each phase samples — the mask's expected width."""
+        return [int(m.zone_axes.shape[0]) for m in self._maps]
+
     def zone_correlations(self, rows, inverse_angstrom_factor: Optional[float] = None
                           ) -> Optional[list]:
         """How well every sampled orientation explains this pattern.
@@ -1198,8 +1266,10 @@ class SinglePatternFitter:
             # submitting to the device, so it is serialised like every other
             # torch call site — see spyde.device_lock. Null context off MPS.
             with accelerator_lock(orientation_map.device):
-                # Passed rather than left to default so this preview and
-                # the whole-field run suppress the same zones.
+                # min_detector_fraction is passed rather than left to default
+                # because set_zone_mask masks BY it: a masked zone is one whose
+                # on-detector fraction has been set to zero, so a caller that
+                # lowered this to 0 would silently unmask everything.
                 orientation_map.match_orientations(
                     progress_bar=False, min_number_peaks=self.min_peaks,
                     min_detector_fraction=MIN_DETECTOR_FRACTION)

@@ -283,12 +283,12 @@ class TestRefineIpfTogglesWithTheAction:
         return wizard
 
     def _patched(self, monkeypatch):
-        """Count re-opens instead of building a plan and a window."""
+        """Record re-opens instead of building a plan and a window."""
         opened = []
         import spyde.actions.vector_refine_ipf as module
 
-        def fake_open(session, signal, fitter, phases, vectors, tree):
-            opened.append(True)
+        def fake_open(session, signal, fitter, phases, vectors, tree, **kwargs):
+            opened.append(kwargs)
             return types.SimpleNamespace(_closed=False, node=object())
 
         monkeypatch.setattr(module, "open_refine_ipf", fake_open)
@@ -306,6 +306,17 @@ class TestRefineIpfTogglesWithTheAction:
         wizard = self._wizard(None)
         wizard.ensure_refine_ipf(session=None)
         assert len(opened) == 1
+
+    def test_a_reopened_heat_map_can_still_restrict_the_pattern(self, monkeypatch):
+        """A mask drawn on the triangle has to redraw the matched pattern, so
+        the re-opened heat map needs that overlay — not just the first one
+        built at Generate."""
+        opened = self._patched(monkeypatch)
+        overlay = object()
+        wizard = self._wizard(None)
+        wizard.overlay = overlay
+        wizard.ensure_refine_ipf(session=None)
+        assert opened[0].get("fit_overlay") is overlay
 
     def test_a_live_heat_map_is_left_alone(self, monkeypatch):
         """Re-selecting the action with the window already up must not stack a

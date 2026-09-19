@@ -136,7 +136,7 @@ class VomWizard(WizardController):
         from spyde.actions.vector_refine_ipf import open_refine_ipf
         self.refine_ipf = open_refine_ipf(
             session, self.tree.root, self.fitter, self.phases, vectors,
-            self.tree)
+            self.tree, fit_overlay=self.overlay)
 
     def remove(self) -> None:
         if self._closed:
@@ -265,7 +265,7 @@ def vom_generate_library(session, plot, payload) -> None:
             if fitter is not None:
                 from spyde.actions.vector_refine_ipf import open_refine_ipf
                 refine_ipf = open_refine_ipf(session, root, fitter, phases,
-                                             vecs, tree)
+                                             vecs, tree, fit_overlay=overlay)
 
             wiz = VomWizard(
                 session, tree, phases=phases, overlay=overlay,

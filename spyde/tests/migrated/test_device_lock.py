@@ -207,6 +207,38 @@ class TestOrientationMatcherTakesLock:
             pass
         assert held == [False, False], "CUDA must not be serialised"
 
+    def test_setting_a_zone_mask_takes_the_lock(self, monkeypatch):
+        """Masking builds tensors, so it is a torch call site like the rest.
+
+        It is reached from a double-click, on a different thread from the
+        navigator that may be correlating at that moment — which is the
+        submission race the lock exists for.
+        """
+        import numpy as np
+        import torch
+
+        fitter, _held = self._fitter(monkeypatch)
+        held = []
+
+        class _Frac:
+            device = torch.device("cpu")
+            dtype = torch.float64
+
+            def clone(self):
+                held.append(_lock_is_held_by_me())
+                return self
+
+            def __mul__(self, other):
+                held.append(_lock_is_held_by_me())
+                return self
+
+        fitter._maps[0].plan_frac_shift = _Frac()
+        fitter._full_frac_shift = [_Frac()]
+
+        fitter.set_zone_mask([np.array([True, False])])
+        fitter.set_zone_mask(None)
+        assert held == [True, True], "the zone mask submitted without the lock"
+        assert not _lock_is_held_by_me(), "lock leaked after masking"
 
 
 class TestNeuralPathsTakeLock:
