@@ -8,7 +8,7 @@ tensor whose activations scaled with N and ballooned per-worker memory to
 sub-batches, so peak activation memory scales with K, not N.
 
 Run in a SUBPROCESS that prints a JSON result and ``os._exit(0)`` after, matching
-``test_neural_detect.py`` / ``test_vector_orientation_gpu.py``: torch-CUDA
+``test_neural_detect.py``: torch-CUDA
 teardown can segfault at interpreter exit inside the pytest process on Windows.
 This test specifically needs a real CUDA device (the memory-scaling claim is
 about the CUDA caching allocator) — it skips cleanly when none is available.

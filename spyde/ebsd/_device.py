@@ -5,10 +5,9 @@ Its own module (rather than living in ``indexing.py``) so ``preprocess`` and
 one place to change the policy.
 
 The policy matches ``spyde.fitting.engine.default_device`` and
-``vector_orientation_gpu.select_device``: CUDA > MPS > CPU. It is duplicated
-rather than imported from those because a compute package must not depend on
-``spyde/actions/`` (actions/README.md), and fitting and EBSD are independent
-domains with their own override knobs.
+``spyde.torch_device.select_device``: CUDA > MPS > CPU. It is duplicated rather
+than imported from those because fitting and EBSD are independent domains with
+their own override knobs.
 """
 from __future__ import annotations
 

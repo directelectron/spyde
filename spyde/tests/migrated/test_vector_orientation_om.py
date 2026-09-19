@@ -224,6 +224,20 @@ class TestVectorOrientationOM:
             vom._fit_field(_Vecs(), wizard, {})
         assert calls == ["match"], "a failure must surface, not fall back"
 
+    def test_the_pose_fit_modules_are_gone(self):
+        """There is nothing left to fall back TO.
+
+        The strongest form of the rule above: the per-pattern scipy pose fit
+        and its batched GPU twin are deleted, so no future edit can quietly
+        reinstate the opposite strain sign by importing one.
+        """
+        import importlib
+
+        for name in ("spyde.actions.vector_orientation",
+                     "spyde.actions.vector_orientation_gpu"):
+            with pytest.raises(ModuleNotFoundError):
+                importlib.import_module(name)
+
     def test_refine_settings_reach_the_field_fit(self, monkeypatch):
         """Compute Maps produces the map of the fit the crosshair was showing,
         so it runs with whatever Refine was last set to rather than defaults."""

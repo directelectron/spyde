@@ -80,7 +80,7 @@ class TestProtocolAndFallback:
 
 
 # ── GPU correctness in a subprocess (torch-CUDA segfaults under pytest) ─────────
-# Mirrors test_vector_orientation_gpu.py: RESULT_JSON prefix + flush + os._exit(0)
+# Mirrors test_neural_detect.py: RESULT_JSON prefix + flush + os._exit(0)
 # so the parent reliably sees the result before the torch/CUDA teardown crash.
 _GPU_PROBE = textwrap.dedent("""
     import json, os, sys, numpy as np
