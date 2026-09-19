@@ -89,16 +89,14 @@ test('Vector Orientation Mapping: Generate → Compute opens IPF + strain window
   await expect(page.getByTestId('vector-orientation-wizard')).toBeVisible()
 
   // 1 Load → pick the real cif (mocked); wait for the async picker to resolve.
-  // The Load tab is a door onto the SAMPLE's phases now: add a phase, give it a
-  // structure through the (mocked) file picker, and the row shows what it got.
+  // The Load tab's button opens the SAMPLE's phases with Phase 1 ready to fill,
+  // and the (mocked) file picker gives it a structure.
   await page.getByTestId('vom-add-phase').click()
   await expect(page.getByTestId('periodic-table')).toBeVisible()
-  // The wizard's button already added the phase, and a lone phase is selected
-  // for you — so its row is open without a second "Add phase".
   await expect(page.getByTestId('phase-row-0')).toBeVisible()
   await page.getByTestId('phase-0-cif').click()
   await expect(page.getByTestId('phase-0-structure')).toContainText('Silver__0011135')
-  await page.getByTestId('ptable-apply').click()
+  await page.getByTestId('ptable-done').click()
   await expect(page.getByTestId('vom-cif-list')).toContainText('Silver__0011135')
 
   // 2 Library → Generate (real diffsims library).
@@ -116,18 +114,25 @@ test('Vector Orientation Mapping: Generate → Compute opens IPF + strain window
   }).toBeGreaterThan(0)
   expect(await colorPixels('red')).toBeGreaterThan(0)
 
-  // Generate also fits the WHOLE field on the GPU and opens the live IPF
-  // heatmap (the orientation map appears while you refine — the "super nice" bit).
-  await expect(
-    page.getByTestId('subwindow').filter({ hasText: 'Orientation' }).first(),
-  ).toBeVisible({ timeout: 150_000 })
+  // Generate stops at the library and the live preview. It deliberately does
+  // NOT fit the whole field: that is a scan's compute before the user has
+  // chosen anything, and it put a result window on screen that only Run is
+  // supposed to produce.
+  // Matched on the window's own breadcrumb, not on any text it contains: the
+  // open caret is titled "Vector Orientation Mapping" and lives inside a
+  // subwindow, so a plain hasText finds the wizard and reports a result window
+  // that is not there.
+  const orientationWindows = page.getByTestId('subwindow').filter({
+    has: page.getByTestId('window-breadcrumb').filter({ hasText: 'Orientation' }),
+  })
+  await expect(orientationWindows).toHaveCount(0)
 
   // 3 Refine → the live single-pattern fit streams a strain readout to the
   // Refine tab (Qt parity), and the strain-cap slider re-fits live. The live
   // IPF window opened focused on top of the caret — raise the source first.
   await raise(vsig)
   await page.getByTestId('vom-tab-Refine').click()
-  // Nudge the pair-distance slider → fires vom_refine, which FORCES a fresh
+  // Nudge the strain-cap slider → fires vom_refine, which FORCES a fresh
   // single-pattern fit at the current crosshair and streams vom_fit. Without
   // this, the readout only shows a result if an earlier crosshair event
   // happened to stream one already — flaky on a loaded CI runner (the fit
@@ -145,13 +150,15 @@ test('Vector Orientation Mapping: Generate → Compute opens IPF + strain window
       .toContainText('εxx', { timeout: 8_000 })
   }).toPass({ timeout: 60_000 })
 
-  // 4 Run → reuses the field, adds ONE unified Strain window (IPF already shown).
+  // 4 Run → fits the field and opens the results: the IPF-Z orientation map
+  // and ONE unified Strain window.
   const before = await page.getByTestId('subwindow').count()
   await page.getByTestId('vom-tab-Run').click()
   await page.getByTestId('vom-compute').click()
   await expect.poll(() => page.getByTestId('subwindow').count(), {
-    timeout: 120_000, message: 'strain window never opened',
-  }).toBeGreaterThanOrEqual(before + 1)
+    timeout: 120_000, message: 'result windows never opened',
+  }).toBeGreaterThanOrEqual(before + 2)
+  await expect(orientationWindows.first()).toBeVisible({ timeout: 30_000 })
 
   // The Strain window holds the unified chip strip: εxx / εyy / εxy as views of
   // one window. εxx is selected by default; ⌘-click εyy asks the backend to

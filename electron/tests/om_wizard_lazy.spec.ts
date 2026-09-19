@@ -48,14 +48,14 @@ test('staged wizard: Generate Library → Compute Map opens the IPF window (lazy
   await expect(page.getByTestId('orientation-wizard')).toBeVisible()
 
   // 1 Load → pick the real cif (mocked); wait for it to resolve.
-  // The Load tab is a door onto the SAMPLE's phases: the button adds a row when
-  // there is none, and the (mocked) file picker gives it a structure.
+  // The Load tab's button opens the SAMPLE's phases with Phase 1 ready to fill,
+  // and the (mocked) file picker gives it a structure.
   await page.getByTestId('om-add-phase').click()
   await expect(page.getByTestId('periodic-table')).toBeVisible()
   await expect(page.getByTestId('phase-row-0')).toBeVisible()
   await page.getByTestId('phase-0-cif').click()
   await expect(page.getByTestId('phase-0-structure')).toContainText('Silver__0011135')
-  await page.getByTestId('ptable-apply').click()
+  await page.getByTestId('ptable-done').click()
   await expect(page.getByTestId('om-cif-list')).toContainText('Silver__0011135')
 
   // 2 Library → Generate (real diffsims library on the lazy dataset).

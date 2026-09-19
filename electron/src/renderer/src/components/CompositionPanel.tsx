@@ -1,26 +1,16 @@
 /**
- * CompositionPanel.tsx — the right-dock "Composition" section: what the sample
- * is made of, PHASE by phase.
+ * CompositionPanel.tsx — the right-dock "Composition" section: the sample's
+ * phases, with `&` between them and each phase's structure beside its
+ * elements.
  *
- * A sample is not one element list. A Zr-Nb alloy with Nb platelets in it is
- * α-Zr AND β-Nb, and writing that flat ("Zr, Nb") says something different — it
- * says one compound of both, which is how the COD search came to ask for a
- * Cu-Nb structure and get nothing back. So the chips are clustered into phases
- * with `&` between them, and each phase shows the structure that indexes it
- * once one is chosen.
- *
- * Editing happens in ONE popout (PeriodicTable): clicking elements builds the
- * sample, and selecting a phase first makes those clicks build that phase, so a
- * phase is a SUBSET of the composition rather than a second thing to type in.
- *
- * The flat `Sample.elements` / `Sample.composition` metadata is unchanged
- * underneath — it is the union across phases, plus any element that belongs to
- * the sample without belonging to one, and it is what EELS edge suggestion and
- * EDS quantification read.
+ * A Zr-Nb alloy with Nb platelets in it is α-Zr AND β-Nb. Written flat
+ * ("Zr, Nb") it would say one compound of both — which is why a sample is a
+ * list of phases and not an element list. EELS and EDS fit every element of
+ * every phase; the indexing wizards use each phase's structure.
  */
 import React from 'react'
-import type { Composition, SamplePhase } from '../kernel/SpyDEContext'
-import { PeriodicTable } from './PeriodicTable'
+import type { Composition } from '../kernel/SpyDEContext'
+import { PeriodicTable, structureName, structureTone } from './PeriodicTable'
 
 interface Props {
   activeId: number | null
@@ -28,21 +18,9 @@ interface Props {
   sendAction: (action: string, payload?: Record<string, unknown>, windowId?: number) => void
 }
 
-const base = (p: string) => p.split(/[/\\]/).pop() || p
-
 export function CompositionPanel({ activeId, composition, sendAction }: Props) {
   const [editing, setEditing] = React.useState(false)
-  const elements = composition?.elements ?? []
-  const phases: SamplePhase[] = composition?.phases?.length
-    ? composition.phases
-    // A signal whose composition predates phases still has one: itself.
-    : (elements.length
-      ? [{ elements, percentages: composition?.percentages ?? {},
-           cifPath: null, label: null, codId: null }]
-      : [])
-  const pct = composition?.percentages ?? {}
-  const claimed = new Set(phases.flatMap(p => p.elements))
-  const unassigned = elements.filter(el => !claimed.has(el))
+  const phases = composition?.phases ?? []
 
   return (
     <div style={S.section} data-testid="composition-section">
@@ -54,10 +32,6 @@ export function CompositionPanel({ activeId, composition, sendAction }: Props) {
           <span style={{ ...S.empty, flex: 1, marginLeft: 6 }}
             data-testid="composition-empty">No elements set</span>
         )}
-        {/* One door. Elements and phases are edited in the same popout, because
-            a phase is a SUBSET of the composition — telling them to two
-            different modals is what made a two-phase sample impossible to
-            describe in the first place. */}
         <button data-testid="composition-edit" style={S.editBtn}
           onClick={() => setEditing(true)}>
           {phases.length ? 'Edit' : '＋ Elements and Phase'}
@@ -65,63 +39,37 @@ export function CompositionPanel({ activeId, composition, sendAction }: Props) {
       </div>
 
       {phases.map((phase, index) => (
-        <div key={index} style={S.phaseRow} data-testid={`composition-phase-${index}`}>
-          {index > 0 && <span style={S.amp}>&amp;</span>}
-          <div style={S.chips} data-testid={index === 0 ? 'composition-chips' : undefined}>
+        <div key={phase.id} style={S.phaseRow} data-testid={`composition-phase-${index}`}>
+          {index > 0 && <span style={S.ampersand}>&amp;</span>}
+          <div style={S.chips}>
             {phase.elements.length === 0
               ? <span style={S.empty}>no elements</span>
-              : phase.elements.map(el => (
-                <span key={el} style={S.chip} data-testid={`composition-chip-${el}`}>
-                  <span style={S.sym}>{el}</span>
-                  {phase.percentages[el] != null && <span style={S.pct}>{phase.percentages[el]}%</span>}
-                </span>
-              ))}
+              : phase.elements.map(symbol => {
+                const trace = phase.trace.includes(symbol)
+                return (
+                  <span key={symbol} style={trace ? S.traceChip : S.chip}
+                    title={trace ? `${symbol} (trace)` : undefined}
+                    data-trace={trace ? 'true' : undefined}
+                    data-testid={`composition-chip-${index}-${symbol}`}>
+                    <span style={S.symbol}>{symbol}</span>
+                    {phase.percentages[symbol] != null
+                      && <span style={S.percent}>{phase.percentages[symbol]}%</span>}
+                  </span>
+                )
+              })}
           </div>
-          {/* The structure, once it is known — the other half of what a phase
-              IS, and previously visible nowhere outside the wizard. */}
-          {(phase.label || phase.cifPath) && (
-            <span style={S.structure} title={phase.cifPath ?? undefined}
+          {phase.cifPath && (
+            <span style={{ ...S.structure, ...structureTone(phase) }} title={phase.cifPath}
               data-testid={`composition-structure-${index}`}>
-              {phase.label ?? base(phase.cifPath as string)}
+              {structureName(phase)}
             </span>
           )}
         </div>
       ))}
 
-      {/* Elements the sample has that no phase claims — the extra oxygen. They
-          are real composition and would otherwise be recorded but invisible. */}
-      {unassigned.length > 0 && (
-        <div style={S.phaseRow} data-testid="composition-unassigned">
-          <span style={S.amp} title="in the sample, in no phase">+</span>
-          <div style={S.chips}>
-            {unassigned.map(el => (
-              <span key={el} style={S.chip} data-testid={`composition-extra-${el}`}>
-                <span style={S.sym}>{el}</span>
-                {pct[el] != null && <span style={S.pct}>{pct[el]}%</span>}
-              </span>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {editing && (
-        <PeriodicTable
-          // The SAMPLE's elements — the union across phases plus anything that
-          // belongs to the sample without belonging to a phase (the extra
-          // oxygen that is in neither structure you are indexing against).
-          initial={elements}
-          initialPct={composition?.percentages ?? {}}
-          phases={phases}
-          windowId={activeId}
-          sendAction={sendAction}
-          onApply={(els, percentages) => {
-            if (activeId != null) {
-              sendAction('set_composition', { elements: els, percentages }, activeId)
-            }
-            setEditing(false)
-          }}
-          onClose={() => setEditing(false)}
-        />
+      {editing && activeId != null && (
+        <PeriodicTable windowId={activeId} phases={phases} sendAction={sendAction}
+          onClose={() => setEditing(false)} />
       )}
     </div>
   )
@@ -141,16 +89,17 @@ const S: Record<string, React.CSSProperties> = {
   },
   empty: { fontSize: 10, color: '#6c7086' },
   phaseRow: { display: 'flex', alignItems: 'center', gap: 4, marginTop: 2 },
-  amp: { fontSize: 11, fontWeight: 700, color: '#cba6f7' },
+  ampersand: { fontSize: 11, fontWeight: 700, color: '#cba6f7' },
   chips: { display: 'flex', flexWrap: 'wrap', gap: 4 },
   chip: {
     display: 'flex', alignItems: 'center', gap: 3, background: '#1e1e2e',
     border: '1px solid #313244', borderRadius: 12, padding: '2px 8px',
   },
-  sym: { fontSize: 11, fontWeight: 700, color: '#cdd6f4' },
-  pct: { fontSize: 9, color: '#a6adc8' },
-  structure: {
-    flex: 1, textAlign: 'right', fontSize: 9, fontWeight: 600, color: '#a6e3a1',
-    overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+  traceChip: {
+    display: 'flex', alignItems: 'center', gap: 3, background: 'none', opacity: 0.6,
+    border: '1px dashed #585b70', borderRadius: 12, padding: '2px 8px',
   },
+  symbol: { fontSize: 11, fontWeight: 700, color: '#cdd6f4' },
+  percent: { fontSize: 9, color: '#a6adc8' },
+  structure: { flex: 1, textAlign: 'right', fontSize: 9 },
 }

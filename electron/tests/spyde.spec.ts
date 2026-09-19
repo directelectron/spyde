@@ -42,16 +42,19 @@ async function inject(msg: Record<string, unknown>) {
 // Capture outgoing actions in the MAIN process. The renderer's
 // window.electron is a contextBridge object (immutable — can't be wrapped),
 // so we observe the ipcMain 'spyde:action' channel instead.
-// The backend is mocked here, so `add_phase` / `set_phase_structure` reach a
+// The backend is mocked here, so `set_phase_structure` / `remove_phase` reach a
 // stub and nothing comes back. These echo what the real handler emits, which is
 // what the wizards and the dock actually render from.
-const phaseEcho = (phases: Array<{ elements?: string[]; cif_path?: string | null; label?: string | null }>) =>
+const phaseEcho = (phases: Array<{
+  id: string; elements?: string[]; cif_path?: string | null; label?: string | null
+}>) =>
   inject({
     type: 'composition', window_ids: [1],
-    elements: phases.flatMap(p => p.elements ?? []), percentages: {},
-    phases: phases.map(p => ({
-      elements: p.elements ?? [], percentages: {},
-      cif_path: p.cif_path ?? null, label: p.label ?? null, cod_id: null,
+    elements: phases.flatMap(phase => phase.elements ?? []),
+    phases: phases.map(phase => ({
+      id: phase.id, elements: phase.elements ?? [], percentages: {}, trace: [],
+      cif_path: phase.cif_path ?? null, label: phase.label ?? null, cod_id: null,
+      structure_elements: null,
     })),
   })
 
@@ -68,6 +71,12 @@ async function trackActions() {
   })
 }
 const sentActions = () => app.evaluate(() => (globalThis as any).__sent)
+/** The phase id sent with the last *action*, once one has been sent. */
+async function phaseIdOf(action: string): Promise<string> {
+  const ofAction = async () => (await sentActions()).filter((s: any) => s.action === action)
+  await expect.poll(async () => (await ofAction()).length).toBeGreaterThan(0)
+  return (await ofAction()).pop().payload.phase
+}
 
 // The per-window floating toolbar lives BELOW the window and reveals on hover.
 // Hover the owning window so its toolbar becomes visible + interactive before
@@ -498,16 +507,16 @@ test('Vector Orientation Mapping opens the staged wizard and drives Generate→C
   await expect(page.getByTestId('vector-orientation-wizard')).toBeVisible()
   await expect(page.getByTestId('vom-tab-Run')).toBeDisabled()
 
-  // The Load tab is a door onto the SAMPLE's phases: the button adds a row when
-  // there is none, and the (mocked) file picker gives it a structure.
+  // The Load tab's button opens the SAMPLE's phases with Phase 1 ready to fill,
+  // and the (mocked) file picker gives it a structure.
   await page.getByTestId('vom-add-phase').click()
   await expect(page.getByTestId('periodic-table')).toBeVisible()
-  await phaseEcho([{}])                                   // add_phase landed
   await expect(page.getByTestId('phase-row-0')).toBeVisible()
   await page.getByTestId('phase-0-cif').click()
-  await phaseEcho([{ cif_path: '/tmp/Ag.cif', label: 'Ag' }])   // …and the pick
+  // The pick landed, on the phase the popout named.
+  await phaseEcho([{ id: await phaseIdOf('set_phase_structure'), cif_path: '/tmp/Ag.cif', label: 'Ag' }])
   await expect(page.getByTestId('phase-0-structure')).toContainText('Ag')
-  await page.getByTestId('ptable-apply').click()
+  await page.getByTestId('ptable-done').click()
   await expect(page.getByTestId('vom-cif-list')).toContainText('Ag')
   await page.getByTestId('vom-tab-Library').click()
   await page.getByTestId('vom-generate').click()
@@ -621,18 +630,16 @@ test('Orientation Mapping opens the staged wizard and drives the staged actions'
   await expect(page.getByTestId('om-tab-Load')).toBeVisible()
   await expect(page.getByTestId('om-tab-Refine')).toBeDisabled()
 
-  // 1 Load → pick a .cif (mocked). Wait for the async picker to resolve (the
-  // button label becomes the filename) before generating.
-  // The Load tab is a door onto the SAMPLE's phases: the button adds a row when
-  // there is none, and the (mocked) file picker gives it a structure.
+  // 1 Load. The Load tab's button opens the SAMPLE's phases with Phase 1 ready to fill,
+  // and the (mocked) file picker gives it a structure.
   await page.getByTestId('om-add-phase').click()
   await expect(page.getByTestId('periodic-table')).toBeVisible()
-  await phaseEcho([{}])                                   // add_phase landed
   await expect(page.getByTestId('phase-row-0')).toBeVisible()
   await page.getByTestId('phase-0-cif').click()
-  await phaseEcho([{ cif_path: '/tmp/Ag.cif', label: 'Ag' }])   // …and the pick
+  // The pick landed, on the phase the popout named.
+  await phaseEcho([{ id: await phaseIdOf('set_phase_structure'), cif_path: '/tmp/Ag.cif', label: 'Ag' }])
   await expect(page.getByTestId('phase-0-structure')).toContainText('Ag')
-  await page.getByTestId('ptable-apply').click()
+  await page.getByTestId('ptable-done').click()
   await expect(page.getByTestId('om-cif-list')).toContainText('Ag')
   // 2 Library → Generate Library → dispatches om_generate_library + unlocks Refine.
   await page.getByTestId('om-tab-Library').click()
@@ -658,6 +665,7 @@ test('Orientation Mapping opens the staged wizard and drives the staged actions'
 })
 
 test('a phase belongs to the sample, so it survives closing the wizard', async () => {
+  await trackActions()
   await app.evaluate(({ ipcMain }) => {
     ipcMain.removeHandler('spyde:pick-file')
     ipcMain.handle('spyde:pick-file', async () => '/tmp/Quartz.cif')
@@ -676,16 +684,16 @@ test('a phase belongs to the sample, so it survives closing the wizard', async (
   await reveal()
   await page.getByTestId('action-btn-Orientation Mapping').click()
   await expect(page.getByTestId('orientation-wizard')).toBeVisible()
-  // The Load tab is a door onto the SAMPLE's phases: the button adds a row when
-  // there is none, and the (mocked) file picker gives it a structure.
+  // The Load tab's button opens the SAMPLE's phases with Phase 1 ready to fill,
+  // and the (mocked) file picker gives it a structure.
   await page.getByTestId('om-add-phase').click()
   await expect(page.getByTestId('periodic-table')).toBeVisible()
-  await phaseEcho([{}])                                   // add_phase landed
   await expect(page.getByTestId('phase-row-0')).toBeVisible()
   await page.getByTestId('phase-0-cif').click()
-  await phaseEcho([{ cif_path: '/tmp/Quartz.cif', label: 'Quartz' }])   // …and the pick
+  // The pick landed, on the phase the popout named.
+  await phaseEcho([{ id: await phaseIdOf('set_phase_structure'), cif_path: '/tmp/Quartz.cif', label: 'Quartz' }])
   await expect(page.getByTestId('phase-0-structure')).toContainText('Quartz')
-  await page.getByTestId('ptable-apply').click()
+  await page.getByTestId('ptable-done').click()
   await expect(page.getByTestId('om-cif-list')).toContainText('Quartz')
 
   // Close + reopen → the phase is still there. Nothing is "remembered" for
@@ -700,7 +708,7 @@ test('a phase belongs to the sample, so it survives closing the wizard', async (
   await page.getByTestId('om-add-phase').click()
   await page.getByTestId('phase-0-remove').click()
   await phaseEcho([])
-  await page.getByTestId('ptable-apply').click()
+  await page.getByTestId('ptable-done').click()
   await expect(page.getByTestId('om-cif-list')).toContainText('No phases yet')
   await expect(page.getByTestId('composition-empty')).toBeVisible()
 })

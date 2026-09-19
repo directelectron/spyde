@@ -98,7 +98,28 @@ class TestMultiPhaseOrientation:
                          and tree._om_wizard.sim is not None)
             wiz = tree._om_wizard
             assert len(wiz.phases) == 2
-            # Live refine overlay is single-phase only → skipped for multi-phase.
-            assert wiz.overlay is None
+            # The matched template is drawn whichever phase it belongs to.
+            assert wiz.overlay is not None
         finally:
             close_session(session)
+
+
+class TestTwoPhaseTemplateSpots:
+    """The spots drawn for a matched template come from that template's own
+    phase. A two-phase library holds one rotation set PER PHASE, so counting
+    its `rotations` counts phases, not templates."""
+
+    def test_a_second_phase_template_draws_that_phases_spots(self):
+        from spyde.actions.orientation_compute import (
+            _template_spots_pyxem, generate_library_from_phases, template_tables,
+        )
+        aluminium, iron = _two_phases()
+        both = generate_library_from_phases([aluminium, iron], 200.0, 10.0, 1e-4, 1.0)
+        iron_only = generate_library_from_phases([iron], 200.0, 10.0, 1e-4, 1.0)
+        _quaternions, phase_of = template_tables(both)
+        iron_templates = np.flatnonzero(phase_of == 1)
+        assert iron_templates.size == template_tables(iron_only)[0].shape[0]
+        for index in (iron_templates[0], iron_templates[-1]):
+            np.testing.assert_allclose(
+                _template_spots_pyxem(both, int(index), 30.0, 1.0),
+                _template_spots_pyxem(iron_only, int(index - iron_templates[0]), 30.0, 1.0))

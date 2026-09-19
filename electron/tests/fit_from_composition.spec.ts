@@ -55,8 +55,8 @@ test('the Fit caret builds an EELS model from the composition', async () => {
     await expect(page.locator('[data-testid="fit-from-composition"]')).toHaveCount(0)
     await page.screenshot({ path: `${SHOTS}/01-no-elements.png`, fullPage: true })
 
-    // Set the composition the way Plot Control's panel does.
-    await backendAction(page, 'set_composition', { elements: ['C', 'N', 'O'] })
+    // Give the sample a phase, as Plot Control's panel does.
+    await backendAction(page, 'add_phase', { elements: ['C', 'N', 'O'] })
     const fromComp = page.locator('[data-testid="fit-from-composition"]')
     await expect(fromComp).toBeVisible({ timeout: 20_000 })
     await expect(fromComp).toHaveText(/C, N, O/)

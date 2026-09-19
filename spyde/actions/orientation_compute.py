@@ -183,7 +183,10 @@ def _pyxem_template_arrays(sim):
     if cached is not None:
         return cached
     from pyxem.utils.indexation_utils import phase2dict
-    n = sim.rotations.size if hasattr(sim.rotations, "size") else len(sim.rotations)
+    # One row per TEMPLATE, across every phase: a multi-phase library's
+    # `rotations` holds one entry per phase, so its size counts phases.
+    _quaternions, phase_of = template_tables(sim)
+    n = int(phase_of.shape[0])
     phases = list(sim_phases_list(sim))
     try:
         phases_dicts = [phase2dict(p) for p in phases]
@@ -199,8 +202,7 @@ def _pyxem_template_arrays(sim):
         h = getattr(dv, "hkl", None)
         hkl[k] = np.asarray(h) if h is not None else np.zeros((len(dv.data), 3))
         inten[k] = np.asarray(dv.intensity, float)
-    # Single-phase libraries (the only OM path here) → all templates phase 0.
-    phase_index = np.zeros(n, dtype=int)
+    phase_index = phase_of.astype(int)
     out = (data, hkl, inten, phases_dicts, phase_index)
     sim._spyde_pyxem_arrays = out
     return out

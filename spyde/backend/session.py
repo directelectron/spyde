@@ -320,7 +320,7 @@ class Session(
             log.debug("navigator options emit failed: %s", e)
         try:
             from spyde.actions.composition import emit_composition
-            emit_composition(tree, self._tree_window_ids(tree))
+            emit_composition(self, tree)
         except Exception as e:
             log.warning("composition emit failed: %s", e)
 

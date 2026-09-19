@@ -235,7 +235,7 @@ test('two-phase vector orientation reaches phase + strain windows', async () => 
   await page.getByTestId('ptable-add-phase').click()
   await page.getByTestId('phase-1-cif').click()
   await expect(page.getByTestId('phase-1-structure')).toContainText('beta_Nb')
-  await page.getByTestId('ptable-apply').click()
+  await page.getByTestId('ptable-done').click()
   const list = await page.getByTestId('vom-cif-list').innerText()
   console.log('[phase list]\n' + list)
   expect(list).toContain('Zr')

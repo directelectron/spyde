@@ -11,9 +11,8 @@
  */
 import React from 'react'
 import { WizardShell, TabRow, Field, NumInput, Slider, Check, S } from './WizardShell'
-import { useDebouncedAction } from './wizardHooks'
-import { PeriodicTable, PHASE_STYLE } from './PeriodicTable'
-import { useSpyDE } from '../kernel/SpyDEContext'
+import { useDebouncedAction, useWizardEvent } from './wizardHooks'
+import { SamplePhasesField, useSamplePhases, structuresOf, missingStructures } from './SamplePhases'
 
 const TABS = ['Load', 'Library', 'Refine', 'Run'] as const
 type Tab = typeof TABS[number]
@@ -36,12 +35,7 @@ const _omStore = new Map<number, OmSaved>()
 export function OrientationWizard({ caretPos, windowId, sendAction, onClose }: Props) {
   const saved = _omStore.get(windowId)
   const [tab, setTab] = React.useState<Tab>(saved?.tab ?? 'Load')
-  // The phases come from the SAMPLE, not this caret: composition and structure
-  // are one thing, so the dock and both orientation wizards read one list.
-  const { state } = useSpyDE()
-  const composition = state.composition.get(windowId)
-  const phases = composition?.phases ?? []
-  const [phasesOpen, setPhasesOpen] = React.useState(false)
+  const phases = useSamplePhases(windowId)
   const [voltage, setVoltage] = React.useState(saved?.voltage ?? 200)
   const [resolution, setResolution] = React.useState(saved?.resolution ?? 1.0)
   const [minInt, setMinInt] = React.useState(saved?.minInt ?? 0.0001)
@@ -61,17 +55,24 @@ export function OrientationWizard({ caretPos, windowId, sendAction, onClose }: P
   // Debounced live refine — a pending refine is cancelled on unmount so
   // om_refine can't fire at a torn-down preview mid-debounce.
   const sendRefine = useDebouncedAction(sendAction, 'om_refine', windowId)
-  const base = (p: string) => p.split(/[/\\]/).pop() || p
+
+  // The library builds off-thread; its reply is what ends "Generating library…".
+  useWizardEvent('spyde:om_library_ready', windowId, (detail) => {
+    if (detail.ok) {
+      setStatus(`Library ready (${Number(detail.n_templates ?? 0).toLocaleString()} templates) — `
+        + 'move the crosshair to refine, or Compute Map.')
+    } else {
+      setLibReady(false)
+      setTab('Library')
+      setStatus(`Library failed: ${String(detail.error ?? 'unknown error')}`)
+    }
+  })
 
   const generate = () => {
-    // A phase with no structure yet contributes no templates; name it rather
-    // than silently building a library that is missing it.
-    const missing = phases.filter(p => !p.cifPath)
-    const paths = phases.map(p => p.cifPath).filter(Boolean) as string[]
+    const paths = structuresOf(phases)
     if (!paths.length) { setStatus('Give at least one phase a structure first.'); return }
-    setStatus(missing.length
-      ? `Generating without ${missing.map(p => p.elements.join('-') || 'a phase').join(', ')} — no structure set.`
-      : 'Generating library…')
+    // A phase with no structure contributes no templates; say which.
+    setStatus(missingStructures(phases) ?? 'Generating library…')
     sendAction('om_generate_library', {
       cif_paths: paths, accelerating_voltage: voltage, resolution, minimum_intensity: minInt,
     }, windowId)
@@ -97,48 +98,8 @@ export function OrientationWizard({ caretPos, windowId, sendAction, onClose }: P
 
       {tab === 'Load' && (
         <div style={S.page}>
-          <label style={S.lbl}>Sample phases</label>
-          {/* A door onto the sample's phases, shared with the dock and the
-              vector wizard — not a private .cif list nothing else can see. */}
-          <button data-testid="om-add-phase" style={S.primary}
-            onClick={() => {
-              // Clicking "Add phase" with none yet should land on a usable
-              // row, not on an empty editor with a second Add phase in it.
-              if (!phases.length) sendAction('add_phase', {}, windowId)
-              setPhasesOpen(true)
-            }}>{phases.length ? 'Phases' : '＋ Add phase'}</button>
-          <div data-testid="om-cif-list" style={S.cifList}>
-            {phases.length === 0
-              ? <span style={S.hint}>No phases yet — add at least one.</span>
-              : phases.map((phase, index) => (
-                <div key={index} style={S.cifRow}
-                  title={phase.cifPath ?? phase.elements.join('-')}>
-                  <span style={S.cifName}>
-                    {phase.elements.join('-') || `phase ${index + 1}`}
-                  </span>
-                  <span style={phase.cifPath ? PHASE_STYLE.set : PHASE_STYLE.unset}>
-                    {phase.label ?? (phase.cifPath ? base(phase.cifPath) : 'no structure')}
-                  </span>
-                </div>
-              ))}
-          </div>
+          <SamplePhasesField windowId={windowId} sendAction={sendAction} testidPrefix="om" />
           <Field label="Voltage (kV)"><NumInput value={voltage} onChange={setVoltage} step="1" width={60} /></Field>
-          {phasesOpen && (
-            // The SAME popout the dock opens: a phase's elements and its
-            // structure belong together, and the sample owns both.
-            <PeriodicTable
-              initial={composition?.elements ?? []}
-              initialPct={composition?.percentages ?? {}}
-              phases={phases}
-              windowId={windowId}
-              sendAction={sendAction}
-              onApply={(els, percentages) => {
-                sendAction('set_composition', { elements: els, percentages }, windowId)
-                setPhasesOpen(false)
-              }}
-              onClose={() => setPhasesOpen(false)}
-            />
-          )}
         </div>
       )}
 

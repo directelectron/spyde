@@ -56,6 +56,30 @@ class MissingExtra(RuntimeError):
     """Raised when the ``eels`` extra is needed but not installed."""
 
 
+def keep_only_elements(signal, elements) -> None:
+    """Make *signal* name exactly *elements*, in its metadata and wherever
+    exspy keeps a copy.
+
+    Replacing ``Sample.elements`` alone is not enough. exspy's ``add_lines``
+    adds back the element of every entry in ``Sample.xray_lines``, so a removed
+    element whose line stayed would still be fitted; and an EELS signal keeps
+    its elements and edges on the signal as well as in the metadata.
+    """
+    elements = [str(symbol) for symbol in elements]
+    metadata = signal.metadata
+    lines = metadata.get_item("Sample.xray_lines", None)
+    if lines is not None:
+        metadata.set_item("Sample.xray_lines", [
+            str(line) for line in lines if str(line).split("_")[0] in elements])
+    if hasattr(signal, "subshells"):
+        signal.elements, signal.subshells = set(), set()
+    metadata.set_item("Sample.elements", [])
+    if elements and hasattr(signal, "add_elements"):
+        signal.add_elements(elements)
+    else:
+        metadata.set_item("Sample.elements", elements)
+
+
 def _require_exspy():
     try:
         import exspy  # noqa: F401
@@ -123,8 +147,8 @@ def model_for_composition(signal, elements=None, *, prune: bool = True,
         An EELS or EDS signal (needs the ``eels`` extra for the signal type to
         resolve at all).
     elements : sequence of str, optional
-        e.g. ``["Fe", "Ni", "Cu"]``. Defaults to whatever is already on
-        ``metadata.Sample.elements``.
+        e.g. ``["Fe", "Ni", "Cu"]``: the model has exactly these, whatever the
+        signal's metadata says. Defaults to ``metadata.Sample.elements``.
     prune : bool
         Drop components positioned outside the measured range (see
         :func:`prune_to_range`).
@@ -150,8 +174,10 @@ def model_for_composition(signal, elements=None, *, prune: bool = True,
     s = signal.deepcopy()
 
     if elements:
-        s.add_elements(list(elements))
-    have = list(getattr(s.metadata, "Sample", {}).get_item("elements", [])
+        # Replace, not add: the signal may be a node made before an element was
+        # removed from the sample, and adding to its list would fit that too.
+        keep_only_elements(s, elements)
+    have =list(getattr(s.metadata, "Sample", {}).get_item("elements", [])
                 if hasattr(getattr(s.metadata, "Sample", None), "get_item")
                 else [])
     if not have:

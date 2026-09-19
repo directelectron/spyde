@@ -105,23 +105,23 @@ export interface ChunkInfo {
   signal_split: boolean
 }
 /** One phase of the sample: what it is made of, and the structure that indexes
- *  it. `cifPath` is null until one is chosen — a phase whose composition is
- *  known but whose structure is not is a normal state, and it is the state you
- *  search COD from. */
+ *  it. `cifPath` is null until one is chosen — a phase whose elements are
+ *  known but whose structure is not is what COD is searched from. `trace`
+ *  names the elements that count for EELS/EDS but are not the structure's. */
 export interface SamplePhase {
+  id: string
   elements: string[]
   percentages: Record<string, number>
+  trace: string[]
   cifPath: string | null
   label: string | null
   codId: string | null
 }
 
-/** `elements`/`percentages` are the flat union across phases — the
- *  HyperSpy-canonical fields that EELS edge suggestion and EDS quantification
- *  read. `phases` is how the sample is actually divided up. */
+/** The sample is its `phases`. `elements` is their union, computed by the
+ *  backend, for whatever only asks what the sample contains (the fit wizards). */
 export interface Composition {
   elements: string[]
-  percentages: Record<string, number>
   phases: SamplePhase[]
 }
 export interface Histogram {
@@ -1040,13 +1040,14 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
             windowIds: msg.window_ids ?? [],
             composition: {
               elements: msg.elements ?? [],
-              percentages: msg.percentages ?? {},
-              phases: ((msg.phases ?? []) as Record<string, unknown>[]).map((p) => ({
-                elements: (p.elements ?? []) as string[],
-                percentages: (p.percentages ?? {}) as Record<string, number>,
-                cifPath: (p.cif_path ?? null) as string | null,
-                label: (p.label ?? null) as string | null,
-                codId: (p.cod_id ?? null) as string | null,
+              phases: (msg.phases ?? []).map((phase) => ({
+                id: phase.id,
+                elements: phase.elements,
+                percentages: phase.percentages,
+                trace: phase.trace,
+                cifPath: phase.cif_path,
+                label: phase.label,
+                codId: phase.cod_id,
               })),
             },
           })
@@ -1349,7 +1350,6 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
         case 'fv_models':
         case 'fv_calibration':
         case 'cod_results':
-        case 'cod_cif_ready':
         case 'gpu_status_result':
         case 'first_run_result':
         case 'console_node_bound':
