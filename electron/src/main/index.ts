@@ -5,10 +5,11 @@ import {
   app, BrowserWindow, dialog, ipcMain, Menu, shell, nativeTheme, net, protocol,
   clipboard, ClipboardItem, nativeImage, powerMonitor,
 } from 'electron'
-import { join, basename, resolve } from 'path'
+import { join, basename, dirname, resolve } from 'path'
 import { pathToFileURL } from 'url'
 import { tmpdir } from 'os'
 import { existsSync, realpathSync, statSync, writeFileSync, rmSync, appendFileSync } from 'fs'
+import { writeFile } from 'fs/promises'
 import { execFile } from 'child_process'
 import {
   configureShell,
@@ -996,9 +997,43 @@ ipcMain.handle('report:export-pdf', async (_e, htmlPath: string, pdfPath: string
 })
 
 // A data URL is ~4/3 the size of the decoded bytes (base64) — cap the STRING
-// itself so we reject before nativeImage does any decode work at all.
-const CLIPBOARD_PNG_MAX_BYTES = 32 * 1024 * 1024
-const CLIPBOARD_PNG_MAX_DATA_URL_LEN = Math.ceil((CLIPBOARD_PNG_MAX_BYTES * 4) / 3) + 64
+// itself so we reject before any decode work at all.
+const PNG_MAX_BYTES = 32 * 1024 * 1024
+const PNG_MAX_DATA_URL_LEN = Math.ceil((PNG_MAX_BYTES * 4) / 3) + 64
+const PNG_DATA_URL_PREFIX = 'data:image/png;base64,'
+const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
+let lastPngFolder: string | null = null
+
+/** Save a figure's PNG through a native Save dialog. A figure's own "Save PNG…"
+ *  hands its image to the host (anyplotlib's framed save), and the host asks
+ *  where to put it. The name comes from the figure, so only its last path part
+ *  is kept, and the bytes must really be a PNG. */
+ipcMain.handle('spyde:save-png', async (event, dataUrl: string, suggestedName: string) => {
+  if (typeof dataUrl !== 'string' || !dataUrl.startsWith(PNG_DATA_URL_PREFIX)) {
+    return { ok: false, error: 'expected a base64 data:image/png URL' }
+  }
+  if (dataUrl.length > PNG_MAX_DATA_URL_LEN) return { ok: false, error: 'image too large' }
+  const bytes = Buffer.from(dataUrl.slice(PNG_DATA_URL_PREFIX.length), 'base64')
+  if (!bytes.subarray(0, PNG_SIGNATURE.length).equals(PNG_SIGNATURE)) {
+    return { ok: false, error: 'not a PNG image' }
+  }
+  const name = basename(String(suggestedName || 'figure.png'))
+    .replace(/[<>:"/\\|?*\x00-\x1f]/g, '_')
+  const fileName = name.toLowerCase().endsWith('.png') ? name : `${name}.png`
+  const result = await dialog.showSaveDialog(BrowserWindow.fromWebContents(event.sender) ?? win!, {
+    title: 'Save figure as PNG',
+    defaultPath: join(lastPngFolder ?? app.getPath('downloads'), fileName),
+    filters: [{ name: 'PNG image', extensions: ['png'] }],
+  })
+  if (result.canceled || !result.filePath) return { ok: false, canceled: true }
+  try {
+    await writeFile(result.filePath, bytes)
+  } catch (err) {
+    return { ok: false, error: (err as Error)?.message ?? String(err) }
+  }
+  lastPngFolder = dirname(result.filePath)
+  return { ok: true, path: result.filePath }
+})
 
 /** Write a PNG data URL (e.g. a figure snapshot) to the OS clipboard as an
  *  image, for the Report sidebar's "Copy image" action. Rejects oversized
@@ -1009,7 +1044,7 @@ ipcMain.handle('clipboard:write-png', async (_e, dataUrl: string) => {
   if (typeof dataUrl !== 'string' || !dataUrl.startsWith('data:image/png')) {
     return { ok: false, error: 'expected a data:image/png URL' }
   }
-  if (dataUrl.length > CLIPBOARD_PNG_MAX_DATA_URL_LEN) {
+  if (dataUrl.length > PNG_MAX_DATA_URL_LEN) {
     return { ok: false, error: 'image too large for clipboard' }
   }
   try {

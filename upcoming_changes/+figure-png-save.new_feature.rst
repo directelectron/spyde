@@ -1,0 +1,1 @@
+A figure's own "Save PNG…" (the ⤓ badge, or right-click, on any figure) now writes a file: the figure hands SpyDE its image and SpyDE asks where to save it. Before, the figure fell back to a preview captioned "Right-click the image → Save image as…", a menu the app does not have, so there was no way to save at all.
