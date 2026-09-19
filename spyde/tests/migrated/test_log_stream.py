@@ -138,3 +138,42 @@ class TestInstall:
             log_stream._handler = None
             root.setLevel(root_level_before)
             assert len(root.handlers) == n_before
+
+
+class TestOrientationArea:
+    """The log panel's "orientation" filter must actually catch the
+    orientation modules.
+
+    A rule matches a logger name exactly or as a dotted prefix, so
+    ``spyde.actions.orientation`` matched a submodule of a package that does not
+    exist — never ``orientation_action``. The whole area was empty and every
+    record showed up under "actions" instead, which no test noticed because a
+    misfiled log still gets a tag.
+    """
+
+    def _areas(self):
+        import spyde
+        from de_shell.log_stream import _area_for, register_area_rules
+        register_area_rules(spyde._LOG_AREA_RULES, verbose_packages=("spyde",))
+        return _area_for
+
+    def test_every_orientation_module_is_tagged_orientation(self):
+        import pathlib
+
+        import spyde.actions
+        area_for = self._areas()
+        directory = pathlib.Path(spyde.actions.__file__).parent
+        found = sorted(
+            path.stem for path in directory.glob("*.py")
+            if "orientation" in path.stem or path.stem.startswith("ipf_"))
+        assert found, "no orientation modules found — did the package move?"
+        wrong = [name for name in found
+                 if area_for(f"spyde.actions.{name}") != "orientation"]
+        assert not wrong, (
+            f"these log to the wrong area filter: {wrong}. Add them to "
+            f"spyde._ORIENTATION_MODULES.")
+
+    def test_other_actions_still_fall_through_to_actions(self):
+        area_for = self._areas()
+        assert area_for("spyde.actions.find_vectors") == "vectors"
+        assert area_for("spyde.actions.commit") == "actions"

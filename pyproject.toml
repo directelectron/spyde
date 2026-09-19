@@ -57,7 +57,9 @@ dependencies = [
     "imageio-ffmpeg",
     "imagecodecs",
     "psygnal>=0.10.0",
-    "anyplotlib>=0.10.0",
+    # 0.10.1: a figure keeps its raster through a zoom (the IPF refine heatmap),
+    # and a host that saves exported PNGs itself can say so — SpyDE does both.
+    "anyplotlib>=0.10.1",
     "pyyaml",
     # NOT numexpr. HyperSpy warns "Numexpr is not installed ... which is slower
     # to calculate model" on every model build, but that advice is wrong at
@@ -208,6 +210,12 @@ tests = [
     "playwright>=1.40.0",
     "sphinx_gallery",
     "tifffile",
+    # spyde/external/quantem/diffraction/crystal.py — structure factors from a
+    # cif (ase) and the space-group operations behind its zone-axis wedge
+    # (spglib). A tests extra, not a dependency, because only the benchmark
+    # comparing that matcher to ours imports it; promote both if it ships.
+    "ase",
+    "spglib",
 ]
 doc = [
     "sphinx",

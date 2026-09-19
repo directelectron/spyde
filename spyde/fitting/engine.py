@@ -3,7 +3,7 @@
 HyperSpy's ``multifit`` fits one pixel at a time: measured at ~110 spectra/s on
 this box, i.e. ~10 minutes for a 256x256 spectrum image. This module fits every
 pixel *simultaneously*, following the playbook already proven in
-``spyde/actions/vector_orientation_gpu.py``.
+``spyde/torch_device.py``.
 
 Why it works — the shape argument, which is the whole design:
 
@@ -293,7 +293,8 @@ def fit_batched(spec, data, x, *, weights=None, device=None, max_iter=60,
     # for minutes — holding it end-to-end would stall the live navigator preview
     # for the entire run. Releasing between chunks bounds any other thread's
     # wait to a single chunk, which is the same "hand the device back at your
-    # yield points" rule compute_vector_orientation_gpu follows.
+    # yield points" rule the EBSD refine and the vector orientation matcher
+    # follow.
     for lo_i in range(0, P, chunk):
         hi_i = min(P, lo_i + chunk)
         with accelerator_lock(device):

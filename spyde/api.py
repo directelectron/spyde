@@ -42,11 +42,10 @@ import numpy as np
 if TYPE_CHECKING:  # names only — no runtime imports of the heavy stack
     from spyde.actions.dpc import DpcResult
     from spyde.actions.strain_mapping import StrainField
-    from spyde.actions.vector_orientation import (
-        TemplateLibrary, VectorOrientationResult,
-    )
     from spyde.signals.diffraction_vectors import SpyDEDiffractionVectors
-    from spyde.signals.orientation_map import SpyDEOrientationMap
+    from spyde.signals.orientation_map import (
+        SpyDEOrientationMap, VectorOrientationResult,
+    )
 
 __all__ = [
     "find_vectors",
@@ -211,72 +210,65 @@ def orientation_map(
 
 def vector_orientation_map(
     vectors,
-    library_or_phases: Union["TemplateLibrary", object],
+    phases,
     *,
-    calibration_signal=None,
+    calibration_signal,
     accelerating_voltage: float = 200.0,
     resolution: float = 1.0,
-    minimum_intensity: float = 1e-4,
     r_max: Optional[float] = None,
     gpu: Union[str, bool] = "auto",
     progress=None,
-    client=None,
     **fit_params,
 ) -> "VectorOrientationResult":
-    """Fit orientation + strain per pattern from detected vectors (sparse OM).
+    """Fit orientation, phase and strain per pattern from detected vectors.
 
-    ``library_or_phases`` is either a prebuilt
-    ``vector_orientation.TemplateLibrary`` or CIF path(s)/``Phase`` object(s);
-    building from phases needs ``calibration_signal`` (an
-    ElectronDiffraction2D whose signal axes carry the data's calibration —
-    typically the source signal the vectors were found on).
+    ``phases`` is CIF path(s) or orix ``Phase`` object(s) — one plan is built
+    per phase and each position takes the one whose pattern its peaks best
+    support. ``calibration_signal`` is the ElectronDiffraction2D the vectors
+    were found on; its signal axes carry the calibration the detector was
+    measured in, which is what the vectors are converted from.
 
-    ``gpu="auto"`` uses the whole-field batched torch fit when a CUDA/MPS
-    device exists (the app's production path), otherwise the chunked CPU fit
-    (thread pool without a ``client``). ``fit_params`` are forwarded to the
-    fit (see ``vector_orientation.DEFAULTS``: strain_cap, sigma_schedule, …).
+    Matched by sparse polar correlation (Ophus et al. 2022) against the
+    vendored quantem implementation, the same one the app's live preview and
+    Compute Maps use.
+
+    ``resolution`` is the zone-axis sampling step in degrees. ``fit_params``
+    takes the refinement's own arguments — ``pair_distance`` and
+    ``sigma_excitation``, both Å⁻¹.
+
+    ``gpu="auto"`` runs the correlation and refinement on CUDA/MPS when one
+    exists. Note that for a SINGLE pattern the CPU is faster (a batch of one
+    is launch-overhead bound); this is the whole-field path, where it is not.
     """
-    from spyde.actions.vector_orientation import (
-        TemplateLibrary, build_template_library,
-        compute_vector_orientation_chunked,
+    from spyde.actions._common import reciprocal_radius as _recip
+    from spyde.actions.vector_orientation_quantem import (
+        compute_vector_orientation_quantem,
     )
-    from spyde.actions.vector_orientation_gpu import (
-        compute_vector_orientation_gpu, gpu_available,
-    )
+    from spyde.reciprocal_units import axis_unit_factor
+    from spyde.torch_device import gpu_available, select_device
 
-    if isinstance(library_or_phases, TemplateLibrary):
-        lib = library_or_phases
-        lib_meta = "prebuilt"
-    else:
-        if calibration_signal is None:
-            raise ValueError(
-                "building a template library from phases needs "
-                "calibration_signal= (the source ElectronDiffraction2D); "
-                "alternatively pass a prebuilt TemplateLibrary")
-        from spyde.actions._common import reciprocal_radius as _recip
-        from spyde.actions.orientation_compute import (
-            generate_library_from_phases,
-        )
-        phase_list = _as_phases(library_or_phases)
-        recip_r = _recip(calibration_signal)
-        sim = generate_library_from_phases(
-            phase_list, accelerating_voltage, resolution, minimum_intensity,
-            recip_r)
-        lib = build_template_library(
-            sim, calibration_signal, r_max if r_max is not None else recip_r)
-        lib_meta = [getattr(p, "name", "?") for p in phase_list]
+    phase_list = _as_phases(phases)
+    if not phase_list:
+        raise ValueError("vector_orientation_map needs at least one phase")
+    recip_r = _recip(calibration_signal)
+    factor = float(axis_unit_factor(calibration_signal) or 1.0)
 
     use_gpu = gpu_available() if gpu == "auto" else bool(gpu)
-    if use_gpu:
-        res = compute_vector_orientation_gpu(vectors, lib, fit_params or None,
-                                             progress=progress)
-    else:
-        res = compute_vector_orientation_chunked(
-            vectors, lib, fit_params or None, progress=progress,
-            client=client)
+    device = select_device() if use_gpu else None
+    device_name = device.type if device is not None else "cpu"
+
+    res = compute_vector_orientation_quantem(
+        vectors, phase_list,
+        energy_ev=float(accelerating_voltage) * 1e3,
+        k_max=float(r_max if r_max is not None else recip_r),
+        inverse_angstrom_factor=factor,
+        angle_step_zone_axis_deg=float(resolution),
+        device=device_name, progress=progress,
+        params=fit_params or None)
     if res is not None:
         res.provenance = _provenance("vector_orientation_map", {
-            **(fit_params or {}), "gpu": use_gpu, "library": lib_meta})
+            **(fit_params or {}), "device": device_name,
+            "phases": [getattr(p, "name", "?") for p in phase_list]})
     return res
 
 

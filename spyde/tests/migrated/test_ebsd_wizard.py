@@ -51,7 +51,7 @@ def _cpu_device(monkeypatch):
     Session lifecycles — the multi-threaded Metal profile CLAUDE.md documents
     as fatally racy — and macOS CI died with SIGABRT here when the
     macos-latest image rolled. Accelerator work belongs in a subprocess (the
-    test_vector_orientation_gpu.py pattern), not under the pytest harness.
+    test_neural_detect.py pattern), not under the pytest harness.
 
     Overridable: a maintainer reproducing on a Mac sets SPYDE_EBSD_DEVICE=mps.
     """

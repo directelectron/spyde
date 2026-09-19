@@ -1,11 +1,11 @@
 /**
  * GpuStatusDialog.tsx — Help -> GPU Status…
  *
- * Surfaces spyde.actions.vector_orientation_gpu's existing device diagnostics
+ * Surfaces spyde.torch_device's existing device diagnostics
  * (select_device / gpu_available / gpu_unavailable_reason / torch_available)
  * so a silent CPU fallback is never a mystery. Requests `get_gpu_status` on
  * open and listens for the `gpu_status_result` DOM CustomEvent the same way
- * the composition wizard listens for `cod_results` (SpyDEContext.tsx
+ * the phase popout listens for `cod_results` (SpyDEContext.tsx
  * re-broadcasts wizard-scoped PLOTAPP messages as DOM events).
  */
 import React, { useEffect, useState } from 'react'

@@ -26,6 +26,19 @@ __all__ = ["TOOLBAR_ACTIONS", "METADATA_WIDGET_CONFIG"]
 # for ANY spyde process, tests included: the handler drops sub-WARNING records
 # from packages that aren't declared verbose, so a rule set that only landed on
 # the app's startup path would silently swallow INFO logs everywhere else.
+
+# A rule matches a logger name exactly or as a DOTTED prefix, so it has to name
+# the module — "spyde.actions.orientation" never matched `orientation_action`,
+# only a submodule of a package that does not exist. Every one of these was
+# being tagged "actions" instead. `test_log_stream.TestOrientationArea` reads
+# the directory, so a new orientation module fails the test rather than
+# silently landing in the wrong filter.
+_ORIENTATION_MODULES = (
+    "orientation_action", "orientation_compute",
+    "vector_orientation_om", "vector_orientation_quantem", "vector_refine_ipf",
+    "ipf_density", "ipf_refine", "ipf_refine_render", "ipf_view", "ipf_window",
+)
+
 _LOG_AREA_RULES = (
     ("spyde.dask_manager", "dask"),
     ("spyde.compute_backend", "dask"),
@@ -34,8 +47,8 @@ _LOG_AREA_RULES = (
     ("spyde.signal_tree", "navigator"),
     ("spyde.array_cache", "navigator"),
     ("spyde.actions.find_vectors", "vectors"),
-    ("spyde.actions.vector_orientation", "orientation"),
-    ("spyde.actions.orientation", "orientation"),
+    *((f"spyde.actions.{name}", "orientation")
+      for name in _ORIENTATION_MODULES),
     ("spyde.actions", "actions"),
     ("spyde.signals", "signals"),
     ("spyde.workers", "workers"),

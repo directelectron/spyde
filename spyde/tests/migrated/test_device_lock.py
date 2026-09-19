@@ -133,111 +133,112 @@ class TestAcceleratorLock:
         assert overlap == [], f"concurrent entry: {overlap}"
 
 
-class TestOrientationFitTakesLock:
-    """The vector-orientation fit runs on a worker thread and previously took no
-    lock at all — the ``zero_``/``fill_mps_kernel`` crash."""
+class TestOrientationMatcherTakesLock:
+    """The correlation matcher is a torch call site like any other.
 
-    def test_fit_runs_under_the_lock(self, monkeypatch):
-        from spyde.actions import vector_orientation_gpu as vog
+    It runs on a worker thread (the whole-field fit) and on the overlay lane
+    (the crosshair preview), either of which can overlap the neural spot
+    detector or a calibration. On MPS that is an uncatchable SIGSEGV, and the
+    lock only works if EVERY participant takes it — this pins that the newest
+    participant does.
+    """
+
+    def _fitter(self, monkeypatch, device_type="mps"):
+        """A SinglePatternFitter with its plans stubbed out — the lock is what
+        is under test, not the matching."""
+        from spyde.actions import vector_orientation_quantem as quantem
 
         held = []
-        monkeypatch.setattr(vog, "select_device", lambda: _FakeDev())
-        monkeypatch.setattr(
-            vog, "_compute_vector_orientation_batched",
-            lambda *a, **k: held.append(_lock_is_held_by_me()) or "result")
 
-        assert vog.compute_vector_orientation_gpu(None, None) == "result"
-        assert held == [True]
+        import numpy as _np
+
+        class _Map:
+            device = _FakeDev(device_type)
+            corr = _np.ones((1, 1, 1))
+
+            def match_orientations(self, **kwargs):
+                held.append(_lock_is_held_by_me())
+
+            def refine_orientations(self, **kwargs):
+                held.append(_lock_is_held_by_me())
+
+        fitter = quantem.SinglePatternFitter.__new__(quantem.SinglePatternFitter)
+        fitter.min_peaks = 1
+        fitter.convention = "conjugate"
+        fitter.device = "cpu"
+        fitter.inverse_angstrom_factor = 1.0
+        fitter._metadata = {}
+        fitter._plan_pair_distance = 0.05
+        fitter.pair_distance = None
+        fitter.sigma_excitation = None
+        fitter._maps = [_Map()]
+        return fitter, held
+
+    def test_the_preview_matches_under_the_lock(self, monkeypatch):
+        import numpy as np
+
+        from spyde.actions import vector_orientation_quantem as quantem
+
+        fitter, held = self._fitter(monkeypatch)
+        # Stop after the match/refine: the rest needs a real plan.
+        monkeypatch.setattr(quantem, "reciprocal_affine",
+                            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("stop")))
+        rows = np.zeros((6, 6), np.float64)
+        try:
+            fitter.fit(rows)
+        except RuntimeError:
+            pass
+        assert held == [True, True], "the matcher submitted without the lock"
         assert not _lock_is_held_by_me(), "lock leaked after the fit"
 
-    def test_yield_hands_the_device_back(self, monkeypatch):
-        """The fit yields every ~12 refine steps; each yield must release the
-        device so a concurrent preview waits one yield window, not the whole
-        anneal — and must re-acquire it afterwards."""
-        from spyde.actions import vector_orientation_gpu as vog
-
-        observed = {}
-
-        def fake_fit(*a, **k):
-            # k["on_yield"] is the wrapper's releasing shim, which calls the
-            # caller's on_yield in the middle of the hand-off window.
-            assert _lock_is_held_by_me()
-            k["on_yield"]()
-            observed["held_after_yield"] = _lock_is_held_by_me()
-            return "ok"
-
-        user_calls = []
-        monkeypatch.setattr(vog, "select_device", lambda: _FakeDev())
-        monkeypatch.setattr(vog, "_compute_vector_orientation_batched", fake_fit)
-        vog.compute_vector_orientation_gpu(
-            None, None, on_yield=lambda: user_calls.append(
-                _lock_is_held_by_me()))
-
-        assert user_calls == [False], "device not released during the yield"
-        assert observed["held_after_yield"] is True, "device not re-acquired"
-
-    def test_no_deadlock_against_concurrent_users(self, monkeypatch):
-        """Adding a lock risks deadlock, and the fit's release/re-acquire around
-        each yield is the delicate part. Run the real yield protocol against
-        preview-style acquirers on other threads and require completion."""
-        from spyde.actions import vector_orientation_gpu as vog
-
-        monkeypatch.setattr(vog, "select_device", lambda: _FakeDev())
-
-        def fake_fit(*a, **k):
-            for _ in range(40):
-                k["on_yield"]()          # release -> hand off -> re-acquire
-            return "ok"
-
-        monkeypatch.setattr(vog, "_compute_vector_orientation_batched", fake_fit)
-        done, errors = [], []
-
-        def fit_thread():
-            try:
-                done.append(vog.compute_vector_orientation_gpu(None, None))
-            except Exception as e:  # noqa: BLE001
-                errors.append(repr(e))
-
-        def preview_thread():
-            try:
-                for _ in range(60):
-                    with accelerator_lock(_FakeDev()):
-                        pass
-                done.append("preview")
-            except Exception as e:  # noqa: BLE001
-                errors.append(repr(e))
-
-        ts = [threading.Thread(target=fit_thread)] + [
-            threading.Thread(target=preview_thread) for _ in range(3)]
-        for t in ts:
-            t.start()
-        for t in ts:
-            t.join(timeout=30)
-
-        assert not [t for t in ts if t.is_alive()], "deadlock: thread never finished"
-        assert errors == [], errors
-        assert len(done) == 4
-        assert not _lock_is_held_by_me(), "lock leaked"
-
     def test_off_mps_is_a_passthrough(self, monkeypatch):
-        """CUDA path must be byte-for-byte unchanged: no lock, original on_yield
-        passed straight through."""
-        from spyde.actions import vector_orientation_gpu as vog
+        """CUDA is thread-safe and its stream concurrency is a deliberate
+        throughput win, so the lock must not be taken there."""
+        import numpy as np
 
-        seen = {}
-        sentinel = object()
+        from spyde.actions import vector_orientation_quantem as quantem
 
-        def fake_fit(*a, **k):
-            seen["on_yield"] = k.get("on_yield")
-            seen["held"] = _lock_is_held_by_me()
-            return "cuda"
+        fitter, held = self._fitter(monkeypatch, device_type="cuda")
+        monkeypatch.setattr(quantem, "reciprocal_affine",
+                            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("stop")))
+        try:
+            fitter.fit(np.zeros((6, 6), np.float64))
+        except RuntimeError:
+            pass
+        assert held == [False, False], "CUDA must not be serialised"
 
-        monkeypatch.setattr(vog, "select_device", lambda: _FakeDev("cuda"))
-        monkeypatch.setattr(vog, "_compute_vector_orientation_batched", fake_fit)
-        vog.compute_vector_orientation_gpu(None, None, on_yield=sentinel)
+    def test_setting_a_zone_mask_takes_the_lock(self, monkeypatch):
+        """Masking builds tensors, so it is a torch call site like the rest.
 
-        assert seen["on_yield"] is sentinel
-        assert seen["held"] is False
+        It is reached from a double-click, on a different thread from the
+        navigator that may be correlating at that moment — which is the
+        submission race the lock exists for.
+        """
+        import numpy as np
+        import torch
+
+        fitter, _held = self._fitter(monkeypatch)
+        held = []
+
+        class _Frac:
+            device = torch.device("cpu")
+            dtype = torch.float64
+
+            def clone(self):
+                held.append(_lock_is_held_by_me())
+                return self
+
+            def __mul__(self, other):
+                held.append(_lock_is_held_by_me())
+                return self
+
+        fitter._maps[0].plan_frac_shift = _Frac()
+        fitter._full_frac_shift = [_Frac()]
+
+        fitter.set_zone_mask([np.array([True, False])])
+        fitter.set_zone_mask(None)
+        assert held == [True, True], "the zone mask submitted without the lock"
+        assert not _lock_is_held_by_me(), "lock leaked after masking"
 
 
 class TestNeuralPathsTakeLock:

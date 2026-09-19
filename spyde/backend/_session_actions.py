@@ -422,6 +422,14 @@ class ActionRouterMixin:
             wiz = getattr(tree, "_vom_wizard", None)
             if wiz is not None:
                 nodes.append(getattr(wiz, "overlay", None))
+                # Re-selecting the action brings the IPF heat map back if its
+                # window was closed, then its overlay is toggled with the rest.
+                if visible:
+                    try:
+                        wiz.ensure_refine_ipf(self)
+                    except Exception as e:
+                        log.debug("reopening the vector refine IPF failed: %s", e)
+                nodes.append(getattr(getattr(wiz, "refine_ipf", None), "node", None))
         elif name == "EBSD Indexing":
             wiz = getattr(tree, "_ebsd_wizard", None)
             if wiz is not None:

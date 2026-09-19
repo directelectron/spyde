@@ -175,7 +175,7 @@ class TestCommittedTree:
 
 class TestOrientationStrainCommit:
     def test_the_vom_strain_window_is_percent_and_calibrated(self, window):
-        from spyde.actions.vector_orientation_om import _build_result_windows
+        from spyde.actions.vector_orientation_om import _build_strain_window
         session = window["window"]
         scan = _calibrated_scan()
         scan.metadata.General.title = "Scan"
@@ -183,7 +183,7 @@ class TestOrientationStrainCommit:
         strain[..., 0] = 0.02
         result = type("R", (), {"strain": strain})()
 
-        _build_result_windows(session, scan, result, with_ipf=False)
+        _build_strain_window(session, scan, result)
 
         tree = session.signal_trees[-1]
         assert np.allclose(tree.root.data, 2.0)

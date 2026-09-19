@@ -212,7 +212,7 @@ test('SCREENSHOT: populated application log for visual approval', async () => {
     logMsg('DEBUG', 'spyde.drawing.update_functions', 'cross-chunk move → routing via shared memory'),
     logMsg('INFO', 'spyde.actions.find_vectors_action', 'Found 5128 diffraction vectors'),
     logMsg('WARNING', 'spyde.dask_manager', 'worker tcp://127.0.0.1:51823 restarted'),
-    logMsg('DEBUG', 'spyde.actions.vector_orientation_gpu', 'CUDA autograd warmup skipped (no CUDA)'),
+    logMsg('DEBUG', 'spyde.actions.vector_orientation_om', 'CUDA autograd warmup skipped (no CUDA)'),
     logMsg('INFO', 'spyde.actions.orientation_action', 'Orientation map complete — 4096 patterns'),
     logMsg('ERROR', 'spyde.actions.composition', 'COD search failed: HTTP 503 (will retry)'),
   ]

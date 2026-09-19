@@ -32,6 +32,7 @@ import { FitWizard } from './FitWizard'
 import { BackgroundWizard } from './BackgroundWizard'
 import { DriftWizard } from './DriftWizard'
 import { DpcWizard } from './DpcWizard'
+import { BetaContext } from './WizardShell'
 
 const WIZARD_ACTIONS = new Set([
   'Orientation Mapping', 'Find Diffraction Vectors', 'Vector Orientation Mapping',
@@ -340,7 +341,7 @@ export function FloatingToolbar({
         return (
           <button
             key={a.name}
-            title={a.name}
+            title={a.beta ? `${a.name} (Beta — still under development)` : a.name}
             data-testid={`action-btn-${a.name}`}
             className="spyde-tb-btn"
             style={{ ...(active ? styles.btnActive : {}), position: 'relative' }}
@@ -354,12 +355,16 @@ export function FloatingToolbar({
                 {ffSpeed}x
               </span>
             )}
+            {a.beta && (
+              <span data-testid={`beta-badge-${a.name}`} style={styles.betaBadge}>β</span>
+            )}
           </button>
         )
       })}
 
       {/* Static wrapper (no box of its own) — lets the placement effect measure
           the open caret without affecting its absolute positioning. */}
+      <BetaContext.Provider value={!!openAction?.beta}>
       <div ref={caretWrapRef}>
         {openAction && openAction.name === 'Orientation Mapping' && (
           <OrientationWizard
@@ -435,6 +440,7 @@ export function FloatingToolbar({
           />
         )}
       </div>
+      </BetaContext.Provider>
       {openAction && !hasParams(openAction) && hasSubs(openAction) && (
         <SubToolbar
           action={openAction}
@@ -736,6 +742,12 @@ const styles: Record<string, React.CSSProperties> = {
   speedBadge: {
     position: 'absolute', bottom: -3, right: -3,
     background: '#f38ba8', color: '#11111b',
+    fontSize: 8, fontWeight: 700, lineHeight: 1,
+    padding: '1px 3px', borderRadius: 6, pointerEvents: 'none',
+  },
+  betaBadge: {
+    position: 'absolute', top: -3, right: -3,
+    background: '#fab387', color: '#11111b',
     fontSize: 8, fontWeight: 700, lineHeight: 1,
     padding: '1px 3px', borderRadius: 6, pointerEvents: 'none',
   },

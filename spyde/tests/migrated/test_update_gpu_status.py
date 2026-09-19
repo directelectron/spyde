@@ -91,7 +91,7 @@ class TestGpuStatusAction:
         assert isinstance(result["reason"], str) and result["reason"]
 
     def test_reports_no_gpu_without_torch(self, window, monkeypatch):
-        import spyde.actions.vector_orientation_gpu as vog
+        import spyde.torch_device as vog
 
         monkeypatch.setattr(vog, "torch_available", lambda: False)
         monkeypatch.setattr(vog, "gpu_available", lambda: False)

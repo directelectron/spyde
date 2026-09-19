@@ -1,8 +1,8 @@
 """Correctness tests for the vendored SpotUNet detector + the model registry.
 
 Run in ONE SUBPROCESS (all modes sequentially, one tagged ``RESULT_JSON
-<mode> {...}`` line each, then ``os._exit(0)``), matching
-``test_vector_orientation_gpu.py``: torch teardown (esp. with CUDA) can segfault
+<mode> {...}`` line each, then ``os._exit(0)``) — the pattern the other GPU
+tests here follow: torch teardown (esp. with CUDA) can segfault
 at interpreter exit inside the pytest process on Windows, and a fresh
 subprocess per test paid the cold ``import spyde.models``+torch (~4-5 s) five
 times over.  The ``upgrade`` mode mutates (backs up/restores) the user

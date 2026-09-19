@@ -5,17 +5,19 @@
  *   1 Load    — the SAMPLE's phases (composition + structure, shared with the
  *               dock) + accelerating voltage.
  *   2 Library — angle resolution + min intensity → `vom_generate_library`.
- *   3 Refine  — strain cap + match tolerance sliders re-fit the pattern under the
- *               crosshair live (`vom_refine`); the fitted template (green) tracks
- *               the measured vectors (red) and the recovered strain/residual is
- *               shown — Qt "3 Refine" parity.
- *   4 Run     — strain cap + smoothing → `vom_run` (IPF-Z + εxx/εyy/εxy windows).
+ *   3 Refine  — the matcher's pairing distance + excitation width re-fit the
+ *               pattern under the crosshair live (`vom_refine`); the matched
+ *               pattern (green) tracks the measured vectors (red) and the
+ *               recovered strain/residual is shown. Both are Å⁻¹ on the slider
+ *               and Å⁻¹ on the wire, as the schema declares them.
+ *   4 Run     — fit every position with Refine's settings → `vom_run` (IPF-Z +
+ *               εxx/εyy/εxy windows). No strain cap: the matcher solves the
+ *               deformation in closed form and has nothing to bound.
  */
 import React from 'react'
 import { WizardShell, TabRow, Field, NumInput, Slider, Check, S } from './WizardShell'
 import { useDebouncedAction, useWizardEvent } from './wizardHooks'
-import { PeriodicTable, PHASE_STYLE } from './PeriodicTable'
-import { useSpyDE } from '../kernel/SpyDEContext'
+import { SamplePhasesField, useSamplePhases, structuresOf, missingStructures } from './SamplePhases'
 
 const TABS = ['Load', 'Library', 'Refine', 'Run'] as const
 type Tab = typeof TABS[number]
@@ -38,7 +40,7 @@ interface VomFit {
 // (a ~1 min rebuild) just because the React caret was torn down and remounted.
 interface VomSaved {
   tab: Tab; voltage: number; resolution: number; minInt: number
-  strainCap: number; tolerance: number; gamma: number; kPow: number
+  pairDistance: number; sigmaExcitation: number
   smooth: boolean; libReady: boolean
 }
 const _vomStore = new Map<number, VomSaved>()
@@ -46,20 +48,12 @@ const _vomStore = new Map<number, VomSaved>()
 export function VectorOrientationWizard({ caretPos, windowId, sendAction, onClose }: Props) {
   const saved = _vomStore.get(windowId)
   const [tab, setTab] = React.useState<Tab>(saved?.tab ?? 'Load')
-  // The phases come from the SAMPLE, not from this caret: composition and
-  // structure are one thing, so the dock and the wizard read the same list and
-  // a structure chosen here is recorded on the dataset.
-  const { state } = useSpyDE()
-  const composition = state.composition.get(windowId)
-  const phases = composition?.phases ?? []
-  const [phasesOpen, setPhasesOpen] = React.useState(false)
+  const phases = useSamplePhases(windowId)
   const [voltage, setVoltage] = React.useState(saved?.voltage ?? 200)
   const [resolution, setResolution] = React.useState(saved?.resolution ?? 1.0)
   const [minInt, setMinInt] = React.useState(saved?.minInt ?? 0.0001)
-  const [strainCap, setStrainCap] = React.useState(saved?.strainCap ?? 5.0)   // %
-  const [tolerance, setTolerance] = React.useState(saved?.tolerance ?? 4.0)   // % (sink bandwidth)
-  const [gamma, setGamma] = React.useState(saved?.gamma ?? 50)                // % → 0..1 intensity compression
-  const [kPow, setKPow] = React.useState(saved?.kPow ?? 0)                    // high-k lever-arm exponent
+  const [pairDistance, setPairDistance] = React.useState(saved?.pairDistance ?? 0.05)        // Å⁻¹
+  const [sigmaExcitation, setSigmaExcitation] = React.useState(saved?.sigmaExcitation ?? 0.04)  // Å⁻¹
   const [smooth, setSmooth] = React.useState(saved?.smooth ?? true)
   const [libReady, setLibReady] = React.useState(saved?.libReady ?? false)
   const [fit, setFit] = React.useState<VomFit | null>(null)
@@ -69,30 +63,38 @@ export function VectorOrientationWizard({ caretPos, windowId, sendAction, onClos
 
   // Persist the state for this window on every change so reopening restores it.
   React.useEffect(() => {
-    _vomStore.set(windowId, { tab, voltage, resolution, minInt, strainCap, tolerance, gamma, kPow, smooth, libReady })
-  }, [windowId, tab, voltage, resolution, minInt, strainCap, tolerance, gamma, kPow, smooth, libReady])
+    _vomStore.set(windowId, { tab, voltage, resolution, minInt,
+      pairDistance, sigmaExcitation, smooth, libReady })
+  }, [windowId, tab, voltage, resolution, minInt, pairDistance,
+      sigmaExcitation, smooth, libReady])
 
   // Debounced live refine — a pending refine is cancelled on unmount so
   // vom_refine can't fire at a torn-down preview mid-debounce.
   const sendRefine = useDebouncedAction(sendAction, 'vom_refine', windowId)
+
+  // The library builds off-thread; its reply is what ends "Generating library…".
+  useWizardEvent('spyde:vom_library_ready', windowId, (detail) => {
+    if (detail.ok) {
+      setStatus(`Library ready (${Number(detail.n_templates ?? 0).toLocaleString()} templates) — `
+        + 'move the crosshair to refine, or Compute Maps.')
+    } else {
+      setLibReady(false)
+      setTab('Library')
+      setStatus(`Library failed: ${String(detail.error ?? 'unknown error')}`)
+    }
+  })
 
   // Live single-pattern fit readout streamed from the backend overlay.
   useWizardEvent('spyde:vom_fit', windowId, (d) => {
     setFit(d as unknown as VomFit)
   })
 
-  const base = (p: string) => p.split(/[/\\]/).pop() || p
   const generate = () => {
-    // A phase with no structure yet cannot contribute templates; say which one
-    // rather than silently building a library that is missing it.
-    const missing = phases.filter(p => !p.cifPath)
-    const paths = phases.map(p => p.cifPath).filter(Boolean) as string[]
+    const paths = structuresOf(phases)
     if (!paths.length) { setStatus('Give at least one phase a structure first.'); return }
-    if (missing.length) {
-      setStatus(`Generating without ${missing.map(p => p.elements.join('-') || 'a phase').join(', ')} — no structure set.`)
-    } else {
-      setStatus('Generating library… (this can take ~1 min for a full library)')
-    }
+    // A phase with no structure contributes no templates; say which.
+    setStatus(missingStructures(phases)
+      ?? 'Generating library… (this can take ~1 min for a full library)')
     sendAction('vom_generate_library', {
       cif_paths: paths, accelerating_voltage: voltage, resolution, minimum_intensity: minInt,
     }, windowId)
@@ -100,17 +102,19 @@ export function VectorOrientationWizard({ caretPos, windowId, sendAction, onClos
     setTab('Refine')
   }
 
-  // Debounced live refine — strain cap & tolerance are sent as fractions;
-  // gamma (intensity compression) as a 0..1 fraction; k_power as-is.
-  const refine = (next: Partial<{ strainCap: number; tolerance: number; gamma: number; kPow: number }>) => {
-    const cap = next.strainCap ?? strainCap, tol = next.tolerance ?? tolerance
-    const g = next.gamma ?? gamma, k = next.kPow ?? kPow
-    sendRefine(() => ({ strain_cap: cap / 100, sink_bw: tol / 100, gamma: g / 100, k_power: k }))
+  // Debounced live refine. Both knobs are Å⁻¹ on the slider and Å⁻¹ on the
+  // wire — the schema declares those units, so any host reading it sends the
+  // same number. (The sliders this replaced showed percentages and dispatched
+  // fractions, which only agreed because this caret did the division itself.)
+  const refine = (next: Partial<{ pairDistance: number; sigmaExcitation: number }>) => {
+    sendRefine(() => ({
+      pair_distance: next.pairDistance ?? pairDistance,
+      sigma_excitation: next.sigmaExcitation ?? sigmaExcitation,
+    }))
   }
   const compute = () => {
     setStatus('Computing orientation + strain maps…')
-    sendAction('vom_run', { strain_cap: strainCap / 100, sink_bw: tolerance / 100,
-      gamma: gamma / 100, k_power: kPow, smooth }, windowId)
+    sendAction('vom_run', { pair_distance: pairDistance, sigma_excitation: sigmaExcitation, smooth }, windowId)
   }
 
   const pct = (v?: number) => (v === undefined ? '—' : `${(v * 100).toFixed(2)}%`)
@@ -123,50 +127,8 @@ export function VectorOrientationWizard({ caretPos, windowId, sendAction, onClos
 
       {tab === 'Load' && (
         <div style={S.page}>
-          <label style={S.lbl}>Sample phases</label>
-          {/* The phases belong to the SAMPLE, not to this caret — composition
-              and structure are one thing, and the dock shows the same list. So
-              this is a door onto that widget rather than a private .cif list
-              the rest of the app cannot see. */}
-          <button data-testid="vom-add-phase" style={S.primary}
-            onClick={() => {
-              // Clicking "Add phase" with none yet should land on a usable
-              // row, not on an empty editor with a second Add phase in it.
-              if (!phases.length) sendAction('add_phase', {}, windowId)
-              setPhasesOpen(true)
-            }}>{phases.length ? 'Phases' : '＋ Add phase'}</button>
-          <div data-testid="vom-cif-list" style={S.cifList}>
-            {phases.length === 0
-              ? <span style={S.hint}>No phases yet — add at least one.</span>
-              : phases.map((phase, index) => (
-                <div key={index} style={S.cifRow}
-                  title={phase.cifPath ?? phase.elements.join('-')}>
-                  <span style={S.cifName}>
-                    {phase.elements.join('-') || `phase ${index + 1}`}
-                  </span>
-                  <span style={phase.cifPath ? PHASE_STYLE.set : PHASE_STYLE.unset}>
-                    {phase.label ?? (phase.cifPath ? base(phase.cifPath) : 'no structure')}
-                  </span>
-                </div>
-              ))}
-          </div>
+          <SamplePhasesField windowId={windowId} sendAction={sendAction} testidPrefix="vom" />
           <Field label="Voltage (kV)"><NumInput value={voltage} onChange={setVoltage} step="1" width={60} /></Field>
-          {phasesOpen && (
-            // The SAME popout the dock opens: a phase's elements and its
-            // structure belong together, and the sample owns both.
-            <PeriodicTable
-              initial={composition?.elements ?? []}
-              initialPct={composition?.percentages ?? {}}
-              phases={phases}
-              windowId={windowId}
-              sendAction={sendAction}
-              onApply={(els, percentages) => {
-                sendAction('set_composition', { elements: els, percentages }, windowId)
-                setPhasesOpen(false)
-              }}
-              onClose={() => setPhasesOpen(false)}
-            />
-          )}
         </div>
       )}
 
@@ -180,38 +142,35 @@ export function VectorOrientationWizard({ caretPos, windowId, sendAction, onClos
 
       {tab === 'Refine' && (
         <div style={S.page}>
-          <div style={S.hint}>Move the crosshair on the navigator; the green template
-            fits the red vectors. Tune the cap/tolerance to taste.</div>
-          <Field label="Strain cap %">
-            <Slider testid="vom-strain-cap" value={strainCap} min={0.5} max={10} step={0.1}
-              onChange={(n) => { setStrainCap(n); refine({ strainCap: n }) }} />
+          <div style={S.hint}>Move the crosshair on the navigator; the green
+            matched pattern fits the red vectors.</div>
+          <Field label="Pair distance (Å⁻¹)">
+            <Slider testid="vom-pair-distance" value={pairDistance}
+              min={0.01} max={0.15} step={0.005}
+              onChange={(n) => { setPairDistance(n); refine({ pairDistance: n }) }} />
           </Field>
-          <Field label="Tolerance %">
-            <Slider testid="vom-tolerance" value={tolerance} min={0.5} max={8} step={0.1}
-              onChange={(n) => { setTolerance(n); refine({ tolerance: n }) }} />
+          <Field label="Excitation σ (Å⁻¹)">
+            <Slider testid="vom-sigma-excitation" value={sigmaExcitation}
+              min={0.01} max={0.12} step={0.005}
+              onChange={(n) => { setSigmaExcitation(n); refine({ sigmaExcitation: n }) }} />
           </Field>
-          <Field label="Intensity γ">
-            <Slider testid="vom-gamma" value={gamma} min={0} max={100} step={1}
-              onChange={(n) => { setGamma(n); refine({ gamma: n }) }} />
-          </Field>
-          <Field label="High-k weight">
-            <Slider testid="vom-kpower" value={kPow} min={0} max={2} step={0.1}
-              onChange={(n) => { setKPow(n); refine({ kPow: n }) }} />
-          </Field>
-          <div style={S.hint}>γ compresses peak intensity (low γ = let dim high-k
-            reflections drive the orientation); High-k weight adds an explicit
-            |g| lever-arm. Defaults γ=0.5, high-k=0.</div>
+          <div style={S.hint}>Pair distance is how near a simulated reflection
+            has to be to count as the same peak; too small and real peaks go
+            unpaired, too large and one spot claims its neighbours. Excitation σ
+            is how far off the Ewald sphere a reflection may sit and still be
+            treated as excited. Defaults 0.05 and 0.04 Å⁻¹.</div>
           <div data-testid="vom-strain-readout" style={S.hint}>
             {fit && fit.ok
               ? `εxx=${pct(fit.exx)}  εyy=${pct(fit.eyy)}  εxy=${pct(fit.exy)}  ·  resid=${fit.residual?.toFixed(4)}  matched=${fit.matched}`
-              : 'No fit yet — move the crosshair to a pattern with ≥4 vectors.'}
+              : 'No fit yet — move the crosshair to a pattern with ≥5 vectors.'}
           </div>
         </div>
       )}
 
       {tab === 'Run' && (
         <div style={S.page}>
-          <Field label="Strain cap %"><NumInput value={strainCap} onChange={setStrainCap} step="0.5" /></Field>
+          <div style={S.hint}>Fits every position with the settings from Refine,
+            then opens the orientation map and the strain maps.</div>
           <Check testid="vom-smooth" checked={smooth} onChange={setSmooth} label="Smooth strain (TV)" />
           <button data-testid="vom-compute" style={S.primary} onClick={compute}>Compute Maps</button>
         </div>

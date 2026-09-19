@@ -52,18 +52,32 @@ def _triangle_xy(phase):
 
 
 def build_phase_ipf(sim) -> list[dict]:
+    """Per-phase IPF geometry for a diffsims simulation — see
+    :func:`build_phase_ipf_for`, which this hands its template table to."""
+    from spyde.actions.orientation_compute import template_tables, sim_phases_list
+
+    quats, phase_of = template_tables(sim)
+    return build_phase_ipf_for(quats, phase_of, sim_phases_list(sim))
+
+
+def build_phase_ipf_for(quats, phase_of, phases) -> list[dict]:
     """Per-phase IPF geometry (geometry-only → compute ONCE per library): each
-    phase's template stereographic positions, global template indices, triangle
-    outline + corner labels, and a Delaunay interpolation grid for the heatmap."""
+    phase's orientation stereographic positions, global indices, triangle
+    outline + corner labels, and a Delaunay interpolation grid for the heatmap.
+
+    Takes the orientation table directly rather than a simulation, because the
+    correlation matcher samples zone axes rather than building diffsims
+    templates and has no simulation to hand — but projects them onto the same
+    triangle, so both paths render through the same panels.
+    """
     from orix.quaternion import Rotation
     from orix.vector import Vector3d
     from orix.projections import StereographicProjection
     from scipy.spatial import Delaunay
     from matplotlib.path import Path
-    from spyde.actions.orientation_compute import template_tables, sim_phases_list
 
-    quats, phase_of = template_tables(sim)
-    phases = sim_phases_list(sim)
+    quats = np.asarray(quats, float)
+    phase_of = np.asarray(phase_of)
     sp = StereographicProjection()
     infos: list[dict] = []
     for p, phase in enumerate(phases):

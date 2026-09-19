@@ -231,21 +231,24 @@ class TestPolarGridParity:
 class TestMeasuredVectorParity:
     """Vectors are stored in the detector's units and fitted in Å⁻¹."""
 
-    def test_library_carries_the_factor_for_its_detector(self):
-        from spyde.actions.vector_orientation import TemplateLibrary
+    def test_the_peaks_adapter_converts_to_inverse_angstrom(self):
+        """The matcher works entirely in Å⁻¹ and the vectors are stored in the
+        detector's own units, so the adapter that presents one to the other is
+        where the two meet."""
+        from spyde.actions.vector_orientation_quantem import PeaksAdapter
 
-        library = TemplateLibrary(
-            spots_xy=[], spots_I=[], template_quats=np.zeros((0, 4)),
-            template_phase=np.zeros(0, np.int16), phases_meta=[], cache={},
-            radial_range=(0.0, 1.0), r_max=1.0, inverse_angstrom_factor=0.1)
-        rows = np.zeros((2, 6), np.float64)
-        rows[:, 2] = [3.9, -3.9]          # kx in nm⁻¹
-        rows[:, 3] = [0.0, 0.0]
+        class _Vectors:
+            n_time = 0
+            nav_shape = (1, 2)
 
-        from spyde.actions.vector_orientation import measured_in_inverse_angstrom
-        converted = measured_in_inverse_angstrom(rows, library)
-        assert converted[0, 0] == pytest.approx(0.39)
-        assert converted[1, 0] == pytest.approx(-0.39)
+            def at(self, row, column):
+                rows = np.zeros((1, 6), np.float64)
+                rows[:, 2] = 3.9 if column == 0 else -3.9   # kx in nm⁻¹
+                return rows
+
+        peaks = PeaksAdapter(_Vectors(), inverse_angstrom_factor=0.1)
+        assert peaks[0, 0].array[0, 0] == pytest.approx(0.39)
+        assert peaks[0, 1].array[0, 0] == pytest.approx(-0.39)
 
     def test_detector_pixels_places_inverse_angstrom_spots_correctly(self):
         from spyde.actions.vector_overlay import DetectorPixels

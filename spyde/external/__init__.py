@@ -63,6 +63,7 @@ _APPLIED = False
 # it — this keeps registration lazy (no upstream import at `import spyde.external`
 # time) while still discoverable from one list.
 _PATCH_SUBPACKAGES = (
+    "spyde.external.emdatabase",
     "spyde.external.hyperspy",
     "spyde.external.numcodecs",
     "spyde.external.rosettasciio",

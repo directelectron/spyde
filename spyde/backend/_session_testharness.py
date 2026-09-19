@@ -443,15 +443,48 @@ class TestHarnessMixin:
                           detector=tuple(p.get("detector", (60, 60))))
         self._add_signal(s, source_path="test_data_ebsd")
 
+    #: The calibrated SPED-Ag scan, taken straight from Zenodo rather than
+    #: through ``pyxem.data.sped_ag()``.
+    #:
+    #: Both packaged routes to this dataset are stale in the same way. pyxem
+    #: 0.21 pins record 15490547 (``_registry._zenodo_url``, "version 0.9.0")
+    #: and em_database 0.4.0's ``SPEDAg.yaml`` pins the same record and md5.
+    #: That copy carries EXACTLY HALF the true reciprocal calibration —
+    #: 0.013364 against 0.026728 Å⁻¹ per pixel — so every measured vector
+    #: reaches a template matcher at half its length, Ag {111} reads as
+    #: 0.21 Å⁻¹ instead of 0.42, and no crystal can be fitted to it. Nothing
+    #: raises; the overlay just draws simulated spots beside the measured ones.
+    #:
+    #: Record 21790591 ("Pyxem 4D STEM Demo Data", v10) has the corrected file.
+    #: Delete this and go back to ``pyxem.data.sped_ag()`` once its registry
+    #: points there.
+    _SPED_AG_SCALE = 0.02672830388733737     # Å⁻¹ per pixel, as published
+
     def _load_test_data_sped_ag(self) -> None:
-        """Test-only: load the REAL sped_ag 4-D STEM scan (pyxem.data.sped_ag —
-        208×64 patterns of 112×112, a strained Ag SPED dataset with genuine
-        diffraction spots). Unlike the synthetic disk fixtures this has a real
-        reciprocal lattice, so the orientation overlay's matched-template spots
-        land on actual diffraction peaks — needed to SEE the overlay working
-        (not just render). Downloads on first use (pooch-cached)."""
-        import pyxem.data as pxd
-        s = pxd.sped_ag(allow_download=True)
+        """Test-only: load the REAL sped_ag 4-D STEM scan (208×64 patterns of
+        112×112, a strained Ag SPED dataset with genuine diffraction spots).
+        Unlike the synthetic disk fixtures this has a real reciprocal lattice,
+        so the orientation overlay's matched-template spots land on actual
+        diffraction peaks — needed to SEE the overlay working (not just
+        render). Downloads on first use (pooch-cached)."""
+        import hyperspy.api as hs
+        import pooch
+
+        from spyde.external.emdatabase.sped_ag import DATASET
+
+        path = pooch.retrieve(
+            url=f"{DATASET['source']}/{DATASET['file']}",
+            known_hash=DATASET["checksum"],
+            fname="SPED-Ag-calibrated.zspy", path=pooch.os_cache("spyde"))
+        s = hs.load(path)
+        # The fixture is only worth anything if it is the calibrated copy; a
+        # silently halved axis is the exact failure this loader exists to avoid.
+        scale = float(s.axes_manager.signal_axes[0].scale)
+        if abs(scale - self._SPED_AG_SCALE) > 1e-6 * self._SPED_AG_SCALE:
+            raise RuntimeError(
+                f"SPED-Ag reciprocal scale is {scale} Å⁻¹/px, expected "
+                f"{self._SPED_AG_SCALE} — this is not the calibrated copy, and "
+                "template matching against it cannot work")
         try:
             s.set_signal_type("electron_diffraction")
         except Exception as e:

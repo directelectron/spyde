@@ -530,7 +530,7 @@ def ebsd_run(session, plot, payload) -> None:
     # fix vector-orientation mapping needed — CLAUDE.md, GPU Computing).
     if do_refine:
         try:
-            from spyde.actions.vector_orientation_gpu import warmup_autograd
+            from spyde.torch_device import warmup_autograd
             warmup_autograd()
         except Exception as e:
             log.debug("CUDA autograd warmup failed: %s", e)
