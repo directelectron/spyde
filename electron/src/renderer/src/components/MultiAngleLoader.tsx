@@ -130,7 +130,7 @@ const EMPTY_SOLVE: MapedSolve = {
 
 export const EMPTY_MAPED_STATE: MapedState = {
   members: [], reference: null, shells: [], scan_shape: null,
-  virtual_image: null, available_virtual_images: [],
+  virtual_image: null, available_virtual_images: [], beam_roi: null,
   real: EMPTY_SOLVE, reciprocal: EMPTY_SOLVE,
   busy: false, message: '', can_commit: false,
 }
@@ -1216,9 +1216,16 @@ function BeamRegionBox({ roi, detector, onChange }: {
   const top = ((roi.cy - roi.half) / height) * 100
   const size = ((roi.half * 2) / Math.max(width, height)) * 100
 
-  /** Drag in panel pixels, applied in detector pixels. */
+  /** Drag in panel pixels, applied in detector pixels.
+   *
+   * No `preventDefault` and no pointer capture on the way in: both stop the
+   * browser synthesising the click, and a DOUBLE-click on the region is how
+   * the panel under it gets enlarged — which is the only place the region can
+   * be aimed properly. The listeners go on the window instead, so a fast drag
+   * that leaves the box still tracks, and a two-pixel dead zone keeps the
+   * jitter of a double-click from moving anything.
+   */
   const drag = (event: React.PointerEvent, mode: 'move' | 'size') => {
-    event.preventDefault()
     event.stopPropagation()
     const panel = host.current?.parentElement
     if (!panel) return
@@ -1227,8 +1234,6 @@ function BeamRegionBox({ roi, detector, onChange }: {
     const perPixelY = height / box.height
     const startX = event.clientX, startY = event.clientY
     const start = { ...roi }
-    const target = event.currentTarget as HTMLElement
-    target.setPointerCapture(event.pointerId)
 
     const clamp = (next: BeamRoi): BeamRoi => {
       const half = Math.max(3, Math.min(next.half, Math.min(width, height) / 2))
@@ -1239,6 +1244,7 @@ function BeamRegionBox({ roi, detector, onChange }: {
       }
     }
     const onMove = (move: PointerEvent) => {
+      if (Math.abs(move.clientX - startX) < 2 && Math.abs(move.clientY - startY) < 2) return
       const dx = (move.clientX - startX) * perPixelX
       const dy = (move.clientY - startY) * perPixelY
       onChange(clamp(mode === 'move'
@@ -1246,18 +1252,21 @@ function BeamRegionBox({ roi, detector, onChange }: {
         : { ...start, half: start.half + (dx + dy) / 2 }))
     }
     const onUp = () => {
-      target.releasePointerCapture(event.pointerId)
-      target.removeEventListener('pointermove', onMove as EventListener)
-      target.removeEventListener('pointerup', onUp)
+      window.removeEventListener('pointermove', onMove)
+      window.removeEventListener('pointerup', onUp)
     }
-    target.addEventListener('pointermove', onMove as EventListener)
-    target.addEventListener('pointerup', onUp)
+    window.addEventListener('pointermove', onMove)
+    window.addEventListener('pointerup', onUp)
   }
 
   return (
     <div ref={host} data-testid="maped-beam-roi"
       onPointerDown={(e) => drag(e, 'move')}
-      onDoubleClick={(e) => e.stopPropagation()}
+      /* The double-click is deliberately NOT swallowed: it enlarges the panel,
+         and the region sits over the middle of it — exactly where someone
+         double-clicks to get a closer look at the beam they are aiming at.
+         A drag only moves the region once the pointer moves, so the two
+         gestures do not collide. */
       style={{ ...styles.beamRoi, left: `${left}%`, top: `${top}%`,
                width: `${size}%`, height: `${size}%` }}
     >
@@ -1419,7 +1428,7 @@ function ExtentInput({ value, onChange, testid, width }: {
  * double-clicks into this. Escape or a click anywhere dismisses it; the detail
  * box swallows its own clicks so the controls inside it stay usable.
  */
-function PanelZoom({ src, caption, detail, onClose }: {
+function PanelZoom({ src, caption, detail, roi, detector, onRoi, onClose }: {
   src: string | null
   caption: string
   detail?: React.ReactNode

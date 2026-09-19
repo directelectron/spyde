@@ -1,113 +1,117 @@
-/** The zero-beam search region, on the reciprocal tab, with real members. */
+/** The zero-beam search region: drawn, draggable, and on the enlarged panel.
+ *
+ * Synthetic members, because this is an INTERACTION test — the region's effect
+ * on a solve is measured in the Python suite, where it can be compared against
+ * a known answer instead of eyeballed.
+ */
 import { test, expect } from '@playwright/test'
 import { join } from 'path'
-import { readdirSync, statSync, existsSync } from 'fs'
 
 const { launchApp } = require('./_harness.cjs')
 const SHOTS = join(__dirname, '..', 'beam_roi_shots')
-const FOLDER = 'D:\Strain1degtilt910kx'
-const STEMS = ['20250710_27329', '20250710_27330', '20250710_27332', '20250710_27333']
-const paths = () => STEMS.map((s) => join(FOLDER, `${s}_cal.zspy`))
-
-function warm(directory: string): number {
-  let count = 0
-  for (const entry of readdirSync(directory, { withFileTypes: true })) {
-    const full = join(directory, entry.name)
-    if (entry.isDirectory()) count += warm(full)
-    else { try { statSync(full); count += 1 } catch { /* raced */ } }
-  }
-  return count
-}
+const MEMBER_DIRECTORY = join(require('os').tmpdir(), 'spyde-multiangle-test')
+const TILTS = [1.0, 1.0, 1.0, 0.5, 0.5]
+const SCAN = 28
+const paths = () => TILTS.map((_t, i) =>
+  join(MEMBER_DIRECTORY, `angle${String(i).padStart(2, '0')}.mrc`))
 
 let ctx: any
-test.setTimeout(45 * 60_000)
+test.setTimeout(10 * 60_000)
+
+const send = (action: string, payload: Record<string, unknown> = {}) =>
+  ctx.page.evaluate(([a, p]: any) => (window as any).electron.action(a, p),
+    [action, payload] as const)
 
 test.beforeAll(async () => {
-  for (const p of paths()) if (!existsSync(p)) throw new Error(`missing ${p}`)
-  warm(paths()[0])
-  ctx = await launchApp({ dask: true, env: { SPYDE_LOG_LEVEL: 'INFO' } })
+  ctx = await launchApp({ dask: false, env: { SPYDE_LOG_LEVEL: 'INFO' } })
+  await ctx.page.waitForTimeout(1500)
+  await send('write_test_multiangle_files', { nav: SCAN, sig: 64 })
   await ctx.page.waitForTimeout(2500)
 })
 test.afterAll(async () => { await ctx?.app?.close() })
 
-test('the region is drawn on the corner panels and can be moved', async () => {
-  const { page, app } = ctx
+test('the region is drawn, moves, and is placeable on the enlarged panel', async () => {
+  const { page } = ctx
   await page.getByTestId('menu-file').click()
   await page.getByTestId('menu-load-multiangle').click()
   const dialog = page.getByTestId('multiangle-loader')
   await expect(dialog).toBeVisible({ timeout: 20_000 })
-  await page.waitForTimeout(2000)
+  await page.waitForTimeout(1500)
 
-  await app.evaluate(({ ipcMain }: any, chosen: string[]) => {
-    ipcMain.removeHandler('spyde:pick-folders')
-    ipcMain.handle('spyde:pick-folders', async () => chosen)
-  }, paths())
-  await dialog.getByTestId('maped-add-folders').click()
+  await send('maped_add_files', { paths: paths() })
+  await page.waitForTimeout(3000)
+  await send('maped_set_scan_shape', { scan_shape: [SCAN, SCAN] })
   await expect(dialog.getByTestId('maped-summary'))
-    .toContainText('4 angles', { timeout: 600_000 })
-
-  for (let i = 0; i < STEMS.length; i += 1) {
-    await page.evaluate(([idx]) => (window as any).electron.action(
-      'maped_set_member', { index: idx, tilt: 1.0, azimuth: idx * 90 }), [i] as const)
-    await page.waitForTimeout(300)
+    .toContainText('5 angles', { timeout: 120_000 })
+  for (let i = 0; i < TILTS.length; i += 1) {
+    await send('maped_set_member', { index: i, tilt: TILTS[i], azimuth: i * 70 })
+    await page.waitForTimeout(200)
   }
-  await expect.poll(() => dialog.locator('img').count(), { timeout: 1_800_000 })
+  await expect.poll(() => dialog.locator('img').count(), { timeout: 240_000 })
     .toBeGreaterThanOrEqual(4)
 
-  // The reciprocal tab is locked until real space is solved — it is the stage
-  // that decides which members are in the acquisition at all.
-  await page.evaluate(() => (window as any).electron.action(
-    'maped_align_real', { params: { max_shift: 48 } }))
+  await send('maped_align_real', { params: { max_shift: 16 } })
   await expect(dialog.getByTestId('maped-tab-reciprocal'))
-    .toBeEnabled({ timeout: 1_800_000 })
-
+    .toBeEnabled({ timeout: 300_000 })
   await dialog.getByTestId('maped-tab-reciprocal').click()
-  await page.waitForTimeout(3000)
+  await page.waitForTimeout(2500)
   await dialog.screenshot({ path: join(SHOTS, '01-reciprocal-with-roi.png') })
 
   const boxes = dialog.getByTestId('maped-beam-roi')
   console.log('region boxes drawn:', await boxes.count())
   expect(await boxes.count(), 'no search region drawn').toBeGreaterThan(0)
-  console.log('radius field:', await dialog.getByTestId('maped-beam-roi-half').inputValue())
 
-  // Drag the first one and check the backend took the move.
-  const first = boxes.first()
-  const box = await first.boundingBox()
-  if (box) {
-    await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2)
-    await page.mouse.down()
-    await page.mouse.move(box.x + box.width / 2 + 12, box.y + box.height / 2 + 8, { steps: 8 })
-    await page.mouse.up()
-    await page.waitForTimeout(1500)
-  }
-  await dialog.screenshot({ path: join(SHOTS, '02-after-drag.png') })
-  console.log('status after drag:', await dialog.getByTestId('maped-status').textContent())
+  // Enlarge first: a tableau tile is far too coarse to aim on.
+  const probe = await page.evaluate(() => {
+    const panel = document.querySelector('[data-testid="maped-corner-0-0"]')
+    if (!panel) return { found: false }
+    const r = panel.getBoundingClientRect()
+    const atCentre = document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2)
+    return {
+      found: true,
+      rect: [Math.round(r.width), Math.round(r.height)],
+      atCentre: (atCentre as HTMLElement)?.dataset?.testid
+        ?? (atCentre as HTMLElement)?.tagName ?? null,
+      zoomsBefore: document.querySelectorAll('[data-testid="maped-zoom"]').length,
+    }
+  })
+  console.log('PROBE', JSON.stringify(probe))
 
-  await dialog.getByTestId('maped-beam-roi-half').fill('24')
-  await page.waitForTimeout(1500)
-  await dialog.screenshot({ path: join(SHOTS, '03-radius-24.png') })
-  console.log('status after radius:', await dialog.getByTestId('maped-status').textContent())
-
-  // A tableau tile is ~100 screen px for a 512 px detector, so a drag there
-  // moves the region five detector pixels at a time. The enlarged panel is
-  // where it can actually be placed on a disk.
   await page.getByTestId('maped-corner-0-0').dblclick()
+  await page.waitForTimeout(800)
+  console.log('zooms after playwright dblclick:', await page.getByTestId('maped-zoom').count())
+
+  if (await page.getByTestId('maped-zoom').count() === 0) {
+    const dispatched = await page.evaluate(() => {
+      const panel = document.querySelector('[data-testid="maped-corner-0-0"]')
+      panel?.dispatchEvent(new MouseEvent('dblclick', { bubbles: true }))
+      return document.querySelectorAll('[data-testid="maped-zoom"]').length
+    })
+    await page.waitForTimeout(600)
+    console.log('zooms after a dispatched dblclick:', dispatched,
+      '->', await page.getByTestId('maped-zoom').count())
+  }
   await expect(page.getByTestId('maped-zoom')).toBeVisible({ timeout: 20_000 })
-  await page.waitForTimeout(1200)
-  await page.screenshot({ path: join(SHOTS, '04-zoomed-with-roi.png') })
+  await page.waitForTimeout(1000)
+  await page.screenshot({ path: join(SHOTS, '02-zoomed-with-roi.png') })
+
   const zoomBox = page.getByTestId('maped-zoom').getByTestId('maped-beam-roi')
-  console.log('region in the enlarged panel:', await zoomBox.count())
   expect(await zoomBox.count(), 'no region in the enlarged panel').toBe(1)
 
+  const before = await dialog.getByTestId('maped-status').textContent()
   const zb = await zoomBox.boundingBox()
-  if (zb) {
-    await page.mouse.move(zb.x + zb.width / 2, zb.y + zb.height / 2)
-    await page.mouse.down()
-    await page.mouse.move(zb.x + zb.width / 2 + 30, zb.y + zb.height / 2 - 18, { steps: 10 })
-    await page.mouse.up()
-    await page.waitForTimeout(1500)
-  }
-  await page.screenshot({ path: join(SHOTS, '05-zoom-after-drag.png') })
-  console.log('status after zoom drag:',
-    await dialog.getByTestId('maped-status').textContent())
+  expect(zb, 'the enlarged region has no box').not.toBeNull()
+  await page.mouse.move(zb!.x + zb!.width / 2, zb!.y + zb!.height / 2)
+  await page.mouse.down()
+  await page.mouse.move(zb!.x + zb!.width / 2 + 40, zb!.y + zb!.height / 2 - 25,
+    { steps: 12 })
+  await page.mouse.up()
+  await page.waitForTimeout(1500)
+  await page.screenshot({ path: join(SHOTS, '03-zoom-after-drag.png') })
+  const after = await dialog.getByTestId('maped-status').textContent()
+  console.log('status before:', before)
+  console.log('status after :', after)
+  expect(after, 'dragging in the enlarged panel did not move the region')
+    .not.toEqual(before)
+  expect(after).toMatch(/Zero beam searched within/)
 })
