@@ -1777,3 +1777,149 @@ class TestTheAlignedSumWindow:
             loader._show_aligned_sum(session, session._multiangle_loader)
 
         assert len(self._figures(window["messages"][before:])) == 1
+
+
+def _planted_pattern(size=512, beam=(250.0, 262.0), beam_peak=900.0,
+                     reflection=(250.0, 346.0), reflection_peak=2600.0):
+    """A zero beam near the middle and a BRIGHTER reflection 84 px away.
+
+    84 px is where GaN (0002) lands on the real acquisition this came from,
+    and the reflection outshining the zero beam is the ordinary case off zone
+    axis. A centre of mass over the whole frame is dragged towards whichever
+    reflections a tilt excites; this is the smallest thing that shows it.
+    """
+    y, x = np.mgrid[0:size, 0:size].astype(np.float64)
+    def blob(cy, cx, peak, width=6.0):
+        return peak * np.exp(-(((y - cy) ** 2 + (x - cx) ** 2) /
+                               (2.0 * width ** 2)))
+    return (blob(*beam, beam_peak) + blob(*reflection, reflection_peak)
+            + 1.0).astype(np.float32)
+
+
+class TestTheBeamSearchRegion:
+    """The reciprocal stage looks for the zero beam where it is told to."""
+
+    def test_no_region_means_the_whole_pattern(self):
+        assert loader.beam_region(None, (64, 64)) is None
+        assert loader.beam_region({}, (64, 64)) is None
+
+    def test_a_region_is_clipped_to_the_pattern(self):
+        rows, columns = loader.beam_region(
+            {"cy": 4.0, "cx": 60.0, "half": 10.0}, (64, 64))
+        assert (rows.start, rows.stop) == (0, 15)
+        assert (columns.start, columns.stop) == (50, 64)
+
+    def test_a_region_off_the_pattern_is_refused_rather_than_empty(self):
+        assert loader.beam_region(
+            {"cy": -50.0, "cx": 32.0, "half": 4.0}, (64, 64)) is None
+
+    def test_nonsense_is_ignored_rather_than_raised(self):
+        assert loader.beam_region({"cy": 1.0}, (64, 64)) is None
+        assert loader.beam_region({"cy": "a", "cx": 1, "half": 2}, (64, 64)) is None
+
+    def test_the_whole_pattern_is_pulled_by_a_bright_reflection(self):
+        """The defect, stated as a measurement rather than a story."""
+        pattern = _planted_pattern()
+        x, _y = loader._beam_position(pattern, dict(loader.DEFAULTS), None)
+        centre_x = loader._beam_position(
+            _planted_pattern(reflection_peak=0.0),
+            dict(loader.DEFAULTS), None)[0]
+        assert abs(x - centre_x) > 20.0
+
+    def test_a_region_on_the_beam_measures_the_beam(self):
+        pattern = _planted_pattern()
+        roi = {"cy": 256.0, "cx": 256.0, "half": 32.0}
+        x, y = loader._beam_position(pattern, dict(loader.DEFAULTS), roi)
+        alone = loader._beam_position(
+            _planted_pattern(reflection_peak=0.0), dict(loader.DEFAULTS), roi)
+        assert abs(x - alone[0]) < 1.0
+        assert abs(y - alone[1]) < 1.0
+
+    def test_the_region_is_reported_in_the_full_patterns_frame(self):
+        """Where the region sits must not change the answer.
+
+        Not compared against the whole-pattern reading, which is not a
+        reference: a centre of mass over the whole frame is dragged towards
+        the middle by the background alone, which is half of why the region
+        exists.
+        """
+        pattern = _planted_pattern(beam=(250.0, 262.0), reflection_peak=0.0)
+        answers = [
+            loader._beam_position(pattern, dict(loader.DEFAULTS), roi)
+            for roi in ({"cy": 250.0, "cx": 262.0, "half": 40.0},
+                        {"cy": 240.0, "cx": 250.0, "half": 60.0},
+                        {"cy": 262.0, "cx": 275.0, "half": 50.0})]
+        # Within a pixel, not exactly: a centre of mass is pulled towards its
+        # OWN middle by the background, so where the region sits moves the
+        # answer slightly. Forgetting the correction instead moves it by the
+        # region's origin, which is tens of pixels.
+        for x, y in answers[1:]:
+            assert abs(x - answers[0][0]) < 1.5
+            assert abs(y - answers[0][1]) < 1.5
+        # And it is the planted beam: the finder reports centre − beam, so a
+        # beam 6 px right of and 6 px above the middle of a 512 frame reads
+        # (−6, +6).
+        assert abs(answers[0][0] - -6.0) < 1.0
+        assert abs(answers[0][1] - 6.0) < 1.0
+
+
+class TestSettingTheBeamRegion:
+    def test_it_is_placed_on_the_detector_once_members_are_probed(self):
+        state = loader.MultiAngleLoaderState()
+        state.members = [loader.LoaderMember(path="a", name="a",
+                                             detector_shape=(512, 512))]
+        loader._default_beam_roi(state)
+        assert state.beam_roi == {"cy": 256.0, "cx": 256.0, "half": 64.0}
+
+    def test_a_region_already_chosen_is_not_overwritten(self):
+        state = loader.MultiAngleLoaderState()
+        state.members = [loader.LoaderMember(path="a", name="a",
+                                             detector_shape=(512, 512))]
+        state.beam_roi = {"cy": 10.0, "cx": 20.0, "half": 5.0}
+        loader._default_beam_roi(state)
+        assert state.beam_roi == {"cy": 10.0, "cx": 20.0, "half": 5.0}
+
+    def test_moving_it_throws_the_reciprocal_solve_away(self, window):
+        session = window["window"]
+        loader.maped_open_loader(session, None, {})
+        state = session._multiangle_loader
+        state.reciprocal.offsets = np.zeros((2, 2), dtype=np.int64)
+        loader.maped_set_beam_roi(
+            session, None, {"beam_roi": {"cy": 1.0, "cx": 2.0, "half": 3.0}})
+        assert state.beam_roi == {"cy": 1.0, "cx": 2.0, "half": 3.0}
+        assert not state.reciprocal.solved
+
+    def test_resending_the_same_region_keeps_the_solve(self, window):
+        session = window["window"]
+        loader.maped_open_loader(session, None, {})
+        state = session._multiangle_loader
+        roi = {"cy": 1.0, "cx": 2.0, "half": 3.0}
+        loader.maped_set_beam_roi(session, None, {"beam_roi": roi})
+        state.reciprocal.offsets = np.zeros((2, 2), dtype=np.int64)
+        loader.maped_set_beam_roi(session, None, {"beam_roi": dict(roi)})
+        assert state.reciprocal.solved
+
+    def test_null_searches_the_whole_pattern_again(self, window):
+        session = window["window"]
+        loader.maped_open_loader(session, None, {})
+        state = session._multiangle_loader
+        state.beam_roi = {"cy": 1.0, "cx": 2.0, "half": 3.0}
+        loader.maped_set_beam_roi(session, None, {"beam_roi": None})
+        assert state.beam_roi is None
+
+    def test_a_region_with_no_size_is_refused(self, window):
+        session = window["window"]
+        loader.maped_open_loader(session, None, {})
+        state = session._multiangle_loader
+        loader.maped_set_beam_roi(
+            session, None, {"beam_roi": {"cy": 1.0, "cx": 2.0, "half": 0.0}})
+        assert state.beam_roi is None
+
+    def test_the_snapshot_carries_it(self, window):
+        session = window["window"]
+        loader.maped_open_loader(session, None, {})
+        state = session._multiangle_loader
+        loader.maped_set_beam_roi(
+            session, None, {"beam_roi": {"cy": 1.0, "cx": 2.0, "half": 3.0}})
+        message = loader.state_message(state)
+        assert message["beam_roi"] == {"cy": 1.0, "cx": 2.0, "half": 3.0}

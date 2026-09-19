@@ -337,6 +337,16 @@ class MultiAngleLoaderState:
     #: field would be comparing two different pictures and calling the
     #: difference drift.
     virtual_image: str | None = None
+    #: Where the reciprocal stage looks for the zero beam, as
+    #: ``{"cy": …, "cx": …, "half": …}`` in DETECTOR pixels, or ``None`` for
+    #: the whole pattern. ONE for the acquisition, like the scan shape: the
+    #: members are the same detector at the same camera length, and a region
+    #: per member could be placed on a different reflection in each.
+    #:
+    #: It exists because the beam finder is a centre of mass, which over a
+    #: whole pattern is pulled bodily towards whichever reflections a tilt
+    #: happens to excite. Placed on the zero beam it measures the zero beam.
+    beam_roi: dict | None = None
     #: The open aligned-sum window, or ``None``. One per dialog: re-running the
     #: alignment repaints it rather than opening another, and a ✕ on it clears
     #: this through the controller's ``close``.
@@ -546,6 +556,7 @@ def state_message(state: MultiAngleLoaderState | None) -> dict:
         return {"type": "maped_state", "members": [], "reference": None,
                 "shells": [], "scan_shape": None,
                 "virtual_image": None, "available_virtual_images": [],
+                "beam_roi": None,
                 "real": LoaderStage().as_message(),
                 "reciprocal": {**LoaderStage().as_message(), "corners": {}},
                 "busy": False, "message": "", "can_commit": False}
@@ -591,6 +602,9 @@ def state_message(state: MultiAngleLoaderState | None) -> dict:
                        else [int(v) for v in state.scan_shape]),
         "virtual_image": state.virtual_image,
         "available_virtual_images": state.available_virtual_images,
+        "beam_roi": (None if not state.beam_roi else
+                     {key: float(value)
+                      for key, value in state.beam_roi.items()}),
         "real": state.real.as_message(),
         "reciprocal": {**state.reciprocal.as_message(),
                        "corners": _corners_message(state)},
@@ -1418,7 +1432,36 @@ def _solver_parameters(params) -> dict:
             if name in params}
 
 
-def _beam_position(pattern, params: dict) -> tuple[float, float]:
+def beam_region(roi, shape) -> tuple[slice, slice] | None:
+    """``(rows, columns)`` for the ``{cy, cx, half}`` *roi*, clipped to *shape*.
+
+    ``None`` when there is no region, which means the whole pattern — what the
+    stage did before a region could be given at all.
+    """
+    if not roi:
+        return None
+    try:
+        cy = float(roi["cy"])
+        cx = float(roi["cx"])
+        half = float(roi["half"])
+    except (KeyError, TypeError, ValueError):
+        log.debug("ignoring a beam region that is not {cy, cx, half}: %r", roi)
+        return None
+    if half <= 0:
+        return None
+    height, width = int(shape[0]), int(shape[1])
+    rows = slice(max(0, int(round(cy - half))),
+                 min(height, int(round(cy + half)) + 1))
+    columns = slice(max(0, int(round(cx - half))),
+                    min(width, int(round(cx + half)) + 1))
+    if rows.stop - rows.start < 2 or columns.stop - columns.start < 2:
+        log.debug("a beam region of %r leaves nothing of a %r pattern to "
+                  "search; using the whole pattern", roi, shape)
+        return None
+    return rows, columns
+
+
+def _beam_position(pattern, params: dict, roi=None) -> tuple[float, float]:
     """One pattern's direct beam as ``(x, y)``, pyxem's order and convention.
 
     ``get_direct_beam_position`` reports ``centre − beam``: not the beam's
@@ -1426,10 +1469,22 @@ def _beam_position(pattern, params: dict) -> tuple[float, float]:
     caller here, because each one only ever takes DIFFERENCES between two
     members' values, and the frame centre — whatever pyxem takes it to be —
     cancels in the difference.
+
+    *roi* is the region the beam is looked for in. Cropping here rather than
+    passing ``half_square_width`` down is what lets the region sit ANYWHERE:
+    that argument crops a square about the frame's own middle, and a descanned
+    zero beam is not there. It matters more than it sounds — the default method
+    is a centre of mass, so over a whole pattern it is pulled bodily by
+    whichever reflections a tilt happens to excite, and members that differ
+    only in excitation come back tens of pixels apart.
     """
     import hyperspy.api as hs
 
-    signal = hs.signals.Signal2D(np.asarray(pattern, dtype=np.float32))
+    pattern = np.asarray(pattern, dtype=np.float32)
+    region = beam_region(roi, pattern.shape)
+    searched = pattern if region is None else pattern[region[0], region[1]]
+
+    signal = hs.signals.Signal2D(searched)
     signal.set_signal_type("electron_diffraction")
     arguments = {"method": str(params.get("beam_method",
                                           DEFAULTS["beam_method"])),
@@ -1440,7 +1495,16 @@ def _beam_position(pattern, params: dict) -> tuple[float, float]:
         arguments["half_square_width"] = half_square_width
     position = np.asarray(signal.get_direct_beam_position(**arguments).data,
                           dtype=np.float64).ravel()
-    return float(position[0]), float(position[1])
+    x, y = float(position[0]), float(position[1])
+    if region is not None:
+        # Back into the FULL pattern's frame. The answer is centre − beam, so a
+        # crop moves it by the difference of the two centres less the crop's
+        # own origin; both centres follow the same convention, so whatever
+        # pyxem takes "centre" to mean cancels out of the difference.
+        rows, columns = region
+        x += (pattern.shape[1] - searched.shape[1]) / 2.0 - columns.start
+        y += (pattern.shape[0] - searched.shape[0]) / 2.0 - rows.start
+    return x, y
 
 
 def _offsets_from_positions(positions, reference: int):
@@ -1456,13 +1520,14 @@ def _offsets_from_positions(positions, reference: int):
     return offsets, (shifts - offsets).astype(np.float32)
 
 
-def _beam_offsets(patterns, reference: int, params: dict):
+def _beam_offsets(patterns, reference: int, params: dict, roi=None):
     """Reciprocal offsets from the beam fitted in each member's MEAN pattern."""
     return _offsets_from_positions(
-        [_beam_position(pattern, params) for pattern in patterns], reference)
+        [_beam_position(pattern, params, roi) for pattern in patterns],
+        reference)
 
 
-def _corner_beam_position(member: LoaderMember, params: dict
+def _corner_beam_position(member: LoaderMember, params: dict, roi=None
                           ) -> tuple[float, float]:
     """One member's beam position, from the four scan corners alone.
 
@@ -1485,16 +1550,16 @@ def _corner_beam_position(member: LoaderMember, params: dict
     for corner, pattern in enumerate(member.corner_patterns):
         rows, columns = corner_slice(nav_shape, corner,
                                      member.corner_extents[corner])
-        field[rows, columns] = _beam_position(pattern, params)
+        field[rows, columns] = _beam_position(pattern, params, roi)
     plane = plane_through(field, None)
     middle = plane[nav_shape[0] // 2, nav_shape[1] // 2]
     return float(middle[0]), float(middle[1])
 
 
-def _corner_offsets(members, reference: int, params: dict):
+def _corner_offsets(members, reference: int, params: dict, roi=None):
     """Reciprocal offsets from every member's four scan corners."""
     return _offsets_from_positions(
-        [_corner_beam_position(member, params) for member in members],
+        [_corner_beam_position(member, params, roi) for member in members],
         reference)
 
 
@@ -1718,6 +1783,7 @@ def maped_add_files(session, plot, payload) -> None:
         if not is_current(state, "_probe_generation", generation):
             return
         _resettle(state)
+        _default_beam_roi(state)
         state.message = _member_summary(state)
         _emit_state(state)
         # Straight on into reading the members for the tableau, WITHOUT letting
@@ -2069,6 +2135,71 @@ def _not_ready(state: MultiAngleLoaderState) -> str | None:
     return None
 
 
+def maped_set_beam_roi(session, plot, payload) -> None:
+    """Place the region the reciprocal stage looks for the zero beam in.
+
+    ``{"cy": …, "cx": …, "half": …}`` in detector pixels, or ``null`` to search
+    the whole pattern again. One region for the acquisition — see
+    :attr:`MultiAngleLoaderState.beam_roi`.
+
+    Nothing is recomputed here. Moving the region invalidates the reciprocal
+    solve and stops, because the corner sums it would be applied to are
+    unchanged: only the search inside them moves, and re-running that is the
+    Align button's job, not a side effect of dragging.
+    """
+    state = _loader_state(session)
+    raw = (payload or {}).get("beam_roi", (payload or {}).get("roi"))
+
+    if raw is None:
+        roi = None
+    else:
+        try:
+            roi = {"cy": float(raw["cy"]), "cx": float(raw["cx"]),
+                   "half": float(raw["half"])}
+        except (KeyError, TypeError, ValueError):
+            emit_error("A beam region is {cy, cx, half} in detector pixels; "
+                       f"got {raw!r}.")
+            _emit_state(state)
+            return
+        if roi["half"] <= 0:
+            emit_error(f"A beam region needs a positive half-width; got "
+                       f"{roi['half']:g}.")
+            _emit_state(state)
+            return
+
+    if roi != state.beam_roi:
+        state.beam_roi = roi
+        # Only on a real move: a renderer re-sending a resting value is
+        # ordinary, and throwing a solved alignment away for it would make the
+        # stage impossible to hold on to.
+        state.invalidate_reciprocal()
+    state.message = ("Searching the whole pattern for the zero beam"
+                     if roi is None else
+                     f"Zero beam searched within {roi['half']:g} px of "
+                     f"({roi['cx']:.0f}, {roi['cy']:.0f})")
+    _emit_state(state)
+
+
+def _default_beam_roi(state: MultiAngleLoaderState) -> None:
+    """Put a region on the middle of the detector, once its size is known.
+
+    A default rather than nothing, because nothing is the broken case: the
+    finder is a centre of mass, and over a whole pattern it reads wherever the
+    excited reflections happen to lie. An eighth of the detector about the
+    middle holds a descanned zero beam and excludes the first reflections at
+    this camera length; it is a starting point to drag, not a measurement.
+    """
+    if state.beam_roi is not None:
+        return
+    shapes = [member.detector_shape for member in state.members
+              if member.detector_shape is not None]
+    if not shapes:
+        return
+    height, width = (int(size) for size in shapes[0][:2])
+    state.beam_roi = {"cy": height / 2.0, "cx": width / 2.0,
+                      "half": max(8.0, round(min(height, width) / 8.0))}
+
+
 def maped_align_real(session, plot, payload) -> None:
     """Solve the real-space alignment on a worker, from the virtual images.
 
@@ -2146,17 +2277,21 @@ def maped_align_reciprocal(session, plot, payload) -> None:
         _emit_state(state)
         return
     parameters = dict(payload.get("params") or {})
+    # From the state, not the payload: the region is something the user placed
+    # and can see, so a solve started from anywhere has to use the one on
+    # screen rather than whichever the caller happened to pass.
+    roi = dict(state.beam_roi) if state.beam_roi else None
     reference = int(state.reference)
     members = list(state.members)          # see maped_align_real
 
     def _work():
         if method == "corners":
             _ensure_corner_sums(state, members)
-            return _corner_offsets(members, reference, parameters)
+            return _corner_offsets(members, reference, parameters, roi)
         _ensure_reductions(state, members)
         patterns = [member.pattern for member in members]
         if method == "beam":
-            return _beam_offsets(patterns, reference, parameters)
+            return _beam_offsets(patterns, reference, parameters, roi)
         return solve_reciprocal(np.stack(patterns), reference=reference,
                                 **_solver_parameters(parameters))
 
