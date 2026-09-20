@@ -36,6 +36,7 @@ record.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import threading
 
@@ -50,10 +51,19 @@ from spyde.backend._session_files import (
 
 log = logging.getLogger(__name__)
 
-#: Scan positions per navigation chunk of the members' common grid. Matches the
-#: default :mod:`spyde.multiangle.load` chooses, so members loaded through
-#: either door land on the same grid.
+#: Scan positions per navigation chunk of the members' common grid, when the
+#: composed frame's size is not known. Matches the default
+#: :mod:`spyde.multiangle.load` chooses, so members loaded through either door
+#: land on the same grid.
 NAV_CHUNK = 32
+
+#: What ONE composed navigation chunk should weigh. A chunk is what every
+#: consumer holds whole, so bytes are the thing to fix, not a count of scan
+#: positions: 32 x 32 is 134 MB of 256 x 256 uint16 patterns and 1.04 GB of
+#: 507 x 501 uint32 ones, and at a gigabyte nothing downstream will take the
+#: chunking as it stands — find-vectors sizes its ghost blocks to 100 MB, so it
+#: rechunks, which is the one move the aligned read exists to avoid.
+NAV_CHUNK_BYTES = 100 * 1024 ** 2
 
 #: Rounding this far from a whole pixel means the integer alignment was the
 #: better of two near-equal choices, which the user should hear about rather
@@ -127,6 +137,45 @@ def _solve_model(paths, tilts, azimuths, images, patterns, reference: int):
     )
 
 
+def composed_nav_chunk(members, target_bytes: int = NAV_CHUNK_BYTES) -> int:
+    """Scan positions per axis in one composed navigation chunk.
+
+    Derived from what a composed FRAME weighs rather than fixed, because that
+    is what changes between acquisitions: the same 32 that is 134 MB of
+    256 x 256 uint16 patterns is 1.04 GB of 507 x 501 uint32 ones, once the
+    detector is bigger and summing four uint16 members has promoted the sum to
+    uint32. A chunk is held whole by everyone who touches it, so its SIZE is
+    the quantity to hold steady.
+
+    ONE number for the acquisition, not one per member: the members share the
+    common grid, and :func:`~spyde.multiangle.compose.member_nav_chunks` needs
+    their crops to keep landing on it.
+
+    Nothing here is an alignment constraint — a frame-chunked store addresses
+    every frame separately, so any value splits no stored chunk. Falls back to
+    :data:`NAV_CHUNK` when a member does not say what its frames are.
+    """
+    from spyde.multiangle.compose import sum_dtype
+
+    # A signal or the bare array: the composition is handed both, and which one
+    # it is says nothing about how big a chunk should be.
+    arrays = [getattr(member, "data", member) for member in members]
+    arrays = [array for array in arrays
+              if getattr(array, "shape", None) is not None
+              and getattr(array, "dtype", None) is not None
+              and len(array.shape) >= 2]
+    if not arrays:
+        return NAV_CHUNK
+    shapes = [tuple(int(s) for s in array.shape[-2:]) for array in arrays]
+    dtypes = [array.dtype for array in arrays]
+    frame_bytes = (shapes[0][0] * shapes[0][1]
+                   * np.dtype(sum_dtype(dtypes[0], len(dtypes))).itemsize)
+    if frame_bytes <= 0:
+        return NAV_CHUNK
+    # Per AXIS, so the chunk is nav_chunk**2 frames.
+    return max(1, int(math.isqrt(max(1, int(target_bytes // frame_bytes)))))
+
+
 def _aligned_arrays(members, model):
     """Every member on the common grid, aligned as it is READ where it can be.
 
@@ -149,14 +198,15 @@ def _aligned_arrays(members, model):
         aligned_from_signal, load_aligned_store_member,
     )
 
+    nav_chunk = composed_nav_chunk(members)
     aligned = []
     for index, member in enumerate(members):
         # Checked against None, never for truthiness: these are arrays, and
         # `a or b` asks a multi-element array whether it is true, which raises.
-        array = aligned_from_signal(member, model, index, nav_chunk=NAV_CHUNK)
+        array = aligned_from_signal(member, model, index, nav_chunk=nav_chunk)
         if array is None:
             array = load_aligned_store_member(
-                member, model, index, nav_chunk=NAV_CHUNK)
+                member, model, index, nav_chunk=nav_chunk)
         if array is None:
             array = aligned_member(member, model, index)
         aligned.append(array)

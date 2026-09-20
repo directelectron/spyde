@@ -7,6 +7,7 @@ not read a single member. The second half is the Memory-Safety rule from
 CLAUDE.md — these arrays are tens of gigabytes in the field, and a stray
 ``.compute()`` on one would take the machine down rather than run slowly.
 """
+import math
 from unittest.mock import patch
 
 import dask.array as da
@@ -18,6 +19,8 @@ from spyde.multiangle.compose import (
     composed_axis_offsets, composed_nav_chunks, member_nav_chunks,
     sum_dtype, _aligned_members,
 )
+from hyperspy._signals.signal2d import LazySignal2D
+
 from spyde.multiangle.model import MultiAngleModel
 
 SCAN = (24, 28)
@@ -278,3 +281,91 @@ class TestComposedAxisOffsets:
             detector_offsets=(-1.0, -1.0), detector_scales=(0.1, 0.1))
         assert scan_origin == (5.0, 6.0)
         assert detector_origin == (-1.0, -1.0)
+
+
+class TestTheComposedChunkIsSizedByBytes:
+    """A navigation chunk is what every consumer holds whole, so its SIZE is
+    the thing to hold steady — not a count of scan positions.
+
+    The count used to be fixed at 32, which is 134 MB of 256 x 256 uint16
+    patterns and 1.04 GB of 507 x 501 uint32 ones. At a gigabyte nothing
+    downstream accepts the chunking as it stands, so find-vectors rechunked —
+    the one move the aligned read exists to avoid.
+    """
+
+    def _members(self, count, detector, dtype=np.uint16):
+        return [LazySignal2D(da.zeros((16, 16) + detector, dtype=dtype,
+                                      chunks=(1, 1) + detector))
+                for _ in range(count)]
+
+    @pytest.mark.parametrize("detector", [(128, 128), (256, 256), (507, 501),
+                                          (1024, 1024)])
+    def test_the_chunk_stays_within_the_budget(self, detector):
+        from spyde.backend._session_multiangle import (
+            NAV_CHUNK_BYTES, composed_nav_chunk,
+        )
+        members = self._members(4, detector)
+        chunk = composed_nav_chunk(members)
+        frame_bytes = detector[0] * detector[1] * np.dtype(
+            sum_dtype(np.uint16, 4)).itemsize
+        assert chunk >= 1
+        assert chunk * chunk * frame_bytes <= NAV_CHUNK_BYTES
+
+    def test_a_bigger_detector_gets_fewer_positions(self):
+        from spyde.backend._session_multiangle import composed_nav_chunk
+        small = composed_nav_chunk(self._members(4, (128, 128)))
+        large = composed_nav_chunk(self._members(4, (1024, 1024)))
+        assert small > large
+
+    def test_it_is_sized_by_the_SUMS_dtype_not_the_members(self):
+        """Four uint16 members compose to uint32 — twice the bytes per frame.
+
+        Sizing against the members' own dtype would let through a chunk twice
+        the budget, which is the mistake that makes a chunk bigger than anyone
+        downstream will hold.
+        """
+        from spyde.backend._session_multiangle import (
+            NAV_CHUNK_BYTES, composed_nav_chunk,
+        )
+        detector = (507, 501)
+        members = self._members(4, detector, np.uint16)
+        chunk = composed_nav_chunk(members)
+        composed_frame = detector[0] * detector[1] * np.dtype(
+            sum_dtype(np.uint16, 4)).itemsize
+        member_frame = detector[0] * detector[1] * 2
+        naive = int(math.isqrt(NAV_CHUNK_BYTES // member_frame))
+        assert chunk < naive
+        assert naive * naive * composed_frame > NAV_CHUNK_BYTES
+        assert chunk * chunk * composed_frame <= NAV_CHUNK_BYTES
+
+    def test_find_vectors_keeps_the_composed_chunking(self):
+        """The contract that matters: no rechunk downstream.
+
+        find-vectors keeps the stored chunking when every navigation chunk is
+        within its own ghost budget, and rechunks otherwise. A composition
+        sized in bytes has to land inside that window for every detector, or
+        the alignment work is undone by the next step.
+        """
+        from spyde.actions.find_vectors.orchestrate import _nav_chunk_size
+        from spyde.backend._session_multiangle import composed_nav_chunk
+        for detector in ((128, 128), (256, 256), (507, 501), (1024, 1024)):
+            members = self._members(4, detector)
+            chunk = composed_nav_chunk(members)
+            budget = _nav_chunk_size(0.0, max_ram_mb=100, sig_shape=detector)
+            keep_limit = min(max(2 * budget, budget), 255)
+            assert chunk <= keep_limit, (
+                f"{detector}: composed {chunk} exceeds find-vectors' "
+                f"keep limit {keep_limit}, so it would rechunk")
+
+    def test_members_that_say_nothing_fall_back(self):
+        from spyde.backend._session_multiangle import (
+            NAV_CHUNK, composed_nav_chunk,
+        )
+        assert composed_nav_chunk([]) == NAV_CHUNK
+
+    def test_a_bare_array_is_read_as_readily_as_a_signal(self):
+        """The composition is handed both, and which one says nothing about size."""
+        from spyde.backend._session_multiangle import composed_nav_chunk
+        signals = self._members(4, (256, 256))
+        bare = [signal.data for signal in signals]
+        assert composed_nav_chunk(bare) == composed_nav_chunk(signals)
