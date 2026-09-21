@@ -49,7 +49,7 @@ functions:
     plot_dim: [ 2 ]
     toolbar_side: right
   Rebin:
-    description: Rebin the signal data to reduce its size.
+    description: Rebin the detector, the scan, or both, to reduce the size.
     icon: drawing/toolbars/icons/rebin.svg
     parameters:
       scale_x:
@@ -60,13 +60,21 @@ functions:
         name: Scale Y
         type: int
         default: 2
+      scan_x:
+        name: Scan X
+        type: int
+        default: 1
+      scan_y:
+        name: Scan Y
+        type: int
+        default: 1
     function: spyde.actions.base.Rebin2DAction
     plot_dim: [ 2 ]
     toolbar_side: bottom
     navigation: False
     toggle: True
   Crop:
-    description: Crop the dataset to a spatial (image) box and optional time range. Produces a smaller lazy dataset (no data copied). Leave a range at 0 to keep that axis whole.
+    description: Crop the dataset to a detector box, a scan box, or both. Produces a smaller lazy dataset (no data copied). Leave a range at 0 to keep that axis whole.
     icon: drawing/toolbars/icons/crop.svg
     function: spyde.actions.base.CropAction
     plot_dim: [ 2 ]
@@ -95,6 +103,22 @@ functions:
         default: 0
       t1:
         name: T end
+        type: int
+        default: 0
+      scan_x0:
+        name: Scan X start
+        type: int
+        default: 0
+      scan_x1:
+        name: Scan X end
+        type: int
+        default: 0
+      scan_y0:
+        name: Scan Y start
+        type: int
+        default: 0
+      scan_y1:
+        name: Scan Y end
         type: int
         default: 0
   Center Zero Beam:

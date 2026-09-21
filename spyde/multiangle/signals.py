@@ -135,6 +135,14 @@ def _carry_metadata(signal, members, model):
             log.warning("the multi-angle members' metadata was not carried "
                         "over to the composition: %s", e)
     try:
+        # The OFFSETS and the member paths belong here as much as the angles.
+        # Without them a composed file says which acquisition it came from but
+        # not what was done to it, so it cannot be reproduced, checked, or
+        # taken apart again — and an alignment that was finished by hand
+        # exists nowhere else at all. Recovering it afterwards from the sum
+        # does not work: correlating each member back against the result gets
+        # the placement close and wrong, and rebuilding at those offsets
+        # misses by thousands of counts.
         signal.metadata.set_item("Acquisition.multiangle", {
             "n_members": int(model.n_members),
             "n_shells": int(model.n_shells),
@@ -142,9 +150,13 @@ def _carry_metadata(signal, members, model):
             "azimuths": [float(value) for value in model.azimuths],
             "shell_ids": [int(value) for value in model.shell_ids],
             "reference": int(model.reference),
+            "nav_offsets": [[int(dy), int(dx)] for dy, dx in model.nav_offsets],
+            "dp_offsets": [[int(dy), int(dx)] for dy, dx in model.dp_offsets],
+            "paths": [str(path) for path in model.paths],
         })
-    except Exception:
-        pass
+    except Exception as e:
+        log.warning("the multi-angle acquisition was not recorded on the "
+                    "composition: %s", e)
     return signal
 
 

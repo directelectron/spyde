@@ -187,23 +187,57 @@ class Rebin2DAction(TransformAction):
     method = "rebin"
     node_name = "Binned"
     # Frame N of the binned output is a deterministic downsample of frame N of
-    # the input only — a bounded, local per-frame transform.
+    # the input only — a bounded, local per-frame transform. Binning the SCAN
+    # is not: an output position is built from several input ones, so it is
+    # left off that promise.
     is_local_per_frame = True
     parameters = {
         "scale_x": {"default": 2},
         "scale_y": {"default": 2},
+        "scan_x": {"default": 1},
+        "scan_y": {"default": 1},
     }
 
-    def build_kwargs(self, signal, scale_x=2, scale_y=2, **_):
-        if signal.axes_manager.signal_dimension != 2:
+    def build_kwargs(self, signal, scale_x=2, scale_y=2, scan_x=1, scan_y=1,
+                     **_):
+        """Bin the detector, the scan, or both.
+
+        The scan was not binnable at all before, which left no way to shrink a
+        4-D dataset in the direction that usually dominates its size — and no
+        way to save a reduced one out of the app.
+
+        ``scale`` is in the axes manager's own order, which is display order:
+        navigation axes first, fastest first, then the signal axes. For a 4-D
+        scan that is (scan x, scan y, kx, ky), and an array shaped
+        (scan y, scan x, ky, kx).
+        """
+        manager = signal.axes_manager
+        if manager.signal_dimension != 2:
             raise RuntimeError("Current signal is not 2D, cannot rebin2d.")
-        nav = signal.axes_manager.navigation_dimension
-        return {"scale": [1] * nav + [int(scale_x), int(scale_y)]}
+        navigation = int(manager.navigation_dimension)
+        scan = [1] * navigation
+        if navigation >= 1:
+            scan[0] = max(1, int(scan_x))
+        if navigation >= 2:
+            scan[1] = max(1, int(scan_y))
+        # hyperspy rebins by SUMMING, and every axis divides exactly or it
+        # raises. Refusing here says which axis and by how much, where the
+        # library's message names neither.
+        for size, factor, label in zip(
+                list(manager.navigation_shape) + list(manager.signal_shape),
+                scan + [int(scale_x), int(scale_y)],
+                ["scan x", "scan y", "detector x", "detector y"]):
+            if factor > 1 and int(size) % factor:
+                raise RuntimeError(
+                    f"{label} is {int(size)} px, which {factor} does not "
+                    f"divide — crop it to a multiple of {factor} first")
+        return {"scale": scan + [int(scale_x), int(scale_y)]}
 
 
 # ── Crop ─────────────────────────────────────────────────────────────────────
 
-def _crop_signal(signal, x0=0, x1=0, y0=0, y1=0, t0=0, t1=0, **_):
+def _crop_signal(signal, x0=0, x1=0, y0=0, y1=0, t0=0, t1=0,
+                 scan_x0=0, scan_x1=0, scan_y0=0, scan_y1=0, **_):
     """Crop a 2-D-signal dataset to a spatial (image) box and, for a movie /
     navigated dataset, an optional leading-nav (time/first-nav-axis) range.
 
@@ -219,6 +253,17 @@ def _crop_signal(signal, x0=0, x1=0, y0=0, y1=0, t0=0, t1=0, **_):
     default) means "keep the full extent" on that axis, so a pure spatial crop
     leaves the nav axis whole; if every bound is 0 the signal is returned
     UNCHANGED (no redundant node).
+
+    ``scan_x0:scan_x1`` / ``scan_y0:scan_y1`` are the SCAN box, both
+    navigation axes at once. Spelled out rather than shortened because the
+    detector branch below already binds ``sx0``/``sy0`` as LOCALS: sharing the
+    name let it overwrite the arguments before this read them, and the scan
+    was then cropped to the detector's box — a wrong answer that still
+    produced a plausible dataset.
+    ``t0:t1`` reaches only the first of them, which is a movie's time axis and,
+    on a 4-D scan, half of the answer — there was no way to trim the slow axis
+    at all, and so no way to cut a scan down to a region of interest before
+    saving it.
     """
     am = signal.axes_manager
     sig_shape = tuple(int(s) for s in am.signal_shape)   # (x, y) display order
@@ -237,7 +282,9 @@ def _crop_signal(signal, x0=0, x1=0, y0=0, y1=0, t0=0, t1=0, **_):
 
     want_spatial = any(int(v or 0) for v in (x0, x1, y0, y1))
     want_time = bool(int(t0 or 0) or int(t1 or 0))
-    if not want_spatial and not want_time:
+    want_scan = any(int(v or 0)
+                    for v in (scan_x0, scan_x1, scan_y0, scan_y1))
+    if not want_spatial and not want_time and not want_scan:
         return signal          # all-zero crop → no-op, don't add a redundant node
 
     out = signal
@@ -251,6 +298,16 @@ def _crop_signal(signal, x0=0, x1=0, y0=0, y1=0, t0=0, t1=0, **_):
         # inav indexes the FIRST navigation axis (display order): a movie's time
         # axis, or a 4-D scan's fast (x) axis.
         out = out.inav[nt0:nt1]
+    if am.navigation_dimension >= 1 and want_scan:
+        # inav takes the navigation axes in display order, fastest first, so
+        # this is (scan x, scan y) against an array shaped (scan y, scan x).
+        shape = tuple(int(size) for size in out.axes_manager.navigation_shape)
+        nx0, nx1 = _bounds(scan_x0, scan_x1, shape[0])
+        if am.navigation_dimension >= 2:
+            ny0, ny1 = _bounds(scan_y0, scan_y1, shape[1])
+            out = out.inav[nx0:nx1, ny0:ny1]
+        else:
+            out = out.inav[nx0:nx1]
     return out
 
 

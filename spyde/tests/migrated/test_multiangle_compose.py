@@ -369,3 +369,31 @@ class TestTheComposedChunkIsSizedByBytes:
         signals = self._members(4, (256, 256))
         bare = [signal.data for signal in signals]
         assert composed_nav_chunk(bare) == composed_nav_chunk(signals)
+
+
+class TestTheCompositionSaysWhatMadeIt:
+    """A composed dataset has to carry its own alignment.
+
+    Without the offsets it names the acquisition but not what was done to it,
+    so it cannot be reproduced, checked, or taken apart — and an alignment
+    finished by hand exists nowhere else. Recovering it from the result
+    afterwards does not work: correlating each member back against the sum
+    places it close and wrong, and rebuilding there misses by thousands of
+    counts.
+    """
+
+    def test_the_offsets_and_paths_are_on_it(self, members_and_model):
+        from spyde.multiangle.compose import aligned_member
+        from spyde.multiangle.signals import build_summed_signal
+
+        members, _raw, model = members_and_model
+        signals = [LazySignal2D(block) for block in members]
+        aligned = [aligned_member(signal, model, index)
+                   for index, signal in enumerate(signals)]
+        summed = build_summed_signal(aligned, signals, model)
+
+        recorded = summed.metadata.get_item("Acquisition.multiangle")
+        assert recorded["nav_offsets"] == model.nav_offsets.tolist()
+        assert recorded["dp_offsets"] == model.dp_offsets.tolist()
+        assert recorded["paths"] == list(model.paths)
+        assert recorded["reference"] == int(model.reference)

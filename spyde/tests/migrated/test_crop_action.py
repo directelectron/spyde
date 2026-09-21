@@ -10,6 +10,7 @@ from __future__ import annotations
 import time
 
 import numpy as np
+import pytest
 import dask.array as da
 import hyperspy.api as hs
 
@@ -299,3 +300,81 @@ class TestCropInToolbar:
                     if not p.is_navigator and p.plot_state is not None)
         names = get_toolbar_actions_for_plot(plot.plot_state)[2]
         assert "Crop" in names, f"Crop missing from toolbar actions: {names}"
+
+
+class TestCroppingAndBinningTheScan:
+    """The scan axes, not just the detector.
+
+    A 4-D dataset is usually far bigger in the scan than the detector, and
+    neither action could touch it: Rebin built ``[1] * nav + [x, y]`` and Crop
+    reached only the FIRST navigation axis. So a scan could not be cut to a
+    region of interest, nor reduced, nor therefore saved smaller.
+    """
+
+    def _scan(self):
+        import hyperspy.api as hs
+        return hs.signals.Signal2D(
+            np.arange(8 * 10 * 6 * 4, dtype=np.uint16).reshape(8, 10, 6, 4))
+
+    def test_the_scan_box_crops_both_axes(self):
+        from spyde.actions.base import _crop_signal
+
+        signal = self._scan()
+        out = _crop_signal(signal, scan_x0=2, scan_x1=8,
+                           scan_y0=1, scan_y1=6)
+        assert out.data.shape == (5, 6, 6, 4)
+        # The right pixels, not merely the right count.
+        assert np.array_equal(out.data, signal.inav[2:8, 1:6].data)
+
+    def test_the_scan_box_does_not_take_the_detector_box(self):
+        """The bug this had: the detector branch binds `sx0`/`sy0` as LOCALS,
+        so arguments of that name were overwritten before the scan branch read
+        them and the scan came back cropped to the detector's bounds — the
+        wrong region, at a shape plausible enough to keep."""
+        from spyde.actions.base import _crop_signal
+
+        signal = self._scan()
+        out = _crop_signal(signal, scan_x0=2, scan_x1=8, scan_y0=1, scan_y1=6,
+                           x0=1, x1=3, y0=0, y1=4)
+        assert out.data.shape == (5, 6, 4, 2)
+        assert np.array_equal(out.data,
+                              signal.inav[2:8, 1:6].isig[1:3, 0:4].data)
+
+    def test_nothing_asked_for_changes_nothing(self):
+        from spyde.actions.base import _crop_signal
+
+        signal = self._scan()
+        assert _crop_signal(signal) is signal
+
+    def test_rebin_reduces_the_scan(self):
+        from spyde.actions.base import Rebin2DAction
+
+        signal = self._scan()
+        kwargs = Rebin2DAction.build_kwargs(
+            None, signal, scale_x=1, scale_y=1, scan_x=2, scan_y=2)
+        assert signal.rebin(**kwargs).data.shape == (4, 5, 6, 4)
+
+    def test_rebin_reduces_both_spaces_at_once(self):
+        from spyde.actions.base import Rebin2DAction
+
+        signal = self._scan()
+        kwargs = Rebin2DAction.build_kwargs(
+            None, signal, scale_x=2, scale_y=2, scan_x=2, scan_y=2)
+        assert signal.rebin(**kwargs).data.shape == (4, 5, 3, 2)
+
+    def test_rebin_defaults_leave_the_scan_alone(self):
+        """Binning the detector was what this did before, and still is."""
+        from spyde.actions.base import Rebin2DAction
+
+        signal = self._scan()
+        kwargs = Rebin2DAction.build_kwargs(None, signal)
+        assert kwargs["scale"] == [1, 1, 2, 2]
+
+    def test_a_factor_that_does_not_divide_says_which_axis(self):
+        """hyperspy raises on this too, naming neither the axis nor the size."""
+        from spyde.actions.base import Rebin2DAction
+
+        signal = self._scan()
+        with pytest.raises(RuntimeError, match="scan x is 10 px"):
+            Rebin2DAction.build_kwargs(None, signal, scale_x=1, scale_y=1,
+                                       scan_x=3, scan_y=1)
