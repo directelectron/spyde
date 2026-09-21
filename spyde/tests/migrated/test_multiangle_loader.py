@@ -2163,3 +2163,29 @@ class TestComparingTwoMembers:
         assert quiesce(window["window"]), why_busy(window["window"])
         pair = _last_state(window["messages"])["real"]["pair"]
         assert pair is None or pair["index"] == 1
+
+
+class TestTheRingAndTheShellsAgree:
+    """The tableau groups members onto rings by a tilt tolerance written in
+    the TSX; the backend groups them into shells by one written in Python.
+    They drifted to 0.05 against 0.01, and two members then sat on one ring
+    while the status line counted two shells. Parsing the TSX is the only
+    place that disagreement shows."""
+
+    def test_the_tsx_tolerance_is_the_shell_tolerance(self):
+        import pathlib
+        import re
+
+        from spyde.multiangle.model import DEFAULT_SHELL_TOLERANCE
+
+        path = (pathlib.Path(__file__).resolve().parents[3] / "electron"
+                / "src" / "renderer" / "src" / "components"
+                / "MultiAngleLoader.tsx")
+        assert path.exists(), f"the loader moved: {path}"
+        found = re.search(r"const TILT_TOLERANCE_DEG = ([0-9.]+)",
+                          path.read_text(encoding="utf-8"))
+        assert found, "TILT_TOLERANCE_DEG is no longer a plain constant"
+        assert float(found.group(1)) == DEFAULT_SHELL_TOLERANCE, (
+            f"the TSX draws rings at {found.group(1)}° while the backend "
+            f"counts shells at {DEFAULT_SHELL_TOLERANCE}°")
+

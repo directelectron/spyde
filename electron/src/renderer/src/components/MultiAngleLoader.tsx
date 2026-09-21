@@ -49,8 +49,11 @@ const AMBIGUOUS_RESIDUAL_PX = 0.4
 
 /** Two tilts this close are the same ring. A shell groups tilts within a
  *  tolerance, so a scaffold ring at 1.0° must still claim a member the backend
- *  probed as 0.999°. */
-const TILT_TOLERANCE_DEG = 0.05
+ *  probed as 0.999°. The SAME number as `DEFAULT_SHELL_TOLERANCE` in
+ *  spyde/multiangle/model.py, which decides the shells the status line counts:
+ *  at 0.05 here the picture drew two members on one ring that the text called
+ *  two shells. A test parses this line to keep them equal. */
+const TILT_TOLERANCE_DEG = 0.01
 
 /** Corner order is row-major over the scan: the backend's `previews[0]` is the
  *  scan's first position, `previews[3]` its last. */
@@ -606,6 +609,10 @@ export function MultiAngleLoader({ sendAction, onClose }: {
   //: the data, so it lives here and never goes to the backend.
   const [selected, setSelected] = useState<number | null>(null)
   const nudgeRef = useRef<HTMLDivElement | null>(null)
+  // The pair view's own pad. Sharing the grid's ref left whichever pad
+  // mounted last holding it, so the arrow keys could land on the member
+  // the OTHER pad was showing.
+  const pairNudgeRef = useRef<HTMLDivElement | null>(null)
   const evidenceRef = useRef<HTMLDivElement | null>(null)
   // A drop whose files resolve to no OS path is the one failure a drop handler
   // can have SILENTLY (Electron 44 removed File.path; the preload bridge's
@@ -1061,7 +1068,7 @@ export function MultiAngleLoader({ sendAction, onClose }: {
               && state.real.confidence.votes > 0
               && !state.real.confidence.determined[axis.key])
             .map((axis) => axis.label)}
-          padRef={nudgeRef}
+          padRef={pairNudgeRef}
           onSet={(index, offset) =>
             sendAction('maped_set_real_offset', { index, offset })}
           onImage={(name) => sendAction('maped_set_pair',
