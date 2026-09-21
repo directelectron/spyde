@@ -194,7 +194,7 @@ def best_real_space(images, *, reference=0, score, **solver_kwargs):
     """
     attempts = []
     best = best_gain = best_residuals = None
-    default_gain = None
+    default = default_gain = default_residuals = default_named = None
     for label, prefilter in REGISTRATION_PREFILTERS:
         prepared = (images if prefilter is None
                     else np.stack([prefilter(image) for image in images]))
@@ -213,17 +213,30 @@ def best_real_space(images, *, reference=0, score, **solver_kwargs):
             attempts.append((named, gain, None))
             if prefilter is None and candidate is REGISTRATION_CANDIDATES[0]:
                 default = np.asarray(offsets, dtype=np.int64)
-                default_gain, default_residuals, default_named = (
-                    gain, residuals, named)
+                default_residuals, default_named = residuals, named
+                default_gain = gain if np.isfinite(gain) else None
+            # A candidate the score could not measure (its offsets leave no
+            # window to score) is not the best of anything. Ranking it as
+            # -inf silently handed the answer to the raw-intensity default.
+            if not np.isfinite(gain):
+                continue
             if best_gain is None or gain > best_gain:
                 best, best_gain, best_residuals, best_named = (
                     np.asarray(offsets, dtype=np.int64), gain, residuals, named)
 
     if best is None:
-        raise ValueError("no registration candidate produced offsets")
+        if default is None:
+            raise ValueError("no registration candidate produced offsets")
+        # Nothing could be scored: the default answer, said to be unscored
+        # (a NaN gain, which the dialog shows as no measurement).
+        return default, default_residuals, {
+            "attempts": attempts, "gain": float("nan"), "decisive": False,
+            "chosen": default_named}
 
+    # The margin is relative to the default's size, which also holds when a
+    # score is negative; `default * 1.1` inverts there.
     decisive = (default_gain is None
-                or best_gain > default_gain * (1.0 + DECISIVE_MARGIN))
+                or best_gain > default_gain + DECISIVE_MARGIN * abs(default_gain))
     if not decisive:
         best, best_gain, best_residuals, best_named = (
             default, default_gain, default_residuals, default_named)
@@ -288,7 +301,10 @@ def _patch_sharpness(patch):
         low, high = offsets.min(axis=0), offsets.max(axis=0)
         height = patch.shape[1] - (high[0] - low[0])
         width = patch.shape[2] - (high[1] - low[1])
-        if height < 24 or width < 24:
+        # A patch of 48 px under a 32 px search can leave 16 px in common;
+        # that is still a window to score. Refusing anything under 24 px
+        # left every candidate unscored and the choice to the default.
+        if height < 8 or width < 8:
             return float("-inf")
         total = np.zeros((height, width), dtype=np.float64)
         for image, (dy, dx) in zip(patch, offsets):
@@ -365,10 +381,16 @@ def vote_real_space(images, *, reference=0, score, **solver_kwargs):
             # everywhere and would score as unanimous. Tested per axis, not
             # per member: a patch can register across the layers and fail
             # along them, and usually does.
+            #
+            # The zeros are left OUT of the agreement and IN the median. A
+            # member whose true offset on this axis is zero votes zero from
+            # every patch that registered it; dropping those left the few
+            # that mis-registered to set its offset unopposed, at an
+            # agreement of one.
             speaking = values[values != 0.0]
             if speaking.size < MINIMUM_VOTES:
                 continue
-            middle = float(np.median(speaking))
+            middle = float(np.median(values))
             fractions.append(float(np.mean(
                 np.abs(speaking - middle) <= AGREEMENT_TOLERANCE)))
             voted[member, axis] = int(round(middle))

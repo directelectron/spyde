@@ -234,6 +234,42 @@ class Rebin2DAction(TransformAction):
         return {"scale": factors,
                 "dtype": _rebin_dtype(signal.data.dtype, factors)}
 
+    def run(self, **params):
+        # Taken before the run: it switches the window to the new node, and
+        # `self.signal` follows the window.
+        source = self.signal
+        new = super().run(**params)
+        if new is not None:
+            _record_binning(new, source)
+        return new
+
+
+def _record_binning(binned, source) -> None:
+    """Note on a multi-angle stack how far it has been reduced.
+
+    Its recorded member offsets are in the pixels of the composition and are
+    not rescaled — they would stop being whole pixels — so the record says
+    what they are now measured against. Cumulative across repeated rebins.
+    """
+    from spyde.signals.multiangle import MULTIANGLE_METADATA
+
+    metadata = binned.metadata
+    if not metadata.has_item(MULTIANGLE_METADATA):
+        return
+    navigation = binned.axes_manager.navigation_dimension
+    before, after = source.data.shape, binned.data.shape
+    factors = [max(1, int(b) // max(1, int(a))) for b, a in zip(before, after)]
+    scan = factors[navigation - 2:navigation] if navigation >= 2 else [1, 1]
+    detector = factors[navigation:navigation + 2]
+    key = f"{MULTIANGLE_METADATA}.binned_by"
+    previous = metadata.get_item(key, None)
+    previous = (previous.as_dictionary() if hasattr(previous, "as_dictionary")
+                else previous) or {"scan": [1, 1], "detector": [1, 1]}
+    metadata.set_item(key, {
+        "scan": [int(p) * int(f) for p, f in zip(previous["scan"], scan)],
+        "detector": [int(p) * int(f)
+                     for p, f in zip(previous["detector"], detector)]})
+
 
 def _rebin_dtype(source_dtype, factors):
     """The narrowest dtype that holds a sum of this many source pixels.

@@ -32,6 +32,8 @@ anything reading the edge.
 """
 from __future__ import annotations
 
+import logging
+
 import numpy as np
 
 #: Summing N members of an integer type overflows that type, so the sum is
@@ -61,6 +63,8 @@ def sum_dtype(source_dtype, n_members: int):
         )
     if n_members < 1:
         raise ValueError(f"n_members must be at least 1; got {n_members}")
+    if n_members == 1:
+        return dtype
 
     largest = int(np.iinfo(dtype).max) * int(n_members)
     smallest = int(np.iinfo(dtype).min) * int(n_members)
@@ -77,6 +81,9 @@ def sum_dtype(source_dtype, n_members: int):
     # as a bare 5-D array. Real detector counts sit nowhere near 2**63, so the
     # sum stays exact in practice, and a stack the loader can show beats one
     # it cannot.
+    logging.getLogger(__name__).warning(
+        "summing %d members of %s in %s: a value above %.3g would wrap",
+        n_members, dtype, dtype, np.iinfo(dtype).max / n_members)
     return dtype
 
 

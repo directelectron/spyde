@@ -463,7 +463,11 @@ def _sum_over_angles(stack, indices, title):
     indices = [int(index) for index in indices]
     data = stack.data
     wanted = sum_dtype(data.dtype, len(indices))
-    summed = data[indices].astype(wanted).sum(axis=0)
+    # `dtype=` on the sum as well as the cast: a reduction over an unsigned
+    # integer array promotes to uint64 on its own, and the cast alone left a
+    # freshly composed uint32 node reopening as uint64 — twice the bytes per
+    # frame, and a different dtype from the one that was saved.
+    summed = data[indices].astype(wanted).sum(axis=0, dtype=wanted)
 
     signal = stack._deepcopy_with_new_data(summed)
     # Drop the angle axis: it described planes that have just been added up,
@@ -471,10 +475,13 @@ def _sum_over_angles(stack, indices, title):
     angle = signal.axes_manager.navigation_axes[-1]
     signal.axes_manager.remove(angle)
     signal.metadata.set_item("General.title", title)
+    # The sum must not keep the STACK's type: it would be recognised as a
+    # stack on reopening and the rebuild would raise on a 4-D array. With no
+    # member type recorded (members opened from a raw format carry none) it
+    # is a diffraction signal, which is what the stack's own class extends.
     member_type = stack.metadata.get_item(
         f"{MULTIANGLE_METADATA}.member_signal_type", "")
-    if member_type:
-        signal.set_signal_type(member_type)
+    signal.set_signal_type(member_type or "electron_diffraction")
 
     recorded = model_from_metadata(stack)
     if recorded is None:

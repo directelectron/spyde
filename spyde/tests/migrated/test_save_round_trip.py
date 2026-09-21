@@ -421,8 +421,7 @@ class TestTheStackTypeStaysDiffraction:
             "gated on that is gone")
 
     def test_a_stack_is_recognised_by_its_type_alone(self):
-        """Without the shape check: a file may be opened lazily in pieces, and
-        the type is the cheapest thing that identifies one."""
+        """The type plus the angle axis; the metadata need not say more."""
         from spyde.signals.multiangle import (
             MULTIANGLE_METADATA, MULTIANGLE_SIGNAL_TYPE, is_multiangle_stack,
         )
@@ -673,6 +672,81 @@ class TestASavedFileIsNotChunkedInSlivers:
             back = hs.load(str(path), lazy=True)
             assert back.data.chunksize == (10, 10, 4, 4), back.data.chunksize
             assert np.array_equal(np.asarray(back.data), data[3:, 6:])
+        finally:
+            close_session(session)
+
+
+class TestASumIsNeverAStack:
+    """A 4-D sum inherited the stack's type when the members carried none,
+    was recognised as a stack on reopening, and the rebuild raised on it —
+    which, now that a failed rebuild is an error in the app, told the user
+    their ordinary dataset could not be re-expanded."""
+
+    def _stack(self):
+        from spyde.signals.multiangle import MULTIANGLE_METADATA, MULTIANGLE_SIGNAL_TYPE
+
+        signal = hs.signals.Signal2D(np.ones((3, 4, 5, 6, 6), dtype=np.uint16))
+        signal.metadata.set_item(MULTIANGLE_METADATA, {
+            "n_members": 3, "n_shells": 1, "tilts": [1.0] * 3,
+            "azimuths": [0.0, 120.0, 240.0], "shell_ids": [0] * 3,
+            "reference": 0})
+        signal.set_signal_type(MULTIANGLE_SIGNAL_TYPE)
+        return signal
+
+    def test_a_4d_signal_with_the_type_is_not_a_stack(self):
+        from spyde.signals.multiangle import MULTIANGLE_SIGNAL_TYPE, is_multiangle_stack
+
+        stack = self._stack()
+        assert is_multiangle_stack(stack)
+        summed = hs.signals.Signal2D(np.ones((4, 5, 6, 6), dtype=np.uint32))
+        summed.metadata.set_item("Acquisition.multiangle",
+                                 stack.metadata.get_item(
+                                     "Acquisition.multiangle").as_dictionary())
+        summed.set_signal_type(MULTIANGLE_SIGNAL_TYPE)
+        assert not is_multiangle_stack(summed)
+
+    def test_the_sum_of_typeless_members_is_diffraction(self):
+        from spyde.backend._session_multiangle import _sum_over_angles
+
+        summed = _sum_over_angles(self._stack(), range(3), "Summed")
+        assert summed.metadata.Signal.signal_type == "electron_diffraction"
+        assert summed.data.dtype == np.dtype(np.uint32), \
+            "three uint16 members sum into uint32, not numpy's uint64"
+
+
+class TestRebinRecordsTheReduction:
+    def test_binned_by_is_cumulative(self):
+        from spyde.actions.base import Rebin2DAction
+        from spyde.actions.context import ActionContext
+        from spyde.signals.multiangle import MULTIANGLE_METADATA
+
+        session = make_session()
+        signal = hs.signals.Signal2D(np.ones((2, 8, 8, 8, 8), dtype=np.uint16))
+        signal.metadata.set_item(MULTIANGLE_METADATA, {
+            "n_members": 2, "nav_offsets": [[0, 0], [3, -2]]})
+        signal.set_signal_type("electron_diffraction")
+        session._add_signal(signal)
+        try:
+            plot = next(p for p in session._plots
+                        if not getattr(p, "is_navigator", False)
+                        and getattr(getattr(p, "plot_state", None),
+                                    "current_signal", None) is not None)
+            params = {"scale_x": 2, "scale_y": 2, "scan_x": 2, "scan_y": 1}
+            once = Rebin2DAction(ActionContext(
+                plot=plot, params=params, action_name="Rebin")).run(**params)
+            recorded = once.metadata.get_item(
+                f"{MULTIANGLE_METADATA}.binned_by").as_dictionary()
+            assert recorded == {"scan": [1, 2], "detector": [2, 2]}, recorded
+            assert once.metadata.get_item(
+                f"{MULTIANGLE_METADATA}.nav_offsets") == [[0, 0], [3, -2]], \
+                "the offsets stay in the composition's pixels"
+            from spyde.actions.lifecycle import show_tree_node
+            show_tree_node(plot, session.signal_trees[0], once)
+            twice = Rebin2DAction(ActionContext(
+                plot=plot, params=params, action_name="Rebin")).run(**params)
+            recorded = twice.metadata.get_item(
+                f"{MULTIANGLE_METADATA}.binned_by").as_dictionary()
+            assert recorded == {"scan": [1, 4], "detector": [4, 4]}, recorded
         finally:
             close_session(session)
 

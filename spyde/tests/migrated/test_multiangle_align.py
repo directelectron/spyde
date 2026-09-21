@@ -787,3 +787,62 @@ class TestPatchesVoting:
             images, reference=0, score=_sharpness(images), max_shift=8.0)
         assert np.array_equal(offsets, whole)
         assert report["determined"] == {"y": False, "x": False}
+
+
+class TestZeroIsAVote:
+    """A member whose true offset on an axis is zero votes zero from every
+    patch that registered it. Dropping the zeros left the few patches that
+    mis-registered to set its offset — unopposed, and at an agreement of one.
+    The zeros now count in the median; only the agreement leaves them out."""
+
+    def test_the_median_counts_the_zeros(self, monkeypatch):
+        from spyde.multiangle import align
+
+        images = np.random.default_rng(0).normal(size=(4, 150, 150))
+        windows = align.patch_windows(images[0].shape)
+        assert len(windows) >= 8
+        truth = np.array([[0, 0], [0, 5], [4, -3], [-6, 2]])
+        outliers = truth.copy()
+        outliers[1, 0] = 2
+        calls = iter([truth] + [truth] * (len(windows) - 5) + [outliers] * 5)
+
+        def stub(images, *, reference=0, score, **_):
+            found = next(calls)
+            return found, np.zeros((len(found), 2)), {
+                "attempts": [], "gain": 1.0, "decisive": True, "chosen": {}}
+
+        monkeypatch.setattr(align, "best_real_space", stub)
+        voted, _residuals, report = align.vote_real_space(
+            images, reference=0, score=lambda offsets: 1.0)
+        assert report["votes"] == len(windows)
+        assert voted[1, 0] == 0, (
+            f"member 1's y offset came out {voted[1, 0]}: five outliers "
+            f"outvoted {len(windows) - 5} correct zeros")
+        assert np.array_equal(voted, truth)
+
+
+class TestAnUnscorableCandidateIsNotTheBest:
+    """A patch of 48 px under a 32 px search can leave 16 px in common. The
+    score refused anything under 24 and returned -inf for every candidate,
+    and -inf beat nothing, so the raw-intensity default won by default —
+    reported with a gain of -inf as if it had been measured."""
+
+    def test_a_narrow_window_is_still_scored(self):
+        from spyde.multiangle.align import _patch_sharpness
+
+        patch = np.random.default_rng(1).normal(size=(3, 60, 60))
+        score = _patch_sharpness(patch)
+        spread = np.array([[0, 0], [37, 0], [0, 37]])
+        assert np.isfinite(score(spread))
+
+    def test_all_unscorable_means_unscored_not_decisive(self):
+        from spyde.multiangle.align import best_real_space
+
+        images = np.random.default_rng(2).normal(size=(3, 64, 64))
+        offsets, _residuals, report = best_real_space(
+            images, reference=0, score=lambda _offsets: float("-inf"))
+        assert offsets.shape == (3, 2)
+        assert not report["decisive"]
+        assert np.isnan(report["gain"]), report["gain"]
+        assert report["chosen"]["on"] == "raw intensity"
+

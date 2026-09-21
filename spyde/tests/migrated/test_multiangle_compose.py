@@ -419,3 +419,6 @@ class TestSumDtypeWidth:
     def test_a_small_source_gets_the_narrowest_exact_width(self):
         assert sum_dtype(np.uint8, 4) == np.dtype(np.uint16)
         assert sum_dtype(np.uint16, 16) == np.dtype(np.uint32)
+
+    def test_one_member_sums_into_itself(self):
+        assert sum_dtype(np.uint8, 1) == np.dtype(np.uint8)

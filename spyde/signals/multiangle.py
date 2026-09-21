@@ -17,9 +17,14 @@ type has already cost this project once — every diffraction action silently
 disappeared. By inheriting, a multi-angle stack is still a diffraction signal
 to everything that asks, and is its own thing to the loader.
 
-Recognition falls back to the METADATA and the angle axis, because a file
+Recognition is by the METADATA and the angle axis, not the type: a file
 written before this type existed carries the metadata and not the type, and
-because a 4-D SUM carries the metadata without being a stack.
+a 4-D SUM can carry both without being a stack.
+
+The recorded ``nav_offsets`` and ``dp_offsets`` are in the pixels of the
+composition. A stack reduced afterwards records how far by in ``binned_by``
+(``{"scan": [y, x], "detector": [ky, kx]}``, cumulative), so the offsets can
+still be read against the members that made it.
 """
 from __future__ import annotations
 
@@ -39,8 +44,8 @@ def is_multiangle_stack(signal) -> bool:
     metadata = getattr(signal, "metadata", None)
     if metadata is None or not metadata.has_item(MULTIANGLE_METADATA):
         return False
-    if metadata.get_item("Signal.signal_type", "") == MULTIANGLE_SIGNAL_TYPE:
-        return True
+    # The type is not enough on its own: a 4-D sum can inherit it from the
+    # stack it was reduced from, and rebuilding a tree around a sum raises.
     recorded = metadata.get_item(MULTIANGLE_METADATA)
     try:
         members = int(recorded["n_members"])
