@@ -366,46 +366,6 @@ class TestShells:
 
 
 class TestMultiAngleModel:
-    def test_round_trip(self, model, tmp_path):
-        path = str(tmp_path / "multiangle.npz")
-        model.save(path)
-        loaded = MultiAngleModel.load(path)
-        assert loaded.paths == model.paths
-        assert np.array_equal(loaded.tilts, model.tilts)
-        assert np.array_equal(loaded.azimuths, model.azimuths)
-        assert np.array_equal(loaded.shell_ids, model.shell_ids)
-        assert np.array_equal(loaded.nav_offsets, model.nav_offsets)
-        assert np.array_equal(loaded.dp_offsets, model.dp_offsets)
-        assert np.array_equal(loaded.nav_residuals, model.nav_residuals)
-        assert np.array_equal(loaded.dp_residuals, model.dp_residuals)
-        assert loaded.reference == model.reference
-        assert loaded.provenance == model.provenance
-        assert np.issubdtype(loaded.nav_offsets.dtype, np.integer)
-
-    def test_round_trip_without_residuals(self, model, tmp_path):
-        bare = MultiAngleModel(
-            paths=model.paths, tilts=model.tilts, azimuths=model.azimuths,
-            shell_ids=model.shell_ids, nav_offsets=model.nav_offsets,
-            dp_offsets=model.dp_offsets, reference=model.reference)
-        path = str(tmp_path / "bare.npz")
-        bare.save(path)
-        loaded = MultiAngleModel.load(path)
-        assert loaded.nav_residuals is None
-        assert loaded.dp_residuals is None
-        assert loaded.provenance is None
-
-    def test_rejects_an_unknown_format_version(self, model, tmp_path):
-        path = str(tmp_path / "future.npz")
-        model.save(path)
-        with np.load(path, allow_pickle=False) as stored:
-            arrays = {name: stored[name] for name in stored.files}
-        meta = json.loads(str(arrays["meta"].item()))
-        meta["format_version"] = FUTURE_VERSION
-        arrays["meta"] = np.array(json.dumps(meta))
-        np.savez_compressed(path, **arrays)
-        with pytest.raises(ValueError, match="format version"):
-            MultiAngleModel.load(path)
-
     def test_rejects_non_integer_offsets(self, model):
         offsets = model.nav_offsets.astype(np.float64)
         offsets[1, 0] += 0.5

@@ -274,19 +274,5 @@ def composite_navigator(navigators, model):
     grid, added. Exactly the reasoning behind ``_reader_navigator``: a navigator
     somebody already has beats one computed from the whole dataset.
     """
-    if len(navigators) != model.n_members:
-        raise ValueError(
-            f"the model describes {model.n_members} members but "
-            f"{len(navigators)} navigators were given")
-    first = np.asarray(navigators[0])
-    total = None
-    for member_index, navigator in enumerate(navigators):
-        image = np.asarray(navigator)
-        if image.shape != first.shape:
-            raise ValueError(
-                "navigators must all be the members' own scan shape; got "
-                f"{image.shape} and {first.shape}")
-        rows, columns = model.nav_slices(member_index, image.shape)
-        region = image[rows, columns].astype(np.float64)
-        total = region if total is None else total + region
-    return total
+    return member_navigator_planes(navigators, model).astype(
+        np.float64).sum(axis=0)

@@ -554,16 +554,11 @@ class TestTheRingOnAReopenedAcquisition:
     def test_a_pick_shows_one_angle_and_says_so(self, tmp_path):
         import time
 
-        from spyde.tests.migrated.conftest import close_session, make_session
+        from spyde.tests.migrated.conftest import close_session, make_session, open_saved
 
         session = make_session()
         try:
-            session.open_file(str(self._saved(tmp_path)))
-            deadline = time.time() + 60.0
-            while time.time() < deadline and not session.signal_trees:
-                time.sleep(0.2)
-            tree = session.signal_trees[0]
-            time.sleep(1.0)
+            tree = open_saved(session, self._saved(tmp_path))
             controller = ring.open_multiangle_navigator(session, tree)
             assert controller is not None
             assert controller.showing_one_angle() is False
@@ -584,16 +579,11 @@ class TestTheRingOnAReopenedAcquisition:
         from spyde.actions.base import Rebin2DAction
         from spyde.actions.context import ActionContext
         from spyde.actions.lifecycle import show_tree_node
-        from spyde.tests.migrated.conftest import close_session, make_session
+        from spyde.tests.migrated.conftest import close_session, make_session, open_saved
 
         session = make_session()
         try:
-            session.open_file(str(self._saved(tmp_path)))
-            deadline = time.time() + 60.0
-            while time.time() < deadline and not session.signal_trees:
-                time.sleep(0.2)
-            tree = session.signal_trees[0]
-            time.sleep(1.0)
+            tree = open_saved(session, self._saved(tmp_path))
             plot = next(p for p in tree.signal_plots)
             show_tree_node(plot, tree, tree.root_node.signal)
             params = {"scale_x": 2, "scale_y": 2, "scan_x": 1, "scan_y": 1}

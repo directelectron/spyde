@@ -723,6 +723,29 @@ def _stretched(array: np.ndarray) -> np.ndarray:
     return (np.clip(scaled, 0.0, 1.0) * 255.0).astype(np.uint8)
 
 
+def _encode_png(image, max_edge: int) -> str:
+    """A PIL image as a ``data:image/png;base64,…`` URL, no longer than
+    *max_edge* on its long side. Downscaled with a box filter, never upscaled:
+    enlarging would ship interpolated pixels that say nothing the small ones
+    did not."""
+    import base64
+    import io
+
+    from PIL import Image
+
+    longest = max(image.size)
+    if longest > max_edge:
+        scale = max_edge / float(longest)
+        image = image.resize(
+            (max(1, int(round(image.width * scale))),
+             max(1, int(round(image.height * scale)))),
+            Image.BOX)
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG", optimize=True)
+    return ("data:image/png;base64,"
+            + base64.b64encode(buffer.getvalue()).decode("ascii"))
+
+
 def _thumbnail(array) -> str | None:
     """*array* as a ``data:image/png;base64,…`` thumbnail, or ``None``.
 
@@ -740,23 +763,10 @@ def _thumbnail(array) -> str | None:
     if values.ndim != 2 or values.size == 0:
         return None
 
-    import base64
-    import io
-
     from PIL import Image
 
     image = Image.fromarray(_stretched(values), mode="L")
-    longest = max(image.size)
-    if longest > PREVIEW_MAX_EDGE:
-        scale = PREVIEW_MAX_EDGE / float(longest)
-        image = image.resize(
-            (max(1, int(round(image.width * scale))),
-             max(1, int(round(image.height * scale)))),
-            Image.BOX)
-    buffer = io.BytesIO()
-    image.save(buffer, format="PNG", optimize=True)
-    return ("data:image/png;base64,"
-            + base64.b64encode(buffer.getvalue()).decode("ascii"))
+    return _encode_png(image, PREVIEW_MAX_EDGE)
 
 
 #: How big a picture the pair view gets. Far above `PREVIEW_MAX_EDGE`,
@@ -783,25 +793,12 @@ def _thumbnail_rgb(red, cyan) -> str | None:
     if first.ndim != 2 or first.shape != second.shape or first.size == 0:
         return None
 
-    import base64
-    import io
-
     from PIL import Image
 
     left = _stretched(first)
     right = _stretched(second)
     image = Image.fromarray(np.stack([left, right, right], axis=-1), mode="RGB")
-    longest = max(image.size)
-    if longest > PAIR_MAX_EDGE:
-        scale = PAIR_MAX_EDGE / float(longest)
-        image = image.resize(
-            (max(1, int(round(image.width * scale))),
-             max(1, int(round(image.height * scale)))),
-            Image.BOX)
-    buffer = io.BytesIO()
-    image.save(buffer, format="PNG", optimize=True)
-    return ("data:image/png;base64,"
-            + base64.b64encode(buffer.getvalue()).decode("ascii"))
+    return _encode_png(image, PAIR_MAX_EDGE)
 
 
 def _pair_overlap(reference, member, offset):
@@ -1351,10 +1348,8 @@ def _start_preview_fill(session, state: MultiAngleLoaderState) -> None:
         return
 
     generation = bump_generation(state, "_preview_generation")
-    state.busy = True
-    state.message = (f"Reading {len(members)} member"
-                     f"{'s' if len(members) != 1 else ''} for the tableau…")
-    _emit_state(state)
+    message = (f"Reading {len(members)} member"
+               f"{'s' if len(members) != 1 else ''} for the tableau…")
 
     def _wanted(member: LoaderMember) -> bool:
         """Still this pass, and still a member of the acquisition.
@@ -1400,20 +1395,10 @@ def _start_preview_fill(session, state: MultiAngleLoaderState) -> None:
         state.message = settled_message
         _emit_state(state)
 
-    def _failed(error):
-        emit_error(f"Reading the members for the tableau failed: {error}")
-
-        def _apply():
-            if not is_current(state, "_preview_generation", generation):
-                return
-            state.busy = False
-            state.message = f"Reading the members failed: {error}"
-            _emit_state(state)
-
-        _on_main(session, _apply)
-
-    run_on_worker(session, _work, name="maped-previews",
-                  on_done=_done, on_error=_failed)
+    _staged_work(session, state, generation_key="_preview_generation",
+                 generation=generation, message=message, name="maped-previews",
+                 work=_work, on_done=_done,
+                 failure="Reading the members for the tableau failed")
 
 
 # ── the aligned-sum window ───────────────────────────────────────────────────
@@ -1800,6 +1785,42 @@ def _corner_offsets(members, reference: int, params: dict, roi=None):
         reference)
 
 
+def _staged_work(session, state, *, generation_key: str, generation: int,
+                 message: str, name: str, work, on_done, failure: str) -> None:
+    """Run *work* on a worker for *state*: announce it busy, guard the result,
+    and report a failure on both channels.
+
+    *generation* is the value the caller took from ``bump_generation`` so its
+    own closures can test it too. *on_done* runs on the main thread only for a
+    CURRENT result — a run superseded by a later click or by closing the
+    dialog is dropped on arrival. *failure* names the step in the error the
+    status bar and the dialog both show; it was written out five times before
+    this, each copy one message string apart.
+    """
+    state.busy = True
+    state.message = message
+    _emit_state(state)
+
+    def _done(result):
+        if not is_current(state, generation_key, generation):
+            return
+        on_done(result)
+
+    def _failed(error):
+        emit_error(f"{failure}: {error}")
+
+        def _apply():
+            if not is_current(state, generation_key, generation):
+                return
+            state.busy = False
+            state.message = f"{failure}: {error}"
+            _emit_state(state)
+
+        _on_main(session, _apply)
+
+    run_on_worker(session, work, name=name, on_done=_done, on_error=_failed)
+
+
 def _start_stage(session, state, *, attribute: str, generation_key: str,
                  name: str, message: str, work, on_solved=None) -> None:
     """Run one alignment stage on a worker and announce it, start and end.
@@ -1816,14 +1837,9 @@ def _start_stage(session, state, *, attribute: str, generation_key: str,
     open one.
     """
     generation = bump_generation(state, generation_key)
-    state.busy = True
-    state.message = message
     emit_status(message)
-    _emit_state(state)
 
     def _done(result):
-        if not is_current(state, generation_key, generation):
-            return
         offsets, residuals = result
         solved = np.asarray(offsets, dtype=np.int64)
         stage = LoaderStage(offsets=solved,
@@ -1844,20 +1860,10 @@ def _start_stage(session, state, *, attribute: str, generation_key: str,
             except Exception as e:
                 log.debug("the %s evidence window failed: %s", name, e)
 
-    def _failed(error):
-        emit_error(f"{name} alignment failed: {error}")
-
-        def _apply():
-            if not is_current(state, generation_key, generation):
-                return
-            state.busy = False
-            state.message = f"{name} alignment failed: {error}"
-            _emit_state(state)
-
-        _on_main(session, _apply)
-
-    run_on_worker(session, work, name=f"maped-align-{attribute}",
-                  on_done=_done, on_error=_failed)
+    _staged_work(session, state, generation_key=generation_key,
+                 generation=generation, message=message,
+                 name=f"maped-align-{attribute}", work=work, on_done=_done,
+                 failure=f"{name} alignment failed")
 
 
 # ── the staged actions ───────────────────────────────────────────────────────
@@ -1991,9 +1997,7 @@ def maped_add_files(session, plot, payload) -> None:
     # offsets were solved for, whatever the probe goes on to find.
     state.invalidate_alignments()
     generation = bump_generation(state, "_probe_generation")
-    state.busy = True
-    state.message = f"Opening {len(pending)} file{'s' if len(pending) != 1 else ''}…"
-    _emit_state(state)
+    message = f"Opening {len(pending)} file{'s' if len(pending) != 1 else ''}…"
 
     def _work():
         from spyde.backend.heavy_imports import ensure_heavy_imports
@@ -2027,20 +2031,10 @@ def maped_add_files(session, plot, payload) -> None:
         # the next thing the user is waiting for, not a separate request.
         _start_preview_fill(session, state)
 
-    def _failed(error):
-        emit_error(f"Opening the multi-angle members failed: {error}")
-
-        def _apply():
-            if not is_current(state, "_probe_generation", generation):
-                return
-            state.busy = False
-            state.message = f"Opening the members failed: {error}"
-            _emit_state(state)
-
-        _on_main(session, _apply)
-
-    run_on_worker(session, _work, name="maped-probe",
-                  on_done=_done, on_error=_failed)
+    _staged_work(session, state, generation_key="_probe_generation",
+                 generation=generation, message=message, name="maped-probe",
+                 work=_work, on_done=_done,
+                 failure="Opening the multi-angle members failed")
 
 
 def _parse_scan_shape(raw):
@@ -2093,14 +2087,12 @@ def maped_set_scan_shape(session, plot, payload) -> None:
 
     reader_options = dict(state.reader_options)
     generation = bump_generation(state, "_probe_generation")
-    state.busy = True
-    state.message = (
+    message = (
         f"Re-opening {len(stale)} member"
         f"{'s' if len(stale) != 1 else ''} with a {described} scan…"
         if scan_shape else
         f"Re-opening {len(stale)} member"
         f"{'s' if len(stale) != 1 else ''} without a scan shape…")
-    _emit_state(state)
 
     def _work():
         from spyde.backend.heavy_imports import ensure_heavy_imports
@@ -2128,20 +2120,10 @@ def maped_set_scan_shape(session, plot, payload) -> None:
         # interrupted before reaching, without letting go of `busy`.
         _start_preview_fill(session, state)
 
-    def _failed(error):
-        emit_error(f"Applying the scan shape failed: {error}")
-
-        def _apply():
-            if not is_current(state, "_probe_generation", generation):
-                return
-            state.busy = False
-            state.message = f"Applying the scan shape failed: {error}"
-            _emit_state(state)
-
-        _on_main(session, _apply)
-
-    run_on_worker(session, _work, name="maped-scan-shape",
-                  on_done=_done, on_error=_failed)
+    _staged_work(session, state, generation_key="_probe_generation",
+                 generation=generation, message=message,
+                 name="maped-scan-shape", work=_work, on_done=_done,
+                 failure="Applying the scan shape failed")
 
 
 def maped_remove_member(session, plot, payload) -> None:
@@ -2317,13 +2299,11 @@ def maped_set_corner_extent(session, plot, payload) -> None:
         return
 
     generation = bump_generation(state, "_corner_generation")
-    state.busy = True
-    state.message = (
+    message = (
         f"Summing the {CORNER_NAMES[corner]} corner of {len(usable)} member"
         f"{'s' if len(usable) != 1 else ''}…" if extent is not None
         else f"Summing the scan corners of {len(usable)} member"
              f"{'s' if len(usable) != 1 else ''}…")
-    _emit_state(state)
 
     def _work():
         from spyde.backend.heavy_imports import ensure_heavy_imports
@@ -2340,20 +2320,10 @@ def maped_set_corner_extent(session, plot, payload) -> None:
             f"scan" if extent is not None else "Scan corners summed")
         _emit_state(state)
 
-    def _failed(error):
-        emit_error(f"Summing the scan corners failed: {error}")
-
-        def _apply():
-            if not is_current(state, "_corner_generation", generation):
-                return
-            state.busy = False
-            state.message = f"Summing the scan corners failed: {error}"
-            _emit_state(state)
-
-        _on_main(session, _apply)
-
-    run_on_worker(session, _work, name="maped-corners",
-                  on_done=_done, on_error=_failed)
+    _staged_work(session, state, generation_key="_corner_generation",
+                 generation=generation, message=message, name="maped-corners",
+                 work=_work, on_done=_done,
+                 failure="Summing the scan corners failed")
 
 
 def _not_ready(state: MultiAngleLoaderState) -> str | None:

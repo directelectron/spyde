@@ -97,21 +97,15 @@ def _check_members(members, paths) -> None:
 def _member_overviews(members):
     """``(images, patterns)`` — each member's real-space image and mean pattern.
 
-    These are the two images the alignment is solved on, and the only reduction
-    of a member this loader performs. Both of a member's are asked for in ONE
-    call so the pass over the file serves them together instead of once each.
-    Reductions stream chunk by chunk, so nothing here holds a member in memory.
+    The same reduction the staged loader makes of a member — the image over
+    every position, the pattern over a sample of them — so the two entry
+    points solve on the same pictures. Imported here rather than at the top:
+    the loader module imports this one.
     """
-    import dask.array as da
+    from spyde.backend._session_multiangle_loader import _member_reductions
 
-    reductions = []
-    for member in members:
-        data = member.data
-        reductions.append(data.sum(axis=(-2, -1), dtype=np.float64))
-        reductions.append(data.mean(axis=(0, 1), dtype=np.float64))
-    computed = da.compute(*reductions)
-    return ([np.asarray(value) for value in computed[0::2]],
-            [np.asarray(value) for value in computed[1::2]])
+    reduced = [_member_reductions(member) for member in members]
+    return [image for image, _pattern in reduced], [pattern for _image, pattern in reduced]
 
 
 def _solve_model(paths, tilts, azimuths, images, patterns, reference: int):

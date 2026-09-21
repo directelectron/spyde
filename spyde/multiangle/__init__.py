@@ -44,7 +44,6 @@ from __future__ import annotations
 from spyde.multiangle.align import solve_real_space, solve_reciprocal
 from spyde.multiangle.model import (
     DEFAULT_SHELL_TOLERANCE,
-    FORMAT_VERSION,
     MultiAngleModel,
     assign_shells,
 )
@@ -58,5 +57,5 @@ __all__ = [
     "make_multiangle",
     "SyntheticMultiAngle",
     "DEFAULT_SHELL_TOLERANCE",
-    "FORMAT_VERSION",
+    "",
 ]

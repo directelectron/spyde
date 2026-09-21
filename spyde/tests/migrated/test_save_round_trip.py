@@ -24,7 +24,7 @@ import hyperspy.api as hs
 import numpy as np
 import pytest
 
-from spyde.tests.migrated.conftest import close_session, make_session
+from spyde.tests.migrated.conftest import close_session, make_session, open_saved
 
 
 def _saved(session, path, plot=None, timeout=120.0):
@@ -320,24 +320,6 @@ class TestTheCropCaretSendsWhatTheBackendTakes:
                     f"the caret's `{state}` state has no field {key}")
 
 
-def _open_saved(session, path, *, needs_summed=True):
-    """Open *path* and wait for its tree — and for its Summed node when one
-    is expected: the tree is registered before the rebuild attaches the
-    sums, so polling for the tree alone can see it a moment too early."""
-    session.open_file(str(path))
-    deadline = time.time() + 60.0
-    while time.time() < deadline:
-        trees = session.signal_trees
-        if trees and (not needs_summed
-                      or "Summed" in trees[0].root_node.children):
-            time.sleep(0.5)
-            return trees[0]
-        time.sleep(0.2)
-    assert session.signal_trees, "the file never opened"
-    raise AssertionError(f"the tree has no Summed node: "
-                         f"{list(session.signal_trees[0].root_node.children)}")
-
-
 class TestAMultiAngleAcquisitionReopensWhole:
     """Saved and reopened, a composed acquisition is its TREE again.
 
@@ -386,7 +368,7 @@ class TestAMultiAngleAcquisitionReopensWhole:
 
         session = make_session()
         try:
-            tree = _open_saved(session, path)
+            tree = open_saved(session, path)
             assert tree.root_node.name == "Aligned Stack", (
                 f"the root is {tree.root_node.name!r}; the stack reopened as a "
                 "plain dataset")
@@ -509,12 +491,7 @@ class TestTheAngleRingComesBackToo:
         path = self._saved_stack(tmp_path)
         session = make_session()
         try:
-            session.open_file(str(path))
-            deadline = time.time() + 60.0
-            while time.time() < deadline and not session.signal_trees:
-                time.sleep(0.2)
-            assert session.signal_trees, "the file never opened"
-            tree = session.signal_trees[0]
+            tree = open_saved(session, path)
 
             assert multiangle_model(tree) is not None, (
                 "the tree has no model, so the ring will refuse to draw for "
@@ -583,7 +560,7 @@ class TestAWideStackStillReopensWhole:
         return signal, data
 
     def _open(self, session, path, needs_summed=True):
-        return _open_saved(session, path, needs_summed=needs_summed)
+        return open_saved(session, path, needs_summed=needs_summed)
 
     def test_a_uint64_stack_reopens_as_a_tree(self, tmp_path):
         stack, data = self._stack(np.uint64)
@@ -783,7 +760,7 @@ class TestAReopenedTreeIsTheComposedOne:
         return path, data
 
     def _open(self, session, path, needs_summed=True):
-        return _open_saved(session, path, needs_summed=needs_summed)
+        return open_saved(session, path, needs_summed=needs_summed)
 
     def test_the_model_reports_the_recorded_offsets(self, tmp_path):
         from spyde.actions.multiangle_navigator import multiangle_model

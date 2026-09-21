@@ -38,8 +38,6 @@ from typing import Any
 
 import numpy as np
 
-# Bumped when the on-disk layout changes incompatibly.
-FORMAT_VERSION = 1
 
 #: Tilt magnitudes closer than this (degrees) are the same shell. Nominal tilts
 #: come from the acquisition and are usually exact, but a value read back from an
@@ -325,53 +323,6 @@ class MultiAngleModel:
                 f"member_index {member_index} outside 0..{self.n_members - 1}")
 
     # ── serialisation ────────────────────────────────────────────────────────
-
-    def save(self, path: str) -> None:
-        """Write to a compressed ``.npz``. Small enough to sit beside the data."""
-        meta = {
-            "format_version": FORMAT_VERSION,
-            "paths": self.paths,
-            "reference": self.reference,
-            "provenance": self.provenance,
-        }
-        arrays = {
-            "tilts": self.tilts,
-            "azimuths": self.azimuths,
-            "shell_ids": self.shell_ids,
-            "nav_offsets": self.nav_offsets,
-            "dp_offsets": self.dp_offsets,
-            "meta": np.array(json.dumps(meta)),
-        }
-        if self.nav_residuals is not None:
-            arrays["nav_residuals"] = self.nav_residuals
-        if self.dp_residuals is not None:
-            arrays["dp_residuals"] = self.dp_residuals
-        np.savez_compressed(path, **arrays)
-
-    @classmethod
-    def load(cls, path: str) -> "MultiAngleModel":
-        with np.load(path, allow_pickle=False) as stored:
-            meta = json.loads(str(stored["meta"].item()))
-            version = meta.get("format_version")
-            if version != FORMAT_VERSION:
-                raise ValueError(
-                    f"unsupported MultiAngleModel format version {version!r} "
-                    f"(this build reads {FORMAT_VERSION})"
-                )
-            return cls(
-                paths=list(meta.get("paths", [])),
-                tilts=stored["tilts"],
-                azimuths=stored["azimuths"],
-                shell_ids=stored["shell_ids"],
-                nav_offsets=stored["nav_offsets"],
-                dp_offsets=stored["dp_offsets"],
-                reference=int(meta.get("reference", 0)),
-                nav_residuals=(stored["nav_residuals"]
-                               if "nav_residuals" in stored.files else None),
-                dp_residuals=(stored["dp_residuals"]
-                              if "dp_residuals" in stored.files else None),
-                provenance=meta.get("provenance"),
-            )
 
     def __repr__(self) -> str:
         return (
