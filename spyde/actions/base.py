@@ -498,11 +498,12 @@ class CropAction(TransformAction):
         "y1": {"default": 0},
         "t0": {"default": 0},
         "t1": {"default": 0},
-        # Declared HERE as well as on the toolbar: the action resolves only
-        # the fields it lists and `build_kwargs` forwards only what it names,
-        # so a parameter missing from either is accepted by the dialog and
-        # silently dropped on the way through — the crop then runs, succeeds,
-        # and ignores the box.
+        # Listed for the DEFAULTS. What actually carries a field through is
+        # `build_kwargs` naming it in the dict it returns: `_resolved_params`
+        # merges `ctx.params` wholesale, so the toolbar's values arrive here
+        # either way, and then a key the returned dict omits is dropped. That
+        # omission is what made a scan crop run, succeed, and return the whole
+        # dataset.
         "scan_x0": {"default": 0},
         "scan_x1": {"default": 0},
         "scan_y0": {"default": 0},

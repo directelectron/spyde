@@ -159,3 +159,92 @@ class TestCroppingThenSaving:
                                             scan_y0=1, scan_y1=3)
         assert forwarded["scan_x1"] == 4 and forwarded["scan_y1"] == 3, \
             "build_kwargs dropped the scan box"
+
+
+class TestTheActionItselfCrops:
+    """Through `run()`, the way the toolbar reaches it.
+
+    The earlier tests here drove `_crop_signal` directly and passed while the
+    toolbar's Crop quietly ignored its scan box: `build_kwargs` returned a
+    dict that did not NAME the scan keys, so they were dropped between the
+    resolved parameters and the transform. Neither end was wrong; the wiring
+    between them was, and only a call to `run()` goes through it.
+
+    Not `CropAction.parameters` — that supplies defaults, and
+    `_resolved_params` merges `ctx.params` wholesale, so the toolbar's values
+    arrive with or without it. Removing it leaves these tests passing;
+    removing the keys from the returned dict fails them with the shape the
+    user saw.
+    """
+
+    def _session_with(self, data):
+        session = make_session()
+        signal = hs.signals.Signal2D(data)
+        signal.set_signal_type("electron_diffraction")
+        session._add_signal(signal)
+        return session
+
+    def _data_plot(self, session):
+        return next(plot for plot in session._plots
+                    if not getattr(plot, "is_navigator", False)
+                    and getattr(getattr(plot, "plot_state", None),
+                                "current_signal", None) is not None)
+
+    def test_running_crop_reduces_the_scan(self):
+        from spyde.actions.base import CropAction
+        from spyde.actions.context import ActionContext
+
+        data = np.arange(6 * 8 * 4 * 4, dtype=np.uint16).reshape(6, 8, 4, 4)
+        session = self._session_with(data)
+        try:
+            plot = self._data_plot(session)
+            params = {"scan_x0": 1, "scan_x1": 6, "scan_y0": 2, "scan_y1": 5}
+            action = CropAction(
+                ActionContext(plot=plot, params=params, action_name="Crop"))
+            new = action.run(**params)
+            assert new is not None, "Crop produced no node"
+            assert new.data.shape == (3, 5, 4, 4), (
+                f"Crop returned {new.data.shape}; the scan box did not reach "
+                "the transform")
+            assert np.array_equal(np.asarray(new.data), data[2:5, 1:6])
+        finally:
+            close_session(session)
+
+    def test_the_declared_parameters_are_what_gets_resolved(self):
+        """`_resolved_params` seeds from `self.parameters`, so a field on the
+        toolbar and absent there is accepted and dropped."""
+        from spyde.actions.base import CropAction
+        from spyde.actions.context import ActionContext
+
+        data = np.zeros((4, 5, 4, 4), dtype=np.uint16)
+        session = self._session_with(data)
+        try:
+            params = {"scan_x0": 1, "scan_x1": 4, "scan_y0": 1, "scan_y1": 3}
+            action = CropAction(ActionContext(
+                plot=self._data_plot(session), params=params,
+                action_name="Crop"))
+            resolved = action._resolved_params(params)
+            for key, value in params.items():
+                assert resolved.get(key) == value, (
+                    f"{key} did not survive resolution — check it is in "
+                    "CropAction.parameters as well as the toolbar")
+        finally:
+            close_session(session)
+
+    def test_running_rebin_reduces_the_scan(self):
+        from spyde.actions.base import Rebin2DAction
+        from spyde.actions.context import ActionContext
+
+        data = np.arange(8 * 10 * 4 * 4, dtype=np.uint16).reshape(8, 10, 4, 4)
+        session = self._session_with(data)
+        try:
+            params = {"scale_x": 2, "scale_y": 2, "scan_x": 2, "scan_y": 2}
+            action = Rebin2DAction(ActionContext(
+                plot=self._data_plot(session), params=params,
+                action_name="Rebin"))
+            new = action.run(**params)
+            assert new is not None and new.data.shape == (4, 5, 2, 2), (
+                f"Rebin returned "
+                f"{None if new is None else new.data.shape}; want (4, 5, 2, 2)")
+        finally:
+            close_session(session)
