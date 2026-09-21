@@ -430,3 +430,71 @@ class TestTheStackTypeStaysDiffraction:
         signal.metadata.set_item(MULTIANGLE_METADATA, {"n_members": 3})
         signal.set_signal_type("electron_diffraction")
         assert is_multiangle_stack(signal)
+
+
+class TestTheAngleRingComesBackToo:
+    """The ring is driven by the MODEL, and the model lived in the recipe.
+
+    A recipe is a runtime object attached when an acquisition is composed; it
+    is not written to the file. So a reopened acquisition re-expanded into its
+    nodes and then had no angles — `multiangle_model` asked the recipe, found
+    none, and the ring refused with "needs a multi-angle acquisition" about a
+    multi-angle acquisition.
+    """
+
+    def _saved_stack(self, tmp_path):
+        from spyde.signals.multiangle import (
+            MULTIANGLE_METADATA, MULTIANGLE_SIGNAL_TYPE,
+        )
+
+        data = np.random.default_rng(7).integers(
+            0, 400, (4, 5, 6, 4, 4), dtype=np.uint16)
+        signal = hs.signals.Signal2D(data)
+        signal.metadata.set_item(MULTIANGLE_METADATA, {
+            "n_members": 4, "n_shells": 2, "tilts": [0.5, 0.5, 1.0, 1.0],
+            "azimuths": [0.0, 90.0, 180.0, 270.0], "shell_ids": [0, 0, 1, 1],
+            "reference": 0, "nav_offsets": [[0, 0]] * 4,
+            "dp_offsets": [[0, 0]] * 4, "paths": ["a", "b", "c", "d"],
+            "member_signal_type": "electron_diffraction"})
+        signal.set_signal_type(MULTIANGLE_SIGNAL_TYPE)
+        path = tmp_path / "acquisition.zspy"
+        signal.save(str(path))
+        return path
+
+    def test_the_model_is_read_from_the_file(self, tmp_path):
+        """Without a recipe: it is the metadata or nothing."""
+        from spyde.multiangle.model import model_from_metadata
+
+        path = self._saved_stack(tmp_path)
+        back = hs.load(str(path), lazy=True)
+        from spyde.multiangle.recipe import recipe_for
+        assert recipe_for(back) is None, \
+            "a file should not carry a recipe; this test proves nothing"
+        model = model_from_metadata(back)
+        assert model is not None, "the model did not survive the file"
+        assert model.n_members == 4
+        assert list(model.azimuths) == [0.0, 90.0, 180.0, 270.0]
+
+    def test_the_ring_opens_on_a_reopened_acquisition(self, tmp_path):
+        from spyde.actions.multiangle_navigator import (
+            multiangle_model, open_multiangle_navigator, stack_signal,
+        )
+
+        path = self._saved_stack(tmp_path)
+        session = make_session()
+        try:
+            session.open_file(str(path))
+            deadline = time.time() + 60.0
+            while time.time() < deadline and not session.signal_trees:
+                time.sleep(0.2)
+            assert session.signal_trees, "the file never opened"
+            tree = session.signal_trees[0]
+
+            assert multiangle_model(tree) is not None, (
+                "the tree has no model, so the ring will refuse to draw for "
+                "a multi-angle acquisition")
+            assert stack_signal(tree) is not None, "no angle-axis node found"
+            assert open_multiangle_navigator(session, tree) is not None, \
+                "the angle ring did not open"
+        finally:
+            close_session(session)

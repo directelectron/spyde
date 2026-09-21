@@ -445,10 +445,20 @@ def _sum_over_angles(stack, indices, title):
     The saved stack IS the aligned members, so a sum over its leading axis is
     the same array the composition produced — no members, no offsets and no
     re-reading of anything are needed to get the Summed node back.
+
+    The node carries a RECIPE, which is what makes looking at it bearable. A
+    composed node displayed through its dask graph computes the whole
+    enclosing block to show one frame; through the recipe it reads one frame
+    per angle and adds them (CLAUDE.md, Live-Display 3 — measured at 2196 ms
+    against 0.55 ms on a comparable node). The "members" here are the stack's
+    own per-angle slices and the offsets are ZERO, because a saved stack is
+    already aligned and shifting it again would serve the wrong position.
     """
     import numpy as np
 
     from spyde.multiangle.compose import sum_dtype
+    from spyde.multiangle.model import MultiAngleModel, model_from_metadata
+    from spyde.multiangle.recipe import MultiAngleRecipe, attach_recipe
 
     indices = [int(index) for index in indices]
     data = stack.data
@@ -465,7 +475,27 @@ def _sum_over_angles(stack, indices, title):
         f"{MULTIANGLE_METADATA}.member_signal_type", "")
     if member_type:
         signal.set_signal_type(member_type)
-    return signal
+
+    recorded = model_from_metadata(stack)
+    if recorded is None:
+        return signal
+    # Zeroed, not the recorded offsets: those describe where each member sat
+    # in its OWN file, and were applied when the stack was written. Re-using
+    # them would shift an already-aligned stack a second time, which serves a
+    # real frame from the wrong scan position — wrong and invisible.
+    members = len(recorded.paths)
+    aligned = MultiAngleModel(
+        paths=list(recorded.paths), tilts=recorded.tilts,
+        azimuths=recorded.azimuths, shell_ids=recorded.shell_ids,
+        nav_offsets=np.zeros((members, 2), dtype=np.int64),
+        dp_offsets=np.zeros((members, 2), dtype=np.int64),
+        reference=int(recorded.reference))
+    # `inav` takes the navigation axes in display order, fastest first, so the
+    # angle is LAST: (x, y, angle).
+    planes = tuple(stack.inav[:, :, index] for index in indices)
+    return attach_recipe(signal, MultiAngleRecipe(
+        members=planes, model=aligned, has_angle_axis=False,
+        dtype=summed.dtype, member_indices=tuple(indices)))
 
 
 def rebuild_multiangle_tree(session, signal, source_path=None):

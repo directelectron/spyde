@@ -82,22 +82,38 @@ def multiangle_model(tree):
     Every composed node carries the same model, so the first one found answers
     for the tree.
     """
+    from spyde.multiangle.model import model_from_metadata
     from spyde.multiangle.recipe import recipe_for
 
-    for node in getattr(tree, "walk", lambda: [])():
+    nodes = list(getattr(tree, "walk", lambda: [])())
+    for node in nodes:
         recipe = recipe_for(node.signal)
         if recipe is not None:
             return recipe.model
+    # A signal READ BACK FROM A FILE has no recipe — recipes are runtime
+    # objects and are not written out. The metadata carries the same model,
+    # which is the reason it is recorded.
+    for node in nodes:
+        model = model_from_metadata(node.signal)
+        if model is not None:
+            return model
     return None
 
 
 def stack_signal(tree):
     """The 5-D per-angle node — the one a pick on the ring switches to."""
     from spyde.multiangle.recipe import recipe_for
+    from spyde.signals.multiangle import is_multiangle_stack
 
-    for node in getattr(tree, "walk", lambda: [])():
+    nodes = list(getattr(tree, "walk", lambda: [])())
+    for node in nodes:
         recipe = recipe_for(node.signal)
         if recipe is not None and recipe.has_angle_axis:
+            return node.signal
+    # Same reason: from a file there is no recipe to ask, and the angle axis
+    # is what `has_angle_axis` was reporting anyway.
+    for node in nodes:
+        if is_multiangle_stack(node.signal):
             return node.signal
     return None
 

@@ -380,3 +380,48 @@ class MultiAngleModel:
             f"max_abs_nav_offset={self.max_abs_nav_offset} px, "
             f"max_abs_dp_offset={self.max_abs_dp_offset} px)"
         )
+
+
+def model_from_metadata(signal):
+    """The model a composed signal RECORDS, or None if it records none.
+
+    A recipe is a runtime object: it is attached when an acquisition is
+    composed and does not survive being written to a file. Everything the
+    model holds is in the metadata precisely so a reopened dataset still
+    knows what it is — without this, a saved acquisition re-expands into its
+    nodes and then has no angles to draw a ring from.
+    """
+    import numpy as np
+
+    from spyde.signals.multiangle import MULTIANGLE_METADATA
+
+    metadata = getattr(signal, "metadata", None)
+    if metadata is None or not metadata.has_item(MULTIANGLE_METADATA):
+        return None
+    read = lambda key, default=None: metadata.get_item(
+        f"{MULTIANGLE_METADATA}.{key}", default)
+    try:
+        members = int(read("n_members"))
+    except (TypeError, ValueError):
+        return None
+    if members < 1:
+        return None
+    zeros = [[0, 0]] * members
+    try:
+        return MultiAngleModel(
+            paths=[str(path) for path in
+                   read("paths", [f"member{i}" for i in range(members)])],
+            tilts=np.asarray([float(v) for v in
+                              read("tilts", [0.0] * members)]),
+            azimuths=np.asarray([float(v) for v in
+                                 read("azimuths", [0.0] * members)]),
+            shell_ids=np.asarray([int(v) for v in
+                                  read("shell_ids", [0] * members)],
+                                 dtype=np.int64),
+            nav_offsets=np.asarray(read("nav_offsets", zeros), dtype=np.int64),
+            dp_offsets=np.asarray(read("dp_offsets", zeros), dtype=np.int64),
+            reference=int(read("reference", 0)),
+        )
+    except Exception:
+        # A file with half a record is a file to open plainly, not to fail on.
+        return None
