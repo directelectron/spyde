@@ -82,6 +82,7 @@ from spyde.backend._session_multiangle_loader import (
 from spyde.backend._session_testharness import _write_minimal_mrc
 from spyde.multiangle import make_multiangle
 from spyde.tests.migrated._async import (
+    call_on_loop,
     drain_loop, quiesce, wait_until, why_busy,
 )
 from spyde.tests.migrated.conftest import close_session, make_session
@@ -1528,6 +1529,10 @@ class TestTheThumbnails:
         _with_angles(session, acquisition)
         maped_align_real(session, None, {"params": {}})
         assert _wait(lambda: _last_state(window["messages"])["real"]["solved"])
+        # "solved" is announced before the first solve's thumbnails have all
+        # been encoded; counting from here caught that solve's own late
+        # encodes and called them a cache miss.
+        assert quiesce(session), why_busy(session)
 
         encoded = []
         real = loader._thumbnail
@@ -1626,8 +1631,15 @@ class TestTheThumbnails:
                      and any(member.preview
                              for member in session._multiangle_loader.members))
 
-        maped_close_loader(session, None, {})
-        after_close = len(window["messages"])
+        # Closed ON THE LOOP, as the app closes it: a handler called from the
+        # test thread can bump the generation while a fill's callback is
+        # already past its check on the loop, and that interleaving does not
+        # exist in the app, where both run on the loop in turn.
+        def _close():
+            maped_close_loader(session, None, {})
+            return len(window["messages"])
+
+        after_close = call_on_loop(session, _close)
         assert quiesce(session), why_busy(session)
         drain_loop(session)
 
