@@ -31,7 +31,8 @@
  * whether the acquisition can be opened.
  */
 import React, { useEffect, useMemo, useRef, useState } from 'react'
-import { TabRow, Field, NumInput } from './WizardShell'
+import { TabRow, Field, NumInput, Info, PrimaryButton } from './WizardShell'
+import { formatBytes } from '../kernel/format'
 import { Dropdown } from './Dropdown'
 import { useKeyedDebounce, type SendAction } from './wizardHooks'
 
@@ -350,15 +351,6 @@ function formatDegrees(value: number | null): string {
 function formatAzimuth(value: number): string {
   const rounded = Math.round(value * 10) / 10
   return `${Number.isInteger(rounded) ? rounded : rounded.toFixed(1)}°`
-}
-
-function formatBytes(value: number | null): string {
-  if (value == null || !Number.isFinite(value) || value <= 0) return ''
-  const units = ['B', 'kB', 'MB', 'GB', 'TB']
-  let scaled = value
-  let unit = 0
-  while (scaled >= 1000 && unit < units.length - 1) { scaled /= 1000; unit += 1 }
-  return `${scaled < 10 && unit > 0 ? scaled.toFixed(1) : Math.round(scaled)} ${units[unit]}`
 }
 
 /** "angle07.mrc" → "angle07". A caption inside a 56-pixel tile has room for the
@@ -973,11 +965,11 @@ export function MultiAngleLoader({ sendAction, onClose }: {
                   aligned picture does not get, and that picture is the whole
                   point of the panel below. */}
               <div style={styles.runRow}>
-                <Field label={<>Max shift (px) <Info testid="maped-info-max-shift" text={INFO.maxShift} /></>}>
+                <Field label={<>Max shift (px) <Info width={300} testid="maped-info-max-shift" text={INFO.maxShift} /></>}>
                   <NumInput value={maxShift} onChange={setMaxShift}
                     step="1" width={72} testid="maped-max-shift" />
                 </Field>
-                <RunButton
+                <PrimaryButton
                   testid="maped-run-real" busy={state.busy}
                   label={state.real.solved ? 'Re-run' : 'Run'}
                   onClick={() => sendAction('maped_align_real', { params: { max_shift: maxShift } })}
@@ -1020,7 +1012,7 @@ export function MultiAngleLoader({ sendAction, onClose }: {
                   () => sendAction('maped_set_beam_roi', { beam_roi: roi }))}
               />
 
-              <RunButton
+              <PrimaryButton
                 testid="maped-run-reciprocal" busy={state.busy}
                 label={state.reciprocal.solved
                   ? 'Re-run'
@@ -2171,7 +2163,7 @@ function ScanShapeField({ value, onChange }: {
 
   return (
     <div data-testid="maped-scan-shape" style={styles.scanShape}>
-      <Field label={<>Scan grid <Info testid="maped-info-scan-shape" text={INFO.scanShape} /></>}>
+      <Field label={<>Scan grid <Info width={300} testid="maped-info-scan-shape" text={INFO.scanShape} /></>}>
         <span style={styles.scanInputs}>
           <input data-testid="maped-scan-x" type="number" step="1" min="1"
             placeholder="x" style={styles.scanInput}
@@ -2210,26 +2202,6 @@ const INFO = {
  * layout, and `whiteSpace: normal` because it sits inside a `Field` label,
  * which is nowrap so a control label never breaks mid-word.
  */
-function Info({ text, testid }: { text: string; testid: string }) {
-  const [open, setOpen] = useState(false)
-  useEffect(() => {
-    if (!open) return
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setOpen(false) }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [open])
-  return (
-    <span style={{ position: 'relative', display: 'inline-flex' }}>
-      <button data-testid={testid} aria-expanded={open} title="More information"
-        style={styles.infoBtn} onClick={() => setOpen((v) => !v)}>ⓘ</button>
-      {open && (
-        <div data-testid={`${testid}-text`} style={styles.infoText}
-          onClick={() => setOpen(false)}>{text}</div>
-      )}
-    </span>
-  )
-}
-
 /** A degrees field. The raw text is held locally until blur so a `maped_state`
  *  arriving mid-edit cannot rewrite what is being typed, and only a finite
  *  number is ever sent (a bare Number() would push NaN on "-" or "1."). */
@@ -2257,17 +2229,6 @@ function AngleInput({ value, onChange, label, testid }: {
       />
       <span style={styles.angleUnit}>°</span>
     </label>
-  )
-}
-
-function RunButton({ busy, label, onClick, testid }: {
-  busy: boolean; label: string; onClick: () => void; testid: string
-}) {
-  return (
-    <button data-testid={testid} disabled={busy} onClick={onClick}
-      style={{ ...styles.run, ...(busy ? styles.runBusy : null) }}>
-      {busy ? 'Running…' : label}
-    </button>
   )
 }
 
@@ -2690,18 +2651,6 @@ const styles: Record<string, React.CSSProperties> = {
   },
   scanTimes: { fontSize: 11, color: '#6c7086' },
   scanHint: { fontSize: 10.5, color: '#6c7086', lineHeight: 1.4 },
-  infoBtn: {
-    background: 'none', border: 'none', color: '#6c7086', cursor: 'pointer',
-    fontSize: 11, padding: 0, lineHeight: 1, flex: '0 0 auto',
-  },
-  infoText: {
-    position: 'absolute', top: 'calc(100% + 4px)', left: -8,
-    width: 300, zIndex: 20,
-    fontSize: 10.5, color: '#cdd6f4', background: '#1e1e2e',
-    border: '1px solid #45475a', borderRadius: 5, padding: '6px 8px',
-    lineHeight: 1.45, boxShadow: '0 8px 20px rgba(0,0,0,0.55)',
-    whiteSpace: 'normal', cursor: 'pointer',
-  },
   angle: { display: 'flex', alignItems: 'center', gap: 3 },
   angleLabel: { fontSize: 10, color: '#6c7086' },
   angleInput: {
@@ -2709,11 +2658,6 @@ const styles: Record<string, React.CSSProperties> = {
     border: '1px solid #313244', borderRadius: 4, padding: '3px 5px', fontSize: 11,
   },
   angleUnit: { fontSize: 10, color: '#6c7086' },
-  run: {
-    alignSelf: 'flex-start', background: ACCENT, color: '#11111b', border: 'none',
-    borderRadius: 6, padding: '7px 16px', fontSize: 12, fontWeight: 600, cursor: 'pointer',
-  },
-  runBusy: { background: '#45475a', color: '#a6adc8', cursor: 'progress' },
   hint: { fontSize: 11.5, color: '#6c7086', fontStyle: 'italic' },
   result: { display: 'flex', flexDirection: 'column', gap: 6 },
   residual: { fontSize: 12.5, fontWeight: 600 },

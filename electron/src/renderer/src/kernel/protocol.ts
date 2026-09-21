@@ -1044,64 +1044,6 @@ export interface DpcResultMessage extends MsgBase {
 }
 
 /**
- * The whole Multi-Angle 4D STEM acquisition being assembled, re-sent after
- * EVERY `maped_*` action — this one snapshot is the loader's only source of
- * truth, so the dialog never keeps an edited copy of its own.
- *
- * A member with `error` set failed to open: its shape/dtype fields are null and
- * it belongs to no shell, but it still appears in `members` so the loader can
- * show the failure instead of a silent absence.
- */
-export interface MultiAngleMemberInfo {
-  index: number
-  path: string
-  name: string
-  scan_shape: number[] | null
-  detector_shape: number[] | null
-  dtype: string | null
-  size_bytes: number | null
-  /** Degrees from the acquisition's centre, and about it. */
-  tilt: number | null
-  azimuth: number | null
-  /** Index into `shells`, or null while the member has no tilt. */
-  shell: number | null
-  error: string | null
-}
-
-/** One tilt magnitude and the members taken at it. */
-export interface MultiAngleShellInfo {
-  shell: number
-  tilt: number
-  members: number[]
-}
-
-/** One alignment answer. `offsets` is the integer shift applied per member;
- *  `residuals` is what rounding to it discarded, so a value near 0.5 px means
- *  that member's integer offset could have gone either way. */
-export interface MultiAngleSolve {
-  solved: boolean
-  offsets: number[][] | null
-  residuals: number[] | null
-  max_residual: number | null
-}
-
-export interface MultiAngleStateMessage extends MsgBase {
-  type: 'maped_state'
-  members: MultiAngleMemberInfo[]
-  reference: number | null
-  shells: MultiAngleShellInfo[]
-  /** Scan grid [x, y] forced on every member, or null for "whatever each file
-   *  says". One grid per acquisition — an MRC carries no scan grid of its own,
-   *  so without this a bare MRC member probes as a 3-D stack and errors. */
-  scan_shape: number[] | null
-  real: MultiAngleSolve
-  reciprocal: MultiAngleSolve
-  busy: boolean
-  message: string
-  can_commit: boolean
-}
-
-/**
  * Wizard-scoped events re-broadcast verbatim as DOM CustomEvents (the caret
  * components subscribe directly). The payload beyond `type` is consumer-defined,
  * so it stays untyped here (the `MsgBase` index signature covers field access).
@@ -1130,6 +1072,9 @@ export interface WizardEventMessage extends MsgBase {
     | 'cod_results'
     | 'gpu_status_result'
     | 'first_run_result'
+    // Multi-angle loader: the whole acquisition, re-sent after every
+    // maped_* action. Parsed field by field by the dialog itself.
+    | 'maped_state'
 }
 
 // ── MDI image layering (overlay) ────────────────────────────────────────────
@@ -1235,7 +1180,6 @@ export type PlotAppMessage =
   | DpcResultMessage
   | DpcRegionMessage
   | StrainRotationMessage
-  | MultiAngleStateMessage
 
 /**
  * Narrow a raw incoming message (`Record<string, unknown>` from the IPC bridge)
