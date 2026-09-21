@@ -102,6 +102,14 @@ test('vector-OM opens the map window AND the IPF explorer window', async () => {
   await expect(page.getByTestId('vom-cif-list')).toContainText('Silver__0011135')
   await page.getByTestId('vom-tab-Library').click()
   await page.getByTestId('vom-generate').click()
+  // Generate stops at the library and the live preview; the map and the
+  // explorer are Compute's to open (see vector_om_lazy.spec.ts).
+  await expect(page.getByTestId('status-text'))
+    .toContainText(/Vector Orientation: ready/, { timeout: 120_000 })
+  // The caret's tabs are not under the IPF Refine window Generate opens
+  // over the source window; its titlebar is, so it is not clicked.
+  await page.getByTestId('vom-tab-Run').click()
+  await page.getByTestId('vom-compute').click()
 
   // The explorer window is the one that owns the toggle group.
   const toggle = page.getByTestId(/^ipf-view-toggle-/).first()
