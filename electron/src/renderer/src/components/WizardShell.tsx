@@ -178,6 +178,7 @@ export const S: Record<string, React.CSSProperties> = {
   tabActive: { background: '#313244', border: 'none', color: '#cdd6f4', cursor: 'pointer', fontSize: 11, padding: '2px 7px', borderRadius: 4, fontWeight: 600 },
   tabLocked: { background: 'none', border: 'none', color: '#494d64', cursor: 'not-allowed', fontSize: 11, padding: '2px 7px', borderRadius: 4 },
   page: { display: 'flex', flexDirection: 'column', gap: 6, paddingTop: 2 },
+  groupLabel: { fontSize: 10.5, color: '#6c7086', marginTop: 4, borderTop: '1px solid #313244', paddingTop: 5 },
   // `flexWrap` so an expanded ⓘ disclosure (width:100%) drops to its own line
   // rather than crushing the control beside it.
   fieldRow: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 6, flexWrap: 'wrap' },

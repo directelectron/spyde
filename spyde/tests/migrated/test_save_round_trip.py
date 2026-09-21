@@ -248,3 +248,55 @@ class TestTheActionItselfCrops:
                 f"{None if new is None else new.data.shape}; want (4, 5, 2, 2)")
         finally:
             close_session(session)
+
+
+class TestTheCropCaretSendsWhatTheBackendTakes:
+    """The caret is the ONLY thing that reaches Crop from the app.
+
+    `CropWizard.tsx` is a hand-written panel with its own fields, so the
+    toolbar's declared parameters never reach the UI for this action. The
+    backend grew a scan box, every Python test passed, and the app went on
+    cropping only the detector — because the caret sent `{x0, x1, y0, y1}`
+    and nothing else. Reading the TSX is the only place that mismatch shows.
+    """
+
+    def _caret(self):
+        import pathlib
+
+        path = (pathlib.Path(__file__).resolve().parents[3] / "electron"
+                / "src" / "renderer" / "src" / "components" / "CropWizard.tsx")
+        assert path.exists(), f"the Crop caret moved: {path}"
+        return path.read_text(encoding="utf-8")
+
+    def test_the_caret_offers_the_scan_box(self):
+        caret = self._caret()
+        for testid in ("crop-scan-x0", "crop-scan-x1",
+                       "crop-scan-y0", "crop-scan-y1"):
+            assert testid in caret, (
+                f"{testid} is not in CropWizard.tsx — the backend takes a "
+                "scan box and the caret cannot send one")
+
+    def test_the_caret_sends_the_scan_box(self):
+        """Offering the fields is not sending them: they have to be in the
+        payload `doCrop` hands to `toolbar_action`."""
+        caret = self._caret()
+        start = caret.index("const doCrop")
+        payload = caret[start:caret.index("}", caret.index("toolbar_action",
+                                                           start))]
+        assert "scan" in payload, (
+            "doCrop does not put the scan box in the params it sends; it "
+            f"sends: {payload.strip()}")
+
+    def test_what_it_sends_is_what_the_transform_takes(self):
+        """Every key the caret sends has to be one `_crop_signal` names, or it
+        is dropped without a word on the way through `build_kwargs`."""
+        import inspect
+
+        from spyde.actions.base import _crop_signal
+
+        accepted = set(inspect.signature(_crop_signal).parameters)
+        caret = self._caret()
+        for key in ("x0", "x1", "y0", "y1",
+                    "scan_x0", "scan_x1", "scan_y0", "scan_y1"):
+            assert key in accepted, f"_crop_signal does not take {key}"
+            assert key in caret, f"the caret never mentions {key}"

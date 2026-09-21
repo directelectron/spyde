@@ -32,6 +32,12 @@ interface Props {
 export function CropWizard({ caretPos, windowId, sendAction, onClose }: Props) {
   const { state } = useSpyDE()
   const [box, setBox] = React.useState({ x0: 0, x1: 0, y0: 0, y1: 0 })
+  // The SCAN box, typed only: the on-plot rectangle lives on the diffraction
+  // pattern and so can only describe the detector. A 4-D dataset is usually
+  // far bigger in the scan, and there was no way to trim it here at all —
+  // the backend has taken a scan box for a while and this never sent one.
+  const [scan, setScan] = React.useState(
+    { scan_x0: 0, scan_x1: 0, scan_y0: 0, scan_y1: 0 })
   const [status, setStatus] = React.useState(
     'Drag the box to the region to keep, then Crop.',
   )
@@ -68,12 +74,19 @@ export function CropWizard({ caretPos, windowId, sendAction, onClose }: Props) {
     sendAction('crop_set_region', next, windowId)
   }
 
+  const setScanField = (key: keyof typeof scan, v: number) => {
+    // Not through crop_set_region: that moves the DETECTOR widget, which has
+    // nothing to say about the scan.
+    setScan({ ...scan, [key]: v })
+  }
+
   const doCrop = () => {
     setStatus('Cropping…')
     // The backend reads the WIDGET's live geometry as the primary input (see
     // CropAction.build_kwargs) — the typed fields ride along as a fallback for
     // hosts with no widget (notebook/script use of CropAction directly).
-    sendAction('toolbar_action', { name: 'Crop', params: box }, windowId)
+    sendAction('toolbar_action',
+      { name: 'Crop', params: { ...box, ...scan } }, windowId)
     onClose()
   }
 
@@ -85,6 +98,11 @@ export function CropWizard({ caretPos, windowId, sendAction, onClose }: Props) {
         <Field label="X end"><NumInput testid="crop-x1" value={box.x1} step="1" onChange={(v) => setField('x1', v)} /></Field>
         <Field label="Y start"><NumInput testid="crop-y0" value={box.y0} step="1" onChange={(v) => setField('y0', v)} /></Field>
         <Field label="Y end"><NumInput testid="crop-y1" value={box.y1} step="1" onChange={(v) => setField('y1', v)} /></Field>
+        <div style={S.groupLabel}>Scan (leave at 0 to keep it whole)</div>
+        <Field label="Scan X start"><NumInput testid="crop-scan-x0" value={scan.scan_x0} step="1" onChange={(v) => setScanField('scan_x0', v)} /></Field>
+        <Field label="Scan X end"><NumInput testid="crop-scan-x1" value={scan.scan_x1} step="1" onChange={(v) => setScanField('scan_x1', v)} /></Field>
+        <Field label="Scan Y start"><NumInput testid="crop-scan-y0" value={scan.scan_y0} step="1" onChange={(v) => setScanField('scan_y0', v)} /></Field>
+        <Field label="Scan Y end"><NumInput testid="crop-scan-y1" value={scan.scan_y1} step="1" onChange={(v) => setScanField('scan_y1', v)} /></Field>
         <button data-testid="crop-run" style={S.primary} onClick={doCrop}>Crop</button>
       </div>
     </WizardShell>
