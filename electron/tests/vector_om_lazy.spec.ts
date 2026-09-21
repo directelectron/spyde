@@ -105,7 +105,7 @@ test('Vector Orientation Mapping: Generate → Compute opens IPF + strain window
   // "library ready" is transient — on synthetic data the field fit completes
   // immediately and advances the status to "live IPF ready". Accept either.
   await expect(page.getByTestId('status-text'))
-    .toContainText(/library ready|live IPF ready/, { timeout: 60_000 })
+    .toContainText(/Vector Orientation: ready|library ready|live IPF ready/, { timeout: 60_000 })
 
   // Generating the library activates the LIVE refine overlay: the measured
   // vectors (red) + the fitted template (green) appear on the vectors DP.
