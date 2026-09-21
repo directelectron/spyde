@@ -133,8 +133,12 @@ class TestCroppingThenSaving:
             assert cropped.data.shape == (3, 5, 4, 4), \
                 "the scan box did not reach the crop"
             session._add_signal(cropped)
-            back = _saved(session, tmp_path / "cropped.zspy",
-                          _plots_of(session)[-1])
+            # By what it SHOWS: indexing the plot list by position picks up
+            # whatever another test left open.
+            plot = next(p for p in session._plots
+                        if getattr(getattr(p, "plot_state", None),
+                                   "current_signal", None) is cropped)
+            back = _saved(session, tmp_path / "cropped.zspy", plot)
             assert back.data.shape == (3, 5, 4, 4)
             assert np.array_equal(np.asarray(back.data),
                                   data[2:5, 1:6])
@@ -300,3 +304,129 @@ class TestTheCropCaretSendsWhatTheBackendTakes:
                     "scan_x0", "scan_x1", "scan_y0", "scan_y1"):
             assert key in accepted, f"_crop_signal does not take {key}"
             assert key in caret, f"the caret never mentions {key}"
+
+
+class TestAMultiAngleAcquisitionReopensWhole:
+    """Saved and reopened, a composed acquisition is its TREE again.
+
+    Otherwise it is a 5-D array: the alignment survives and everything built
+    on it does not — no Summed node, no shells, no angle ring — and a dataset
+    published that way hands the next person an array with no way to know what
+    it is. Nothing extra is needed to rebuild them: the sums are reductions
+    over the stack's own leading axis and the angles are in its metadata.
+    """
+
+    def _stack(self, members=4, shells=(0, 0, 1, 1)):
+        from spyde.signals.multiangle import MULTIANGLE_METADATA
+
+        generator = np.random.default_rng(7)
+        data = generator.integers(
+            0, 400, (members, 5, 6, 4, 4), dtype=np.uint16)
+        signal = hs.signals.Signal2D(data)
+        signal.metadata.set_item(MULTIANGLE_METADATA, {
+            "n_members": members,
+            "n_shells": len(set(shells)),
+            "tilts": [1.0 if shell else 0.5 for shell in shells],
+            "azimuths": [i * 90.0 for i in range(members)],
+            "shell_ids": list(shells),
+            "reference": 0,
+            "member_signal_type": "electron_diffraction",
+        })
+        signal.set_signal_type("electron_diffraction")
+        return signal, np.asarray(data)
+
+    def test_a_stack_is_recognised_and_a_sum_is_not(self):
+        from spyde.signals.multiangle import is_multiangle_stack
+
+        stack, _data = self._stack()
+        assert is_multiangle_stack(stack)
+        summed = hs.signals.Signal2D(np.zeros((5, 6, 4, 4), dtype=np.uint16))
+        summed.metadata.set_item("Acquisition.multiangle",
+                                 stack.metadata.get_item(
+                                     "Acquisition.multiangle").as_dictionary())
+        assert not is_multiangle_stack(summed), \
+            "a 4-D SUM carries the same metadata and is not a stack"
+
+    def test_reopening_rebuilds_the_nodes(self, tmp_path):
+        stack, data = self._stack()
+        path = tmp_path / "acquisition.zspy"
+        stack.save(str(path))
+
+        session = make_session()
+        try:
+            session.open_file(str(path))
+            deadline = time.time() + 60.0
+            while time.time() < deadline and not session.signal_trees:
+                time.sleep(0.2)
+            assert session.signal_trees, "the file never opened"
+            tree = session.signal_trees[0]
+            assert tree.root_node.name == "Aligned Stack", (
+                f"the root is {tree.root_node.name!r}; the stack reopened as a "
+                "plain dataset")
+            names = set(tree.root_node.children)
+            assert "Summed" in names, f"no Summed node, only {names}"
+        finally:
+            close_session(session)
+
+    def test_the_summed_node_is_the_members_added(self, tmp_path):
+        """Not merely present — the same numbers the composition produced."""
+        from spyde.backend._session_multiangle import _sum_over_angles
+
+        stack, data = self._stack()
+        summed = _sum_over_angles(stack, range(data.shape[0]), "Summed")
+        assert summed.data.shape == data.shape[1:]
+        assert np.array_equal(np.asarray(summed.data),
+                              data.astype(np.uint64).sum(axis=0))
+
+    def test_the_sums_are_diffraction_again(self, tmp_path):
+        """The stack's own type says multi-angle; the sums are patterns, and
+        the whole diffraction toolchain is gated on them saying so."""
+        from spyde.backend._session_multiangle import _sum_over_angles
+
+        stack, data = self._stack()
+        summed = _sum_over_angles(stack, range(data.shape[0]), "Summed")
+        assert summed.metadata.Signal.signal_type == "electron_diffraction"
+
+
+class TestTheStackTypeStaysDiffraction:
+    """The type exists so a saved acquisition can be recognised. It EXTENDS
+    ElectronDiffraction2D so that costs nothing: the toolchain is gated on the
+    signal type, and a composed acquisition losing it once made every
+    diffraction action disappear from the window."""
+
+    def test_the_type_is_a_diffraction_signal(self):
+        from pyxem.signals import Diffraction2D
+
+        from spyde.signals.multiangle import MULTIANGLE_SIGNAL_TYPE
+
+        signal = hs.signals.Signal2D(
+            np.zeros((3, 4, 5, 6, 6), dtype=np.uint16))
+        signal.set_signal_type(MULTIANGLE_SIGNAL_TYPE)
+        assert isinstance(signal, Diffraction2D), (
+            "a multi-angle stack is not a diffraction signal; every action "
+            "gated on that is gone")
+
+    def test_a_stack_is_recognised_by_its_type_alone(self):
+        """Without the shape check: a file may be opened lazily in pieces, and
+        the type is the cheapest thing that identifies one."""
+        from spyde.signals.multiangle import (
+            MULTIANGLE_METADATA, MULTIANGLE_SIGNAL_TYPE, is_multiangle_stack,
+        )
+
+        signal = hs.signals.Signal2D(
+            np.zeros((3, 4, 5, 6, 6), dtype=np.uint16))
+        signal.metadata.set_item(MULTIANGLE_METADATA, {"n_members": 3})
+        signal.set_signal_type(MULTIANGLE_SIGNAL_TYPE)
+        assert is_multiangle_stack(signal)
+
+    def test_an_older_file_without_the_type_is_still_recognised(self):
+        """Every acquisition composed before the type existed."""
+        from spyde.signals.multiangle import (
+            MULTIANGLE_METADATA, is_multiangle_stack,
+        )
+
+        signal = hs.signals.Signal2D(
+            np.zeros((3, 4, 5, 6, 6), dtype=np.uint16))
+        signal.metadata.set_item(MULTIANGLE_METADATA, {"n_members": 3})
+        signal.set_signal_type("electron_diffraction")
+        assert is_multiangle_stack(signal)

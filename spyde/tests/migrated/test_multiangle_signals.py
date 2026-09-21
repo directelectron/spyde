@@ -303,11 +303,25 @@ class TestTheMembersMetadataIsCarried:
         summed = build_summed_signal(aligned, members, model)
         assert summed.metadata.Signal.signal_type == "electron_diffraction"
 
-    def test_the_stack_keeps_the_signal_type(self, acquisition):
+    def test_the_stack_is_still_a_diffraction_signal(self, acquisition):
+        """It carries a type of its OWN so the loader can recognise a saved
+        acquisition — and that type extends ElectronDiffraction2D, because the
+        toolchain is gated on the type and a composed acquisition losing it
+        once made every diffraction action disappear. What matters is not the
+        string but that everything asking still gets yes."""
+        from pyxem.signals import Diffraction2D
+
+        from spyde.signals.multiangle import MULTIANGLE_SIGNAL_TYPE
+
         aligned, members, model = acquisition
         self._reference(members)
         stack = build_stack_signal(aligned, members, model)
-        assert stack.metadata.Signal.signal_type == "electron_diffraction"
+        assert stack.metadata.Signal.signal_type == MULTIANGLE_SIGNAL_TYPE
+        assert isinstance(stack, Diffraction2D), (
+            "the stack is not a diffraction signal any more; every action "
+            "gated on that has just vanished from it")
+        assert stack.metadata.get_item(
+            "Acquisition.multiangle.member_signal_type") ==             "electron_diffraction"
 
     def test_the_instrument_and_provenance_come_across(self, acquisition):
         aligned, members, model = acquisition

@@ -438,6 +438,13 @@ class FileLoaderMixin:
                 return
             for sig in signal:
                 self._maybe_set_insitu_signal_type(sig)
+                # A saved multi-angle acquisition opens as its whole tree, not
+                # as a bare 5-D array: the sums are reductions over its own
+                # leading axis and the angles are in its metadata, so
+                # everything built on the alignment can be put back without
+                # the members or the offsets.
+                if self._maybe_rebuild_multiangle(sig, path) is not None:
+                    continue
                 self._add_signal(sig, source_path=path,
                                  navigator_override=_reader_navigator(sig))
             self._add_recent(path)
@@ -923,6 +930,24 @@ class FileLoaderMixin:
             return sig
 
     # ── Save ─────────────────────────────────────────────────────────────────
+
+    def _maybe_rebuild_multiangle(self, signal, path):
+        """Rebuild the multi-angle tree around *signal*, or None if it is not
+        one. Never fatal: a stack that cannot be re-expanded is still a
+        dataset, and must open as one."""
+        from spyde.signals.multiangle import is_multiangle_stack
+
+        if not is_multiangle_stack(signal):
+            return None
+        try:
+            from spyde.backend._session_multiangle import (
+                rebuild_multiangle_tree,
+            )
+            return rebuild_multiangle_tree(self, signal, source_path=path)
+        except Exception as e:
+            log.warning("a saved multi-angle acquisition would not re-expand, "
+                        "opening it as a plain dataset: %s", e)
+            return None
 
     def _resolve_save_plot(self, plot):
         """Pick the plot to save: the one passed (from its window), else the

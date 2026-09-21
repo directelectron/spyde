@@ -45,6 +45,8 @@ import numpy as np
 from de_shell import ipc
 from de_shell.ipc import emit_status, emit_error
 
+from spyde.signals.multiangle import MULTIANGLE_METADATA
+
 from spyde.backend._session_files import (
     SUPPORTED_EXTS, _is_supported_dataset_path, _path_ext,
 )
@@ -435,6 +437,84 @@ def compose_multiangle_tree(session, members, model, images):
     session._dispatch_to_main(lambda: _open_angle_ring(tree))
     _report_multiangle(model, summed)
     return tree, summed
+
+
+def _sum_over_angles(stack, indices, title):
+    """The stack's chosen angles added, as a 4-D node.
+
+    The saved stack IS the aligned members, so a sum over its leading axis is
+    the same array the composition produced — no members, no offsets and no
+    re-reading of anything are needed to get the Summed node back.
+    """
+    import numpy as np
+
+    from spyde.multiangle.compose import sum_dtype
+
+    indices = [int(index) for index in indices]
+    data = stack.data
+    wanted = sum_dtype(data.dtype, len(indices))
+    summed = data[indices].astype(wanted).sum(axis=0)
+
+    signal = stack._deepcopy_with_new_data(summed)
+    # Drop the angle axis: it described planes that have just been added up,
+    # and leaving it makes a 4-D array claim a 5-D calibration.
+    angle = signal.axes_manager.navigation_axes[-1]
+    signal.axes_manager.remove(angle)
+    signal.metadata.set_item("General.title", title)
+    member_type = stack.metadata.get_item(
+        f"{MULTIANGLE_METADATA}.member_signal_type", "")
+    if member_type:
+        signal.set_signal_type(member_type)
+    return signal
+
+
+def rebuild_multiangle_tree(session, signal, source_path=None):
+    """Put the multi-angle tree back around a stack read from a file.
+
+    A saved acquisition is otherwise just a 5-D array: the alignment survives
+    and everything built on it does not, so reopening one gave no Summed node,
+    no shells and no angle ring. Nothing extra is needed to rebuild them — the
+    sums are reductions over the stack's own leading axis, and the tilts,
+    azimuths, shells and reference come from `Acquisition.multiangle`.
+
+    Returns the tree, or None when *signal* is not a saved stack.
+    """
+    from spyde.signals.multiangle import is_multiangle_stack
+
+    if not is_multiangle_stack(signal):
+        return None
+    # `get_item`, not `get`: the metadata is a DictionaryTreeBrowser and has
+    # no mapping interface, so `.get` raises and the caller's except turns a
+    # whole acquisition back into a bare array.
+    recorded = signal.metadata
+    members = int(recorded.get_item(f"{MULTIANGLE_METADATA}.n_members"))
+    shell_ids = [int(value) for value in recorded.get_item(
+        f"{MULTIANGLE_METADATA}.shell_ids", [0] * members)]
+    tilts = [float(value) for value in recorded.get_item(
+        f"{MULTIANGLE_METADATA}.tilts", [0.0] * members)]
+
+    summed = _sum_over_angles(signal, range(members), "Summed")
+    # One shell IS the summed node; a child duplicating its parent is a node
+    # the user cannot tell apart. Same rule the composition follows.
+    by_shell: dict[int, list[int]] = {}
+    for index, shell in enumerate(shell_ids):
+        by_shell.setdefault(shell, []).append(index)
+    shells = [] if len(by_shell) < 2 else [
+        (f"{tilts[indices[0]]:g}°", _sum_over_angles(
+            signal, indices, f"{tilts[indices[0]]:g}°"))
+        for shell, indices in sorted(by_shell.items())
+    ]
+
+    tree = session._add_signal(signal, source_path=source_path)
+    tree.root_node.name = "Aligned Stack"
+    _attach_node(tree, signal, summed, "Summed")
+    for title, shell_signal in shells:
+        _attach_node(tree, summed, shell_signal, title)
+    session._dispatch_to_main(lambda: _display(tree, summed))
+    session._dispatch_to_main(lambda: _open_angle_ring(tree))
+    emit_status(f"Multi-angle acquisition: {members} angles, "
+                f"{len(by_shell)} shell{'s' if len(by_shell) != 1 else ''}")
+    return tree
 
 
 def _report_multiangle(model, summed) -> None:

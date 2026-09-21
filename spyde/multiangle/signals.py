@@ -47,6 +47,8 @@ from spyde.multiangle.compose import (
     composed_axis_offsets, stack_aligned, sum_aligned,
 )
 from spyde.multiangle.recipe import MultiAngleRecipe, attach_recipe
+from spyde.signals.multiangle import (
+    MULTIANGLE_METADATA, MULTIANGLE_SIGNAL_TYPE)
 
 log = logging.getLogger(__name__)
 
@@ -185,6 +187,16 @@ def build_stack_signal(aligned, members, model, *, title=None):
     _carry_metadata(signal, members, model)
     signal.metadata.set_item(
         "General.title", title or f"Multi-Angle ({model.n_members} angles)")
+    # The stack gets a type of its own, and keeps the members' recorded beside
+    # it so the SUMS can be given it back. Safe only because that type EXTENDS
+    # ElectronDiffraction2D: the toolchain is gated on the type, and a
+    # composed acquisition losing it once made every diffraction action
+    # disappear.
+    member_type = signal.metadata.get_item("Signal.signal_type", "")
+    if member_type and member_type != MULTIANGLE_SIGNAL_TYPE:
+        signal.metadata.set_item(
+            f"{MULTIANGLE_METADATA}.member_signal_type", member_type)
+    signal.set_signal_type(MULTIANGLE_SIGNAL_TYPE)
     return attach_recipe(signal, MultiAngleRecipe(
         members=tuple(members), model=model, has_angle_axis=True,
         member_indices=tuple(range(len(members)))))
