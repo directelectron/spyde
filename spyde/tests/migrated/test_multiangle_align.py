@@ -33,6 +33,8 @@ from spyde.multiangle.align import (
     REGISTRATION_CANDIDATES,
     REGISTRATION_PREFILTERS,
     best_real_space,
+    patch_windows,
+    vote_real_space,
 )
 
 # Mixed shells on purpose: 1 centre member, 6 at one tilt, 3 at another. Equal
@@ -668,3 +670,120 @@ class TestChoosingBySharpness:
                                            * len(REGISTRATION_CANDIDATES))
         assert {named["on"] for named, _gain, _error in report["attempts"]} == \
             {label for label, _prefilter in REGISTRATION_PREFILTERS}
+
+
+def _shifted(base, offsets, noise=2.0, seed=0):
+    """Members whose recovered offsets should BE *offsets*.
+
+    An offset is what a member must have ADDED to it to land on the common
+    grid, so a member carrying offset (dy, dx) has its content rolled the
+    other way. Getting this backwards makes a correct solver look
+    sign-flipped.
+    """
+    generator = np.random.default_rng(seed)
+    return np.stack([
+        np.roll(np.roll(base, -int(dy), axis=0), -int(dx), axis=1)
+        + generator.normal(0.0, noise, base.shape)
+        for dy, dx in offsets])
+
+
+def _stripes(shape=(180, 180), seed=11):
+    """Vertical bands — structure ACROSS x, none at all along y.
+
+    Irregularly spaced on purpose. Evenly spaced ones repeat, so the offset
+    across them is only knowable modulo the spacing and noise picks which
+    period; that is a real effect on a layered specimen but it is not what
+    these tests are about.
+    """
+    from scipy.ndimage import gaussian_filter1d
+
+    generator = np.random.default_rng(seed)
+    profile = gaussian_filter1d(generator.normal(0.0, 1.0, shape[1]), 3.0)
+    profile = profile / (profile.std() + 1e-9)
+    return 100.0 + 25.0 * np.repeat(profile[None, :], shape[0], axis=0)
+
+
+def _sharpness(images):
+    from scipy.ndimage import gaussian_filter
+
+    def score(offsets):
+        offsets = np.asarray(offsets, dtype=int)
+        low, high = offsets.min(axis=0), offsets.max(axis=0)
+        height = images.shape[1] - (high[0] - low[0])
+        width = images.shape[2] - (high[1] - low[1])
+        if height < 24 or width < 24:
+            return float("-inf")
+        total = np.zeros((height, width))
+        for image, (dy, dx) in zip(images, offsets):
+            total += image[high[0] - dy:high[0] - dy + height,
+                           high[1] - dx:high[1] - dx + width]
+        total /= len(images)
+        return float(np.std(total - gaussian_filter(total, 6))
+                     / (abs(float(np.mean(total))) + 1e-9))
+    return score
+
+
+class TestPatchesVoting:
+    """`vote_real_space` registers overlapping patches and reports how far
+    they agree, which is how the loader learns WHICH AXES the specimen
+    determines rather than assuming both.
+    """
+
+    def test_stripes_determine_across_but_not_along(self):
+        """The contract, and the reason this exists.
+
+        Vertical stripes are identical under a shift ALONG them, so no method
+        can recover that offset — and both axes still come back as numbers.
+        Only the agreement distinguishes them.
+        """
+        planted = [(0, 0), (0, 7), (0, -5), (0, 11)]
+        images = _shifted(_stripes(), planted, seed=1)
+        offsets, _residuals, report = vote_real_space(
+            images, reference=0, score=_sharpness(images), max_shift=16.0)
+
+        assert report["determined"]["x"] is True, report["agreement"]
+        assert report["determined"]["y"] is False, report["agreement"]
+        assert report["agreement"]["x"] > report["agreement"]["y"]
+        assert np.array_equal(offsets[:, 1], [dx for _dy, dx in planted])
+
+    def test_a_two_dimensional_scene_determines_both(self):
+        """A scene with something to see in both directions must not be
+        reported as uncertain — the test above has to be measuring the SCENE,
+        not some property of the method.
+
+        The structure has to be EVERYWHERE, not one feature in the middle: a
+        patch can only speak for the ground it covers, so a lone blob leaves
+        most patches with nothing to say and the agreement stays low — which
+        is correct, and not what this test is asking.
+        """
+        base = _stripes(seed=5) + _stripes(seed=6).T - 100.0
+        planted = [(0, 0), (6, 7), (-9, -5), (4, 11)]
+        images = _shifted(base, planted, seed=2)
+        _offsets, _residuals, report = vote_real_space(
+            images, reference=0, score=_sharpness(images), max_shift=16.0)
+
+        assert report["determined"]["y"] is True, report["agreement"]
+        assert report["agreement"]["y"] > 0.5
+
+    def test_a_failed_axis_does_not_vote_for_zero(self):
+        """The trap this got wrong once: a patch that finds nothing returns
+        zero on that axis, and counting those as votes makes an axis with NO
+        signal look unanimous."""
+        planted = [(0, 0), (0, 7), (0, -5), (0, 11)]
+        images = _shifted(_stripes(), planted, seed=3)
+        _offsets, _residuals, report = vote_real_space(
+            images, reference=0, score=_sharpness(images), max_shift=16.0)
+        assert report["agreement"]["y"] < 0.5
+
+    def test_too_small_to_divide_falls_back(self):
+        """A scan smaller than a patch keeps the whole-field answer rather
+        than voting on slivers."""
+        planted = [(0, 0), (2, 3), (-1, 2)]
+        images = _shifted(_stripes(shape=(40, 40)), planted, seed=4)
+        assert patch_windows(images.shape[1:]) == []
+        offsets, _residuals, report = vote_real_space(
+            images, reference=0, score=_sharpness(images), max_shift=8.0)
+        whole, _r, _report = best_real_space(
+            images, reference=0, score=_sharpness(images), max_shift=8.0)
+        assert np.array_equal(offsets, whole)
+        assert report["determined"] == {"y": False, "x": False}

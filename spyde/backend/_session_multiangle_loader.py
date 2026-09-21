@@ -355,6 +355,17 @@ class MultiAngleLoaderState:
     #: and the sum aligned against the sum unaligned is the whole reason to
     #: believe a solve. The separate window remains for after the dialog closes.
     real_evidence: dict | None = None
+    #: What the real-space solve found out about ITSELF:
+    #: ``{"agreement": {"y": float, "x": float}, "determined": {...},
+    #: "votes": int}``, or ``None`` before it has run.
+    #:
+    #: Overlapping patches of the field are registered separately and their
+    #: answers compared. Where they agree, the specimen determines the offset;
+    #: where they do not, the solve still returns a number and it means
+    #: nothing. A layered specimen is the case that matters — across the layers
+    #: the patches agree, along them the specimen is uniform and they cannot —
+    #: and showing both offsets the same way claims something untrue.
+    real_confidence: dict | None = None
     #: The open aligned-sum window, or ``None``. One per dialog: re-running the
     #: alignment repaints it rather than opening another, and a ✕ on it clears
     #: this through the controller's ``close``.
@@ -449,6 +460,7 @@ class MultiAngleLoaderState:
         different set of pictures and are no longer that answer.
         """
         self.real_evidence = None
+        self.real_confidence = None
         bump_generation(self, "_real_generation")
         self.real = LoaderStage()
 
@@ -569,7 +581,8 @@ def state_message(state: MultiAngleLoaderState | None) -> dict:
                 "shells": [], "scan_shape": None,
                 "virtual_image": None, "available_virtual_images": [],
                 "beam_roi": None,
-                "real": {**LoaderStage().as_message(), "evidence": None},
+                "real": {**LoaderStage().as_message(), "evidence": None,
+                         "confidence": None},
                 "reciprocal": {**LoaderStage().as_message(), "corners": {}},
                 "busy": False, "message": "", "can_commit": False}
 
@@ -618,7 +631,8 @@ def state_message(state: MultiAngleLoaderState | None) -> dict:
                      {key: float(value)
                       for key, value in state.beam_roi.items()}),
         "real": {**state.real.as_message(),
-                 "evidence": state.real_evidence},
+                 "evidence": state.real_evidence,
+                 "confidence": state.real_confidence},
         "reciprocal": {**state.reciprocal.as_message(),
                        "corners": _corners_message(state)},
         "busy": bool(state.busy),
@@ -2286,7 +2300,7 @@ def maped_align_real(session, plot, payload) -> None:
     a crystalline sample locking onto the wrong lattice translation. The other
     keys of :data:`_SOLVER_PARAMETERS` are accepted from a script.
     """
-    from spyde.multiangle.align import best_real_space
+    from spyde.multiangle.align import vote_real_space
 
     state = _loader_state(session)
     problem = _not_ready(state)
@@ -2323,12 +2337,22 @@ def maped_align_real(session, plot, payload) -> None:
             gain = float(evidence.get("gain", float("nan")))
             return gain if np.isfinite(gain) else float("-inf")
 
-        offsets, residuals, report = best_real_space(
+        offsets, residuals, report = vote_real_space(
             images, reference=reference, score=score, **parameters)
         for candidate, gain, failure in report["attempts"]:
             log.debug("real-space candidate %s -> %s", candidate,
                       failure or f"sharpness x{gain:.3f}")
-        log.info("real-space alignment: sharpness x%.2f", report["gain"])
+        agreement = report.get("agreement") or {}
+        state.real_confidence = {
+            "agreement": agreement,
+            "determined": report.get("determined") or {},
+            "votes": int(report.get("votes") or 0),
+        }
+        log.info("real-space alignment: sharpness x%.2f; %d patches agreed "
+                 "%.0f%% across the layers and %.0f%% along them",
+                 report["gain"], state.real_confidence["votes"],
+                 100 * float(agreement.get("x", 0.0)),
+                 100 * float(agreement.get("y", 0.0)))
         return offsets, residuals
 
     named = "computed" if chosen is None else chosen

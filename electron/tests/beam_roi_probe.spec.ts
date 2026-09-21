@@ -128,3 +128,91 @@ test('the region is drawn, moves, and is placeable on the enlarged panel', async
     .not.toEqual(before)
   expect(after).toMatch(/Zero beam searched within/)
 })
+
+/**
+ * The per-axis confidence, in both of its states.
+ *
+ * A four-member scan large enough to divide into patches is far too big to
+ * bundle, so the snapshot the backend would send is dispatched directly. What
+ * is under test is the DISPLAY: that a determined axis and an unconstrained
+ * one are told apart, and that two offsets are not presented as equally good
+ * when only one of them was measured.
+ */
+test('the panel says which axis the specimen determined', async () => {
+  const { page } = ctx
+  const dialog = page.getByTestId('multiangle-loader')
+  await expect(dialog).toBeVisible({ timeout: 20_000 })
+  // The test before this one leaves a corner enlarged, and it covers the tabs.
+  await page.keyboard.press('Escape')
+  await page.waitForTimeout(500)
+  await dialog.getByTestId('maped-tab-real').click()
+
+  // A real image, because the panel declines to draw itself without one.
+  const PIXEL = 'data:image/gif;base64,R0lGODlhAQABAIAAAP///wAAACH5BAEAAAAALAAAAAABAAEAAAICRAEAOw=='
+  const send = (confidence: unknown) => page.evaluate(
+    ([payload, pixel]: any) => {
+      window.dispatchEvent(new CustomEvent('spyde:maped_state', {
+        detail: {
+          type: 'maped_state',
+          // Real members, because the real-space tab is disabled without any
+          // and the dialog drops back to Load.
+          members: [0, 1].map((index) => ({
+            index, path: `angle0${index}.mrc`, name: `angle0${index}.mrc`,
+            scan_shape: [180, 180], detector_shape: [64, 64], dtype: 'uint16',
+            size_bytes: 1024, tilt: 1.0, azimuth: index * 90, shell: 0,
+            error: null, preview: pixel, virtual_images: [],
+          })),
+          reference: 0,
+          shells: [{ shell: 0, tilt: 1.0, members: [0, 1] }],
+          scan_shape: [180, 180], virtual_image: null,
+          available_virtual_images: [], beam_roi: null,
+          real: {
+            solved: true, offsets: [[0, 0], [0, 24]], residuals: null,
+            max_residual: 0.1, corners: {},
+            evidence: { unaligned: pixel, aligned: pixel, gain: 1.49 },
+            confidence: payload,
+          },
+          reciprocal: {
+            solved: false, offsets: null, residuals: null,
+            max_residual: null, corners: {},
+          },
+          busy: false, message: '', can_commit: false,
+        },
+      }))
+    }, [confidence, PIXEL] as const)
+
+  // The case this whole feature exists for, measured on a real acquisition:
+  // across the layers the patches agree, along them they cannot.
+  await send({ agreement: { x: 0.72, y: 0.28 },
+               determined: { x: true, y: false }, votes: 25 })
+  await expect(dialog.getByTestId('maped-real-confidence'))
+    .toBeVisible({ timeout: 10_000 })
+  await page.waitForTimeout(400)
+  await dialog.screenshot({ path: join(SHOTS, '04-confidence-split.png') })
+  expect(await dialog.getByTestId('maped-real-confidence-x').textContent())
+    .toContain('72%')
+  expect(await dialog.getByTestId('maped-real-confidence-y').textContent())
+    .toContain('28%')
+  const warning = await dialog.getByTestId('maped-real-unconstrained')
+    .textContent()
+  console.log('warning:', warning)
+  expect(warning).toContain('down')
+
+  // Both determined: no warning, or it would cry wolf on every good solve.
+  await send({ agreement: { x: 0.81, y: 0.77 },
+               determined: { x: true, y: true }, votes: 25 })
+  await page.waitForTimeout(400)
+  await dialog.screenshot({ path: join(SHOTS, '05-confidence-both.png') })
+  expect(await dialog.getByTestId('maped-real-unconstrained').count(),
+    'warned about an axis it had just called determined').toBe(0)
+
+  // Nothing measured is not a finding about the specimen.
+  await send({ agreement: { x: 0.0, y: 0.0 },
+               determined: { x: false, y: false }, votes: 0 })
+  await page.waitForTimeout(400)
+  const none = await dialog.getByTestId('maped-real-confidence').textContent()
+  console.log('no votes:', none)
+  expect(none).toContain('too few scan positions')
+  expect(await dialog.getByTestId('maped-real-unconstrained').count(),
+    'claimed the specimen fixes nothing when nothing was checked').toBe(0)
+})

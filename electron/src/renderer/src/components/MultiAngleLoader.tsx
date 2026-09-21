@@ -99,6 +99,22 @@ export interface MapedSolve {
   /** Real only: the members summed both ways, and how much sharper aligning
    *  made them. Null until the solve has landed. */
   evidence: MapedEvidence | null
+  /** Real only: which axes the specimen actually determined. */
+  confidence: MapedConfidence | null
+}
+
+/**
+ * How much overlapping patches of the field agreed about each axis.
+ *
+ * A solve always returns two numbers. On a layered specimen only one of them
+ * means anything — across the layers the patches agree, along them the
+ * specimen is uniform and there is nothing to register on — so the dialog has
+ * to say which, or it is claiming knowledge it does not have.
+ */
+export interface MapedConfidence {
+  agreement: { y: number | null; x: number | null }
+  determined: { y: boolean; x: boolean }
+  votes: number
 }
 
 /** The real-space solve's evidence, as pictures. */
@@ -136,7 +152,7 @@ export interface MapedState {
 
 const EMPTY_SOLVE: MapedSolve = {
   solved: false, offsets: null, residuals: null, max_residual: null, corners: {},
-  evidence: null,
+  evidence: null, confidence: null,
 }
 
 export const EMPTY_MAPED_STATE: MapedState = {
@@ -189,6 +205,23 @@ function parseSolve(raw: unknown): MapedSolve {
     max_residual: num(d.max_residual),
     corners: parseCorners(d.corners),
     evidence: parseEvidence(d.evidence),
+    confidence: parseConfidence(d.confidence),
+  }
+}
+
+/** The per-axis agreement, or null when the solve has not reported one. */
+function parseConfidence(raw: unknown): MapedConfidence | null {
+  if (!raw || typeof raw !== 'object') return null
+  const d = raw as Record<string, unknown>
+  const agreement = (d.agreement ?? {}) as Record<string, unknown>
+  const determined = (d.determined ?? {}) as Record<string, unknown>
+  const y = num(agreement.y)
+  const x = num(agreement.x)
+  if (y == null && x == null) return null
+  return {
+    agreement: { y, x },
+    determined: { y: determined.y === true, x: determined.x === true },
+    votes: num(d.votes) ?? 0,
   }
 }
 
@@ -855,7 +888,8 @@ export function MultiAngleLoader({ sendAction, onClose }: {
                 onClick={() => sendAction('maped_align_real', { params: { max_shift: maxShift } })}
               />
               {state.real.evidence && (
-                <AlignmentEvidence evidence={state.real.evidence} />
+                <AlignmentEvidence evidence={state.real.evidence}
+                  confidence={state.real.confidence} />
               )}
               <SolveReport testid="maped-real" solve={state.real} members={state.members} />
             </>
@@ -1225,7 +1259,61 @@ function ProblemList({ members }: { members: MapedMember[] }) {
  * that did not sharpen the sum is the case worth noticing, and a number that
  * only ever appears when it flatters the result is not evidence either.
  */
-function AlignmentEvidence({ evidence }: { evidence: MapedEvidence }) {
+/**
+ * Which axes the specimen determined, from patches of the field voting.
+ *
+ * Stated per axis because they are routinely not alike: on a layered specimen
+ * the patches agree closely across the layers and barely at all along them,
+ * where the specimen is uniform and there is nothing to register on. Both
+ * offsets are still numbers, and without this the dialog presents them as
+ * equally good.
+ */
+function AxisConfidence({ confidence }: { confidence: MapedConfidence }) {
+  const axes = [
+    { key: 'x' as const, label: 'across' },
+    { key: 'y' as const, label: 'down' },
+  ]
+  // No votes is NOT a finding. A scan too small to divide into patches was
+  // never checked, and saying "the specimen does not fix this" about it would
+  // be inventing a result — the opposite of what this panel is for.
+  if (confidence.votes <= 0) {
+    return (
+      <div data-testid="maped-real-confidence" style={styles.confidenceRow}>
+        <span style={{ color: '#6c7086' }}>
+          too few scan positions to check the axes separately
+        </span>
+      </div>
+    )
+  }
+  const weak = axes.filter((axis) => !confidence.determined[axis.key])
+  return (
+    <div data-testid="maped-real-confidence" style={styles.confidenceRow}>
+      <span style={{ color: '#a6adc8' }}>
+        {`${confidence.votes} patches agreed:`}
+      </span>
+      {axes.map((axis) => {
+        const value = confidence.agreement[axis.key]
+        const firm = confidence.determined[axis.key]
+        return (
+          <span key={axis.key}
+            data-testid={`maped-real-confidence-${axis.key}`}
+            style={{ color: firm ? '#a6e3a1' : '#f9e2af' }}>
+            {`${axis.label} ${value == null ? '—' : `${Math.round(value * 100)}%`}`}
+          </span>
+        )
+      })}
+      {weak.length > 0 && (
+        <span data-testid="maped-real-unconstrained" style={styles.confidenceWarning}>
+          {`— the specimen does not fix ${weak.map((a) => a.label).join(' or ')}; `
+           + 'that offset is not measured, so check it'}
+        </span>
+      )}
+    </div>
+  )
+}
+
+function AlignmentEvidence({ evidence, confidence }: {
+  evidence: MapedEvidence, confidence: MapedConfidence | null }) {
   const gain = evidence.gain
   const verdict = gain == null ? null
     : gain >= 1.15 ? { text: 'the members stack', tone: '#a6e3a1' }
@@ -1247,6 +1335,7 @@ function AlignmentEvidence({ evidence }: { evidence: MapedEvidence }) {
           )}
         </div>
       )}
+      {confidence && <AxisConfidence confidence={confidence} />}
       <div style={styles.evidenceRow}>
         {([['Unaligned', evidence.unaligned],
            ['Aligned', evidence.aligned]] as const).map(([label, src]) => (
@@ -1946,6 +2035,11 @@ const styles: Record<string, React.CSSProperties> = {
     borderRadius: 8, padding: 8,
   },
   evidenceHeader: { fontSize: 12 },
+  confidenceRow: {
+    display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'baseline',
+    fontSize: 11.5,
+  },
+  confidenceWarning: { color: '#f9e2af', flexBasis: '100%', fontSize: 11 },
   evidenceRow: { display: 'flex', alignItems: 'flex-start', gap: 10 },
   evidenceFigure: { margin: 0, display: 'flex', flexDirection: 'column', gap: 4 },
   evidenceImage: {
