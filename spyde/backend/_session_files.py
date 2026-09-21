@@ -940,6 +940,28 @@ class FileLoaderMixin:
                     is not None]
         return with_sig[0] if len(with_sig) == 1 else None
 
+    def _data_plot_for(self, plot):
+        """*plot*, unless it is a NAVIGATOR — then its tree's data plot.
+
+        A navigator's signal is a picture OF the dataset, not the dataset. On
+        a multi-angle acquisition it is one virtual image per member, so
+        saving from that window wrote 555 KB of thumbnails where the aligned
+        stack was asked for — under the name given, reporting success.
+        Anything overview-shaped opens cleanly, which is what kept it quiet.
+        """
+        if not getattr(plot, "is_navigator", False):
+            return plot
+        tree = getattr(plot, "signal_tree", None)
+        if tree is None:
+            return plot
+        for candidate in self._plots:
+            if (getattr(candidate, "signal_tree", None) is tree
+                    and not getattr(candidate, "is_navigator", False)
+                    and getattr(getattr(candidate, "plot_state", None),
+                                "current_signal", None) is not None):
+                return candidate
+        return plot
+
     @staticmethod
     def _vectors_for_plot(plot):
         """The :class:`SpyDEDiffractionVectors` attached to *plot*'s tree, or None.
@@ -958,6 +980,7 @@ class FileLoaderMixin:
         if plot is None:
             emit_error("Save: click a signal window first, then Save.")
             return
+        plot = self._data_plot_for(plot)
         signal = getattr(getattr(plot, "plot_state", None), "current_signal", None)
         if signal is None:
             emit_error("Save: no signal in the active window")

@@ -498,9 +498,19 @@ class CropAction(TransformAction):
         "y1": {"default": 0},
         "t0": {"default": 0},
         "t1": {"default": 0},
+        # Declared HERE as well as on the toolbar: the action resolves only
+        # the fields it lists and `build_kwargs` forwards only what it names,
+        # so a parameter missing from either is accepted by the dialog and
+        # silently dropped on the way through — the crop then runs, succeeds,
+        # and ignores the box.
+        "scan_x0": {"default": 0},
+        "scan_x1": {"default": 0},
+        "scan_y0": {"default": 0},
+        "scan_y1": {"default": 0},
     }
 
-    def build_kwargs(self, signal, x0=0, x1=0, y0=0, y1=0, t0=0, t1=0, **_):
+    def build_kwargs(self, signal, x0=0, x1=0, y0=0, y1=0, t0=0, t1=0,
+                     scan_x0=0, scan_x1=0, scan_y0=0, scan_y1=0, **_):
         am = signal.axes_manager
         if am.signal_dimension >= 2:
             sig_ax = am.signal_axes
@@ -514,7 +524,9 @@ class CropAction(TransformAction):
                     # all-zero-means-noop contract applies and no redundant
                     # "Cropped" node is created.
                     x0 = x1 = y0 = y1 = 0
-        return {"x0": x0, "x1": x1, "y0": y0, "y1": y1, "t0": t0, "t1": t1}
+        return {"x0": x0, "x1": x1, "y0": y0, "y1": y1, "t0": t0, "t1": t1,
+                "scan_x0": scan_x0, "scan_x1": scan_x1,
+                "scan_y0": scan_y0, "scan_y1": scan_y1}
 
     def run(self, **params):
         # True no-op (full-frame box / all-zero fields): skip the tree
