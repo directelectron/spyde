@@ -266,3 +266,42 @@ class TestSubsetParity:
         members, model = acquisition
         signal = self._shell_node(members, model, model.shells[1])
         assert recipe_for(signal).indices == (2, 3)
+
+
+class TestReadAhead:
+    """The read-ahead asks a reader where the next decode will happen; a
+    composed node answers with the intersection of its members' chunks."""
+
+    def test_the_span_holds_its_point_and_everything_in_it_is_resident(
+            self, acquisition):
+        from spyde.array_cache.block_cache import BlockCache
+
+        members, model = acquisition
+        composed = compose_sum(members, model)
+        signal = _composed_signal(composed, members, model,
+                                  has_angle_axis=False, dtype=composed.dtype)
+        reader = build_multiangle_reader(signal, composed,
+                                         block_cache=BlockCache(1 << 28))
+        point = (5, 9)
+        assert not reader.is_chunk_resident(point)
+        reader.read_frame(point)
+        span = reader.chunk_span(point)
+        assert span is not None
+        (row_start, row_stop), (column_start, column_stop) = span
+        assert row_start <= point[0] < row_stop
+        assert column_start <= point[1] < column_stop
+        for row in range(row_start, row_stop):
+            for column in range(column_start, column_stop):
+                assert reader.is_chunk_resident((row, column)), (row, column)
+        past = (row_stop, point[1])
+        if past[0] < composed.shape[0]:
+            assert not reader.is_chunk_resident(past), \
+                "the position past the span should still need a decode"
+
+    def test_the_stack_node_spans_one_angle(self, acquisition):
+        members, model = acquisition
+        stacked = compose_stack(members, model)
+        signal = _composed_signal(stacked, members, model, has_angle_axis=True)
+        reader = build_multiangle_reader(signal, stacked)
+        span = reader.chunk_span((2, 5, 9))
+        assert span is not None and span[0] == (2, 3)

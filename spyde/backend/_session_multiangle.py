@@ -495,7 +495,7 @@ def _sum_over_angles(stack, indices, title):
     planes = tuple(stack.inav[:, :, index] for index in indices)
     return attach_recipe(signal, MultiAngleRecipe(
         members=planes, model=aligned, has_angle_axis=False,
-        dtype=summed.dtype, member_indices=tuple(indices)))
+        dtype=summed.dtype, member_indices=tuple(indices), stack=stack))
 
 
 def rebuild_multiangle_tree(session, signal, source_path=None):

@@ -300,10 +300,24 @@ class TestTheCropCaretSendsWhatTheBackendTakes:
 
         accepted = set(inspect.signature(_crop_signal).parameters)
         caret = self._caret()
-        for key in ("x0", "x1", "y0", "y1",
-                    "scan_x0", "scan_x1", "scan_y0", "scan_y1"):
-            assert key in accepted, f"_crop_signal does not take {key}"
-            assert key in caret, f"the caret never mentions {key}"
+        # The keys have to appear in the state `doCrop` spreads into its
+        # payload, not merely somewhere in the file: "x0" is a substring of
+        # "scan_x0", so a whole-file search passed with the detector box gone.
+        fields = {"box": ("x0", "x1", "y0", "y1"),
+                  "scan": ("scan_x0", "scan_x1", "scan_y0", "scan_y1")}
+        start = caret.index("const doCrop")
+        payload = caret[start:caret.index("}", caret.index("toolbar_action",
+                                                           start))]
+        for state, keys in fields.items():
+            assert f"...{state}" in payload, (
+                f"doCrop does not spread `{state}` into the params it sends")
+            declared = caret[caret.index(f"useState") if state == "box"
+                             else caret.index(f"const [{state}"):]
+            declared = declared[:declared.index(")")]
+            for key in keys:
+                assert key in accepted, f"_crop_signal does not take {key}"
+                assert f"{key}:" in declared, (
+                    f"the caret's `{state}` state has no field {key}")
 
 
 class TestAMultiAngleAcquisitionReopensWhole:
@@ -498,3 +512,167 @@ class TestTheAngleRingComesBackToo:
                 "the angle ring did not open"
         finally:
             close_session(session)
+
+
+class TestRebinSumsIntoTheNarrowestDtype:
+    """hyperspy left to itself sums a uint16 into uint64 — four times the
+    bytes that were asked for, and a width nothing downstream can widen for
+    a further sum. Sixteen uint16 pixels fit uint32 exactly."""
+
+    def test_the_kwargs_name_the_dtype(self):
+        from spyde.actions.base import _rebin_dtype
+
+        assert _rebin_dtype(np.uint16, [2, 2, 2, 2]) == np.dtype(np.uint32)
+        assert _rebin_dtype(np.uint16, [1, 1, 2, 2]) == np.dtype(np.uint32)
+        assert _rebin_dtype(np.float32, [2, 2, 2, 2]) == np.dtype(np.float32)
+        assert _rebin_dtype(np.bool_, [2, 2, 2, 2]) is None, \
+            "a dtype with no sum is left to hyperspy"
+
+    def test_a_full_scale_scan_does_not_overflow(self):
+        from spyde.actions.base import Rebin2DAction
+        from spyde.actions.context import ActionContext
+
+        data = np.full((4, 4, 4, 4), np.iinfo(np.uint16).max, dtype=np.uint16)
+        session = make_session()
+        signal = hs.signals.Signal2D(data)
+        signal.set_signal_type("electron_diffraction")
+        session._add_signal(signal)
+        try:
+            plot = next(p for p in session._plots
+                        if not getattr(p, "is_navigator", False)
+                        and getattr(getattr(p, "plot_state", None),
+                                    "current_signal", None) is not None)
+            params = {"scale_x": 2, "scale_y": 2, "scan_x": 2, "scan_y": 2}
+            new = Rebin2DAction(ActionContext(
+                plot=plot, params=params, action_name="Rebin")).run(**params)
+            assert new.data.dtype == np.dtype(np.uint32), (
+                f"rebin produced {new.data.dtype}; want uint32")
+            assert int(np.asarray(new.data).max()) == 16 * 65535
+        finally:
+            close_session(session)
+
+
+class TestAWideStackStillReopensWhole:
+    """The failure exactly as it happened: a stack rebinned by the app was
+    uint64, and the reopen fell back to a plain dataset — silently, because
+    the only word of it went to the log."""
+
+    def _stack(self, dtype):
+        from spyde.signals.multiangle import MULTIANGLE_METADATA
+
+        generator = np.random.default_rng(11)
+        data = generator.integers(0, 400, (4, 5, 6, 4, 4)).astype(dtype)
+        signal = hs.signals.Signal2D(data)
+        signal.metadata.set_item(MULTIANGLE_METADATA, {
+            "n_members": 4, "n_shells": 1, "tilts": [1.0] * 4,
+            "azimuths": [0.0, 90.0, 180.0, 270.0], "shell_ids": [0] * 4,
+            "reference": 0, "member_signal_type": "electron_diffraction"})
+        signal.set_signal_type("electron_diffraction")
+        return signal, data
+
+    def _open(self, session, path):
+        session.open_file(str(path))
+        deadline = time.time() + 60.0
+        while time.time() < deadline and not session.signal_trees:
+            time.sleep(0.2)
+        assert session.signal_trees, "the file never opened"
+        return session.signal_trees[0]
+
+    def test_a_uint64_stack_reopens_as_a_tree(self, tmp_path):
+        stack, data = self._stack(np.uint64)
+        path = tmp_path / "wide.zspy"
+        stack.save(str(path))
+        session = make_session()
+        try:
+            tree = self._open(session, path)
+            assert tree.root_node.name == "Aligned Stack", (
+                f"the root is {tree.root_node.name!r}: a uint64 stack "
+                "reopened as a plain dataset")
+            summed = tree.root_node.children["Summed"].signal
+            assert summed.data.dtype == np.dtype(np.uint64)
+            assert np.array_equal(np.asarray(summed.data), data.sum(axis=0))
+        finally:
+            close_session(session)
+
+    def test_the_summed_node_reads_through_the_stack(self, tmp_path):
+        """One store reader for all the planes, not a lazy slice per member:
+        measured 25 ms against 55-80 ms per member on a real stack."""
+        from spyde.array_cache.readers.multiangle import build_multiangle_reader
+        from spyde.multiangle.recipe import recipe_for
+
+        stack, data = self._stack(np.uint16)
+        path = tmp_path / "planes.zspy"
+        stack.save(str(path))
+        session = make_session()
+        try:
+            tree = self._open(session, path)
+            root = tree.root_node.signal
+            summed = tree.root_node.children["Summed"].signal
+            assert recipe_for(summed).stack is root
+            reader = build_multiangle_reader(summed, summed.data)
+            assert reader is not None
+            assert reader._stack_reader is not None, \
+                "the planes were not read through the stack's own reader"
+            assert all(member is None for member in reader._member_readers)
+            for row in range(data.shape[1]):
+                for column in range(data.shape[2]):
+                    assert np.array_equal(
+                        reader.read_frame((row, column)),
+                        data[:, row, column].astype(np.uint32).sum(axis=0))
+        finally:
+            close_session(session)
+
+    def test_a_failed_re_expansion_is_said_in_the_app(self, tmp_path,
+                                                      monkeypatch):
+        import spyde.backend._session_files as files
+        import spyde.backend._session_multiangle as multiangle
+
+        stack, _data = self._stack(np.uint16)
+        path = tmp_path / "broken.zspy"
+        stack.save(str(path))
+        errors = []
+        monkeypatch.setattr(files, "emit_error", errors.append)
+        monkeypatch.setattr(multiangle, "rebuild_multiangle_tree",
+                            lambda *a, **k: (_ for _ in ()).throw(
+                                RuntimeError("no accumulator")))
+        session = make_session()
+        try:
+            tree = self._open(session, path)
+            assert tree.root_node.name != "Aligned Stack"
+            assert any("multi-angle" in message and "no accumulator" in message
+                       for message in errors), errors
+        finally:
+            close_session(session)
+
+
+class TestASavedFileIsNotChunkedInSlivers:
+    """A scan cropped from mid-chunk was written in chunks two positions
+    wide, because the writer takes each axis's FIRST dask block as the file's
+    chunk size and a crop origin makes that block a remainder. Every third
+    step of a drag on the saved file then decoded a chunk."""
+
+    def test_the_largest_block_is_the_chunk(self):
+        from spyde.backend._session_files import _uniform_save_chunks
+
+        signal = hs.signals.Signal2D(np.zeros((30, 30, 4, 4), dtype=np.uint16)).as_lazy()
+        signal.data = signal.data.rechunk((10, 10, 4, 4))
+        assert _uniform_save_chunks(signal) is None,             "a regular grid is left to the writer"
+        cropped = signal.inav[6:, :]
+        assert cropped.data.chunks[1][0] == 4, cropped.data.chunks
+        assert _uniform_save_chunks(cropped) == (10, 10, 4, 4)
+
+    def test_the_file_gets_it(self, tmp_path):
+        session = make_session()
+        try:
+            data = np.arange(30 * 30 * 4 * 4, dtype=np.uint16).reshape(30, 30, 4, 4)
+            signal = hs.signals.Signal2D(data).as_lazy()
+            signal.data = signal.data.rechunk((10, 10, 4, 4))
+            cropped = signal.inav[6:, 3:]
+            path = tmp_path / "cropped.zspy"
+            session._save_signal_thread(cropped, str(path), "cropped")
+            back = hs.load(str(path), lazy=True)
+            assert back.data.chunksize == (10, 10, 4, 4), back.data.chunksize
+            assert np.array_equal(np.asarray(back.data), data[3:, 6:])
+        finally:
+            close_session(session)
+

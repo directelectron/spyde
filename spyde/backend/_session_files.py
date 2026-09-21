@@ -34,6 +34,25 @@ SUPPORTED_EXTS = (".hspy", ".zspy", ".mrc", ".tif", ".tiff", ".de5", ".csb")
 _DIR_DATASET_EXTS = (".zspy", ".zarr")
 
 
+def _uniform_save_chunks(signal):
+    """``chunks=`` for writing a lazy *signal*: each axis's largest dask block,
+    or None when that is what the writer would pick anyway.
+
+    The writer's own choice is the first block along each axis. On a regular
+    grid they are the same; after a crop that starts mid-chunk the first block
+    is the remainder, and the whole file inherits a chunk that small. The
+    largest block is the interior's, which the rest of the array already uses,
+    so the writer's rechunk merges neighbours rather than shuffling anything.
+    """
+    data = getattr(signal, "data", None)
+    chunks = getattr(data, "chunks", None)
+    if not chunks:
+        return None
+    first = tuple(int(axis[0]) for axis in chunks)
+    largest = tuple(max(int(size) for size in axis) for axis in chunks)
+    return None if largest == first else largest
+
+
 def _path_ext(path: str) -> str:
     """Lowercased extension, working for both files and `.zspy`/`.zarr` dirs."""
     return os.path.splitext(path)[1].lower()
@@ -945,8 +964,14 @@ class FileLoaderMixin:
             )
             return rebuild_multiangle_tree(self, signal, source_path=path)
         except Exception as e:
+            # Said in the app, not only the log: a stack that opens as a bare
+            # 5-D array looks like a dataset that was never multi-angle, and
+            # the person who saved it has no way to tell the two apart.
             log.warning("a saved multi-angle acquisition would not re-expand, "
                         "opening it as a plain dataset: %s", e)
+            emit_error(f"{os.path.basename(path)} is a multi-angle acquisition "
+                       f"that could not be re-expanded, so it opened as a "
+                       f"plain 5-D dataset: {e}")
             return None
 
     def _resolve_save_plot(self, plot):
@@ -1041,6 +1066,16 @@ class FileLoaderMixin:
         ).start()
 
     def _save_signal_thread(self, signal, path: str, name: str) -> None:
+        """Write *signal* to *path* off the loop, then say so.
+
+        A lazy signal is written in its own chunks — except that the writer
+        takes each axis's FIRST block as the file's chunk size, and a crop
+        that starts mid-chunk leaves a sliver there: a scan cropped from
+        column 16 of a 10-wide grid was written in chunks two positions wide,
+        and every third step of a drag on the saved file decoded a chunk.
+        :func:`_uniform_save_chunks` hands the writer the largest block per
+        axis instead, which is what the interior of the array already is.
+        """
         try:
             import dask
             # Prefer the distributed cluster when the data is lazy and a client is
@@ -1049,15 +1084,20 @@ class FileLoaderMixin:
             # local save. Either way this is on a daemon thread, never the loop.
             client = getattr(self.dask_manager, "client", None)
             is_lazy = bool(getattr(signal, "_lazy", False))
+            options = {}
+            if is_lazy and _path_ext(path) in (".zspy", ".zarr", ".hspy"):
+                chunks = _uniform_save_chunks(signal)
+                if chunks is not None:
+                    options["chunks"] = chunks
             t0 = time.time()
             if is_lazy and client is not None:
                 # hyperspy writes the Zarr store lazily; computing under the
                 # distributed scheduler dispatches the chunk writes to workers.
                 with dask.config.set(scheduler=client):
-                    signal.save(path, overwrite=True)
+                    signal.save(path, overwrite=True, **options)
             else:
                 with dask.config.set(scheduler="synchronous"):
-                    signal.save(path, overwrite=True)
+                    signal.save(path, overwrite=True, **options)
             dt = time.time() - t0
             ipc.emit({"type": "loading", "busy": False, "text": ""})
             ipc.emit({"type": "saved", "path": path})

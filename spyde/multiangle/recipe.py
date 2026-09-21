@@ -49,6 +49,13 @@ class MultiAngleRecipe:
     dtype
         The accumulator the sum is taken in. Ignored when *has_angle_axis*,
         where a frame is one member's own pixels and keeps their type.
+    stack
+        The 5-D signal the members are planes of, when they are — a node
+        rebuilt from a saved acquisition rather than composed from files.
+        The reader then reads every member from the stack's ONE store reader
+        instead of through a lazy slice per member, which is the difference
+        between decoding a chunk and asking dask to (measured 25 ms against
+        55-80 ms per member on a real stack).
     """
 
     members: tuple
@@ -56,6 +63,7 @@ class MultiAngleRecipe:
     has_angle_axis: bool
     dtype: Any = None
     member_indices: tuple | None = None
+    stack: Any = None
 
     @property
     def n_members(self) -> int:

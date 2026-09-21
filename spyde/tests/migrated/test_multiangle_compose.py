@@ -397,3 +397,25 @@ class TestTheCompositionSaysWhatMadeIt:
         assert recorded["dp_offsets"] == model.dp_offsets.tolist()
         assert recorded["paths"] == list(model.paths)
         assert recorded["reference"] == int(model.reference)
+
+
+class TestSumDtypeWidth:
+    """The accumulator is the narrowest EXACT width, and there is always one.
+
+    A rebinned stack came back as uint64 and the old rule, which knew no
+    accumulator wider than that, raised — and a whole acquisition reopened as
+    a bare 5-D array because of it. A 64-bit source is already the widest
+    width there is; refusing it helps nobody.
+    """
+
+    def test_a_64_bit_source_keeps_its_width(self):
+        assert sum_dtype(np.uint64, 4) == np.dtype(np.uint64)
+        assert sum_dtype(np.int64, 4) == np.dtype(np.int64)
+
+    def test_never_narrower_than_the_source(self):
+        assert sum_dtype(np.uint16, 1) == np.dtype(np.uint16)
+        assert sum_dtype(np.uint32, 1) == np.dtype(np.uint32)
+
+    def test_a_small_source_gets_the_narrowest_exact_width(self):
+        assert sum_dtype(np.uint8, 4) == np.dtype(np.uint16)
+        assert sum_dtype(np.uint16, 16) == np.dtype(np.uint32)

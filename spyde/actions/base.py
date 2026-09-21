@@ -223,15 +223,37 @@ class Rebin2DAction(TransformAction):
         # hyperspy rebins by SUMMING, and every axis divides exactly or it
         # raises. Refusing here says which axis and by how much, where the
         # library's message names neither.
+        factors = scan + [int(scale_x), int(scale_y)]
         for size, factor, label in zip(
                 list(manager.navigation_shape) + list(manager.signal_shape),
-                scan + [int(scale_x), int(scale_y)],
-                ["scan x", "scan y", "detector x", "detector y"]):
+                factors, ["scan x", "scan y", "detector x", "detector y"]):
             if factor > 1 and int(size) % factor:
                 raise RuntimeError(
                     f"{label} is {int(size)} px, which {factor} does not "
                     f"divide — crop it to a multiple of {factor} first")
-        return {"scale": scan + [int(scale_x), int(scale_y)]}
+        return {"scale": factors,
+                "dtype": _rebin_dtype(signal.data.dtype, factors)}
+
+
+def _rebin_dtype(source_dtype, factors):
+    """The narrowest dtype that holds a sum of this many source pixels.
+
+    Left to itself hyperspy sums into numpy's default accumulator, which turns
+    a uint16 scan binned 2x2x2x2 into uint64 — four times the bytes that were
+    asked for, and a dtype nothing downstream can widen for a further sum.
+    Here the sum of 16 uint16 pixels lands in uint32, which is exact and half
+    the size. A float stays a float; a dtype with no notion of a sum (bool,
+    strings) is left to hyperspy's default.
+    """
+    from spyde.multiangle.compose import sum_dtype
+
+    count = 1
+    for factor in factors:
+        count *= max(1, int(factor))
+    try:
+        return sum_dtype(source_dtype, count)
+    except (TypeError, ValueError):
+        return None
 
 
 # ── Crop ─────────────────────────────────────────────────────────────────────

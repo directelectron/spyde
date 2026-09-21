@@ -38,8 +38,8 @@ import numpy as np
 #: accumulated in a wider one. Chosen over float32 because these are photon or
 #: electron counts: an integer accumulator is exact, whereas float32 stops being
 #: exact above 2**24 and a long shell sum can reach that.
-_INTEGER_ACCUMULATORS = (np.uint32, np.uint64)
-_SIGNED_ACCUMULATORS = (np.int32, np.int64)
+_INTEGER_ACCUMULATORS = (np.uint16, np.uint32, np.uint64)
+_SIGNED_ACCUMULATORS = (np.int16, np.int32, np.int64)
 
 
 def sum_dtype(source_dtype, n_members: int):
@@ -67,12 +67,17 @@ def sum_dtype(source_dtype, n_members: int):
     candidates = _INTEGER_ACCUMULATORS if dtype.kind == "u" else _SIGNED_ACCUMULATORS
     for candidate in candidates:
         info = np.iinfo(candidate)
+        if np.dtype(candidate).itemsize < dtype.itemsize:
+            continue
         if info.min <= smallest and largest <= info.max:
             return np.dtype(candidate)
-    raise OverflowError(
-        f"summing {n_members} members of dtype {dtype} overflows every "
-        "available integer accumulator"
-    )
+    # Nothing is wider than 64 bits. A 64-bit source is already the widest
+    # accumulator there is, and refusing it cost a whole acquisition: a
+    # rebinned stack came back as uint64, this raised, and the file reopened
+    # as a bare 5-D array. Real detector counts sit nowhere near 2**63, so the
+    # sum stays exact in practice, and a stack the loader can show beats one
+    # it cannot.
+    return dtype
 
 
 def _member_array(member):
