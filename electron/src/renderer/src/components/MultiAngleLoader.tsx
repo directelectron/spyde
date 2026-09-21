@@ -104,6 +104,18 @@ export interface MapedSolve {
   /** Real only: what the SOLVER answered, kept so a member moved by hand can
    *  be put back. Null before a solve. */
   solver_offsets: number[][] | null
+  /** Real only: the open pairwise comparison, or null. */
+  pair: MapedPair | null
+}
+
+/** One member against the reference: both pictures and their overlay. */
+export interface MapedPair {
+  index: number
+  image: string | null
+  member: string | null
+  reference: string | null
+  overlay: string | null
+  gain: number | null
 }
 
 /**
@@ -158,7 +170,7 @@ export interface MapedState {
 
 const EMPTY_SOLVE: MapedSolve = {
   solved: false, offsets: null, residuals: null, max_residual: null, corners: {},
-  evidence: null, confidence: null, solver_offsets: null,
+  evidence: null, confidence: null, solver_offsets: null, pair: null,
 }
 
 export const EMPTY_MAPED_STATE: MapedState = {
@@ -213,6 +225,23 @@ function parseSolve(raw: unknown): MapedSolve {
     evidence: parseEvidence(d.evidence),
     confidence: parseConfidence(d.confidence),
     solver_offsets: parseOffsets(d.solver_offsets),
+    pair: parsePair(d.pair),
+  }
+}
+
+/** The pairwise comparison, or null when none is open. */
+function parsePair(raw: unknown): MapedPair | null {
+  if (!raw || typeof raw !== 'object') return null
+  const d = raw as Record<string, unknown>
+  const index = num(d.index)
+  if (index == null) return null
+  const png = (value: unknown): string | null =>
+    typeof value === 'string' ? value : null
+  return {
+    index,
+    image: typeof d.image === 'string' ? d.image : null,
+    member: png(d.member), reference: png(d.reference),
+    overlay: png(d.overlay), gain: num(d.gain),
   }
 }
 
@@ -645,6 +674,18 @@ export function MultiAngleLoader({ sendAction, onClose }: {
     return () => window.removeEventListener('keydown', onKey)
   }, [zoom])
 
+  // Its own listener, because the zoom's is gated on a zoom being open and
+  // the comparison is not one.
+  const pairOpen = state.real.pair != null
+  useEffect(() => {
+    if (!pairOpen) return
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') sendAction('maped_set_pair', { index: null })
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [pairOpen, sendAction])
+
   // Counted over members that actually OPENED: three bare MRCs that all failed
   // to probe are three slots, but nothing an alignment could be solved on, and
   // an enabled tab there just moves the failure one click further in.
@@ -786,7 +827,17 @@ export function MultiAngleLoader({ sendAction, onClose }: {
       missing={slot.member != null && state.virtual_image != null
         && slot.member.virtual_images.length > 0
         && !slot.member.virtual_images.includes(state.virtual_image)}
-      onZoom={() => slot.member && setZoom({ kind: 'member', index: slot.member.index })}
+      onZoom={() => {
+        if (!slot.member) return
+        // The reference has nothing to be compared against, so it keeps the
+        // plain enlargement.
+        if (state.reference === slot.member.index) {
+          setZoom({ kind: 'member', index: slot.member.index })
+          return
+        }
+        setSelected(slot.member.index)
+        sendAction('maped_set_pair', { index: slot.member.index })
+      }}
       selected={slot.member != null && selected === slot.member.index}
       onSelect={slot.member != null && state.reference !== slot.member.index
         ? () => {
@@ -905,9 +956,9 @@ export function MultiAngleLoader({ sendAction, onClose }: {
                 />
               </Field>
 
-              <AngleTableau
+              <AngleGrid
                 testid="maped-tableau-real" rings={layout.rings}
-                size={TABLEAU_SIZE} slotSize={SLOT_SIZE_REAL} renderSlot={virtualImageSlot}
+                slotSize={SLOT_SIZE_REAL} renderSlot={virtualImageSlot}
                 empty="No members placed on the ring yet."
               />
 
@@ -999,6 +1050,25 @@ export function MultiAngleLoader({ sendAction, onClose }: {
       </div>
 
       {zoomed}
+      {state.real.pair && (
+        <PairView
+          pair={state.real.pair} members={state.members}
+          reference={state.reference}
+          images={state.available_virtual_images}
+          offsets={state.real.offsets} solverOffsets={state.real.solver_offsets}
+          weak={NUDGE_AXES
+            .filter((axis) => state.real.confidence
+              && state.real.confidence.votes > 0
+              && !state.real.confidence.determined[axis.key])
+            .map((axis) => axis.label)}
+          padRef={nudgeRef}
+          onSet={(index, offset) =>
+            sendAction('maped_set_real_offset', { index, offset })}
+          onImage={(name) => sendAction('maped_set_pair',
+            { index: state.real.pair?.index, image: name })}
+          onClose={() => sendAction('maped_set_pair', { index: null })}
+        />
+      )}
     </div>
   )
 }
@@ -1009,7 +1079,11 @@ export function MultiAngleLoader({ sendAction, onClose }: {
 
 const TABLEAU_SIZE = 372
 const SLOT_SIZE_LOAD = 56
-const SLOT_SIZE_REAL = 62
+//: Twice the ring's tile. On the real-space tab the pictures ARE the content
+//: — the user is judging whether they line up — and the ring's geometry says
+//: nothing there that the grid's caption does not say in words.
+const SLOT_SIZE_REAL = 128
+const GRID_GAP = 12
 /** Room outside the outermost ring for its tilt label. */
 const RING_MARGIN = 10
 
@@ -1021,6 +1095,44 @@ const RING_MARGIN = 10
  * target and a button — all three of which an `<img>` inside a positioned box
  * gives for free and an SVG node does not.
  */
+/**
+ * The members as a grid of pictures, for the tab that is about the pictures.
+ *
+ * The ring cannot be made to fill its square: the radius encodes the tilt, so
+ * bigger tiles mean fewer of them before they overlap — at 372 px the inner
+ * ring holds four. The Load tab needs that geometry, because dropping a file
+ * on an azimuth is how an acquisition is assembled there. By the real-space
+ * tab the acquisition exists and the tiles are read-only evidence, so the
+ * angles go in the caption and the space goes to the images.
+ */
+function AngleGrid({ rings, slotSize, renderSlot, testid, empty }: {
+  rings: Ring[]
+  slotSize: number
+  renderSlot: (slot: Slot, ring: Ring) => React.ReactNode
+  testid: string
+  empty: string
+}) {
+  const placed = rings.flatMap((ring) => ring.slots
+    .filter((slot) => slot.member != null)
+    .map((slot) => ({ slot, ring })))
+  if (placed.length === 0) {
+    return <div data-testid={`${testid}-empty`} style={styles.tableauEmpty}>{empty}</div>
+  }
+  return (
+    <div data-testid={testid} style={styles.grid}>
+      {placed.map(({ slot, ring }) => (
+        <div key={slot.key} style={styles.gridCell}>
+          {renderSlot(slot, ring)}
+          <div style={styles.gridCaption}>
+            {`${formatDegrees(ring.tilt)} · ${formatAzimuth(slot.azimuth)}`}
+          </div>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+
 function AngleTableau({ rings, size, slotSize, renderSlot, testid, empty }: {
   rings: Ring[]
   size: number
@@ -1377,6 +1489,111 @@ function AxisConfidence({ confidence, onNudge }: {
     </div>
   )
 }
+
+/**
+ * One member against the reference, and the two overlaid.
+ *
+ * The tab's evidence is the sum over EVERY member, where one member's
+ * contribution is a fraction and moving it by a pixel changes almost nothing
+ * visible. Judging an alignment needs the two pictures that are supposed to
+ * coincide and nothing else in the way.
+ *
+ * The overlay is the member in red over the reference in cyan. Misaligned,
+ * every edge carries a coloured fringe and the side the fringe falls on says
+ * which way to press; aligned, the colours cancel to grey — a state the eye
+ * reads without being told what score to expect.
+ */
+function PairView({ pair, members, reference, images, offsets, solverOffsets,
+                   weak, padRef, onSet, onImage, onClose }: {
+  pair: MapedPair
+  members: MapedMember[]
+  reference: number | null
+  images: string[]
+  offsets: number[][] | null
+  solverOffsets: number[][] | null
+  weak: string[]
+  padRef: React.MutableRefObject<HTMLDivElement | null>
+  onSet: (index: number, offset: number[] | null) => void
+  onImage: (name: string | null) => void
+  onClose: () => void
+}) {
+  useEffect(() => { padRef.current?.focus() }, [pair.index, padRef])
+  const member = members.find((m) => m.index === pair.index) ?? null
+  const fixed = members.find((m) => m.index === reference) ?? null
+  const strip = (name: string): string => name.replace(/\.[^.]+$/, '')
+  const gain = pair.gain
+
+  return (
+    <div data-testid="maped-pair" style={styles.zoomOverlay}>
+      <div style={styles.pairBox}>
+        <div style={styles.pairHead}>
+          <span style={{ color: '#cdd6f4', fontWeight: 600 }}>
+            {`${strip(member?.name ?? '?')} ↔ ${strip(fixed?.name ?? '?')}`}
+            <span style={{ color: '#6c7086', fontWeight: 400 }}> (reference)</span>
+          </span>
+          <span style={{ flex: 1 }} />
+          <span style={{ color: '#a6adc8', fontSize: 11 }}>Image</span>
+          <select
+            data-testid="maped-pair-image" style={styles.nudgeSelect}
+            value={pair.image ?? COMPUTE_VI}
+            onChange={(e) => onImage(
+              e.target.value === COMPUTE_VI ? null : e.target.value)}
+          >
+            {[...images.map((name) => ({ value: name, label: name })),
+              { value: COMPUTE_VI, label: 'Compute from the data' }]
+              .map((option) => (
+                <option key={option.value} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
+          </select>
+          <button data-testid="maped-pair-close" style={styles.nudgeReset}
+            onClick={onClose}>Close</button>
+        </div>
+
+        <div style={styles.pairRow}>
+          <div style={styles.pairSide}>
+            {([['maped-pair-member', strip(member?.name ?? ''), pair.member],
+               ['maped-pair-reference', `${strip(fixed?.name ?? '')} ★`,
+                pair.reference]] as const).map(([testid, label, src]) => (
+              <figure key={testid} style={styles.pairFigure}>
+                {src && <img data-testid={testid} src={src} alt=""
+                  style={styles.pairSmall} draggable={false} />}
+                <figcaption style={styles.evidenceCaption}>{label}</figcaption>
+              </figure>
+            ))}
+          </div>
+          {pair.overlay && (
+            <figure style={styles.pairFigure}>
+              <img data-testid="maped-pair-overlay" src={pair.overlay} alt=""
+                style={styles.pairBig} draggable={false} />
+              <figcaption style={styles.evidenceCaption}>
+                {`red = ${strip(member?.name ?? '')} · `
+                 + `cyan = ${strip(fixed?.name ?? '')} · grey = aligned`}
+              </figcaption>
+            </figure>
+          )}
+        </div>
+
+        <NudgePad
+          members={members} reference={reference} selected={pair.index}
+          offsets={offsets} solverOffsets={solverOffsets} weak={weak}
+          padRef={padRef} onSelect={() => undefined} onSet={onSet}
+        />
+
+        <div style={styles.pairFoot}>
+          <span data-testid="maped-pair-gain">
+            {gain == null ? 'pair sharpness —'
+              : `pair sharpness x${gain.toFixed(2)}`}
+          </span>
+          <span style={{ flex: 1 }} />
+          <span style={{ color: '#6c7086' }}>Esc closes</span>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 
 const NUDGE_AXES = [
   { key: 'x' as const, label: 'across' },
@@ -2123,6 +2340,12 @@ const styles: Record<string, React.CSSProperties> = {
     position: 'relative', alignSelf: 'center', flex: '0 0 auto',
     background: '#11111b', border: '1px solid #313244', borderRadius: 12,
   },
+  grid: {
+    display: 'flex', flexWrap: 'wrap', gap: GRID_GAP,
+    alignContent: 'flex-start',
+  },
+  gridCell: { display: 'flex', flexDirection: 'column', gap: 3 },
+  gridCaption: { fontSize: 10, color: '#6c7086', textAlign: 'center' },
   tableauEmpty: {
     display: 'flex', alignItems: 'center', justifyContent: 'center',
     border: '1px dashed #45475a', borderRadius: 12, padding: '34px 12px',
@@ -2344,6 +2567,26 @@ const styles: Record<string, React.CSSProperties> = {
     borderRadius: 4, cursor: 'pointer', fontSize: 11, padding: '1px 6px',
   },
   nudgeHelp: { fontSize: 10.5 },
+  pairBox: {
+    display: 'flex', flexDirection: 'column', gap: 8,
+    background: '#181825', border: '1px solid #313244', borderRadius: 10,
+    padding: 12, maxWidth: '100%', maxHeight: '100%',
+  },
+  pairHead: { display: 'flex', gap: 8, alignItems: 'center', fontSize: 12 },
+  pairRow: { display: 'flex', gap: 10, alignItems: 'flex-start' },
+  pairSide: { display: 'flex', flexDirection: 'column', gap: 8 },
+  pairFigure: { margin: 0, display: 'flex', flexDirection: 'column', gap: 3 },
+  pairSmall: {
+    width: 200, height: 200, objectFit: 'contain',
+    imageRendering: 'pixelated', background: '#11111b', borderRadius: 4,
+  },
+  pairBig: {
+    // The judging picture, so it gets the room: a one-pixel fringe has to be
+    // a visible block, which needs integer upscaling and no smoothing.
+    width: 412, height: 412, objectFit: 'contain',
+    imageRendering: 'pixelated', background: '#11111b', borderRadius: 4,
+  },
+  pairFoot: { display: 'flex', gap: 8, fontSize: 11.5, color: '#a6adc8' },
   nudgeSpent: { opacity: 0.4, cursor: 'default' },
   runRow: { display: 'flex', gap: 14, alignItems: 'flex-end' },
   evidenceColumns: { display: 'flex', gap: 10, alignItems: 'flex-start' },

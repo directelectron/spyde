@@ -288,3 +288,55 @@ test('arrow keys nudge the selected member', async () => {
   await dialog.getByTestId('maped-nudge-reset').click()
   await expect.poll(readOffset, { timeout: 15_000 }).toEqual(start)
 })
+
+/**
+ * The pairwise view: a member, the reference, and the two overlaid.
+ *
+ * Double-click is the way in because it already meant "look closer" on these
+ * tiles; the reference keeps the plain enlargement, having nothing to be
+ * compared against.
+ */
+test('double-click compares a member with the reference', async () => {
+  const { page } = ctx
+  const dialog = page.getByTestId('multiangle-loader')
+  await expect(dialog).toBeVisible({ timeout: 20_000 })
+  await page.keyboard.press('Escape')
+  await page.waitForTimeout(400)
+  await send('maped_align_real', { params: { max_shift: 16 } })
+  await page.waitForTimeout(2000)
+  await dialog.getByTestId('maped-tab-real').click()
+  await expect(dialog.getByTestId('maped-nudge'))
+    .toBeVisible({ timeout: 300_000 })
+
+  const movable = dialog.locator('[aria-selected]')
+  expect(await movable.count()).toBeGreaterThan(0)
+  await movable.first().dblclick()
+
+  const pair = page.getByTestId('maped-pair')
+  await expect(pair).toBeVisible({ timeout: 20_000 })
+  for (const part of ['maped-pair-member', 'maped-pair-reference',
+                      'maped-pair-overlay']) {
+    await expect(pair.getByTestId(part)).toBeVisible()
+  }
+  await page.waitForTimeout(600)
+  await page.screenshot({ path: join(SHOTS, '08-pair-view.png') })
+
+  // The overlay must follow the keys, or the view is decoration.
+  const overlayOf = () => pair.getByTestId('maped-pair-overlay')
+    .getAttribute('src')
+  const before = await overlayOf()
+  await page.keyboard.press('ArrowRight')
+  await page.keyboard.press('ArrowRight')
+  await expect.poll(overlayOf, { timeout: 15_000 }).not.toEqual(before)
+  await page.waitForTimeout(400)
+  await page.screenshot({ path: join(SHOTS, '09-pair-nudged.png') })
+
+  // Switching the image here must not throw away the solve being edited.
+  const images = await pair.getByTestId('maped-pair-image')
+    .locator('option').count()
+  expect(images, 'no images offered').toBeGreaterThan(0)
+
+  await page.keyboard.press('Escape')
+  await expect(pair).toBeHidden({ timeout: 10_000 })
+  await expect(dialog.getByTestId('maped-nudge')).toBeVisible()
+})

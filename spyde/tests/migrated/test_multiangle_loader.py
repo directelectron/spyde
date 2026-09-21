@@ -74,7 +74,8 @@ from spyde.backend import _session_multiangle_loader as loader
 from spyde.backend._session_multiangle_loader import (
     maped_add_files, maped_align_real, maped_align_reciprocal,
     maped_close_loader, maped_commit, maped_open_loader, maped_remove_member,
-    maped_set_corner_extent, maped_set_member, maped_set_real_offset,
+    maped_set_corner_extent, maped_set_member, maped_set_pair,
+    maped_set_real_offset,
     maped_set_reference,
     maped_set_scan_shape, maped_set_virtual_image,
 )
@@ -2074,3 +2075,91 @@ class TestSizingAMemberIsFree:
         path.write_bytes(b"\0" * 2048)
         member = loader.LoaderMember(path=str(path), name="member.mrc")
         assert loader._member_size_bytes(member) == 2048
+
+
+class TestComparingTwoMembers:
+    """The pairwise view: one member against the reference, and their overlay.
+
+    It exists because the sum over every member dilutes one member's move to
+    a fraction, so the picture the nudge pad is judged by barely changes when
+    the thing being nudged does.
+    """
+
+    def _solved(self, window, acquisition):
+        _with_angles(window["window"], acquisition)
+        maped_align_real(window["window"], None, {"params": {}})
+        assert _wait(lambda: _last_state(window["messages"])["real"]["solved"])
+
+    def test_opening_it_gives_three_pictures_and_a_gain(
+            self, window, acquisition):
+        self._solved(window, acquisition)
+        maped_set_pair(window["window"], None, {"index": 1})
+        pair = _last_state(window["messages"])["real"]["pair"]
+        assert pair is not None and pair["index"] == 1
+        for part in ("member", "reference", "overlay"):
+            assert str(pair[part]).startswith("data:image/png;base64,"), part
+        assert pair["gain"] is None or np.isfinite(pair["gain"])
+
+    def test_the_overlay_is_in_colour(self, window, acquisition):
+        """Red against cyan, so a misalignment is a coloured fringe whose SIDE
+        says which way to press — not a sharpness the eye has to score."""
+        import base64
+        import io
+
+        from PIL import Image
+
+        self._solved(window, acquisition)
+        maped_set_pair(window["window"], None, {"index": 1})
+        pair = _last_state(window["messages"])["real"]["pair"]
+        raw = base64.b64decode(pair["overlay"].split(",", 1)[1])
+        assert Image.open(io.BytesIO(raw)).mode == "RGB"
+
+    def test_nudging_redraws_it(self, window, acquisition):
+        self._solved(window, acquisition)
+        maped_set_pair(window["window"], None, {"index": 1})
+        before = _last_state(window["messages"])["real"]["pair"]["overlay"]
+        offsets = _last_state(window["messages"])["real"]["offsets"]
+        maped_set_real_offset(window["window"], None,
+                              {"index": 1,
+                               "offset": [offsets[1][0] + 2, offsets[1][1] + 2]})
+        after = _last_state(window["messages"])["real"]["pair"]["overlay"]
+        assert after != before, "the comparison did not follow the member"
+
+    def test_the_view_picks_its_own_image_without_dropping_the_solve(
+            self, window, acquisition):
+        """The loader's own image choice invalidates the real-space solve, by
+        design — its offsets were measured on different pictures. The view has
+        to be able to flip between images while the offsets it is editing stay
+        exactly where they are."""
+        self._solved(window, acquisition)
+        offsets = _last_state(window["messages"])["real"]["offsets"]
+        names = _last_state(window["messages"])["available_virtual_images"]
+        maped_set_pair(window["window"], None,
+                       {"index": 1, "image": names[0] if names else None})
+        state = _last_state(window["messages"])
+        assert state["real"]["solved"], "switching the view's image lost the solve"
+        assert state["real"]["offsets"] == offsets
+
+    def test_the_reference_is_not_a_pair(self, window, acquisition):
+        self._solved(window, acquisition)
+        reference = _last_state(window["messages"])["reference"]
+        before = len(window["messages"])
+        maped_set_pair(window["window"], None, {"index": reference})
+        errors = [m for m in window["messages"][before:]
+                  if isinstance(m, dict) and m.get("type") == "error"]
+        assert errors and "reference" in str(errors[0].get("text"))
+
+    def test_closing_it_clears_the_pictures(self, window, acquisition):
+        self._solved(window, acquisition)
+        maped_set_pair(window["window"], None, {"index": 1})
+        maped_set_pair(window["window"], None, {"index": None})
+        assert _last_state(window["messages"])["real"]["pair"] is None
+
+    def test_a_new_solve_drops_it(self, window, acquisition):
+        """Its pictures were drawn from offsets a re-solve has replaced."""
+        self._solved(window, acquisition)
+        maped_set_pair(window["window"], None, {"index": 1})
+        maped_align_real(window["window"], None, {"params": {"upsample": 4}})
+        assert quiesce(window["window"]), why_busy(window["window"])
+        pair = _last_state(window["messages"])["real"]["pair"]
+        assert pair is None or pair["index"] == 1

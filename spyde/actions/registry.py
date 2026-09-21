@@ -89,6 +89,7 @@ _SPYDE_STAGED_HANDLERS: dict[str, str] = {
     "maped_set_beam_roi":     "spyde.backend._session_multiangle_loader.maped_set_beam_roi",
     "maped_align_real":       "spyde.backend._session_multiangle_loader.maped_align_real",
     "maped_set_real_offset":  "spyde.backend._session_multiangle_loader.maped_set_real_offset",
+    "maped_set_pair":         "spyde.backend._session_multiangle_loader.maped_set_pair",
     "maped_align_reciprocal": "spyde.backend._session_multiangle_loader.maped_align_reciprocal",
     "maped_commit":           "spyde.backend._session_multiangle_loader.maped_commit",
     "add_navigator_from_window": "spyde.actions.navigator_views.add_navigator_from_window",

@@ -374,6 +374,15 @@ class MultiAngleLoaderState:
     #: the patches agree, along them the specimen is uniform and they cannot —
     #: and showing both offsets the same way claims something untrue.
     real_confidence: dict | None = None
+    #: The open pairwise comparison, or ``None``:
+    #: ``{"index", "image", "member", "reference", "overlay", "gain"}``.
+    #:
+    #: Aligning one member against the reference alone, because in the sum
+    #: over every member one member's contribution is a fraction and a small
+    #: move is invisible in it. ``image`` is LOCAL to this view — switching it
+    #: must not go through ``maped_set_virtual_image``, which drops the
+    #: real-space solve whose offsets are being edited.
+    real_pair: dict | None = None
     #: The open aligned-sum window, or ``None``. One per dialog: re-running the
     #: alignment repaints it rather than opening another, and a ✕ on it clears
     #: this through the controller's ``close``.
@@ -469,6 +478,7 @@ class MultiAngleLoaderState:
         """
         self.real_evidence = None
         self.real_confidence = None
+        self.real_pair = None
         bump_generation(self, "_real_generation")
         self.real = LoaderStage()
 
@@ -590,7 +600,7 @@ def state_message(state: MultiAngleLoaderState | None) -> dict:
                 "virtual_image": None, "available_virtual_images": [],
                 "beam_roi": None,
                 "real": {**LoaderStage().as_message(), "evidence": None,
-                         "confidence": None},
+                         "confidence": None, "pair": None},
                 "reciprocal": {**LoaderStage().as_message(), "corners": {}},
                 "busy": False, "message": "", "can_commit": False}
 
@@ -640,7 +650,8 @@ def state_message(state: MultiAngleLoaderState | None) -> dict:
                       for key, value in state.beam_roi.items()}),
         "real": {**state.real.as_message(),
                  "evidence": state.real_evidence,
-                 "confidence": state.real_confidence},
+                 "confidence": state.real_confidence,
+                 "pair": state.real_pair},
         "reciprocal": {**state.reciprocal.as_message(),
                        "corners": _corners_message(state)},
         "busy": bool(state.busy),
@@ -746,6 +757,102 @@ def _thumbnail(array) -> str | None:
     image.save(buffer, format="PNG", optimize=True)
     return ("data:image/png;base64,"
             + base64.b64encode(buffer.getvalue()).decode("ascii"))
+
+
+#: How big a picture the pair view gets. Far above `PREVIEW_MAX_EDGE`,
+#: deliberately: a tile is a reminder of which member is which, and this is
+#: the thing a 1 px error has to be visible in.
+PAIR_MAX_EDGE = 512
+
+
+def _thumbnail_rgb(red, cyan) -> str | None:
+    """Two images as one picture: *red* in red, *cyan* in green and blue.
+
+    The pair is judged on colour rather than on sharpness because sharpness
+    cannot be judged without something to compare it to. Misaligned, every
+    edge carries a coloured fringe and the fringe's SIDE says which way to
+    press; aligned, the colours cancel to grey, which the eye reads with no
+    reference value at all. A difference image also goes to zero, but so does
+    it along an axis with no features, and a sum asks the user to see a 1 px
+    change in a picture of hundreds.
+    """
+    if red is None or cyan is None:
+        return None
+    first = np.asarray(red)
+    second = np.asarray(cyan)
+    if first.ndim != 2 or first.shape != second.shape or first.size == 0:
+        return None
+
+    import base64
+    import io
+
+    from PIL import Image
+
+    left = _stretched(first)
+    right = _stretched(second)
+    image = Image.fromarray(np.stack([left, right, right], axis=-1), mode="RGB")
+    longest = max(image.size)
+    if longest > PAIR_MAX_EDGE:
+        scale = PAIR_MAX_EDGE / float(longest)
+        image = image.resize(
+            (max(1, int(round(image.width * scale))),
+             max(1, int(round(image.height * scale)))),
+            Image.BOX)
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG", optimize=True)
+    return ("data:image/png;base64,"
+            + base64.b64encode(buffer.getvalue()).decode("ascii"))
+
+
+def _pair_overlap(reference, member, offset):
+    """*reference* and *member* cropped to the region THEY share.
+
+    Its own overlap, not the one every member shares: a pair being compared
+    should not lose the ground some third member happens to miss.
+    """
+    dy, dx = int(offset[0]), int(offset[1])
+    height = min(reference.shape[0], member.shape[0]) - abs(dy)
+    width = min(reference.shape[1], member.shape[1]) - abs(dx)
+    if height < 2 or width < 2:
+        return None, None
+    # An offset is what the member must have ADDED to land on the common grid
+    # (`spyde.multiangle.model`), so the member is READ at the shifted index
+    # and the reference is not. Reversing these still produces a picture, and
+    # a plausible-looking one, but of twice the error.
+    top, left = max(0, dy), max(0, dx)
+    moved_top, moved_left = max(0, -dy), max(0, -dx)
+    return (reference[top:top + height, left:left + width],
+            member[moved_top:moved_top + height,
+                   moved_left:moved_left + width])
+
+
+def _pair_evidence(reference, member, offset) -> dict | None:
+    """The two pictures, their overlay, and what aligning them bought."""
+    fixed, moved = _pair_overlap(np.asarray(reference, dtype=np.float64),
+                                 np.asarray(member, dtype=np.float64), offset)
+    if fixed is None:
+        return None
+    # Measured over the SAME window as the aligned pair, not over the whole
+    # frame. Cropping each case to its own overlap compares two pictures of
+    # different sizes, and `_structure` trims a fixed margin — so the ratio
+    # then reports the crop as much as the alignment. On pure noise that error
+    # inverted the answer: aligned 0.97, unaligned 1.00, when aligning two
+    # copies of one field must give root two.
+    height, width = fixed.shape
+    still = np.asarray(reference, dtype=np.float64)[:height, :width]
+    unmoved = np.asarray(member, dtype=np.float64)[:height, :width]
+    gain = None
+    if still.shape == unmoved.shape == fixed.shape:
+        before = _structure((still + unmoved) / 2.0)
+        after = _structure((fixed + moved) / 2.0)
+        if before > 0:
+            gain = float(after / before)
+    return {
+        "member": _thumbnail(moved),
+        "reference": _thumbnail(fixed),
+        "overlay": _thumbnail_rgb(moved, fixed),
+        "gain": gain,
+    }
 
 
 # ── the virtual images a member already carries ──────────────────────────────
@@ -2479,7 +2586,88 @@ def maped_set_real_offset(session, plot, payload) -> None:
             return
 
     state.real.offsets = trial
+    _refresh_pair(state)
     _show_aligned_sum(session, state)
+    _emit_state(state)
+
+
+def _pair_image(state: MultiAngleLoaderState, member, name):
+    """One member's picture for the pair view, by the view's OWN choice.
+
+    ``name`` is whatever the view is showing, which need not be what the solve
+    registered on — flipping between them is most of the point, since bright
+    field was measured to register better than the total sum while the total
+    sum gives the steadier confidence.
+    """
+    if name is None:
+        return member.image
+    return _virtual_image(member.signal, name)
+
+
+def _refresh_pair(state: MultiAngleLoaderState) -> None:
+    """Redraw the open comparison, or clear it if it cannot be drawn."""
+    current = state.real_pair
+    if current is None:
+        return
+    index = int(current.get("index"))
+    reference = state.reference
+    if (reference is None or not 0 <= index < len(state.members)
+            or index == reference or state.real.offsets is None):
+        state.real_pair = None
+        return
+    name = current.get("image")
+    moving = _pair_image(state, state.members[index], name)
+    fixed = _pair_image(state, state.members[reference], name)
+    if moving is None or fixed is None:
+        state.real_pair = None
+        return
+    offsets = np.asarray(state.real.offsets, dtype=np.int64)
+    # Relative to the reference, which may itself be non-zero.
+    offset = offsets[index] - offsets[reference]
+    evidence = _pair_evidence(fixed, moving, offset)
+    if evidence is None:
+        return                       # keep the last good picture up
+    state.real_pair = {"index": index, "image": name, **evidence}
+
+
+def maped_set_pair(session, plot, payload) -> None:
+    """Open, re-image, or close the pairwise comparison.
+
+    ``payload`` is ``{"index": int | None, "image": str | None}``. ``index``
+    ``None`` closes it. ``image`` names the virtual image THIS VIEW shows and
+    changes nothing else — in particular it does not touch the loader's own
+    choice, because that one invalidates the solve.
+    """
+    state = _loader_state(session)
+    if state is None:
+        return
+    payload = payload or {}
+    if payload.get("index") is None:
+        state.real_pair = None
+        _emit_state(state)
+        return
+    if not state.real.solved:
+        emit_error("align real space before comparing two members")
+        _emit_state(state)
+        return
+    try:
+        index = int(payload.get("index"))
+    except (TypeError, ValueError):
+        emit_error("which member should be compared?")
+        _emit_state(state)
+        return
+    if index == state.reference:
+        emit_error("the reference is what the others are compared against")
+        _emit_state(state)
+        return
+    name = payload.get("image", (state.real_pair or {}).get("image", ...))
+    if name is ...:
+        name = state.virtual_image
+    state.real_pair = {"index": index,
+                       "image": None if name is None else str(name)}
+    _refresh_pair(state)
+    if state.real_pair is None:
+        emit_error("those two members cannot be compared")
     _emit_state(state)
 
 
