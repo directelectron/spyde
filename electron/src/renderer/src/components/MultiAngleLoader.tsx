@@ -96,6 +96,16 @@ export interface MapedSolve {
   max_residual: number | null
   /** Reciprocal only: member index (as a string key) → its corner panels. */
   corners: Record<string, MapedCorners>
+  /** Real only: the members summed both ways, and how much sharper aligning
+   *  made them. Null until the solve has landed. */
+  evidence: MapedEvidence | null
+}
+
+/** The real-space solve's evidence, as pictures. */
+export interface MapedEvidence {
+  unaligned: string | null
+  aligned: string | null
+  gain: number | null
 }
 
 /** A square search region on the detector, by its centre and half-width. */
@@ -126,6 +136,7 @@ export interface MapedState {
 
 const EMPTY_SOLVE: MapedSolve = {
   solved: false, offsets: null, residuals: null, max_residual: null, corners: {},
+  evidence: null,
 }
 
 export const EMPTY_MAPED_STATE: MapedState = {
@@ -177,7 +188,18 @@ function parseSolve(raw: unknown): MapedSolve {
     residuals: numList(d.residuals),
     max_residual: num(d.max_residual),
     corners: parseCorners(d.corners),
+    evidence: parseEvidence(d.evidence),
   }
+}
+
+/** The two summed pictures, or null — including when only one came through. */
+function parseEvidence(raw: unknown): MapedEvidence | null {
+  if (!raw || typeof raw !== 'object') return null
+  const d = raw as Record<string, unknown>
+  const unaligned = typeof d.unaligned === 'string' ? d.unaligned : null
+  const aligned = typeof d.aligned === 'string' ? d.aligned : null
+  if (!unaligned && !aligned) return null
+  return { unaligned, aligned, gain: num(d.gain) }
 }
 
 /** Read one `maped_state` message. Defensive because a half-built member (a
@@ -832,6 +854,9 @@ export function MultiAngleLoader({ sendAction, onClose }: {
                 label={state.real.solved ? 'Re-run' : 'Run'}
                 onClick={() => sendAction('maped_align_real', { params: { max_shift: maxShift } })}
               />
+              {state.real.evidence && (
+                <AlignmentEvidence evidence={state.real.evidence} />
+              )}
               <SolveReport testid="maped-real" solve={state.real} members={state.members} />
             </>
           )}
@@ -1188,6 +1213,56 @@ function ProblemList({ members }: { members: MapedMember[] }) {
  * panels are here before anything has run, with the previews filling in
  * afterwards.
  */
+/**
+ * The real-space solve's evidence: the members summed, aligned and not.
+ *
+ * In the dialog rather than in a window behind it. The dialog is a full-screen
+ * modal, so a figure opened in the workspace cannot be looked at or reached
+ * while it is up — and "the residual was 0.25 px" is not evidence that the
+ * members landed on each other. Two pictures are.
+ *
+ * The sharpness ratio is stated plainly, including when it is ~1.00: a solve
+ * that did not sharpen the sum is the case worth noticing, and a number that
+ * only ever appears when it flatters the result is not evidence either.
+ */
+function AlignmentEvidence({ evidence }: { evidence: MapedEvidence }) {
+  const gain = evidence.gain
+  const verdict = gain == null ? null
+    : gain >= 1.15 ? { text: 'the members stack', tone: '#a6e3a1' }
+    : gain >= 1.05 ? { text: 'a little sharper', tone: '#f9e2af' }
+    : { text: 'aligning barely changed the sum — check it', tone: '#f38ba8' }
+  return (
+    <div data-testid="maped-real-evidence" style={styles.evidenceBox}>
+      {/* The number first: the panel sits at the bottom of a scrolling tab, so
+          anything below the pictures is the part a user does not see. */}
+      {gain != null && (
+        <div style={styles.evidenceHeader}>
+          <span data-testid="maped-real-gain" style={{ color: verdict?.tone }}>
+            {`sharpness x${gain.toFixed(2)}`}
+          </span>
+          {verdict && (
+            <span data-testid="maped-real-verdict" style={{ color: verdict.tone }}>
+              {` · ${verdict.text}`}
+            </span>
+          )}
+        </div>
+      )}
+      <div style={styles.evidenceRow}>
+        {([['Unaligned', evidence.unaligned],
+           ['Aligned', evidence.aligned]] as const).map(([label, src]) => (
+          <figure key={label} style={styles.evidenceFigure}>
+            {src
+              ? <img data-testid={`maped-real-evidence-${label.toLowerCase()}`}
+                  src={src} alt="" style={styles.evidenceImage} draggable={false} />
+              : <div style={styles.evidenceMissing}>not drawn</div>}
+            <figcaption style={styles.evidenceCaption}>{label}</figcaption>
+          </figure>
+        ))}
+      </div>
+    </div>
+  )
+}
+
 /**
  * The zero-beam search region, drawn on a corner panel and draggable on it.
  *
@@ -1865,6 +1940,24 @@ const styles: Record<string, React.CSSProperties> = {
     overflow: 'hidden', cursor: 'zoom-in',
   },
   cornerPanelEmpty: { borderStyle: 'dashed', borderColor: '#45475a' },
+  evidenceBox: {
+    display: 'flex', flexDirection: 'column', gap: 6,
+    background: '#181825', border: '1px solid #313244',
+    borderRadius: 8, padding: 8,
+  },
+  evidenceHeader: { fontSize: 12 },
+  evidenceRow: { display: 'flex', alignItems: 'flex-start', gap: 10 },
+  evidenceFigure: { margin: 0, display: 'flex', flexDirection: 'column', gap: 4 },
+  evidenceImage: {
+    width: 132, height: 132, objectFit: 'contain',
+    imageRendering: 'pixelated', background: '#11111b', borderRadius: 6,
+  },
+  evidenceMissing: {
+    width: 132, height: 132, display: 'flex', alignItems: 'center',
+    justifyContent: 'center', color: '#585b70', fontSize: 11,
+    border: '1px dashed #45475a', borderRadius: 6,
+  },
+  evidenceCaption: { fontSize: 11, color: '#a6adc8', textAlign: 'center' },
   beamRoi: {
     position: 'absolute', boxSizing: 'border-box',
     border: '1.5px solid #a6e3a1', borderRadius: 3,

@@ -53,6 +53,19 @@ test('the region is drawn, moves, and is placeable on the enlarged panel', async
   await send('maped_align_real', { params: { max_shift: 16 } })
   await expect(dialog.getByTestId('maped-tab-reciprocal'))
     .toBeEnabled({ timeout: 300_000 })
+  // The real-space evidence belongs IN the dialog: the dialog is a full-screen
+  // modal, so a window behind it cannot be looked at while it is up. It lives
+  // on the tab that solves it, so stand there.
+  await dialog.getByTestId('maped-tab-real').click()
+  await expect(dialog.getByTestId('maped-real-evidence'))
+    .toBeVisible({ timeout: 300_000 })
+  await page.waitForTimeout(1200)
+  await dialog.screenshot({ path: join(SHOTS, '00-real-evidence.png') })
+  console.log('sharpness:', await dialog.getByTestId('maped-real-gain')
+    .textContent().catch(() => 'none'))
+  console.log('verdict  :', await dialog.getByTestId('maped-real-verdict')
+    .textContent().catch(() => 'none'))
+
   await dialog.getByTestId('maped-tab-reciprocal').click()
   await page.waitForTimeout(2500)
   await dialog.screenshot({ path: join(SHOTS, '01-reciprocal-with-roi.png') })

@@ -547,19 +547,22 @@ class TestTheSolves:
         """The one solver knob the dialog exposes: the guard against a
         periodic lattice locking the correlation onto the wrong translation.
         The planted offsets reach 5 px, so a 6 px cap must still find them."""
-        import spyde.multiangle as multiangle
+        # Patched where `best_real_space` looks it up: the stage now chooses
+        # between registration settings by what they do to the sum, and runs
+        # the solver once per candidate. The knob still has to reach it.
+        from spyde.multiangle import align as align_module
 
         data, _paths = acquisition
         session = window["window"]
         _with_angles(session, acquisition)
-        original = multiangle.solve_real_space
+        original = align_module.solve_real_space
         forwarded = {}
 
         def _capture(images, *, reference=0, **kwargs):
             forwarded.update(kwargs)
             return original(images, reference=reference, **kwargs)
 
-        with patch.object(multiangle, "solve_real_space", _capture):
+        with patch.object(align_module, "solve_real_space", _capture):
             maped_align_real(session, None, {"params": {"max_shift": 6.0}})
             assert _wait(lambda: _last_state(window["messages"])["real"]["solved"])
 

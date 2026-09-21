@@ -347,6 +347,14 @@ class MultiAngleLoaderState:
     #: whole pattern is pulled bodily towards whichever reflections a tilt
     #: happens to excite. Placed on the zero beam it measures the zero beam.
     beam_roi: dict | None = None
+    #: The real-space solve's evidence as the DIALOG shows it:
+    #: ``{"unaligned": <png>, "aligned": <png>, "gain": float}``, or ``None``.
+    #:
+    #: In the dialog because the dialog covers the screen — it is a full-screen
+    #: modal, so a window opened behind it cannot be looked at or reached,
+    #: and the sum aligned against the sum unaligned is the whole reason to
+    #: believe a solve. The separate window remains for after the dialog closes.
+    real_evidence: dict | None = None
     #: The open aligned-sum window, or ``None``. One per dialog: re-running the
     #: alignment repaints it rather than opening another, and a ✕ on it clears
     #: this through the controller's ``close``.
@@ -440,6 +448,7 @@ class MultiAngleLoaderState:
         what they meant, but the real-space offsets came from registering a
         different set of pictures and are no longer that answer.
         """
+        self.real_evidence = None
         bump_generation(self, "_real_generation")
         self.real = LoaderStage()
 
@@ -468,13 +477,15 @@ class MultiAngleLoaderState:
         self.real = LoaderStage()
         self.reciprocal = LoaderStage()
 
-    def build_model(self, *, dp_offsets=None):
+    def build_model(self, *, nav_offsets=None, dp_offsets=None):
         """The :class:`~spyde.multiangle.model.MultiAngleModel` to compose from.
 
-        *dp_offsets* substitutes for the reciprocal solve's. Only one caller
-        passes it: the aligned-sum window asks real-space questions of a model
-        before the reciprocal stage has run, and a model cannot be built
-        without both arrays. Nothing it asks reads the detector offsets.
+        Either offset array can be substituted for the solve's, because both
+        are asked for before their stage has finished: the aligned-sum window
+        asks real-space questions before the reciprocal stage has run, and the
+        real-space stage scores CANDIDATE offsets while choosing between them,
+        when the state holds no answer yet. A model cannot be built without
+        both arrays.
         """
         from spyde.multiangle import MultiAngleModel, assign_shells
 
@@ -486,7 +497,8 @@ class MultiAngleLoaderState:
             azimuths=np.asarray([member.azimuth for member in self.members],
                                 dtype=np.float64),
             shell_ids=assign_shells(tilts),
-            nav_offsets=self.real.offsets,
+            nav_offsets=(self.real.offsets if nav_offsets is None
+                         else nav_offsets),
             dp_offsets=(self.reciprocal.offsets if dp_offsets is None
                         else dp_offsets),
             reference=self.reference,
@@ -557,7 +569,7 @@ def state_message(state: MultiAngleLoaderState | None) -> dict:
                 "shells": [], "scan_shape": None,
                 "virtual_image": None, "available_virtual_images": [],
                 "beam_roi": None,
-                "real": LoaderStage().as_message(),
+                "real": {**LoaderStage().as_message(), "evidence": None},
                 "reciprocal": {**LoaderStage().as_message(), "corners": {}},
                 "busy": False, "message": "", "can_commit": False}
 
@@ -605,7 +617,8 @@ def state_message(state: MultiAngleLoaderState | None) -> dict:
         "beam_roi": (None if not state.beam_roi else
                      {key: float(value)
                       for key, value in state.beam_roi.items()}),
-        "real": state.real.as_message(),
+        "real": {**state.real.as_message(),
+                 "evidence": state.real_evidence},
         "reciprocal": {**state.reciprocal.as_message(),
                        "corners": _corners_message(state)},
         "busy": bool(state.busy),
@@ -1249,6 +1262,52 @@ def _start_preview_fill(session, state: MultiAngleLoaderState) -> None:
 
 # ── the aligned-sum window ───────────────────────────────────────────────────
 
+#: Pixels ignored around the edge of a summed image when measuring how much
+#: structure survived. The members cover different regions, so every candidate
+#: alignment crops differently and leaves its own border — and a border is a
+#: step, which any sharpness measure scores highly.
+_STRUCTURE_MARGIN = 12
+
+#: Scale of the background removed first. The specimen's own shape and the
+#: detector's illumination are smooth and large; they carry most of the
+#: variance and none of the information about whether the members landed on
+#: each other.
+_STRUCTURE_BACKGROUND = 8.0
+
+
+def _structure(image) -> float:
+    """How much fine detail an image holds, per unit brightness.
+
+    The number behind "sharpness x N". Gradient energy was the obvious choice
+    and does not work here: it is won by the border the crop creates, so a
+    worse alignment that crops harder scores higher — measured on a real
+    four-member acquisition, an alignment that visibly BLURRED the layers
+    scored 1.5x, while the one that actually stacked them scored 0.85x. It
+    still fails after excluding the border, because a smooth background ramp
+    dominates what is left.
+
+    So: drop the background, ignore the edges, and measure contrast relative
+    to the mean. On the same acquisition this ranks the alignments the way the
+    specimen does — the layers' own periodicity going 43 -> 294 in
+    signal-to-noise as the score goes 0.88 -> 1.14.
+    """
+    from scipy.ndimage import gaussian_filter
+
+    values = np.asarray(image, dtype=np.float64)
+    margin = _STRUCTURE_MARGIN
+    if min(values.shape) > 3 * margin:
+        values = values[margin:-margin, margin:-margin]
+    finite = np.isfinite(values)
+    if not finite.any():
+        return 0.0
+    filled = np.where(finite, values, np.nanmean(values[finite]))
+    detail = filled - gaussian_filter(filled, _STRUCTURE_BACKGROUND)
+    mean = float(np.mean(filled))
+    if not np.isfinite(mean) or abs(mean) < 1e-12:
+        return 0.0
+    return float(np.std(detail[finite]) / abs(mean))
+
+
 def _alignment_evidence(images, model) -> dict | None:
     """The members summed with the solved offsets applied, and without.
 
@@ -1270,8 +1329,6 @@ def _alignment_evidence(images, model) -> dict | None:
     cover is too small to look at. Reads no member: these are the real-space
     images the solve already registered.
     """
-    from spyde.actions.drift_action import _gradient_energy
-
     scan_shape = np.asarray(images[0]).shape[:2]
     region = model.overlap_shape(scan_shape)
     if min(region) < 2:
@@ -1284,7 +1341,7 @@ def _alignment_evidence(images, model) -> dict | None:
     unaligned = np.mean(
         [np.asarray(image, dtype=np.float64)[reference_slices]
          for image in images], axis=0)
-    before, after = _gradient_energy(unaligned), _gradient_energy(aligned)
+    before, after = _structure(unaligned), _structure(aligned)
     return {"aligned": aligned, "unaligned": unaligned,
             "gain": (after / before) if before > 0 else float("nan")}
 
@@ -1407,6 +1464,22 @@ def _show_aligned_sum(session, state: MultiAngleLoaderState) -> None:
         return
     if evidence is None:
         return
+
+    # Keyed on the offsets it was drawn for, like the member thumbnails are on
+    # theirs: re-running a solve that lands on the same answer produces the
+    # same two pictures, and encoding them again is what the cache exists to
+    # stop. A solve that MOVED a member re-encodes, because it must.
+    gain = float(evidence.get("gain", float("nan")))
+    offsets = np.asarray(model.nav_offsets).tolist()
+    current = state.real_evidence
+    if current is None or current.get("offsets") != offsets:
+        state.real_evidence = {
+            "unaligned": _thumbnail(evidence["unaligned"]),
+            "aligned": _thumbnail(evidence["aligned"]),
+            "gain": None if not np.isfinite(gain) else gain,
+            "offsets": offsets,
+        }
+        _emit_state(state)
 
     window = state.aligned_window
     if window is not None and not window.closed:
@@ -2213,7 +2286,7 @@ def maped_align_real(session, plot, payload) -> None:
     a crystalline sample locking onto the wrong lattice translation. The other
     keys of :data:`_SOLVER_PARAMETERS` are accepted from a script.
     """
-    from spyde.multiangle import solve_real_space
+    from spyde.multiangle.align import best_real_space
 
     state = _loader_state(session)
     problem = _not_ready(state)
@@ -2233,7 +2306,30 @@ def maped_align_real(session, plot, payload) -> None:
             _ensure_reductions(state, members)
         images = np.stack([_member_image(state, member)
                            for member in members])
-        return solve_real_space(images, reference=reference, **parameters)
+
+        def score(offsets):
+            """How much sharper the members are summed at *offsets*.
+
+            The same ratio the dialog shows, so what is optimised here is what
+            the user is shown — and a run that cannot improve on the solver
+            keeps the solver's answer.
+            """
+            trial = state.build_model(
+                nav_offsets=np.asarray(offsets, dtype=np.int64),
+                dp_offsets=np.zeros((len(images), 2), dtype=np.int64))
+            evidence = _alignment_evidence(images, trial)
+            if evidence is None:
+                return float("-inf")
+            gain = float(evidence.get("gain", float("nan")))
+            return gain if np.isfinite(gain) else float("-inf")
+
+        offsets, residuals, report = best_real_space(
+            images, reference=reference, score=score, **parameters)
+        for candidate, gain, failure in report["attempts"]:
+            log.debug("real-space candidate %s -> %s", candidate,
+                      failure or f"sharpness x{gain:.3f}")
+        log.info("real-space alignment: sharpness x%.2f", report["gain"])
+        return offsets, residuals
 
     named = "computed" if chosen is None else chosen
     _start_stage(session, state, attribute="real",
