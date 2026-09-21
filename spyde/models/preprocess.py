@@ -80,14 +80,27 @@ def estimate_disk_diameter(frame: np.ndarray, hp_sigma: float = 20.0) -> float:
     ac = np.fft.fftshift(np.real(np.fft.ifft2(F * np.conj(F))))
     H, W = ac.shape
     cy, cx = H // 2, W // 2
-    # average the horizontal & vertical central-line profiles (robust to anisotropy)
-    prof = 0.5 * (ac[cy] / ac[cy, cx] + ac[:, cx] / ac[cy, cx])
-    l = r = cx
-    while l > 0 and prof[l] > 0.5:
-        l -= 1
-    while r < W - 1 and prof[r] > 0.5:
-        r += 1
-    return float(max(r - l, 1))
+    peak = ac[cy, cx]
+    if peak <= 0:
+        return CANONICAL_DIAMETER
+
+    def half_max_width(profile, centre):
+        """Width of the central peak where it falls below half its maximum."""
+        left = right = centre
+        while left > 0 and profile[left] > 0.5:
+            left -= 1
+        while right < profile.size - 1 and profile[right] > 0.5:
+            right += 1
+        return max(right - left, 1)
+
+    # The two central-line widths, averaged — NOT the two profiles. They only
+    # have the same length on a square detector, so adding them raised on any
+    # other: a cropped or composed pattern (a multi-angle sum is 507 x 501 when
+    # its reciprocal offsets differ between the axes) took the whole neural
+    # detector down. Averaging the widths is what "robust to anisotropy" meant
+    # and it holds for any shape.
+    return float(0.5 * (half_max_width(ac[cy] / peak, cx)
+                        + half_max_width(ac[:, cx] / peak, cy)))
 
 
 def scale_factor(frame: np.ndarray, target: float = CANONICAL_DIAMETER) -> float:
