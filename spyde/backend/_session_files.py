@@ -177,9 +177,15 @@ class FileLoaderMixin:
         # seconds the FIRST time; the OS cache makes the next open instant). Say
         # so, and flag a busy state so the frontend can show a spinner instead of
         # looking hung. Emit the busy flag FIRST so it paints before the read.
-        size_gb = _dataset_size_bytes(path) / 1e9
+        # A directory store is taken as large WITHOUT measuring it. Measuring
+        # one means walking every chunk file, and a frame-chunked .zspy is one
+        # file per frame — 65,579 of them on a 256 x 256 scan, about 35 s of
+        # stat calls on the event loop. That is the very stall this message
+        # exists to warn about, so it must not be paid to decide whether to
+        # show it.
+        large = (os.path.isdir(path) or _dataset_size_bytes(path) >= 1e9)
         name = os.path.basename(path)
-        hint = " (first open of a large file can take a while)" if size_gb >= 1 else ""
+        hint = " (first open of a large file can take a while)" if large else ""
         ipc.emit({"type": "loading", "busy": True, "text": f"Reading {name}…{hint}"})
         emit_status(f"Reading {name}…{hint}")
         threading.Thread(
