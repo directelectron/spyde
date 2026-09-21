@@ -14,7 +14,6 @@
  * report_move_cell, wired by the parent) + a delete button (report_remove_cell).
  */
 import React, { useEffect, useLayoutEffect, useRef, useState } from 'react'
-import { useSpyDE } from '../kernel/SpyDEContext'
 import { renderMarkdown } from '../kernel/markdown'
 import { reportClipboard } from '../kernel/reportClipboard'
 import type { ReportCell as ReportCellType } from '../kernel/protocol'
@@ -228,31 +227,49 @@ const TOOLBAR: Array<[ToolbarCommand, string, string, React.CSSProperties?]> = [
   ['link', '🔗', 'Link', { fontSize: 10 }],
 ]
 
-export function ReportCell({ cell, onUpdate, onRemove, index, dragProps }: Props) {
-  const { sendAction } = useSpyDE()
-  const [editing, setEditing] = useState(false)
+/**
+ * The markdown editor for one cell: the rendered view until it is
+ * double-clicked, then a formatting toolbar over an autosizing textarea with
+ * Ctrl/Cmd-B and Ctrl/Cmd-I. `onCommit(source, html)` fires on blur and on
+ * Ctrl/Cmd-Enter; Escape reverts. `onEditingChange` lets a host gate its own
+ * chrome, because a cell must not be draggable while its text is being edited.
+ *
+ * `testidPrefix` names the pane's testids, so each host keeps the ones its
+ * tests already use.
+ */
+export function MarkdownPane({
+  cell, testidPrefix, emptyHint, onCommit, onEditingChange, renderedStyle,
+}: {
+  cell: ReportCellType
+  testidPrefix: string
+  emptyHint: string
+  onCommit: (source: string, html: string) => void
+  onEditingChange?: (editing: boolean) => void
+  renderedStyle?: React.CSSProperties
+}) {
+  const [editing, setEditingState] = useState(false)
   const [draft, setDraft] = useState(cell.source ?? '')
-  const [hover, setHover] = useState(false)
   const taRef = useRef<HTMLTextAreaElement>(null)
+  const setEditing = (next: boolean) => {
+    setEditingState(next)
+    onEditingChange?.(next)
+  }
 
   // Sync the draft when the backing source changes and we're NOT actively
   // editing (a live report_state update from elsewhere).
   useEffect(() => { if (!editing) setDraft(cell.source ?? '') }, [cell.source, editing])
 
-  // Double-click to edit; the rendered view is shown otherwise.
-  const showEditor = editing
-
   // Autosize the textarea to its content.
   useLayoutEffect(() => {
     const ta = taRef.current
-    if (!ta || !showEditor) return
+    if (!ta || !editing) return
     ta.style.height = 'auto'
     ta.style.height = `${ta.scrollHeight}px`
-  }, [draft, showEditor])
+  }, [draft, editing])
 
   const commit = () => {
     setEditing(false)
-    if (draft !== (cell.source ?? '')) onUpdate(draft, renderMarkdown(draft))
+    if (draft !== (cell.source ?? '')) onCommit(draft, renderMarkdown(draft))
   }
   const revert = () => {
     setDraft(cell.source ?? '')
@@ -275,7 +292,70 @@ export function ReportCell({ cell, onUpdate, onRemove, index, dragProps }: Props
   }
 
   const rendered = React.useMemo(() => renderMarkdown(cell.source ?? ''), [cell.source])
-  const empty = !(cell.source ?? '').trim()
+  if (!editing) {
+    return (
+      <div
+        data-testid={`${testidPrefix}-rendered-${cell.id}`}
+        className="spyde-md"
+        onDoubleClick={() => { setDraft(cell.source ?? ''); setEditing(true) }}
+        title="Double-click to edit"
+        style={{ ...styles.rendered, ...(renderedStyle ?? {}) }}
+      >
+        {(cell.source ?? '').trim()
+          ? <span dangerouslySetInnerHTML={{ __html: rendered }} />
+          : <span style={styles.emptyHint}>{emptyHint}</span>}
+      </div>
+    )
+  }
+  return (
+    <div>
+      {/* Formatting toolbar. onMouseDown preventDefault keeps the textarea
+          focused so a button click can't blur-commit mid-edit. */}
+      <div style={styles.fmtBar} data-testid={`${testidPrefix}-toolbar-${cell.id}`}>
+        {TOOLBAR.map(([cmd, label, tip, extra]) => (
+          <button
+            key={cmd}
+            data-testid={`report-fmt-${cmd}-${cell.id}`}
+            style={{ ...styles.fmtBtn, ...(extra ?? {}) }}
+            title={tip}
+            tabIndex={-1}
+            onMouseDown={(e) => e.preventDefault()}
+            onClick={() => runCommand(cmd)}
+          >{label}</button>
+        ))}
+      </div>
+      <textarea
+        ref={taRef}
+        data-testid={`${testidPrefix}-textarea-${cell.id}`}
+        style={styles.textarea}
+        value={draft}
+        autoFocus
+        spellCheck={false}
+        placeholder="Write markdown…  ($x^2$ and $$…$$ render as math)"
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={commit}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter' && (e.ctrlKey || e.metaKey || e.shiftKey)) {
+            e.preventDefault()
+            ;(e.target as HTMLTextAreaElement).blur()
+          } else if (e.key === 'Escape') {
+            e.preventDefault()
+            revert()
+          } else if ((e.ctrlKey || e.metaKey) && !e.altKey) {
+            const k = e.key.toLowerCase()
+            if (k === 'b') { e.preventDefault(); runCommand('bold') }
+            else if (k === 'i') { e.preventDefault(); runCommand('italic') }
+          }
+        }}
+      />
+    </div>
+  )
+}
+
+export function ReportCell({ cell, onUpdate, onRemove, index, dragProps }: Props) {
+  const [editing, setEditing] = useState(false)
+  const [hover, setHover] = useState(false)
+  const rendered = React.useMemo(() => renderMarkdown(cell.source ?? ''), [cell.source])
 
   // The serialized clipboard form of THIS cell (source + its rendered html, so a
   // paste static-exports real HTML). Rendered from the live source so a paste
@@ -289,7 +369,7 @@ export function ReportCell({ cell, onUpdate, onRemove, index, dragProps }: Props
   return (
     <div
       data-testid={`report-cell-${cell.id}`}
-      draggable={!showEditor}
+      draggable={!editing}
       onDragStart={dragProps.onDragStart}
       onDragOver={dragProps.onDragOver}
       onDrop={dragProps.onDrop}
@@ -303,7 +383,7 @@ export function ReportCell({ cell, onUpdate, onRemove, index, dragProps }: Props
       }}
     >
       {/* Hover chrome: drag handle (reorder) + copy + duplicate + delete. */}
-      {(hover || showEditor) && (
+      {(hover || editing) && (
         <CellChrome
           cellId={cell.id}
           styles={{ chrome: styles.chrome, chromeBtn: styles.chromeBtn, deleteBtn: styles.deleteBtn }}
@@ -321,61 +401,13 @@ export function ReportCell({ cell, onUpdate, onRemove, index, dragProps }: Props
         />
       )}
 
-      {showEditor ? (
-        <div>
-          {/* Formatting toolbar. onMouseDown preventDefault keeps the textarea
-              focused so a button click can't blur-commit mid-edit. */}
-          <div style={styles.fmtBar} data-testid={`report-cell-toolbar-${cell.id}`}>
-            {TOOLBAR.map(([cmd, label, tip, extra]) => (
-              <button
-                key={cmd}
-                data-testid={`report-fmt-${cmd}-${cell.id}`}
-                style={{ ...styles.fmtBtn, ...(extra ?? {}) }}
-                title={tip}
-                tabIndex={-1}
-                onMouseDown={(e) => e.preventDefault()}
-                onClick={() => runCommand(cmd)}
-              >{label}</button>
-            ))}
-          </div>
-          <textarea
-            ref={taRef}
-            data-testid={`report-cell-textarea-${cell.id}`}
-            style={styles.textarea}
-            value={draft}
-            autoFocus={editing}
-            spellCheck={false}
-            placeholder="Write markdown…  ($x^2$ and $$…$$ render as math)"
-            onChange={(e) => setDraft(e.target.value)}
-            onBlur={commit}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter' && (e.ctrlKey || e.metaKey || e.shiftKey)) {
-                e.preventDefault()
-                ;(e.target as HTMLTextAreaElement).blur()
-              } else if (e.key === 'Escape') {
-                e.preventDefault()
-                revert()
-              } else if ((e.ctrlKey || e.metaKey) && !e.altKey) {
-                const k = e.key.toLowerCase()
-                if (k === 'b') { e.preventDefault(); runCommand('bold') }
-                else if (k === 'i') { e.preventDefault(); runCommand('italic') }
-              }
-            }}
-          />
-        </div>
-      ) : (
-        <div
-          data-testid={`report-cell-rendered-${cell.id}`}
-          className="spyde-md"
-          onDoubleClick={() => { setDraft(cell.source ?? ''); setEditing(true) }}
-          title="Double-click to edit"
-          style={styles.rendered}
-        >
-          {empty
-            ? <span style={styles.emptyHint}>Empty text cell — double-click to edit</span>
-            : <span dangerouslySetInnerHTML={{ __html: rendered }} />}
-        </div>
-      )}
+      <MarkdownPane
+        cell={cell}
+        testidPrefix="report-cell"
+        emptyHint="Empty text cell — double-click to edit"
+        onCommit={onUpdate}
+        onEditingChange={setEditing}
+      />
     </div>
   )
 }

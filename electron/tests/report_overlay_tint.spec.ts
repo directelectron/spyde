@@ -29,6 +29,8 @@ const {
 } = require('./_harness.cjs')
 
 const SHOTS = join(__dirname, '..', 'report_overlay_tint_shots')
+// The figure-box height check belongs to the report-fixes batch.
+const FIX_SHOTS = join(__dirname, '..', 'report_fixes_shots')
 
 let ctx: Awaited<ReturnType<typeof launchApp>>
 let workDir: string
@@ -352,6 +354,25 @@ test('2) interactive export embeds the blender; slider→0 drops the red pixels'
       }
       return n
     })
+
+    // The blender posts no height of its own and is emitted with only a width,
+    // so the figure box's CSS is the only thing sizing it. With no height rule
+    // it collapses to the browser's default 150 px inside an overflow:hidden
+    // box and the reader sees a sliver of the page.
+    const blenderHeight = await bpage.evaluate(() => {
+      const frames = Array.from(document.querySelectorAll(
+        'figure.report-figure .fig-box iframe')) as HTMLIFrameElement[]
+      return frames.length
+        ? Math.round(Math.max(...frames.map(
+            (f) => f.getBoundingClientRect().height)))
+        : 0
+    })
+    console.log('[tint] exported blender iframe height =', blenderHeight)
+    await bpage.screenshot({ path: join(FIX_SHOTS, '04-blender-fills-its-box.png'),
+                            fullPage: true })
+    expect(blenderHeight,
+      'the embed collapsed to the browser default instead of filling its box')
+      .toBeGreaterThanOrEqual(300)
 
     const before = await redCount()
     console.log('[tint] exported blender red pixels BEFORE slider =', before)
