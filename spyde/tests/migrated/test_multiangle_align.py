@@ -29,6 +29,11 @@ from spyde.multiangle import (
     solve_real_space,
     solve_reciprocal,
 )
+from spyde.multiangle.align import (
+    REGISTRATION_CANDIDATES,
+    REGISTRATION_PREFILTERS,
+    best_real_space,
+)
 
 # Mixed shells on purpose: 1 centre member, 6 at one tilt, 3 at another. Equal
 # member counts per shell would let a solver that assumed them pass.
@@ -590,3 +595,76 @@ class TestDetectorRemap:
         assert np.any(spread > 1.0), (
             f"inverting the offsets left the beams aligned ({spread} px) — "
             "the alignment test above cannot be distinguishing sign")
+
+
+class TestChoosingBySharpness:
+    """`best_real_space` tries several registrations and keeps the sharpest.
+
+    The trap is that "sharpest" is measured on the summed members, and on a
+    small or low-contrast image that measurement cannot resolve the last pixel
+    — answers a pixel apart score within a percent of each other. Letting the
+    highest number win outright turns that noise into a wrong answer, which is
+    why the choice has to be decisive before it is taken.
+    """
+
+    def _images(self):
+        data = make_multiangle(shells=SHELLS)
+        return data, np.asarray(data.navigators())
+
+    def test_a_score_that_cannot_decide_leaves_the_offsets_right(self):
+        """Noise in the score must not move the answer off the truth.
+
+        Several candidates miss the planted offsets by a pixel here, and a
+        score jittered by a few percent will rank one of them top about as
+        often as not.
+        """
+        data, images = self._images()
+        jitter = np.random.default_rng(0)
+
+        def score(offsets):
+            return 1.0 + 0.03 * jitter.random()
+
+        offsets, _residuals, report = best_real_space(
+            images, reference=data.reference, score=score)
+        assert np.array_equal(offsets, data.nav_offsets), (
+            "a score with no real signal in it changed the answer")
+        assert report["decisive"] is False
+
+    def test_a_decisive_score_is_taken(self):
+        """The margin must not be a way of ignoring the score entirely."""
+        data, images = self._images()
+        default, _residuals = solve_real_space(
+            images, reference=data.reference, **REGISTRATION_CANDIDATES[0])
+
+        def score(offsets):
+            return 1.0 if np.array_equal(offsets, default) else 2.0
+
+        offsets, _residuals, report = best_real_space(
+            images, reference=data.reference, score=score)
+        assert not np.array_equal(offsets, default)
+        assert report["decisive"] is True
+
+    def test_the_prefilters_leave_the_planted_offsets_alone(self):
+        """Registering on intensity CHANGE must still find a planted shift.
+
+        The members come from one scene, so a prefilter has nothing to correct
+        here — it may not cost accuracy for that.
+        """
+        data, images = self._images()
+        for _label, prefilter in REGISTRATION_PREFILTERS:
+            if prefilter is None:
+                continue
+            prepared = np.stack([prefilter(image) for image in images])
+            offsets, _residuals = solve_real_space(
+                prepared, reference=data.reference,
+                **REGISTRATION_CANDIDATES[0])
+            assert np.array_equal(offsets, data.nav_offsets), _label
+
+    def test_every_candidate_is_reported(self):
+        data, images = self._images()
+        _offsets, _residuals, report = best_real_space(
+            images, reference=data.reference, score=lambda o: 1.0)
+        assert len(report["attempts"]) == (len(REGISTRATION_PREFILTERS)
+                                           * len(REGISTRATION_CANDIDATES))
+        assert {named["on"] for named, _gain, _error in report["attempts"]} == \
+            {label for label, _prefilter in REGISTRATION_PREFILTERS}
