@@ -101,6 +101,9 @@ export interface MapedSolve {
   evidence: MapedEvidence | null
   /** Real only: which axes the specimen actually determined. */
   confidence: MapedConfidence | null
+  /** Real only: what the SOLVER answered, kept so a member moved by hand can
+   *  be put back. Null before a solve. */
+  solver_offsets: number[][] | null
 }
 
 /**
@@ -122,6 +125,9 @@ export interface MapedEvidence {
   unaligned: string | null
   aligned: string | null
   gain: number | null
+  /** What the SOLVER's answer scored, kept once a member has been moved by
+   *  hand so the two can be compared. */
+  solver_gain: number | null
 }
 
 /** A square search region on the detector, by its centre and half-width. */
@@ -152,7 +158,7 @@ export interface MapedState {
 
 const EMPTY_SOLVE: MapedSolve = {
   solved: false, offsets: null, residuals: null, max_residual: null, corners: {},
-  evidence: null, confidence: null,
+  evidence: null, confidence: null, solver_offsets: null,
 }
 
 export const EMPTY_MAPED_STATE: MapedState = {
@@ -206,7 +212,18 @@ function parseSolve(raw: unknown): MapedSolve {
     corners: parseCorners(d.corners),
     evidence: parseEvidence(d.evidence),
     confidence: parseConfidence(d.confidence),
+    solver_offsets: parseOffsets(d.solver_offsets),
   }
+}
+
+/** ``[[dy, dx], ...]`` or null — the same shape `offsets` already comes in. */
+function parseOffsets(raw: unknown): number[][] | null {
+  if (!Array.isArray(raw)) return null
+  const rows = raw
+    .map((row) => (Array.isArray(row)
+      ? [num(row[0]), num(row[1])] : [null, null]))
+    .filter((row): row is number[] => row[0] != null && row[1] != null)
+  return rows.length === raw.length ? rows : null
 }
 
 /** The per-axis agreement, or null when the solve has not reported one. */
@@ -232,7 +249,8 @@ function parseEvidence(raw: unknown): MapedEvidence | null {
   const unaligned = typeof d.unaligned === 'string' ? d.unaligned : null
   const aligned = typeof d.aligned === 'string' ? d.aligned : null
   if (!unaligned && !aligned) return null
-  return { unaligned, aligned, gain: num(d.gain) }
+  return { unaligned, aligned, gain: num(d.gain),
+           solver_gain: num(d.solver_gain) }
 }
 
 /** Read one `maped_state` message. Defensive because a half-built member (a
@@ -555,6 +573,11 @@ export function MultiAngleLoader({ sendAction, onClose }: {
   const [maxShift, setMaxShift] = useState(DEFAULT_MAX_SHIFT_PX)
   const [rings, setRings] = useState<RingSpec[]>([])
   const [zoom, setZoom] = useState<ZoomTarget | null>(null)
+  //: Which member the arrow keys move. A view preference, not a fact about
+  //: the data, so it lives here and never goes to the backend.
+  const [selected, setSelected] = useState<number | null>(null)
+  const nudgeRef = useRef<HTMLDivElement | null>(null)
+  const evidenceRef = useRef<HTMLDivElement | null>(null)
   // A drop whose files resolve to no OS path is the one failure a drop handler
   // can have SILENTLY (Electron 44 removed File.path; the preload bridge's
   // webUtils.getPathForFile is what replaces it). Say so rather than no-op.
@@ -764,6 +787,16 @@ export function MultiAngleLoader({ sendAction, onClose }: {
         && slot.member.virtual_images.length > 0
         && !slot.member.virtual_images.includes(state.virtual_image)}
       onZoom={() => slot.member && setZoom({ kind: 'member', index: slot.member.index })}
+      selected={slot.member != null && selected === slot.member.index}
+      onSelect={slot.member != null && state.reference !== slot.member.index
+        ? () => {
+            setSelected(slot.member!.index)
+            nudgeRef.current?.focus()
+            // The BOX, not the pad: the pad is already in view when the
+            // thumbnails below it are not, so scrolling the pad does nothing.
+            evidenceRef.current?.scrollIntoView({ block: 'end' })
+          }
+        : undefined}
     />
   )
 
@@ -878,18 +911,33 @@ export function MultiAngleLoader({ sendAction, onClose }: {
                 empty="No members placed on the ring yet."
               />
 
-              <Field label={<>Max shift (px) <Info testid="maped-info-max-shift" text={INFO.maxShift} /></>}>
-                <NumInput value={maxShift} onChange={setMaxShift}
-                  step="1" width={72} testid="maped-max-shift" />
-              </Field>
-              <RunButton
-                testid="maped-run-real" busy={state.busy}
-                label={state.real.solved ? 'Re-run' : 'Run'}
-                onClick={() => sendAction('maped_align_real', { params: { max_shift: maxShift } })}
-              />
+              {/* One row: every pixel above the evidence box is a pixel the
+                  aligned picture does not get, and that picture is the whole
+                  point of the panel below. */}
+              <div style={styles.runRow}>
+                <Field label={<>Max shift (px) <Info testid="maped-info-max-shift" text={INFO.maxShift} /></>}>
+                  <NumInput value={maxShift} onChange={setMaxShift}
+                    step="1" width={72} testid="maped-max-shift" />
+                </Field>
+                <RunButton
+                  testid="maped-run-real" busy={state.busy}
+                  label={state.real.solved ? 'Re-run' : 'Run'}
+                  onClick={() => sendAction('maped_align_real', { params: { max_shift: maxShift } })}
+                />
+              </div>
               {state.real.evidence && (
                 <AlignmentEvidence evidence={state.real.evidence}
-                  confidence={state.real.confidence} />
+                  confidence={state.real.confidence}
+                  solve={state.real} members={state.members}
+                  reference={state.reference} selected={selected}
+                  padRef={nudgeRef} boxRef={evidenceRef}
+                  onSelect={(index) => {
+                    setSelected(index)
+                    nudgeRef.current?.focus()
+                    evidenceRef.current?.scrollIntoView({ block: 'end' })
+                  }}
+                  onSet={(index, offset) => sendAction(
+                    'maped_set_real_offset', { index, offset })} />
               )}
               <SolveReport testid="maped-real" solve={state.real} members={state.members} />
             </>
@@ -1035,8 +1083,8 @@ function AngleTableau({ rings, size, slotSize, renderSlot, testid, empty }: {
  * one thing this must never do is let an error read as an absence.
  */
 function SlotTile({
-  slot, tilt, size, reference, missing, readOnly,
-  onOpenPicker, onDropFiles, onDropMember, onZoom,
+  slot, tilt, size, reference, missing, readOnly, selected,
+  onOpenPicker, onDropFiles, onDropMember, onZoom, onSelect,
 }: {
   slot: Slot
   tilt: number
@@ -1044,6 +1092,10 @@ function SlotTile({
   reference: boolean
   missing?: boolean
   readOnly?: boolean
+  /** Real-space tab only: this member is the one the arrow keys move. A
+   *  single click selects, which is free because zooming is a DOUBLE click. */
+  selected?: boolean
+  onSelect?: () => void
   onOpenPicker?: () => void
   onDropFiles?: (e: React.DragEvent) => void
   onDropMember?: (index: number) => void
@@ -1087,15 +1139,22 @@ function SlotTile({
       }}
       onDragLeave={readOnly ? undefined : () => setOver(false)}
       onDrop={readOnly ? undefined : accept}
-      onClick={() => { if (!member && !readOnly) onOpenPicker?.() }}
+      onClick={() => {
+        if (member && onSelect) { onSelect(); return }
+        if (!member && !readOnly) onOpenPicker?.()
+      }}
       onDoubleClick={() => onZoom?.()}
       style={{
         ...styles.slot, ...tone,
         width: size, height: size,
         ...(over ? styles.slotOver : null),
         ...(reference ? styles.slotReference : null),
-        cursor: member ? 'grab' : (readOnly ? 'default' : 'pointer'),
+        ...(selected ? styles.slotSelected : null),
+        cursor: member && onSelect ? 'pointer'
+          : member ? 'grab' : (readOnly ? 'default' : 'pointer'),
       }}
+      data-selected={selected ? 'true' : undefined}
+      aria-selected={onSelect ? Boolean(selected) : undefined}
     >
       {member?.preview
         ? <img src={member.preview} alt="" style={styles.slotImage} draggable={false} />
@@ -1268,7 +1327,8 @@ function ProblemList({ members }: { members: MapedMember[] }) {
  * offsets are still numbers, and without this the dialog presents them as
  * equally good.
  */
-function AxisConfidence({ confidence }: { confidence: MapedConfidence }) {
+function AxisConfidence({ confidence, onNudge }: {
+  confidence: MapedConfidence, onNudge?: () => void }) {
   const axes = [
     { key: 'x' as const, label: 'across' },
     { key: 'y' as const, label: 'down' },
@@ -1304,23 +1364,220 @@ function AxisConfidence({ confidence }: { confidence: MapedConfidence }) {
       })}
       {weak.length > 0 && (
         <span data-testid="maped-real-unconstrained" style={styles.confidenceWarning}>
-          {`— the specimen does not fix ${weak.map((a) => a.label).join(' or ')}; `
-           + 'that offset is not measured, so check it'}
+          {`— the specimen does not fix ${weak.map((a) => a.label).join(' or ')}: `
+           + 'that offset is a guess. '}
+          {onNudge && (
+            <button data-testid="maped-nudge-hint" style={styles.confidenceLink}
+              onClick={onNudge}>
+              Set it by eye ↓
+            </button>
+          )}
         </span>
       )}
     </div>
   )
 }
 
-function AlignmentEvidence({ evidence, confidence }: {
-  evidence: MapedEvidence, confidence: MapedConfidence | null }) {
+const NUDGE_AXES = [
+  { key: 'x' as const, label: 'across' },
+  { key: 'y' as const, label: 'down' },
+]
+
+/** How far one press moves a member, and how far with Shift held. */
+const NUDGE_STEP = 1
+const NUDGE_BIG_STEP = 5
+
+/**
+ * Move one member by hand, with the arrow keys.
+ *
+ * Here because the solve reports an offset per axis whether or not the
+ * specimen determined one, and where it did not the number came from noise.
+ * Nobody can register a feature that is not there — but someone looking at
+ * the two pictures below this can place it, and this is how they say so.
+ *
+ * The keys are handled on THIS element, never on the window: the tab also has
+ * number fields and a dropdown, and taking arrows away from those to serve a
+ * pad that may not even be in view would be a poor trade.
+ */
+function NudgePad({ members, reference, selected, offsets, solverOffsets,
+                   weak, padRef, onSelect, onSet }: {
+  members: MapedMember[]
+  reference: number | null
+  selected: number | null
+  offsets: number[][] | null
+  solverOffsets: number[][] | null
+  weak: string[]
+  padRef: React.MutableRefObject<HTMLDivElement | null>
+  onSelect: (index: number) => void
+  onSet: (index: number, offset: number[] | null) => void
+}) {
+  const [live, setLive] = useState(false)
+  const movable = members.filter((m) => m.index !== reference && !m.error)
+  const index = selected != null && movable.some((m) => m.index === selected)
+    ? selected
+    : (movable[0]?.index ?? null)
+  const member = members.find((m) => m.index === index) ?? null
+  // The tableau labels a member without its extension; two names for one
+  // thing in one panel reads like two things.
+  const label = (member?.name ?? '').replace(/\.[^.]+$/, '')
+  const current = index != null ? offsets?.[index] ?? null : null
+  const solver = index != null ? solverOffsets?.[index] ?? null : null
+  const edited = current != null && solver != null
+    && (current[0] !== solver[0] || current[1] !== solver[1])
+
+  // Where the last press asked the member to be. Two presses inside one
+  // round trip would otherwise both add to the same snapshot and the second
+  // would overwrite the first, so a held key would move at snapshot rate and
+  // quick taps would vanish.
+  const pending = useRef<number[] | null>(null)
+  useEffect(() => {
+    const sent = pending.current
+    if (sent && current && sent[0] === current[0] && sent[1] === current[1]) {
+      pending.current = null
+    }
+  }, [current?.[0], current?.[1]])
+  useEffect(() => { pending.current = null }, [index])
+
+  const move = (dy: number, dx: number): void => {
+    const base = pending.current ?? current
+    if (index == null || base == null) return
+    // ABSOLUTE, not a step: a held key can drop every message but the last
+    // and still land in the right place.
+    const next = [base[0] + dy, base[1] + dx]
+    pending.current = next
+    onSet(index, next)
+  }
+
+  const onKeyDown = (e: React.KeyboardEvent): void => {
+    // The member dropdown is inside the pad, so its own keydown bubbles here.
+    // Swallowing that would nudge instead of changing the member AND make the
+    // dropdown unreachable by keyboard.
+    if ((e.target as HTMLElement)?.tagName === 'SELECT') return
+    const step = e.shiftKey ? NUDGE_BIG_STEP : NUDGE_STEP
+    const moves: Record<string, [number, number]> = {
+      ArrowUp: [-step, 0], ArrowDown: [step, 0],
+      ArrowLeft: [0, -step], ArrowRight: [0, step],
+    }
+    const delta = moves[e.key]
+    if (!delta) return          // Escape still closes the zoom, Tab still tabs
+    e.preventDefault()
+    e.stopPropagation()
+    move(delta[0], delta[1])
+  }
+
+  if (index == null) return null
+  return (
+    <div
+      data-testid="maped-nudge" ref={padRef} tabIndex={0}
+      onKeyDown={onKeyDown}
+      onFocus={() => setLive(true)} onBlur={() => setLive(false)}
+      style={{ ...styles.nudgePad, ...(live ? styles.nudgePadLive : null) }}
+    >
+      <div style={styles.nudgeRow}>
+        {movable.length > 1 && (
+          <select
+            data-testid="maped-nudge-member" value={String(index)}
+            onChange={(e) => onSelect(Number(e.target.value))}
+            style={styles.nudgeSelect}
+          >
+            {movable.map((m) => (
+              <option key={m.index} value={String(m.index)}>
+                {m.name.replace(/\.[^.]+$/, '')}
+              </option>
+            ))}
+          </select>
+        )}
+        {movable.length <= 1 && (
+          <span data-testid="maped-nudge-member" style={{ color: '#cdd6f4' }}>
+            {label}
+          </span>
+        )}
+        <span data-testid="maped-nudge-offset"
+          style={{ color: edited ? '#f9e2af' : '#cdd6f4' }}>
+          {current ? `(${current[0]}, ${current[1]}) px` : '—'}
+        </span>
+        {edited && solver && (
+          <span data-testid="maped-nudge-solver" style={{ color: '#6c7086' }}>
+            {`solver (${solver[0]}, ${solver[1]})`}
+          </span>
+        )}
+        {([['maped-nudge-up', '↑', -1, 0],
+           ['maped-nudge-down', '↓', 1, 0],
+           ['maped-nudge-left', '←', 0, -1],
+           ['maped-nudge-right', '→', 0, 1]] as const).map(
+          ([testid, glyph, dy, dx]) => (
+            <button key={testid} data-testid={testid} style={styles.nudgeKey}
+              onClick={() => { move(dy, dx); padRef.current?.focus() }}>
+              {glyph}
+            </button>
+          ))}
+        <button
+          data-testid="maped-nudge-reset"
+          style={{ ...styles.nudgeReset, ...(edited ? null : styles.nudgeSpent) }}
+          disabled={!edited}
+          onClick={() => {
+            pending.current = null
+            onSet(index, null)
+            padRef.current?.focus()
+          }}
+        >
+          Reset
+        </button>
+      </div>
+      <div data-testid="maped-nudge-help"
+        style={{ ...styles.nudgeHelp, color: live ? '#cdd6f4' : '#6c7086' }}>
+        {live ? '' : 'click here, then '}
+        {`arrow keys move ${label || 'it'} · Shift for ${NUDGE_BIG_STEP} px`}
+        {weak.length > 0 && ` · ${weak.join(' and ')} `
+          + `${weak.length > 1 ? 'were' : 'was'} not measured`}
+      </div>
+    </div>
+  )
+}
+
+function AlignmentEvidence({ evidence, confidence, solve, members, reference,
+                            selected, padRef, boxRef, onSelect, onSet }: {
+  evidence: MapedEvidence
+  confidence: MapedConfidence | null
+  solve: MapedSolve
+  members: MapedMember[]
+  reference: number | null
+  selected: number | null
+  padRef: React.MutableRefObject<HTMLDivElement | null>
+  boxRef: React.MutableRefObject<HTMLDivElement | null>
+  onSelect: (index: number) => void
+  onSet: (index: number, offset: number[] | null) => void
+}) {
+  const weakAxes = NUDGE_AXES
+    .filter((axis) => confidence && !confidence.determined[axis.key]
+                      && confidence.votes > 0)
+    .map((axis) => axis.label)
   const gain = evidence.gain
+  // Has anyone been moved by hand? Then the solver's verdict is a judgement
+  // of somebody else's decision, and stating it as if it were about their
+  // move is the misleading case.
+  const edited = solve.offsets != null && solve.solver_offsets != null
+    && solve.offsets.some((row, index) => {
+      const answer = solve.solver_offsets?.[index]
+      return !answer || row[0] !== answer[0] || row[1] !== answer[1]
+    })
+  const solverGain = evidence.solver_gain
   const verdict = gain == null ? null
+    : edited && solverGain != null
+      ? {
+          text: `solver x${solverGain.toFixed(2)}`,
+          tone: gain > solverGain * 1.02 ? '#a6e3a1'
+            : gain < solverGain * 0.98 ? '#f38ba8' : '#f9e2af',
+        }
+    : edited ? { text: 'moved by hand', tone: '#f9e2af' }
     : gain >= 1.15 ? { text: 'the members stack', tone: '#a6e3a1' }
     : gain >= 1.05 ? { text: 'a little sharper', tone: '#f9e2af' }
     : { text: 'aligning barely changed the sum — check it', tone: '#f38ba8' }
   return (
-    <div data-testid="maped-real-evidence" style={styles.evidenceBox}>
+    <div data-testid="maped-real-evidence" style={styles.evidenceBox}
+      ref={boxRef}>
+      <div style={styles.evidenceColumns}>
+      <div style={styles.evidenceText}>
       {/* The number first: the panel sits at the bottom of a scrolling tab, so
           anything below the pictures is the part a user does not see. */}
       {gain != null && (
@@ -1335,7 +1592,21 @@ function AlignmentEvidence({ evidence, confidence }: {
           )}
         </div>
       )}
-      {confidence && <AxisConfidence confidence={confidence} />}
+      {confidence && (
+        <AxisConfidence confidence={confidence}
+          onNudge={() => onSelect(
+            members.find((m) => m.index !== reference && !m.error)?.index ?? 0)}
+        />
+      )}
+      <NudgePad
+        members={members} reference={reference} selected={selected}
+        offsets={solve.offsets} solverOffsets={solve.solver_offsets}
+        weak={weakAxes} padRef={padRef} onSelect={onSelect} onSet={onSet}
+      />
+      </div>
+      {/* Beside the controls, not under them: the tab body scrolls, and a
+          picture below the fold cannot show the user what their key press
+          just did — which is the only reason the pad exists. */}
       <div style={styles.evidenceRow}>
         {([['Unaligned', evidence.unaligned],
            ['Aligned', evidence.aligned]] as const).map(([label, src]) => (
@@ -1347,6 +1618,7 @@ function AlignmentEvidence({ evidence, confidence }: {
             <figcaption style={styles.evidenceCaption}>{label}</figcaption>
           </figure>
         ))}
+      </div>
       </div>
     </div>
   )
@@ -1895,6 +2167,10 @@ const styles: Record<string, React.CSSProperties> = {
     borderColor: ACCENT, borderStyle: 'solid',
     boxShadow: `0 0 0 3px rgba(137,180,250,0.28)`,
   },
+  slotSelected: {
+    borderColor: '#89b4fa', borderWidth: 2,
+    boxShadow: '0 0 0 2px rgba(137, 180, 250, 0.35)',
+  },
   slotReference: { boxShadow: `0 0 0 2px ${WARN}` },
   slotImage: {
     width: '100%', height: '100%', objectFit: 'cover',
@@ -2040,6 +2316,41 @@ const styles: Record<string, React.CSSProperties> = {
     fontSize: 11.5,
   },
   confidenceWarning: { color: '#f9e2af', flexBasis: '100%', fontSize: 11 },
+  confidenceLink: {
+    background: 'none', border: 'none', padding: 0, font: 'inherit',
+    color: '#89b4fa', textDecoration: 'underline', cursor: 'pointer',
+  },
+  nudgePad: {
+    display: 'flex', flexDirection: 'column', gap: 4,
+    border: '1px solid #313244', borderRadius: 6, padding: '5px 7px',
+    outline: '1px solid transparent',
+  },
+  nudgePadLive: { outline: '1px solid #89b4fa', borderColor: '#45475a' },
+  nudgeRow: {
+    display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap',
+    fontSize: 11.5,
+  },
+  nudgeSelect: {
+    background: '#11111b', color: '#cdd6f4', border: '1px solid #45475a',
+    borderRadius: 4, fontSize: 11.5, padding: '1px 4px',
+  },
+  nudgeKey: {
+    background: '#313244', color: '#cdd6f4', border: '1px solid #45475a',
+    borderRadius: 4, cursor: 'pointer', fontSize: 12,
+    width: 22, height: 20, lineHeight: '16px', padding: 0,
+  },
+  nudgeReset: {
+    background: 'none', color: '#a6adc8', border: '1px solid #45475a',
+    borderRadius: 4, cursor: 'pointer', fontSize: 11, padding: '1px 6px',
+  },
+  nudgeHelp: { fontSize: 10.5 },
+  nudgeSpent: { opacity: 0.4, cursor: 'default' },
+  runRow: { display: 'flex', gap: 14, alignItems: 'flex-end' },
+  evidenceColumns: { display: 'flex', gap: 10, alignItems: 'flex-start' },
+  evidenceText: {
+    display: 'flex', flexDirection: 'column', gap: 6,
+    flex: '1 1 380px', minWidth: 0,
+  },
   evidenceRow: { display: 'flex', alignItems: 'flex-start', gap: 10 },
   evidenceFigure: { margin: 0, display: 'flex', flexDirection: 'column', gap: 4 },
   evidenceImage: {

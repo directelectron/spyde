@@ -269,6 +269,11 @@ class LoaderStage:
 
     offsets: np.ndarray | None = None
     residuals: np.ndarray | None = None
+    #: What the SOLVER answered, kept even after a member is moved by hand, so
+    #: there is something to put back. Dies with the stage on every
+    #: invalidation the stage already has, which is why it lives here rather
+    #: than beside it.
+    solver_offsets: np.ndarray | None = None
 
     @property
     def solved(self) -> bool:
@@ -302,6 +307,9 @@ class LoaderStage:
                         else [[int(dy), int(dx)] for dy, dx in self.offsets]),
             "residuals": self.per_member_residuals,
             "max_residual": self.max_residual,
+            "solver_offsets": (
+                None if self.solver_offsets is None
+                else [[int(dy), int(dx)] for dy, dx in self.solver_offsets]),
         }
 
 
@@ -1485,12 +1493,20 @@ def _show_aligned_sum(session, state: MultiAngleLoaderState) -> None:
     # stop. A solve that MOVED a member re-encodes, because it must.
     gain = float(evidence.get("gain", float("nan")))
     offsets = np.asarray(model.nav_offsets).tolist()
+    solver = (None if state.real.solver_offsets is None
+              else np.asarray(state.real.solver_offsets).tolist())
     current = state.real_evidence
     if current is None or current.get("offsets") != offsets:
+        clean = None if not np.isfinite(gain) else gain
+        # Carried forward once a member has been moved by hand, so the panel
+        # can say "x0.96, solver x1.08" instead of applying the SOLVER's
+        # verdict to somebody else's decision.
         state.real_evidence = {
             "unaligned": _thumbnail(evidence["unaligned"]),
             "aligned": _thumbnail(evidence["aligned"]),
-            "gain": None if not np.isfinite(gain) else gain,
+            "gain": clean,
+            "solver_gain": (clean if solver is not None and offsets == solver
+                            else (current or {}).get("solver_gain")),
             "offsets": offsets,
         }
         _emit_state(state)
@@ -1675,8 +1691,10 @@ def _start_stage(session, state, *, attribute: str, generation_key: str,
         if not is_current(state, generation_key, generation):
             return
         offsets, residuals = result
-        stage = LoaderStage(offsets=np.asarray(offsets, dtype=np.int64),
-                            residuals=np.asarray(residuals, dtype=np.float32))
+        solved = np.asarray(offsets, dtype=np.int64)
+        stage = LoaderStage(offsets=solved,
+                            residuals=np.asarray(residuals, dtype=np.float32),
+                            solver_offsets=solved.copy())
         setattr(state, attribute, stage)
         # A stage that reduced the members has given the tableau its first
         # pictures; one that did not finds every preview already current.
@@ -2363,6 +2381,82 @@ def maped_align_real(session, plot, payload) -> None:
                          f"space ({named})…",
                  work=_work,
                  on_solved=lambda: _show_aligned_sum(session, state))
+
+
+def maped_set_real_offset(session, plot, payload) -> None:
+    """Move one member by hand, or put it back where the solver had it.
+
+    ``payload`` is ``{"index": int, "offset": [dy, dx] | None}`` in scan
+    positions. The offset is ABSOLUTE rather than a step, so a held arrow key
+    can drop every message but the last and still land in the right place —
+    with steps, the total would depend on how many survived.
+    ``None`` restores the solver's answer for that member.
+
+    This exists because a solve reports an offset per axis whether or not the
+    specimen determined one. Where the patches disagree (see
+    :func:`spyde.multiangle.align.vote_real_space`) the number came from
+    noise, and on a specimen uniform along one axis no method will do better —
+    but a person looking at the picture can, and this is how they say so.
+
+    It is NOT a solve: nothing is registered again, the loader is never marked
+    busy, and it stays on the event loop. Re-summing the members and encoding
+    two thumbnails is milliseconds; moving that to a worker would grey the
+    dialog out for the length of a key repeat.
+    """
+    state = _loader_state(session)
+    if state is None:
+        return
+    if not state.real.solved or state.real.offsets is None:
+        emit_error("align real space before moving a member by hand")
+        _emit_state(state)
+        return
+    try:
+        index = int((payload or {}).get("index"))
+    except (TypeError, ValueError):
+        emit_error("which member should move?")
+        _emit_state(state)
+        return
+    if not 0 <= index < len(state.real.offsets):
+        emit_error(f"no member {index} to move")
+        _emit_state(state)
+        return
+    if index == state.reference:
+        emit_error("the reference member defines the frame, so it cannot move")
+        _emit_state(state)
+        return
+
+    trial = np.asarray(state.real.offsets, dtype=np.int64).copy()
+    wanted = (payload or {}).get("offset")
+    if wanted is None:
+        if state.real.solver_offsets is None:
+            emit_error("there is no solver answer to go back to")
+            _emit_state(state)
+            return
+        trial[index] = np.asarray(state.real.solver_offsets, dtype=np.int64)[index]
+    else:
+        try:
+            trial[index] = [int(wanted[0]), int(wanted[1])]
+        except (TypeError, ValueError, IndexError):
+            emit_error(f"{wanted!r} is not a (dy, dx) offset")
+            _emit_state(state)
+            return
+
+    # The only bound on a hand-set offset is that the members still overlap.
+    # `max_shift` guards the SOLVER against a wild correlation peak; someone
+    # overriding it on purpose is not who it is there to stop.
+    images = [_member_image(state, member) for member in state.members]
+    if images and not any(image is None for image in images):
+        model = state.build_model(
+            nav_offsets=trial,
+            dp_offsets=np.zeros((len(images), 2), dtype=np.int64))
+        if _alignment_evidence(images, model) is None:
+            emit_error("that leaves the members no common region — move back")
+            _emit_state(state)
+            return
+
+    state.real.offsets = trial
+    _show_aligned_sum(session, state)
+    _emit_state(state)
 
 
 def maped_align_reciprocal(session, plot, payload) -> None:

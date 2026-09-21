@@ -167,8 +167,9 @@ test('the panel says which axis the specimen determined', async () => {
           scan_shape: [180, 180], virtual_image: null,
           available_virtual_images: [], beam_roi: null,
           real: {
-            solved: true, offsets: [[0, 0], [0, 24]], residuals: null,
+            solved: true, offsets: [[0, 0], [3, 24]], residuals: null,
             max_residual: 0.1, corners: {},
+            solver_offsets: [[0, 0], [3, 24]],
             evidence: { unaligned: pixel, aligned: pixel, gain: 1.49 },
             confidence: payload,
           },
@@ -215,4 +216,75 @@ test('the panel says which axis the specimen determined', async () => {
   expect(none).toContain('too few scan positions')
   expect(await dialog.getByTestId('maped-real-unconstrained').count(),
     'claimed the specimen fixes nothing when nothing was checked').toBe(0)
+})
+
+/**
+ * The nudge pad, driven against the REAL backend.
+ *
+ * An earlier version of this dispatched a snapshot and intercepted what the
+ * pad sent. That tested the pad talking to itself: `sendAction` does not go
+ * through the object the test patched, so it recorded nothing while the keys
+ * were in fact moving a member for real. Asserting on the offset the backend
+ * reports back tests the whole loop, and is the only version that can fail
+ * for a real reason.
+ */
+test('arrow keys nudge the selected member', async () => {
+  const { page } = ctx
+  const dialog = page.getByTestId('multiangle-loader')
+  await expect(dialog).toBeVisible({ timeout: 20_000 })
+  await page.keyboard.press('Escape')
+  await page.waitForTimeout(400)
+  // Re-solve rather than inherit whatever the previous test left behind: the
+  // point here is the round trip to a REAL solve, and a test that only works
+  // after its neighbours is a test that will start lying when they change.
+  await send('maped_align_real', { params: { max_shift: 16 } })
+  await page.waitForTimeout(2000)
+  await dialog.getByTestId('maped-tab-real').click()
+  await expect(dialog.getByTestId('maped-nudge'))
+    .toBeVisible({ timeout: 300_000 })
+
+  const readOffset = async (): Promise<number[]> => {
+    const text = await dialog.getByTestId('maped-nudge-offset').textContent()
+    const found = /\(\s*(-?\d+),\s*(-?\d+)\)/.exec(text ?? '')
+    expect(found, `no offset in ${text}`).not.toBeNull()
+    return [Number(found![1]), Number(found![2])]
+  }
+
+  // Selecting in the tableau is what arms the keys, and it is a SINGLE click
+  // because double-click already zooms.
+  // The reference member defines the frame and cannot move, so it is not
+  // selectable; find one that is rather than assuming an index.
+  const selectable = dialog.locator('[aria-selected]')
+  const count = await selectable.count()
+  expect(count, 'no member tile offers itself for selection').toBeGreaterThan(0)
+  const tile = selectable.first()
+  await tile.click()
+  await expect(tile).toHaveAttribute('data-selected', 'true', { timeout: 5_000 })
+  await dialog.screenshot({ path: join(SHOTS, '06-nudge-focused.png') })
+
+  const start = await readOffset()
+  await page.keyboard.press('ArrowDown')
+  await expect.poll(readOffset, { timeout: 15_000 })
+    .toEqual([start[0] + 1, start[1]])
+  await page.keyboard.press('ArrowRight')
+  await expect.poll(readOffset, { timeout: 15_000 })
+    .toEqual([start[0] + 1, start[1] + 1])
+  await page.keyboard.press('Shift+ArrowUp')
+  await expect.poll(readOffset, { timeout: 15_000 })
+    .toEqual([start[0] - 4, start[1] + 1])
+  await dialog.screenshot({ path: join(SHOTS, '07-nudge-moved.png') })
+
+  // Moved by hand, so there is now a solver answer to show and to go back to.
+  await expect(dialog.getByTestId('maped-nudge-solver')).toBeVisible()
+  await expect(dialog.getByTestId('maped-nudge-reset')).toBeEnabled()
+  await dialog.getByTestId('maped-nudge-reset').click()
+  await expect.poll(readOffset, { timeout: 15_000 }).toEqual(start)
+  await expect(dialog.getByTestId('maped-nudge-reset')).toBeDisabled()
+
+  // The buttons do the same thing, for a mouse.
+  await dialog.getByTestId('maped-nudge-left').click()
+  await expect.poll(readOffset, { timeout: 15_000 })
+    .toEqual([start[0], start[1] - 1])
+  await dialog.getByTestId('maped-nudge-reset').click()
+  await expect.poll(readOffset, { timeout: 15_000 }).toEqual(start)
 })

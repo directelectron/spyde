@@ -74,7 +74,8 @@ from spyde.backend import _session_multiangle_loader as loader
 from spyde.backend._session_multiangle_loader import (
     maped_add_files, maped_align_real, maped_align_reciprocal,
     maped_close_loader, maped_commit, maped_open_loader, maped_remove_member,
-    maped_set_corner_extent, maped_set_member, maped_set_reference,
+    maped_set_corner_extent, maped_set_member, maped_set_real_offset,
+    maped_set_reference,
     maped_set_scan_shape, maped_set_virtual_image,
 )
 from spyde.backend._session_testharness import _write_minimal_mrc
@@ -1926,3 +1927,97 @@ class TestSettingTheBeamRegion:
             session, None, {"beam_roi": {"cy": 1.0, "cx": 2.0, "half": 3.0}})
         message = loader.state_message(state)
         assert message["beam_roi"] == {"cy": 1.0, "cx": 2.0, "half": 3.0}
+
+
+class TestMovingAMemberByHand:
+    """`maped_set_real_offset` overrides one member's offset.
+
+    It exists because the solve reports an offset per axis whether or not the
+    specimen determined one — see `vote_real_space`. Where it did not, the
+    number came from noise and a person looking at the picture can do better.
+    """
+
+    def _solved(self, window, acquisition):
+        _with_angles(window["window"], acquisition)
+        maped_align_real(window["window"], None, {"params": {}})
+        assert _wait(lambda: _last_state(window["messages"])["real"]["solved"])
+        return _last_state(window["messages"])["real"]
+
+    def test_the_solver_answer_is_kept_to_go_back_to(self, window, acquisition):
+        real = self._solved(window, acquisition)
+        assert real["solver_offsets"] == real["offsets"]
+
+    def test_a_member_moves_and_the_solver_answer_does_not(
+            self, window, acquisition):
+        real = self._solved(window, acquisition)
+        solver = [list(row) for row in real["offsets"]]
+        wanted = [solver[1][0] + 3, solver[1][1] - 2]
+
+        maped_set_real_offset(window["window"], None,
+                              {"index": 1, "offset": wanted})
+        moved = _last_state(window["messages"])["real"]
+        assert moved["offsets"][1] == wanted
+        assert moved["offsets"][0] == solver[0], "an untouched member moved"
+        assert moved["solver_offsets"] == solver, \
+            "moving by hand overwrote what it has to be able to restore"
+
+    def test_none_puts_it_back(self, window, acquisition):
+        real = self._solved(window, acquisition)
+        solver = [list(row) for row in real["offsets"]]
+        maped_set_real_offset(window["window"], None,
+                              {"index": 1, "offset": [solver[1][0] + 4,
+                                                      solver[1][1] + 4]})
+        maped_set_real_offset(window["window"], None,
+                              {"index": 1, "offset": None})
+        assert _last_state(window["messages"])["real"]["offsets"] == solver
+
+    def test_the_offset_is_absolute_not_a_step(self, window, acquisition):
+        """Sending the same thing twice must land in the same place.
+
+        A held arrow key produces a burst, and the renderer is free to drop
+        all but the last. That is only safe because the payload says where to
+        BE rather than how far to move.
+        """
+        real = self._solved(window, acquisition)
+        wanted = [real["offsets"][1][0] + 2, real["offsets"][1][1] + 2]
+        for _ in range(3):
+            maped_set_real_offset(window["window"], None,
+                                  {"index": 1, "offset": wanted})
+        assert _last_state(window["messages"])["real"]["offsets"][1] == wanted
+
+    def test_the_reference_cannot_move(self, window, acquisition):
+        real = self._solved(window, acquisition)
+        before = [list(row) for row in real["offsets"]]
+        reference = _last_state(window["messages"])["reference"]
+        before_count = len(window["messages"])
+
+        maped_set_real_offset(window["window"], None,
+                              {"index": reference, "offset": [5, 5]})
+        errors = [m for m in window["messages"][before_count:]
+                  if isinstance(m, dict) and m.get("type") == "error"]
+        assert errors and "reference" in str(errors[0].get("text"))
+        assert _last_state(window["messages"])["real"]["offsets"] == before
+
+    def test_it_refuses_to_pull_the_members_apart(self, window, acquisition):
+        """The one hard bound on a hand-set offset is that the members still
+        overlap — `max_shift` guards the SOLVER against a wild correlation
+        peak, and someone overriding it on purpose is not who that is for."""
+        real = self._solved(window, acquisition)
+        before = [list(row) for row in real["offsets"]]
+        before_count = len(window["messages"])
+
+        maped_set_real_offset(window["window"], None,
+                              {"index": 1, "offset": [10_000, 10_000]})
+        errors = [m for m in window["messages"][before_count:]
+                  if isinstance(m, dict) and m.get("type") == "error"]
+        assert errors and "common region" in str(errors[0].get("text"))
+        assert _last_state(window["messages"])["real"]["offsets"] == before
+
+    def test_it_will_not_move_anything_before_a_solve(self, window, acquisition):
+        _with_angles(window["window"], acquisition)
+        before = len(window["messages"])
+        maped_set_real_offset(window["window"], None,
+                              {"index": 1, "offset": [1, 1]})
+        errors = [m for m in window["messages"][before:]
+                  if isinstance(m, dict) and m.get("type") == "error"]
+        assert errors and "align real space" in str(errors[0].get("text"))
