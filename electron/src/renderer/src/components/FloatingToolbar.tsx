@@ -132,6 +132,10 @@ export function FloatingToolbar({
   /** The measured caret width, mirrored into state so the side-placement clamp
    *  re-runs when a caret changes width without changing placement. */
   const [caretW, setCaretW] = React.useState(240)
+  // The bar's own width, for the same clamp: a window dragged partly off the
+  // left or right edge kept its bar centred under it, so the first buttons
+  // walked off the app and their actions could not be reached at all.
+  const [barW, setBarW] = React.useState(0)
   const live = state.activeActions.get(windowId) ?? EMPTY
 
   // Keep the toolbar shown while a popout/caret is open or an action is live —
@@ -187,7 +191,7 @@ export function FloatingToolbar({
     // steer a new window's first-fit search away, and erring large is safe.
     reportCaretRect(
       next === 'below'
-        ? { x: Math.round(wr.x + wr.w / 2 - cw / 2), y: Math.round(belowTop),
+        ? { x: Math.round(wr.x + wr.w / 2 - cw / 2 + barShift), y: Math.round(belowTop),
             w: Math.round(cw), h: Math.round(ch) }
         : next === 'right'
           ? { x: Math.round(wr.x + wr.w + CARET_GAP), y: Math.round(wr.y),
@@ -200,6 +204,8 @@ export function FloatingToolbar({
     // clamp would keep using the previous caret's width — which for a caret
     // that widens on a disclosure is exactly the case that needs it.
     setCaretW(w => (w === cw ? w : cw))
+    const bw = rootRef.current?.offsetWidth ?? 0
+    setBarW(w => (Math.abs(w - bw) < 1 ? w : bw))
   }
   React.useLayoutEffect(() => { place.current() })
 
@@ -303,6 +309,17 @@ export function FloatingToolbar({
     ? wr.x + wr.w + CARET_GAP
     : wr.x - CARET_GAP - caretW
   const clampedLeft = Math.max(0, Math.min(sideLeft, area.w - caretW))
+  // The bar is centred under the window unless that puts part of it off the
+  // area; then it is pushed just far enough to stay whole. Expressed, like
+  // the side carets, as a walk from the window's midline.
+  const barCentred = wr.x + wr.w / 2 - barW / 2
+  const barLeft = winRect && barW > 0
+    ? Math.max(0, Math.min(barCentred, area.w - barW))
+    : barCentred
+  const barShift = barLeft - barCentred
+  const barPos: React.CSSProperties = barShift === 0
+    ? { left: '50%', transform: 'translateX(-50%)' }
+    : { left: '50%', transform: 'none', marginLeft: barLeft - (wr.x + wr.w / 2) }
   const caretPos: React.CSSProperties =
     placement === 'below'
       ? { position: 'absolute', top: '100%', left: '50%', transform: 'translateX(-50%)', marginTop: CARET_GAP }
@@ -321,6 +338,7 @@ export function FloatingToolbar({
       onMouseLeave={onHoverHide}
       style={{
         ...styles.bar,
+        ...barPos,
         ...(inside ? { bottom: BAR_GAP } : { top: '100%', marginTop: BAR_GAP }),
         opacity: shownVisible ? 1 : 0,
         pointerEvents: shownVisible ? 'auto' : 'none',
