@@ -2021,3 +2021,56 @@ class TestMovingAMemberByHand:
         errors = [m for m in window["messages"][before:]
                   if isinstance(m, dict) and m.get("type") == "error"]
         assert errors and "align real space" in str(errors[0].get("text"))
+
+
+class TestSizingAMemberIsFree:
+    """A member's size must never be measured by walking its store.
+
+    A frame-chunked .zspy is one file per frame, so measuring one means a
+    `stat` per frame: 36 s each on a 256 x 256 scan, 145 s for four members —
+    to put one number on four rows that already say the shape and the dtype.
+    """
+
+    def _member(self, tmp_path, shape=(4, 5, 6, 7), dtype="uint16"):
+        import hyperspy.api as hs
+        member = loader.LoaderMember(path=str(tmp_path / "member.zspy"),
+                                     name="member.zspy")
+        member.signal = hs.signals.Signal2D(
+            np.zeros(shape, dtype=np.dtype(dtype)))
+        return member
+
+    def test_the_size_comes_from_the_shape_and_dtype(self, tmp_path):
+        member = self._member(tmp_path)
+        assert loader._member_size_bytes(member) == 4 * 5 * 6 * 7 * 2
+
+    def test_it_does_not_walk_the_store(self, tmp_path, monkeypatch):
+        """The guard: sizing a probed member must not touch the filesystem."""
+        member = self._member(tmp_path)
+
+        def refuse(path):
+            raise AssertionError(f"walked {path} to size a probed member")
+
+        monkeypatch.setattr(loader, "_dataset_size_bytes", refuse)
+        monkeypatch.setattr(loader.os, "walk", refuse)
+        assert loader._member_size_bytes(member) > 0
+
+    def test_a_directory_that_would_not_probe_is_not_walked_either(
+            self, tmp_path, monkeypatch):
+        """Nothing probed means no shape to go on — and still no walk, because
+        the walk is the cost this exists to avoid."""
+        store = tmp_path / "unreadable.zspy"
+        store.mkdir()
+        member = loader.LoaderMember(path=str(store), name="unreadable.zspy")
+
+        def refuse(path):
+            raise AssertionError(f"walked {path}")
+
+        monkeypatch.setattr(loader.os, "walk", refuse)
+        assert loader._member_size_bytes(member) == 0
+
+    def test_a_plain_file_is_still_measured(self, tmp_path):
+        """One `stat` is not the problem, and it is the true size on disk."""
+        path = tmp_path / "member.mrc"
+        path.write_bytes(b"\0" * 2048)
+        member = loader.LoaderMember(path=str(path), name="member.mrc")
+        assert loader._member_size_bytes(member) == 2048
