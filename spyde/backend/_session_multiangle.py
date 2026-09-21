@@ -415,6 +415,17 @@ def compose_multiangle_tree(session, members, model, images):
         for shell_id, member_indices in model.shells.items()
     ]
     navigator = _stack_navigator(images, model)
+    # Kept in the file, so reopening it does not reduce the whole acquisition
+    # to draw a thumbnail: on a 97 GB stack that first open read all of it.
+    stack.metadata.set_item(
+        f"{MULTIANGLE_METADATA}.navigator_planes",
+        np.asarray(navigator.data, dtype=np.float32))
+
+    from spyde.multiangle.compose import composed_nav_chunks
+    if composed_nav_chunks(aligned) is None:
+        log.warning("the members of this multi-angle composition did not "
+                    "land on one navigation chunk grid; the composed graph "
+                    "carries sliver chunks and a save of it will rechunk.")
 
     ipc.emit({"type": "loading", "busy": False, "text": ""})
     # The navigator depends on every member rather than on one path, so the
@@ -523,35 +534,96 @@ def rebuild_multiangle_tree(session, signal, source_path=None):
     # `get_item`, not `get`: the metadata is a DictionaryTreeBrowser and has
     # no mapping interface, so `.get` raises and the caller's except turns a
     # whole acquisition back into a bare array.
+    from spyde.multiangle.model import model_from_metadata
+    from spyde.multiangle.signals import shell_titles
+    from spyde.signals.multiangle import MULTIANGLE_SIGNAL_TYPE
+
     recorded = signal.metadata
     members = int(recorded.get_item(f"{MULTIANGLE_METADATA}.n_members"))
     shell_ids = [int(value) for value in recorded.get_item(
         f"{MULTIANGLE_METADATA}.shell_ids", [0] * members)]
-    tilts = [float(value) for value in recorded.get_item(
-        f"{MULTIANGLE_METADATA}.tilts", [0.0] * members)]
+
+    # A file written before the type existed is brought up to date here, so
+    # a save from this tree writes the current format and the sums know what
+    # type the members were.
+    current_type = recorded.get_item("Signal.signal_type", "") or ""
+    if current_type != MULTIANGLE_SIGNAL_TYPE:
+        if not recorded.has_item(f"{MULTIANGLE_METADATA}.member_signal_type"):
+            recorded.set_item(f"{MULTIANGLE_METADATA}.member_signal_type",
+                              current_type or "electron_diffraction")
+        signal.set_signal_type(MULTIANGLE_SIGNAL_TYPE)
 
     summed = _sum_over_angles(signal, range(members), "Summed")
     # One shell IS the summed node; a child duplicating its parent is a node
-    # the user cannot tell apart. Same rule the composition follows.
+    # the user cannot tell apart. Same rule the composition follows, with the
+    # same names.
     by_shell: dict[int, list[int]] = {}
     for index, shell in enumerate(shell_ids):
         by_shell.setdefault(shell, []).append(index)
+    model = model_from_metadata(signal)
+    titles = shell_titles(model) if model is not None else {}
     shells = [] if len(by_shell) < 2 else [
-        (f"{tilts[indices[0]]:g}°", _sum_over_angles(
-            signal, indices, f"{tilts[indices[0]]:g}°"))
+        (titles.get(shell, f"Summed {shell}"),
+         _sum_over_angles(signal, indices, titles.get(shell, f"Summed {shell}")))
         for shell, indices in sorted(by_shell.items())
     ]
 
-    tree = session._add_signal(signal, source_path=source_path)
-    tree.root_node.name = "Aligned Stack"
-    _attach_node(tree, signal, summed, "Summed")
-    for title, shell_signal in shells:
-        _attach_node(tree, summed, shell_signal, title)
-    session._dispatch_to_main(lambda: _display(tree, summed))
-    session._dispatch_to_main(lambda: _open_angle_ring(tree))
-    emit_status(f"Multi-angle acquisition: {members} angles, "
-                f"{len(by_shell)} shell{'s' if len(by_shell) != 1 else ''}")
+    tree = session._add_signal(
+        signal, source_path=source_path,
+        navigator_override=_recorded_navigator(signal))
+    # From here the tree exists and is the user's: a failure below leaves it
+    # incomplete rather than handing the caller None, which it reads as "not
+    # a multi-angle file" and answers by opening the dataset a second time.
+    try:
+        tree.root_node.name = "Aligned Stack"
+        _attach_node(tree, signal, summed, "Summed")
+        for title, shell_signal in shells:
+            _attach_node(tree, summed, shell_signal, title)
+        session._dispatch_to_main(lambda: _display(tree, summed))
+        session._dispatch_to_main(lambda: _open_angle_ring(tree))
+        emit_status(f"Multi-angle acquisition: {members} angles, "
+                    f"{len(by_shell)} shell{'s' if len(by_shell) != 1 else ''}")
+    except Exception as e:
+        log.warning("the multi-angle tree was only partly rebuilt: %s", e,
+                    exc_info=True)
+        emit_error(f"The multi-angle acquisition opened, but not all of its "
+                   f"tree could be rebuilt: {e}")
     return tree
+
+
+def _recorded_navigator(stack):
+    """The navigator planes the composition kept in the file, as a signal the
+    tree accepts, or None when there are none or they no longer fit.
+
+    A stack rebinned since is matched through ``binned_by`` with a mean over
+    the same blocks; a cropped one cannot be matched and is reduced afresh.
+    """
+    import hyperspy.api as hs
+
+    recorded = stack.metadata
+    key = f"{MULTIANGLE_METADATA}.navigator_planes"
+    if not recorded.has_item(key):
+        return None
+    try:
+        planes = np.asarray(recorded.get_item(key), dtype=np.float32)
+        wanted = tuple(int(size) for size in stack.data.shape[:3])
+        if planes.ndim != 3 or planes.shape[0] != wanted[0]:
+            return None
+        if planes.shape != wanted:
+            binned = recorded.get_item(f"{MULTIANGLE_METADATA}.binned_by", None)
+            if binned is None:
+                return None
+            binned = binned.as_dictionary() if hasattr(
+                binned, "as_dictionary") else binned
+            rows, columns = (int(value) for value in binned["scan"])
+            if planes.shape[1:] != (wanted[1] * rows, wanted[2] * columns):
+                return None
+            planes = planes.reshape(
+                wanted[0], wanted[1], rows, wanted[2], columns).mean(axis=(2, 4))
+        return hs.signals.BaseSignal(planes)
+    except Exception as e:
+        log.debug("the recorded navigator planes were not usable: %s", e)
+        return None
 
 
 def _report_multiangle(model, summed) -> None:

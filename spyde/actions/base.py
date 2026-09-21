@@ -224,9 +224,16 @@ class Rebin2DAction(TransformAction):
         # raises. Refusing here says which axis and by how much, where the
         # library's message names neither.
         factors = scan + [int(scale_x), int(scale_y)]
+        # Labels from the axes, not a list of four: on a 5-D stack a fixed
+        # list ran out one axis early, so the last detector axis was never
+        # checked and the other two were named wrongly.
+        labels = ([f"scan {_axis_label(axis, index)}"
+                   for index, axis in enumerate(manager.navigation_axes)]
+                  + [f"detector {_axis_label(axis, index)}"
+                     for index, axis in enumerate(manager.signal_axes)])
         for size, factor, label in zip(
                 list(manager.navigation_shape) + list(manager.signal_shape),
-                factors, ["scan x", "scan y", "detector x", "detector y"]):
+                factors, labels):
             if factor > 1 and int(size) % factor:
                 raise RuntimeError(
                     f"{label} is {int(size)} px, which {factor} does not "
@@ -242,6 +249,14 @@ class Rebin2DAction(TransformAction):
         if new is not None:
             _record_binning(new, source)
         return new
+
+
+def _axis_label(axis, index: int) -> str:
+    """An axis's name, or its position when hyperspy has none for it."""
+    name = str(getattr(axis, "name", "") or "")
+    if name and name != "<undefined>":
+        return name
+    return ("x", "y")[index] if index < 2 else f"axis {index}"
 
 
 def _record_binning(binned, source) -> None:

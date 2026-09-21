@@ -529,3 +529,82 @@ class TestOpening:
 
         assert ring.multiangle_model(tree) is None
         assert ring.open_multiangle_navigator(session, tree) is None
+
+
+class TestTheRingOnAReopenedAcquisition:
+    """A reopened tree has no recipes. The ring asked only the recipe whether
+    one angle was on screen, so on every reopened dataset it stayed on "all
+    angles": every member lit, no handle, a node switch on every pick."""
+
+    def _saved(self, tmp_path):
+        from spyde.signals.multiangle import MULTIANGLE_METADATA
+
+        data = np.random.default_rng(3).integers(
+            0, 400, (4, 5, 6, 4, 4), dtype=np.uint16)
+        signal = hs.signals.Signal2D(data)
+        signal.metadata.set_item(MULTIANGLE_METADATA, {
+            "n_members": 4, "n_shells": 1, "tilts": [1.0] * 4,
+            "azimuths": [0.0, 90.0, 180.0, 270.0], "shell_ids": [0] * 4,
+            "reference": 0})
+        signal.set_signal_type("electron_diffraction")
+        path = tmp_path / "acquisition.zspy"
+        signal.save(str(path))
+        return path
+
+    def test_a_pick_shows_one_angle_and_says_so(self, tmp_path):
+        import time
+
+        from spyde.tests.migrated.conftest import close_session, make_session
+
+        session = make_session()
+        try:
+            session.open_file(str(self._saved(tmp_path)))
+            deadline = time.time() + 60.0
+            while time.time() < deadline and not session.signal_trees:
+                time.sleep(0.2)
+            tree = session.signal_trees[0]
+            time.sleep(1.0)
+            controller = ring.open_multiangle_navigator(session, tree)
+            assert controller is not None
+            assert controller.showing_one_angle() is False
+            controller.select_member(2)
+            time.sleep(0.5)
+            assert controller.showing_one_angle() is True, \
+                "the stack is on screen and the ring does not know"
+            assert controller.live_members() == (2,)
+            assert len(controller.drawn_highlight()) > 0, "no handle drawn"
+            displayed = controller.displayed_signal()
+            assert displayed is tree.root_node.signal
+        finally:
+            close_session(session)
+
+    def test_a_pick_stays_on_a_binned_stack(self, tmp_path):
+        import time
+
+        from spyde.actions.base import Rebin2DAction
+        from spyde.actions.context import ActionContext
+        from spyde.actions.lifecycle import show_tree_node
+        from spyde.tests.migrated.conftest import close_session, make_session
+
+        session = make_session()
+        try:
+            session.open_file(str(self._saved(tmp_path)))
+            deadline = time.time() + 60.0
+            while time.time() < deadline and not session.signal_trees:
+                time.sleep(0.2)
+            tree = session.signal_trees[0]
+            time.sleep(1.0)
+            plot = next(p for p in tree.signal_plots)
+            show_tree_node(plot, tree, tree.root_node.signal)
+            params = {"scale_x": 2, "scale_y": 2, "scan_x": 1, "scan_y": 1}
+            binned = Rebin2DAction(ActionContext(
+                plot=plot, params=params, action_name="Rebin")).run(**params)
+            assert binned.data.shape == (4, 5, 6, 2, 2)
+            controller = ring.open_multiangle_navigator(session, tree)
+            controller.select_member(1)
+            time.sleep(0.5)
+            assert controller.displayed_signal() is binned, \
+                "the pick threw the user back onto the full-resolution root"
+        finally:
+            close_session(session)
+

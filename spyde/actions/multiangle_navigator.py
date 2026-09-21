@@ -86,9 +86,12 @@ def multiangle_model(tree):
     from spyde.multiangle.recipe import recipe_for
 
     nodes = list(getattr(tree, "walk", lambda: [])())
+    # The stack's recipe first: a SUM's recipe carries zeroed offsets on a
+    # reopened tree (its members are the already-aligned planes), which is
+    # right for reading it and wrong as a description of the acquisition.
     for node in nodes:
         recipe = recipe_for(node.signal)
-        if recipe is not None:
+        if recipe is not None and recipe.has_angle_axis:
             return recipe.model
     # A signal READ BACK FROM A FILE has no recipe — recipes are runtime
     # objects and are not written out. The metadata carries the same model,
@@ -97,14 +100,39 @@ def multiangle_model(tree):
         model = model_from_metadata(node.signal)
         if model is not None:
             return model
+    for node in nodes:
+        recipe = recipe_for(node.signal)
+        if recipe is not None:
+            return recipe.model
     return None
 
 
-def stack_signal(tree):
-    """The 5-D per-angle node — the one a pick on the ring switches to."""
+def is_angle_stack(signal) -> bool:
+    """True when *signal* keeps the angle axis, composed or read from a file."""
     from spyde.multiangle.recipe import recipe_for
     from spyde.signals.multiangle import is_multiangle_stack
 
+    if signal is None:
+        return False
+    recipe = recipe_for(signal)
+    if recipe is not None:
+        return bool(recipe.has_angle_axis)
+    return is_multiangle_stack(signal)
+
+
+def stack_signal(tree, displayed=None):
+    """The 5-D per-angle node — the one a pick on the ring switches to.
+
+    *displayed* wins when it is itself a stack: a Rebin or Crop of the stack
+    keeps the angle axis and the metadata, and a pick that switched to the
+    first stack in the tree put a user who had binned a 97 GB acquisition
+    back on the full-resolution root without a word.
+    """
+    from spyde.multiangle.recipe import recipe_for
+    from spyde.signals.multiangle import is_multiangle_stack
+
+    if is_angle_stack(displayed):
+        return displayed
     nodes = list(getattr(tree, "walk", lambda: [])())
     for node in nodes:
         recipe = recipe_for(node.signal)
@@ -341,10 +369,10 @@ class MultiAngleNavigatorController:
         Read from the tree every time instead of remembered, so a node switch
         made anywhere — the Workflow panel, a script — reaches the ring.
         """
-        from spyde.multiangle.recipe import recipe_for
-
-        recipe = recipe_for(self.displayed_signal())
-        return bool(recipe is not None and recipe.has_angle_axis)
+        # Not the recipe alone: a reopened tree has none, and asking only
+        # it left the ring stuck on "all angles" — every member lit, no
+        # handle, and a full node switch on every pick.
+        return is_angle_stack(self.displayed_signal())
 
     def displayed_signal(self):
         """The node the tree's signal window is showing, or None."""
@@ -509,7 +537,7 @@ class MultiAngleNavigatorController:
     def _show_stack(self) -> None:
         """Switch the display to the 5-D stack, through the ordinary node-switch
         path (which re-slices every navigator, this window's angle included)."""
-        signal = stack_signal(self.tree)
+        signal = stack_signal(self.tree, self.displayed_signal())
         plot = next(iter(getattr(self.tree, "signal_plots", []) or []), None)
         if signal is None or plot is None:
             self._refire_selector()

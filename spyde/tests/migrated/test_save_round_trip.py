@@ -750,3 +750,137 @@ class TestRebinRecordsTheReduction:
         finally:
             close_session(session)
 
+
+class TestAReopenedTreeIsTheComposedOne:
+    """Whatever the compose path gives, the reopen path gives too."""
+
+    def _saved(self, tmp_path, planes=True, shells=(0, 0, 1, 1)):
+        from spyde.signals.multiangle import MULTIANGLE_METADATA
+
+        generator = np.random.default_rng(5)
+        data = generator.integers(0, 400, (4, 6, 8, 4, 4), dtype=np.uint16)
+        signal = hs.signals.Signal2D(data)
+        record = {
+            "n_members": 4, "n_shells": len(set(shells)),
+            "tilts": [1.0 if shell else 0.5 for shell in shells],
+            "azimuths": [0.0, 90.0, 180.0, 270.0], "shell_ids": list(shells),
+            "reference": 0, "nav_offsets": [[0, 0], [1, -1], [0, 2], [-1, 0]],
+            "dp_offsets": [[0, 0]] * 4, "paths": ["a", "b", "c", "d"]}
+        if planes:
+            record["navigator_planes"] = data.sum(axis=(3, 4)).astype(np.float32)
+        signal.metadata.set_item(MULTIANGLE_METADATA, record)
+        signal.set_signal_type("electron_diffraction")
+        path = tmp_path / "acquisition.zspy"
+        signal.save(str(path))
+        return path, data
+
+    def _open(self, session, path):
+        session.open_file(str(path))
+        deadline = time.time() + 60.0
+        while time.time() < deadline and not session.signal_trees:
+            time.sleep(0.2)
+        assert session.signal_trees, "the file never opened"
+        time.sleep(0.5)
+        return session.signal_trees[0]
+
+    def test_the_model_reports_the_recorded_offsets(self, tmp_path):
+        from spyde.actions.multiangle_navigator import multiangle_model
+
+        path, _data = self._saved(tmp_path)
+        session = make_session()
+        try:
+            tree = self._open(session, path)
+            model = multiangle_model(tree)
+            assert model.nav_offsets.tolist() == [[0, 0], [1, -1], [0, 2], [-1, 0]], (
+                "the model answered with the Summed node's zeroed offsets")
+        finally:
+            close_session(session)
+
+    def test_the_shells_carry_the_composed_names(self, tmp_path):
+        path, _data = self._saved(tmp_path)
+        session = make_session()
+        try:
+            tree = self._open(session, path)
+            summed = tree.root_node.children["Summed"]
+            assert set(summed.children) == {"Summed 0.5°", "Summed 1°"}, \
+                set(summed.children)
+        finally:
+            close_session(session)
+
+    def test_the_stack_is_brought_up_to_the_current_type(self, tmp_path):
+        from spyde.signals.multiangle import MULTIANGLE_METADATA, MULTIANGLE_SIGNAL_TYPE
+
+        path, _data = self._saved(tmp_path)
+        session = make_session()
+        try:
+            tree = self._open(session, path)
+            root = tree.root_node.signal
+            assert root.metadata.Signal.signal_type == MULTIANGLE_SIGNAL_TYPE
+            assert root.metadata.get_item(
+                f"{MULTIANGLE_METADATA}.member_signal_type") == "electron_diffraction"
+            summed = tree.root_node.children["Summed"].signal
+            assert summed.metadata.Signal.signal_type == "electron_diffraction"
+        finally:
+            close_session(session)
+
+    def test_the_recorded_planes_are_the_navigator(self, tmp_path, monkeypatch):
+        from spyde.backend.session import Session
+
+        path, data = self._saved(tmp_path)
+        seen = {}
+        original = Session._add_signal
+
+        def spy(self, signal, *args, **kwargs):
+            seen["override"] = kwargs.get("navigator_override")
+            return original(self, signal, *args, **kwargs)
+
+        monkeypatch.setattr(Session, "_add_signal", spy)
+        session = make_session()
+        try:
+            self._open(session, path)
+            override = seen.get("override")
+            assert override is not None, "the tree reduced the whole stack again"
+            assert np.allclose(np.asarray(override.data),
+                               data.sum(axis=(3, 4)).astype(np.float32))
+        finally:
+            close_session(session)
+
+    def test_a_failure_after_the_tree_exists_does_not_open_it_twice(
+            self, tmp_path, monkeypatch):
+        import spyde.backend._session_multiangle as multiangle
+
+        path, _data = self._saved(tmp_path)
+        monkeypatch.setattr(multiangle, "_attach_node",
+                            lambda *a, **k: (_ for _ in ()).throw(
+                                ValueError("attach failed")))
+        session = make_session()
+        try:
+            self._open(session, path)
+            time.sleep(1.0)
+            assert len(session.signal_trees) == 1, (
+                f"{len(session.signal_trees)} trees for one file")
+        finally:
+            close_session(session)
+
+
+class TestRebinRefusesByName:
+    def test_the_last_detector_axis_is_checked_on_a_stack(self):
+        from spyde.actions.base import Rebin2DAction
+        from spyde.actions.context import ActionContext
+
+        session = make_session()
+        signal = hs.signals.Signal2D(np.ones((2, 4, 4, 7, 8), dtype=np.uint16))
+        signal.set_signal_type("electron_diffraction")
+        session._add_signal(signal)
+        try:
+            plot = next(p for p in session._plots
+                        if not getattr(p, "is_navigator", False)
+                        and getattr(getattr(p, "plot_state", None),
+                                    "current_signal", None) is not None)
+            params = {"scale_x": 2, "scale_y": 2, "scan_x": 1, "scan_y": 1}
+            with pytest.raises(RuntimeError, match="detector .* is 7 px"):
+                Rebin2DAction(ActionContext(
+                    plot=plot, params=params, action_name="Rebin")).run(**params)
+        finally:
+            close_session(session)
+
