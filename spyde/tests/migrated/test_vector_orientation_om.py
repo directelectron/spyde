@@ -2,16 +2,19 @@
 Vector Orientation Mapping (Electron, reuse OM wizard pattern).
 
 On a `diffraction_vectors` tree, the staged Vector-Orientation handlers must:
-  vom_generate_library → build the diffsims template library (cached on the tree),
+  vom_generate_library → build one correlation plan per phase (cached on the tree),
   vom_run             → fit orientation + strain for the field and open an IPF-Z
                         window plus εxx / εyy / εxy strain windows, attaching the
                         VectorOrientationResult.
 
-Mirrors `om_generate_library` / `om_run`; uses the sparse-vector matcher.
+Mirrors `om_generate_library` / `om_run`; uses the correlation matcher.
 """
 from __future__ import annotations
 
 import os
+import types
+
+import pytest
 import time
 
 import numpy as np
@@ -34,7 +37,13 @@ def _signal_plot(session, tree):
 
 
 def _multi_disk_4d(nav=(3, 3), sig=(48, 48), scale=0.5):
-    """Four disks per pattern (≥4 vectors → the per-pattern fit actually runs).
+    """Five disks per pattern, so the per-pattern fit actually runs.
+
+    Five and not four: the correlation matcher will not attempt a pattern with
+    fewer than five peaks (upstream's MIN_NUMBER_PEAKS), where the pose fit it
+    replaced needed four. A four-disk fixture leaves every position unmatched
+    and the overlay correctly draws no template — which reads as the wiring
+    being broken.
 
     Calibrated in nm⁻¹ **and meaning it**: 0.5 nm⁻¹/px over 48 px is a
     half-extent of 12 nm⁻¹ = 1.2 Å⁻¹, which comfortably holds silver's
@@ -46,7 +55,8 @@ def _multi_disk_4d(nav=(3, 3), sig=(48, 48), scale=0.5):
     """
     yy, xx = np.mgrid[0:sig[0], 0:sig[1]]
     cy, cx = sig[0] / 2, sig[1] / 2
-    spots = [(cx, cy), (cx + 10, cy + 4), (cx - 8, cy + 9), (cx + 3, cy - 11)]
+    spots = [(cx, cy), (cx + 10, cy + 4), (cx - 8, cy + 9), (cx + 3, cy - 11),
+             (cx - 12, cy - 6)]
     pat = np.zeros(sig, np.float32)
     for sxx, syy in spots:
         pat += ((xx - sxx) ** 2 + (yy - syy) ** 2 <= 6).astype(np.float32)
@@ -84,7 +94,7 @@ class TestVectorOrientationOM:
         # windows). The batched-torch GPU path is validated separately (subprocess
         # GPU test + the sped_ag benchmark) — running torch autograd under pytest
         # is slow (cold JIT) and segfaults on Windows+CUDA.
-        import spyde.actions.vector_orientation_gpu as _gpu
+        import spyde.torch_device as _gpu
         monkeypatch.setattr(_gpu, "select_device", lambda: None)
         session = make_session()
         try:
@@ -96,7 +106,7 @@ class TestVectorOrientationOM:
             #    gracefully — no new tree (the natural staged-wizard ordering,
             #    so it runs against a genuinely library-less tree) ───────────
             before = len(session.signal_trees)
-            vom_run(session, vplot, {"strain_cap": 0.05})   # no library yet
+            vom_run(session, vplot, {})   # no library yet
             time.sleep(0.4)
             assert len(session.signal_trees) == before
 
@@ -106,9 +116,9 @@ class TestVectorOrientationOM:
                 "resolution": 12.0, "minimum_intensity": 1e-4,
             })
             assert _wait(lambda: getattr(vtree, "_vom_wizard", None) is not None
-                         and vtree._vom_wizard.lib is not None), \
-                "template library never built"
-            assert len(vtree._vom_wizard.lib.spots_xy) > 0
+                         and vtree._vom_wizard.fitter is not None), \
+                "correlation plan never built"
+            assert vtree._vom_wizard.fitter._maps, "no plan per phase"
 
             # ── Generate also activates the live refine overlay ─────────────
             assert _wait(lambda: vtree._vom_wizard.overlay is not None), \
@@ -118,36 +128,31 @@ class TestVectorOrientationOM:
             assert set(node.groups) == {"measured", "template"}
             assert (id(node), "measured") in vplot._overlay_groups
             assert (id(node), "template") in vplot._overlay_groups
-            # At a position with at least 4 vectors: measured points drawn,
-            # template fit too.
+            # At a position the matcher will attempt (five peaks or more):
+            # measured points drawn, matched pattern too.
             from spyde.array_cache import reader_for_overlay
             vecs = vtree.diffraction_vectors
             cm = vecs.count_map()
-            ys, xs = np.nonzero(cm >= 4)
+            ys, xs = np.nonzero(cm >= 5)
             if len(ys):
                 value = reader_for_overlay(vplot, node).read_frame(
                     (int(ys[0]), int(xs[0])))
-                assert value["measured"].shape[0] >= 4
-                assert value["template"].shape[1] == 2   # a fitted template
+                assert value["measured"].shape[0] >= 5
+                assert value["template"].shape[1] == 2   # a matched pattern
 
-            # Generate now ALSO fits the whole field and opens the live IPF
-            # heatmap window (Qt parity — the orientation map appears while you
-            # refine, before Compute Maps).
-            assert _wait(lambda: getattr(vtree, "_vom_field", None) is not None,
-                         timeout=90), "live field fit / IPF heatmap never produced"
-            # The IPF heatmap tree is created AFTER _vom_field is set (the worker
-            # sets _vom_field, then calls _build_ipf_heatmap which sets
-            # .vector_orientation). Poll for it rather than asserting immediately —
-            # on slow runners the worker is still between those two steps here.
-            assert _wait(lambda: any(getattr(t, "vector_orientation", None) is not None
-                                     for t in session.signal_trees),
-                         timeout=90), "no IPF heatmap window"
+            # Generate stops at the library and the previews. It does NOT fit
+            # the field: that is a scan's compute before the user has chosen
+            # anything, and the orientation map is Run's to produce.
+            assert not any(getattr(t, "vector_orientation", None) is not None
+                           for t in session.signal_trees), \
+                "Generate produced an orientation map; that is Run's job"
 
-            # ── Compute Maps → reuses the field, adds ONE unified Strain window
+            # ── Compute Maps → fits the field, opens the orientation map and
+            #    ONE unified Strain window
             #    (εxx is its signal plot; εyy / εxy are chip-selectable view
             #    figures emitted into the same window, not new signal trees) ──
             n_before = len(session.signal_trees)
-            vom_run(session, vplot, {"strain_cap": 0.05, "smooth": False})
+            vom_run(session, vplot, {"smooth": False})
             assert _wait(lambda: len(session.signal_trees) >= n_before + 1,
                          timeout=90), "strain window never opened"
             ipf_tree = next((t for t in session.signal_trees
@@ -185,40 +190,155 @@ class TestVectorOrientationOM:
     # of the same wizard (and the overlay variant did not force the CPU fit,
     # so its background field fit could hit CUDA in-process on dev boxes).
 
-    def test_fit_field_prefers_gpu_then_falls_back(self, monkeypatch):
-        """`_fit_field` must dispatch the BATCHED GPU path first (Qt parity — the
-        serial CPU fit is ~30 min on a real 13k-pattern scan) and fall back to CPU
-        only when torch is unavailable or the GPU fit raises."""
+    def test_fit_field_matches_and_does_not_fall_back(self, monkeypatch):
+        """The field is fitted by the correlation matcher, and a failure
+        surfaces instead of being fitted some other way.
+
+        The matcher and the per-pattern pose fit it replaced report strain in
+        opposite senses, so a silent fallback would have made the sign of every
+        strain map depend on which one happened to succeed — a wrong answer
+        rather than a slow one.
+        """
         import spyde.actions.vector_orientation_om as vom
-        import spyde.actions.vector_orientation_gpu as gpu
-        import spyde.actions.vector_orientation as cpu
+        import spyde.actions.vector_orientation_quantem as quantem
 
         class _Vecs:
             nav_shape = (4, 5)
+
+        wizard = types.SimpleNamespace(
+            lib=types.SimpleNamespace(inverse_angstrom_factor=1.0),
+            phases=[object()], voltage=200.0, recip_r=1.5)
         calls = []
 
-        # (1) GPU available + succeeds → CPU never called.
-        monkeypatch.setattr(gpu, "torch_available", lambda: True)
-        monkeypatch.setattr(gpu, "select_device", lambda: type("D", (), {"type": "mps"})())
-        monkeypatch.setattr(gpu, "compute_vector_orientation_gpu",
-                            lambda *a, **k: (calls.append("gpu"), "RESULT")[1])
-        monkeypatch.setattr(cpu, "compute_vector_orientation",
-                            lambda *a, **k: calls.append("cpu"))
-        assert vom._fit_field(_Vecs(), object(), {}) == "RESULT"
-        assert calls == ["gpu"]
+        monkeypatch.setattr(quantem, "compute_vector_orientation_quantem",
+                            lambda *a, **k: (calls.append("match"), "RESULT")[1])
+        assert vom._fit_field(_Vecs(), wizard, {}) == "RESULT"
+        assert calls == ["match"]
 
-        # (2) GPU raises → CPU fallback runs.
         calls.clear()
-        monkeypatch.setattr(gpu, "compute_vector_orientation_gpu",
-                            lambda *a, **k: (calls.append("gpu"), (_ for _ in ()).throw(RuntimeError("boom")))[1])
-        monkeypatch.setattr(cpu, "compute_vector_orientation",
-                            lambda *a, **k: (calls.append("cpu"), "CPU_RESULT")[1])
-        assert vom._fit_field(_Vecs(), object(), {}) == "CPU_RESULT"
-        assert calls == ["gpu", "cpu"]
+        monkeypatch.setattr(
+            quantem, "compute_vector_orientation_quantem",
+            lambda *a, **k: (calls.append("match"),
+                             (_ for _ in ()).throw(RuntimeError("boom")))[1])
+        with pytest.raises(RuntimeError):
+            vom._fit_field(_Vecs(), wizard, {})
+        assert calls == ["match"], "a failure must surface, not fall back"
 
-        # (3) torch unavailable → straight to CPU.
-        calls.clear()
-        monkeypatch.setattr(gpu, "torch_available", lambda: False)
-        assert vom._fit_field(_Vecs(), object(), {}) == "CPU_RESULT"
-        assert calls == ["cpu"]
+    def test_the_pose_fit_modules_are_gone(self):
+        """There is nothing left to fall back TO.
 
+        The strongest form of the rule above: the per-pattern scipy pose fit
+        and its batched GPU twin are deleted, so no future edit can quietly
+        reinstate the opposite strain sign by importing one.
+        """
+        import importlib
+
+        for name in ("spyde.actions.vector_orientation",
+                     "spyde.actions.vector_orientation_gpu"):
+            with pytest.raises(ModuleNotFoundError):
+                importlib.import_module(name)
+
+    def test_refine_settings_reach_the_field_fit(self, monkeypatch):
+        """Compute Maps produces the map of the fit the crosshair was showing,
+        so it runs with whatever Refine was last set to rather than defaults."""
+        import spyde.actions.vector_orientation_om as vom
+        import spyde.actions.vector_orientation_quantem as quantem
+
+        class _Vecs:
+            nav_shape = (2, 2)
+
+        seen = {}
+        monkeypatch.setattr(
+            quantem, "compute_vector_orientation_quantem",
+            lambda *a, **k: (seen.update(k), "RESULT")[1])
+        wizard = types.SimpleNamespace(
+            lib=types.SimpleNamespace(inverse_angstrom_factor=1.0),
+            phases=[object()], voltage=200.0, recip_r=1.5)
+        vom._fit_field(_Vecs(), wizard,
+                       {"pair_distance": 0.07, "sigma_excitation": 0.03})
+        assert seen["params"] == {"pair_distance": 0.07, "sigma_excitation": 0.03}
+
+
+
+class TestRefineIpfTogglesWithTheAction:
+    """Closing the IPF heat map must not retire it.
+
+    Its window is registered with a controller so ✕ tears down the overlay,
+    which is right — nothing should keep correlating for a window nobody is
+    looking at. But that left the heat map gone until the library was rebuilt,
+    which is a minute of work to undo a click. Re-selecting the action brings
+    it back, which is what a toggle is supposed to mean.
+    """
+
+    @staticmethod
+    def _wizard(refine_ipf, fitter=object()):
+        from spyde.actions.vector_orientation_om import VomWizard
+
+        tree = types.SimpleNamespace(
+            root=object(), diffraction_vectors=object(), _vom_wizard=None)
+        wizard = VomWizard(
+            session=None, tree=tree, phases=[], overlay=None,
+            voltage=200.0, recip_r=1.5,
+            refine_ipf=refine_ipf, fitter=fitter)
+        return wizard
+
+    def _patched(self, monkeypatch):
+        """Record re-opens instead of building a plan and a window."""
+        opened = []
+        import spyde.actions.vector_refine_ipf as module
+
+        def fake_open(session, signal, fitter, phases, vectors, tree, **kwargs):
+            opened.append(kwargs)
+            return types.SimpleNamespace(_closed=False, node=object())
+
+        monkeypatch.setattr(module, "open_refine_ipf", fake_open)
+        return opened
+
+    def test_a_closed_heat_map_is_reopened(self, monkeypatch):
+        opened = self._patched(monkeypatch)
+        wizard = self._wizard(types.SimpleNamespace(_closed=True, node=None))
+        wizard.ensure_refine_ipf(session=None)
+        assert len(opened) == 1
+        assert wizard.refine_ipf._closed is False
+
+    def test_a_heat_map_never_opened_is_opened(self, monkeypatch):
+        opened = self._patched(monkeypatch)
+        wizard = self._wizard(None)
+        wizard.ensure_refine_ipf(session=None)
+        assert len(opened) == 1
+
+    def test_a_reopened_heat_map_can_still_restrict_the_pattern(self, monkeypatch):
+        """A mask drawn on the triangle has to redraw the matched pattern, so
+        the re-opened heat map needs that overlay — not just the first one
+        built at Generate."""
+        opened = self._patched(monkeypatch)
+        overlay = object()
+        wizard = self._wizard(None)
+        wizard.overlay = overlay
+        wizard.ensure_refine_ipf(session=None)
+        assert opened[0].get("fit_overlay") is overlay
+
+    def test_a_live_heat_map_is_left_alone(self, monkeypatch):
+        """Re-selecting the action with the window already up must not stack a
+        second one on top of it."""
+        opened = self._patched(monkeypatch)
+        live = types.SimpleNamespace(_closed=False, node=object())
+        wizard = self._wizard(live)
+        wizard.ensure_refine_ipf(session=None)
+        assert opened == []
+        assert wizard.refine_ipf is live
+
+    def test_nothing_is_reopened_without_a_fitter(self, monkeypatch):
+        """No matcher means no correlations to draw; a window would be empty."""
+        opened = self._patched(monkeypatch)
+        wizard = self._wizard(None, fitter=None)
+        wizard.ensure_refine_ipf(session=None)
+        assert opened == []
+
+    def test_a_torn_down_wizard_reopens_nothing(self, monkeypatch):
+        """The tree is closing; re-selecting must not resurrect its windows."""
+        opened = self._patched(monkeypatch)
+        wizard = self._wizard(None)
+        wizard._closed = True
+        wizard.ensure_refine_ipf(session=None)
+        assert opened == []

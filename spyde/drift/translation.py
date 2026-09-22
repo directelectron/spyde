@@ -574,7 +574,9 @@ def solve_translation(
 
     Notes
     -----
-    Frame 0 is the origin by definition and always gets ``(0, 0)``.
+    The reference frame is the origin by definition and gets ``(0, 0)`` with an
+    infinite sharpness. That is frame 0 for every mode but ``"fixed:<i>"``,
+    where frame 0 is registered like any other frame.
     """
     if reference not in ("running", "sequential", "first") and \
             not reference.startswith("fixed:"):
@@ -616,31 +618,37 @@ def solve_translation(
                 f = f * window
             return ops.fft2(f)
 
-        fixed_index = 0
+        reference_index = 0
         if reference.startswith("fixed:"):
-            fixed_index = int(reference.split(":", 1)[1])
-            if not 0 <= fixed_index < n_frames:
+            reference_index = int(reference.split(":", 1)[1])
+            if not 0 <= reference_index < n_frames:
                 raise ValueError(
-                    f"fixed reference index {fixed_index} outside 0..{n_frames - 1}"
+                    f"fixed reference index {reference_index} outside "
+                    f"0..{n_frames - 1}"
                 )
 
-        first = frame_fft(fixed_index if reference.startswith("fixed:") else 0)
-        shifts[0] = (0.0, 0.0)
-        sharp[0] = np.inf if n_frames else np.nan
-        if on_shift is not None and n_frames:
-            on_shift(0, 0.0, 0.0, float("inf"))
+        # The reference frame is the origin by definition; EVERY other frame is
+        # registered against it, frame 0 included when it is not the reference.
+        origin_fft = frame_fft(reference_index)
+        shifts[reference_index] = (0.0, 0.0)
+        sharp[reference_index] = np.inf
+        if on_shift is not None:
+            on_shift(reference_index, 0.0, 0.0, float("inf"))
 
-        ref_fft = first          # running accumulator / fixed reference
+        ref_fft = origin_fft     # running accumulator / fixed reference
         ref_count = 1
-        prev_fft = first         # sequential mode
+        prev_fft = origin_fft    # sequential mode
         cumulative = np.zeros(2, dtype=np.float64)
         accepted_sharp: list[float] = []   # peak strengths folded into the reference
         rejected = 0
 
+        solved = 1
         if progress is not None:
-            progress(1, n_frames)
+            progress(solved, n_frames)
 
-        for i in range(1, n_frames):
+        for i in range(n_frames):
+            if i == reference_index:
+                continue
             if cancel is not None and cancel():
                 log.info("[drift] cancelled at frame %d/%d", i, n_frames)
                 break
@@ -672,8 +680,9 @@ def solve_translation(
 
             if on_shift is not None:
                 on_shift(i, float(shifts[i, 0]), float(shifts[i, 1]), float(s))
+            solved += 1
             if progress is not None:
-                progress(i + 1, n_frames)
+                progress(solved, n_frames)
 
     params = {
         "upsample": int(upsample),

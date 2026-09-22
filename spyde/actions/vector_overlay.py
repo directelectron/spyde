@@ -727,69 +727,68 @@ def attach_strain_selection_overlay(dp_plot, vecs, tree, *, ref_yx, ref_spots,
 
 # ── the vector-orientation refine preview ────────────────────────────────────
 
-def vector_orientation_fit(*, rows, pixels: DetectorPixels, lib,
-                           params: dict) -> dict:
-    """The measured vectors and the fitted template at one position.
+def quantem_orientation_fit(*, rows, pixels: DetectorPixels, fitter,
+                            params: dict) -> dict:
+    """The measured vectors and the matched pattern at one position.
 
-    The pose (theta, A, t) is fitted against the template library and the
-    template is drawn as ``A.Rot(theta).g + t``."""
-    from spyde.actions.vector_orientation import (
-        fit_pattern, project_spots, DEFAULTS, COL_KX, COL_KY, COL_INTENSITY,
-    )
+    The correlation matcher returns a continuous orientation rather than a
+    library index, so the drawn pattern is that orientation's own simulation,
+    deformed by the fitted strain — what the fit actually predicts for this
+    position, which is what makes the overlay worth looking at.
+    """
+    from spyde.signals.diffraction_vectors import COL_KX, COL_KY
 
     rows = np.asarray(rows)
     if rows.size == 0:
         return {"measured": None, "template": None, "fit": None}
-    # The vectors are in the detector's own units and everything the fit
-    # touches — the template library, the soft-assign bandwidths, the no-match
-    # sink — is in Å⁻¹, so they are converted rather than compared across units.
-    measured = pixels.to_inverse_angstrom(rows[:, [COL_KX, COL_KY]])
     measured_px = pixels.to_pixels(rows[:, [COL_KX, COL_KY]].astype(np.float64))
-    if len(rows) < 4:
-        return {"measured": measured_px, "template": None, "fit": None}
+
+    # The Refine tab's knobs are refinement arguments, so they take effect on
+    # the next fit with no plan rebuild.
+    for name in ("pair_distance", "sigma_excitation"):
+        if params.get(name) is not None:
+            setattr(fitter, name, float(params[name]))
 
     try:
-        fit = fit_pattern(measured, rows[:, COL_INTENSITY].astype(np.float64),
-                          lib, {**DEFAULTS, **params})
+        fit = fitter.fit(rows)
     except Exception as e:
-        # A pose that will not converge still has measured vectors to draw,
-        # and the caret's readout has to be told there is no fit.
-        log.debug("the vector-orientation fit failed at this position: %s", e)
+        # A pattern that will not match still has measured vectors to draw, and
+        # the caret's readout has to be told there is no fit.
+        log.debug("the quantem orientation fit failed at this position: %s", e)
         fit = None
     if fit is None:
         return {"measured": measured_px, "template": None, "fit": None}
-    pose = np.zeros(7, np.float64)
-    pose[0] = float(fit.theta)
-    pose[1:5] = np.asarray(fit.affine, float).reshape(-1)
-    pose[5:7] = np.asarray(fit.translation, float)
-    spots = np.asarray(lib.spots_xy[int(fit.template_idx)], np.float64)
     return {"measured": measured_px,
-            "template": pixels.inverse_angstrom_to_pixels(project_spots(pose, spots)),
+            "template": pixels.inverse_angstrom_to_pixels(fit.spots),
             "fit": fit}
 
 
-def attach_vector_orientation_overlay(vecs, lib, tree, *, params=None,
-                                      radius_px=None, on_fit=None):
-    """Draw the measured vectors (red) and the fitted template (green) on the
-    vectors diffraction pattern. Returns the node."""
-    # Take the unit factor from the library rather than re-deriving it from the
-    # axis records: the library was built against the live signal and so can
-    # resolve a detector in mrad, which an axis record alone cannot. Both sides
-    # of this overlay then convert by the same number as the whole-field fit.
+def attach_quantem_orientation_overlay(vecs, fitter, tree, *, params=None,
+                                       radius_px=None, on_fit=None):
+    """Draw the measured vectors (red) and the matched pattern (green), fitted
+    by the quantem correlation matcher. Returns the node.
+
+    Marked ``expensive`` so the fit runs on the overlay lane rather than inline
+    on the navigator dispatcher. One pattern is ~58 ms against a 16.7 ms frame
+    budget, so inline it would stall the very drag it exists to follow; on the
+    lane a superseded position is cancelled by identity and only the position
+    the user rests on is drawn.
+    """
     pixels = DetectorPixels.from_axes(
         vecs.sig_axes,
-        inverse_angstrom_factor=float(getattr(lib, "inverse_angstrom_factor", 1.0)))
+        inverse_angstrom_factor=float(
+            getattr(fitter, "inverse_angstrom_factor", 1.0)))
     if radius_px is None:
         radius_px = getattr(vecs, "kernel_radius_px", 4.0)
     style = {"radius": max(2.0, float(radius_px)), "facecolors": None,
              "linewidths": 1.5, "alpha": 1.0}
     return _add_overlay(
-        tree, tree.root, vector_orientation_fit, name="vom_refine",
-        source=False,
+        tree, tree.root, quantem_orientation_fit, name="vom_refine",
+        source=False, expensive=True,
         groups={"measured": ("circles", dict(style, edgecolors="#ff3030")),
                 "template": ("circles", dict(style, edgecolors="#30ff60"))},
         iterating={"rows": VectorRows(vecs)},
-        static={"pixels": pixels, "lib": lib, "params": dict(params or {})},
+        static={"pixels": pixels, "fitter": fitter, "params": dict(params or {})},
         on_value=(None if on_fit is None
                   else lambda value: on_fit(value.get("fit")
                                             if isinstance(value, dict) else None)),

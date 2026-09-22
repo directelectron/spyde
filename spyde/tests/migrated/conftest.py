@@ -255,3 +255,22 @@ def movie_dataset(captured_messages):
     yield {"window": session, "signal_trees": session.signal_trees,
            "plots": session._plots, "messages": captured_messages}
     close_session(session)
+
+
+def open_saved(session, path, *, needs_summed=True):
+    """Open *path* and wait for its tree — and for its Summed node when one
+    is expected: the tree is registered before a multi-angle rebuild attaches
+    the sums, so polling for the tree alone can see it a moment too early."""
+    session.open_file(str(path))
+    deadline = time.time() + 60.0
+    while time.time() < deadline:
+        trees = session.signal_trees
+        if trees and (not needs_summed
+                      or "Summed" in trees[0].root_node.children):
+            time.sleep(0.5)
+            return trees[0]
+        time.sleep(0.2)
+    assert session.signal_trees, "the file never opened"
+    raise AssertionError(f"the tree has no Summed node: "
+                         f"{list(session.signal_trees[0].root_node.children)}")
+

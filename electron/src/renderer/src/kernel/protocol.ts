@@ -152,11 +152,25 @@ export interface StateUpdateBinaryMessage extends MsgBase {
   buffer: Uint8Array
 }
 
+/** One phase as `spyde/actions/composition.py` stores it. */
+export interface PhaseRecord {
+  id: string
+  elements: string[]
+  percentages: Record<string, number>
+  trace: string[]
+  cif_path: string | null
+  label: string | null
+  cod_id: string | null
+  /** The elements the structure file contains, read when it was chosen. */
+  structure_elements: string[] | null
+}
+
 export interface CompositionMessage extends MsgBase {
   type: 'composition'
   window_ids?: number[]
+  phases?: PhaseRecord[]
+  /** The union of the phases' elements. */
   elements?: string[]
-  percentages?: Record<string, number>
 }
 
 export interface MetadataMessage extends MsgBase {
@@ -1056,9 +1070,11 @@ export interface WizardEventMessage extends MsgBase {
     | 'fv_models'
     | 'fv_calibration'
     | 'cod_results'
-    | 'cod_cif_ready'
     | 'gpu_status_result'
     | 'first_run_result'
+    // Multi-angle loader: the whole acquisition, re-sent after every
+    // maped_* action. Parsed field by field by the dialog itself.
+    | 'maped_state'
 }
 
 // ── MDI image layering (overlay) ────────────────────────────────────────────

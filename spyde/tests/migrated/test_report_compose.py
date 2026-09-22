@@ -10,10 +10,15 @@ from a LAYERED MDI plot carries the layers into the FigureSpec.
 """
 from __future__ import annotations
 
+import os
+
 import numpy as np
+import hyperspy.api as hs
+import pytest
 
 from spyde.actions.report import compose as cx
 from spyde.actions.report import handlers as h
+from spyde.tests.migrated.conftest import make_session
 
 
 # ── helpers ────────────────────────────────────────────────────────────────────
@@ -1072,3 +1077,81 @@ class _StubRef:
 
     def resolve(self, session):
         return self._plot
+
+
+# ── callout source region vs navigation DEPTH ──────────────────────────────────
+
+
+@pytest.fixture
+def stack_5d_session():
+    """A real 5-D tree, whose navigator is a chain of a time selector feeding a
+    spatial one — the only shape whose composed index puts an outer column in
+    front of the spatial (x, y) pair."""
+    os.environ["SPYDE_NO_DASK"] = "1"
+    session = make_session()
+    signal = hs.signals.Signal2D(
+        np.random.rand(2, 4, 5, 8, 8).astype(np.float32))
+    signal.set_signal_type("electron_diffraction")
+    session._add_signal(signal, source_path=None)
+    yield session
+    session.shutdown()
+
+
+@pytest.fixture
+def movie_3d_session():
+    """A real 1-D (time-only) navigation tree — no spatial pair to report."""
+    os.environ["SPYDE_NO_DASK"] = "1"
+    session = make_session()
+    signal = hs.signals.Signal2D(np.random.rand(4, 8, 8).astype(np.float32))
+    session._add_signal(signal, source_path=None)
+    yield session
+    session.shutdown()
+
+
+def _navigation_selectors_by_type(session):
+    manager = session.signal_trees[0].navigator_plot_manager
+    return {type(sel).__name__: sel
+            for sel in manager.all_navigation_selectors}
+
+
+class TestRegionFromSelectorNavigationDepth:
+    def _rect_indices(self, x0, y0, w, h):
+        return np.asarray([[x0 + dx, y0 + dy]
+                           for dy in range(h) for dx in range(w)])
+
+    def test_five_dimensional_region_reads_the_spatial_columns(
+            self, stack_5d_session):
+        """A 5-D selector chain composes (time, x, y). Reading columns 0 and 1
+        as (x, y) reported the TIME plane as the region's x origin: a true
+        x=1..2 / y=2..3 region came back as (1, 1, 1, 2)."""
+        selectors = _navigation_selectors_by_type(stack_5d_session)
+        time_selector = selectors["IntegratingSelector1D"]
+        spatial_selector = selectors["IntegratingSSelector2D"]
+        time_selector.selector._get_selected_indices = lambda: np.array([[1]])
+        spatial_selector.selector._get_selected_indices = (
+            lambda: self._rect_indices(1, 2, 2, 2))
+        spatial_selector.is_integrating = True
+
+        composed = np.asarray(spatial_selector.get_selected_indices())
+        assert composed.shape[1] == 3
+        assert cx._region_from_selector(spatial_selector) == (1, 2, 2, 2)
+
+    def test_four_dimensional_region_unchanged(self):
+        """The 2-column case the helper was written for: last two columns ARE
+        columns 0 and 1."""
+        selector = _FakeSelector(self._rect_indices(1, 2, 2, 2),
+                                 [_FakePlot2()], _FakePW())
+        assert cx._region_from_selector(selector) == (1, 2, 2, 2)
+
+    def test_one_dimensional_navigation_has_no_region(self, movie_3d_session):
+        """A time-only navigation composes a single column, which cannot supply
+        an (x, y) pair — and there is no 2-D navigator image to draw a connector
+        rectangle on."""
+        time_selector = _navigation_selectors_by_type(
+            movie_3d_session)["IntegratingSelector1D"]
+        time_selector.selector._get_selected_indices = (
+            lambda: np.array([[1], [2]]))
+        time_selector.is_integrating = True
+
+        assert np.asarray(time_selector.get_selected_indices()).shape[1] == 1
+        assert cx._region_from_selector(time_selector) is None

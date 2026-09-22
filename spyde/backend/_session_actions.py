@@ -151,6 +151,10 @@ class ActionRouterMixin:
             self._load_test_data_5d(payload)
         elif action == "load_test_data_particles":
             self._load_test_data_particles(payload)
+        elif action == "write_test_multiangle_files":
+            self._write_test_multiangle_files(payload)
+        elif action == "load_test_data_multiangle":
+            self._load_test_data_multiangle(payload)
         elif action == "load_test_data_dpc":
             self._load_test_data_dpc(payload)
         elif action == "test_add_second_navigator":
@@ -222,6 +226,13 @@ class ActionRouterMixin:
             self._update_vi(window_id, payload.get("name"), payload.get("params", {}))
         elif action == "open_file":
             self.open_file(payload["path"])
+        elif action == "open_multiangle":
+            self.open_multiangle(
+                payload.get("paths") or [],
+                payload.get("tilts") or [],
+                payload.get("azimuths") or [],
+                reference=int(payload.get("reference") or 0),
+            )
         elif action == "open_stack":
             self.open_stack(payload.get("paths") or [])
         elif action == "confirm_nav_shape":
@@ -422,6 +433,14 @@ class ActionRouterMixin:
             wiz = getattr(tree, "_vom_wizard", None)
             if wiz is not None:
                 nodes.append(getattr(wiz, "overlay", None))
+                # Re-selecting the action brings the IPF heat map back if its
+                # window was closed, then its overlay is toggled with the rest.
+                if visible:
+                    try:
+                        wiz.ensure_refine_ipf(self)
+                    except Exception as e:
+                        log.debug("reopening the vector refine IPF failed: %s", e)
+                nodes.append(getattr(getattr(wiz, "refine_ipf", None), "node", None))
         elif name == "EBSD Indexing":
             wiz = getattr(tree, "_ebsd_wizard", None)
             if wiz is not None:

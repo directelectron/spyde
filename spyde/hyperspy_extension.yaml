@@ -17,6 +17,18 @@ signals:
     dtype: real
     lazy: False
     module: spyde.signals.dense_diffraction_vectors
+  MultiAngle:
+    signal_type: spyde_multiangle
+    signal_dimension: 2
+    dtype: real
+    lazy: False
+    module: spyde.signals.multiangle
+  LazyMultiAngle:
+    signal_type: spyde_multiangle
+    signal_dimension: 2
+    dtype: real
+    lazy: True
+    module: spyde.signals.multiangle
   InSitu:
     signal_type: insitu
     signal_dimension: 2

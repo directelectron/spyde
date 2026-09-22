@@ -27,18 +27,6 @@ DEFAULTS = dict(accelerating_voltage=200.0, resolution=1.0, n_best=5, gamma=1.0,
                 minimum_intensity=1e-4)
 
 
-def _count_templates(sim) -> int:
-    """Total template count across a possibly multi-phase Simulation2D (its
-    ``rotations`` is a list, one Rotation per phase, when multi-phase)."""
-    try:
-        rots = sim.rotations
-        if isinstance(rots, (list, tuple)):
-            return int(sum(np.asarray(r.data).reshape(-1, 4).shape[0] for r in rots))
-        return int(np.asarray(rots.data).reshape(-1, 4).shape[0])
-    except Exception:
-        return 0
-
-
 def orientation_mapping(ctx, action_name: str = "Orientation Mapping",
                         cif_path: str | None = None, **params):
     """Toolbar entry point (ActionContext convention)."""
@@ -330,7 +318,7 @@ def om_generate_library(session, plot, payload) -> None:
         try:
             from orix.crystal_map import Phase
             from spyde.actions.orientation_compute import (
-                generate_library_from_phases, build_matching_cache,
+                generate_library_from_phases, build_matching_cache, template_tables,
             )
             from spyde.actions.vector_overlay import attach_orientation_overlay
             src_root = _current_signal(src) or tree.root
@@ -338,7 +326,7 @@ def om_generate_library(session, plot, payload) -> None:
             recip_r = _reciprocal_radius(src_root)
             sim = generate_library_from_phases(phases, voltage, resolution,
                                                min_int, recip_r)
-            n_templates = _count_templates(sim)
+            n_templates = int(template_tables(sim)[0].shape[0])
 
             # A regenerated library replaces the previous wizard wholesale —
             # its overlay AND its refine-IPF window tear down together.
@@ -352,14 +340,11 @@ def om_generate_library(session, plot, payload) -> None:
             # best-match overlay AND the per-phase IPF correlation heatmap).
             cache = build_matching_cache(src_root, sim)
 
-            # The single-pattern best-match SPOT overlay is single-phase; skip it
-            # for multi-phase (the whole-field Run handles multi-phase).
-            overlay = None
-            if len(phases) == 1:
-                overlay = attach_orientation_overlay(
-                    src_root, sim, cache, tree,
-                    gamma=DEFAULTS["gamma"], max_radius=recip_r, normalize_templates=False,
-                )
+            # The best-matching template's spots, whichever phase it belongs to.
+            overlay = attach_orientation_overlay(
+                src_root, sim, cache, tree,
+                gamma=DEFAULTS["gamma"], max_radius=recip_r, normalize_templates=False,
+            )
 
             # Live IPF correlation-heatmap window (one triangle per phase): updates
             # as the navigator moves; double-click a triangle to limit the refined
@@ -371,13 +356,14 @@ def om_generate_library(session, plot, payload) -> None:
                 overlay=overlay, refine_ipf=refine_ipf,
                 voltage=voltage, recip_r=recip_r,
             )
-            n_ph = len(phases)
-            extra = "move the crosshair to refine" if n_ph == 1 else f"{n_ph} phases"
-            emit_status(f"Orientation: library ready ({n_templates} templates) — {extra}")
+            emit_status(f"Orientation: library ready ({n_templates} templates, "
+                        f"{len(phases)} phase(s)) — move the crosshair to refine")
             emit({"type": "om_library_ready", "window_id": getattr(src, "window_id", None),
-                  "n_templates": n_templates})
+                  "ok": True, "n_templates": n_templates})
         except Exception as e:
             emit_error(f"Generate Library failed: {e}")
+            emit({"type": "om_library_ready", "window_id": getattr(src, "window_id", None),
+                  "ok": False, "error": str(e)})
             log.exception("Generate Library failed")
 
     from spyde.actions.lifecycle import run_on_worker
@@ -407,8 +393,7 @@ def om_refine(session, plot, payload) -> None:
             except Exception as e:
                 import logging
                 logging.getLogger(__name__).debug("om_refine failed: %s", e)
-        # The IPF heatmap follows the same gamma / normalize knobs (and exists for
-        # multi-phase too, where the spot overlay does not).
+        # The IPF heatmap follows the same gamma / normalize knobs.
         if wiz.refine_ipf is not None:
             try:
                 wiz.refine_ipf.set_refine_params(

@@ -27,7 +27,7 @@
  * CLAUDE.md), so `test_dpc_action.py` parses this file and compares.
  */
 import React from 'react'
-import { WizardShell, TabRow, Field, NumInput, Slider, Select, Check, S } from './WizardShell'
+import { WizardShell, TabRow, Field, NumInput, Slider, Select, Check, Info, S } from './WizardShell'
 import { useWizardLifecycle, useDebouncedAction, useWizardEvent, CommitButton } from './wizardHooks'
 import type { SendAction } from './wizardHooks'
 
@@ -592,39 +592,6 @@ const INFO = {
     + 'and it points the way the field does on screen. Scalar views hide it.',
 }
 
-/**
- * An ⓘ that opens its text as a popover.
- *
- * Not a hover tooltip: the text is a paragraph, and a paragraph that vanishes
- * when the pointer moves cannot be read. Click to open, click (or Escape) to
- * close.
- *
- * Absolutely positioned rather than expanded in place, for two reasons. It
- * costs zero layout — the point of moving this text out of the caret was the
- * real estate, and an inline block just moves the controls down instead. And
- * these sit inside `Field` labels, which are `white-space: nowrap` so a control
- * label never wraps mid-word; inline text inherited that and ran off the edge
- * of the caret.
- */
-function Info({ text, testid }: { text: string; testid: string }) {
-  const [open, setOpen] = React.useState(false)
-  React.useEffect(() => {
-    if (!open) return
-    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setOpen(false) }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [open])
-  return (
-    <span style={{ position: 'relative', display: 'inline-flex' }}>
-      <button data-testid={testid} aria-expanded={open} title="More information"
-        style={infoBtn} onClick={() => setOpen(v => !v)}>ⓘ</button>
-      {open && (
-        <div data-testid={`${testid}-text`} style={infoText}
-          onClick={() => setOpen(false)}>{text}</div>
-      )}
-    </span>
-  )
-}
 
 /**
  * Is the region actually on the beam?
@@ -749,20 +716,6 @@ const readoutStyle: React.CSSProperties = {
 }
 const rowStyle: React.CSSProperties = {
   display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap',
-}
-const infoBtn: React.CSSProperties = {
-  background: 'none', border: 'none', color: '#6c7086', cursor: 'pointer',
-  fontSize: 11, padding: 0, lineHeight: 1, flex: '0 0 auto',
-}
-const infoText: React.CSSProperties = {
-  position: 'absolute', top: 'calc(100% + 4px)', left: -8,
-  width: 216, zIndex: 20,
-  fontSize: 10, color: '#cdd6f4', background: '#1e1e2e',
-  border: '1px solid #45475a', borderRadius: 5, padding: '6px 8px',
-  lineHeight: 1.45, boxShadow: '0 8px 20px rgba(0,0,0,0.55)',
-  // `S.lbl` is nowrap so control labels never break mid-word; this is a
-  // paragraph and must opt back out of that.
-  whiteSpace: 'normal', cursor: 'pointer',
 }
 const beamWrap: React.CSSProperties = {
   borderTop: '1px solid #313244', paddingTop: 6,

@@ -22,7 +22,7 @@ Why this exists: HyperSpy's ``multifit`` fits one pixel at a time, measured at
 ~110 spectra/s on this box — about 10 minutes for a 256x256 spectrum image.
 The engine packs the whole grid into ``(P, C)`` and solves it as one batched
 problem, following the same playbook as
-``spyde/actions/vector_orientation_gpu.py``.
+``spyde/torch_device.py``.
 
 Correctness is defined by HyperSpy: the engine must reproduce ``multifit``'s
 parameters on the same data. See GitHub #50.

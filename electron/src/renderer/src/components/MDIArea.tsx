@@ -5,7 +5,7 @@ import { WindowContent } from './WindowContent'
 import {
   useSpyDE, type SpyDEWindow, type NavigatorOptions,
 } from '../kernel/SpyDEContext'
-import { NAVIGATOR_DRAG_MIME, CONSOLE_VAR_DRAG_MIME } from '../kernel/dnd'
+import { NAVIGATOR_DRAG_MIME, CONSOLE_VAR_DRAG_MIME, pathsFromDrop } from '../kernel/dnd'
 import { Pill, type PillSegment, type WindowPillPayload } from './Pill'
 import { getMovieEditorClaim, subscribeMovieEditorClaim } from '../kernel/movieEditorClaim'
 
@@ -390,12 +390,7 @@ export function MDIArea() {
     }
     if (e.dataTransfer.files.length > 0) {
       e.preventDefault()
-      // Sandboxed renderers have no File.path — the preload resolves each
-      // File to its OS path via webUtils.getPathForFile.
-      const paths = Array.from(e.dataTransfer.files)
-        .map(f => window.electron.pathForFile?.(f))
-        .filter((p): p is string => !!p)
-      for (const path of paths) sendAction('open_file', { path })
+      for (const path of pathsFromDrop(e).paths) sendAction('open_file', { path })
     }
   }, [sendAction])
 

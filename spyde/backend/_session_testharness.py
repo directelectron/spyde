@@ -24,6 +24,34 @@ from de_shell.ipc import emit_error, emit_status
 log = logging.getLogger(__name__)
 
 
+
+def _write_minimal_mrc(path: str, frames) -> None:
+    """Write ``frames`` (n, ny, nx) as a MODE 6 MRC — the real binary path.
+
+    Only the fields the reader needs are set. It exists so the multi-angle test
+    acquisition is memmap-backed like a real one, which is what makes the loader
+    take its aligned-READ path rather than the crop-after-loading fallback; a
+    headerless dump would silently exercise the wrong half of the loader.
+    """
+    import numpy as np
+
+    n_frames, height, width = frames.shape
+    header = np.zeros(256, dtype=np.int32)
+    header[0], header[1], header[2] = width, height, n_frames
+    header[3] = 6                                          # MODE 6 = uint16
+    header[7], header[8], header[9] = width, height, n_frames
+    header[16], header[17], header[18] = 1, 2, 3           # MAPC, MAPR, MAPS
+    lengths = header.view(np.float32)
+    lengths[10], lengths[11], lengths[12] = width, height, n_frames
+    lengths[13] = lengths[14] = lengths[15] = 90.0
+    raw = header.tobytes()
+    raw = raw[:208] + b"MAP " + raw[212:]                  # CMAP stamp
+    raw = raw[:212] + b"\x44\x44\x00\x00" + raw[216:]     # little-endian MACHST
+    with open(path, "wb") as handle:
+        handle.write(raw)
+        handle.write(np.ascontiguousarray(frames).tobytes())
+
+
 class TestHarnessMixin:
     def _dump_dask_state(self, only: str | None = None) -> None:
         """Log a compact snapshot of the dask cluster's state at WARNING level
@@ -273,6 +301,117 @@ class TestHarnessMixin:
         tax.name, tax.units, tax.scale = "time", "s", 1.0
         self._add_signal(s, source_path="test_data_5d")
 
+    def _write_test_multiangle_files(self, payload: dict | None = None) -> None:
+        """Test-only: write a synthetic multi-angle acquisition to disk and say
+        where, WITHOUT opening it.
+
+        The loader dialog is driven by paths, so exercising it end to end needs
+        member files a test can point at. ``_load_test_data_multiangle`` writes
+        the same files but then opens them itself, which skips the dialog — the
+        part under test.
+        """
+        import tempfile
+
+        import numpy as np
+
+        from spyde.multiangle.synthetic import make_multiangle
+
+        payload = payload or {}
+        shells = tuple(
+            (float(tilt), int(count))
+            for tilt, count in payload.get("shells", ((1.0, 3), (0.5, 2)))
+        )
+        scan = int(payload.get("nav", 28))
+        detector = int(payload.get("sig", 32))
+
+        acquisition = make_multiangle(
+            shells=shells, scan_shape=(scan, scan),
+            detector_shape=(detector, detector), seed=0)
+
+        # A FIXED directory, not a fresh temporary one: an end-to-end test has
+        # to name these paths to drive the loader dialog with them, and it
+        # cannot read a random name back out of a message the renderer has no
+        # reason to re-broadcast. Rewritten on every call.
+        directory = os.path.join(tempfile.gettempdir(), "spyde-multiangle-test")
+        os.makedirs(directory, exist_ok=True)
+        self._multiangle_test_directory = directory
+        paths = []
+        for index, member in enumerate(acquisition.members):
+            path = os.path.join(directory, f"angle{index:02d}.mrc")
+            _write_minimal_mrc(path, np.ascontiguousarray(member).reshape(
+                -1, *member.shape[2:]))
+            paths.append(path)
+
+        ipc.emit({
+            "type": "test_multiangle_files",
+            "paths": paths,
+            "directory": directory,
+            "scan_shape": [scan, scan],
+            "tilts": [float(value) for value in acquisition.tilts],
+            "azimuths": [float(value) for value in acquisition.azimuths],
+        })
+
+    def _load_test_data_multiangle(self, payload: dict | None = None) -> None:
+        """Test-only: a synthetic MULTI-ANGLE 4-D STEM acquisition, written to
+        real binary files so the loader takes its real path. No download.
+
+        Two shells by default — 6 members at 1.0° and 4 at 0.5°, which is the
+        shape that matters: shells hold different member counts and the members
+        are not evenly spaced in any single coordinate. Each member is planted
+        with a KNOWN scan offset and detector offset, so the alignment can be
+        scored rather than eyeballed, and each carries a bright asymmetric
+        real-space feature so a member read from the wrong position is visible
+        rather than plausible.
+
+        Written as raw frames on disk deliberately: that is what makes the
+        members memmap-backed, and so exercises the aligned READ
+        (``spyde.multiangle.load``) rather than the crop-after-loading fallback.
+        """
+        import tempfile
+
+        import numpy as np
+
+        from spyde.backend.heavy_imports import ensure_heavy_imports
+        from spyde.multiangle.synthetic import make_multiangle
+
+        ensure_heavy_imports()   # see _load_test_data — don't race the prewarm
+        payload = payload or {}
+        shells = tuple(
+            (float(tilt), int(count))
+            for tilt, count in payload.get("shells", ((1.0, 6), (0.5, 4)))
+        )
+        scan = int(payload.get("nav", 32))
+        detector = int(payload.get("sig", 32))
+
+        acquisition = make_multiangle(
+            shells=shells, scan_shape=(scan, scan),
+            detector_shape=(detector, detector), seed=0)
+
+        # Kept for the process's life: the members are read lazily, so the files
+        # must outlive this call. A TemporaryDirectory object would delete them
+        # the moment it was collected.
+        directory = tempfile.mkdtemp(prefix="spyde-multiangle-")
+        self._multiangle_test_directory = directory
+        paths = []
+        for index, member in enumerate(acquisition.members):
+            path = os.path.join(directory, f"angle{index:02d}.mrc")
+            _write_minimal_mrc(path, np.ascontiguousarray(member).reshape(
+                -1, *member.shape[2:]))
+            paths.append(path)
+
+        log.info("[multiangle] test acquisition: %d members in %d shells -> %s",
+                 len(paths), len(shells), directory)
+        self.open_multiangle(
+            paths,
+            tilts=[float(value) for value in acquisition.tilts],
+            azimuths=[float(value) for value in acquisition.azimuths],
+            reference=int(acquisition.reference),
+            # MRC carries the DETECTOR shape but has no concept of a scan grid;
+            # real acquisitions ship a sidecar naming it, which a synthetic one
+            # has no reason to fake.
+            reader_options={"navigation_shape": (scan, scan)},
+        )
+
     def _load_test_data_dpc(self, payload: dict | None = None) -> None:
         """Test-only: BUNDLED synthetic DPC 4-D STEM with GROUND TRUTH. No file,
         no download, no dask (32×32 nav × 48×48 signal, ~9 MB float32).
@@ -443,15 +582,48 @@ class TestHarnessMixin:
                           detector=tuple(p.get("detector", (60, 60))))
         self._add_signal(s, source_path="test_data_ebsd")
 
+    #: The calibrated SPED-Ag scan, taken straight from Zenodo rather than
+    #: through ``pyxem.data.sped_ag()``.
+    #:
+    #: Both packaged routes to this dataset are stale in the same way. pyxem
+    #: 0.21 pins record 15490547 (``_registry._zenodo_url``, "version 0.9.0")
+    #: and em_database 0.4.0's ``SPEDAg.yaml`` pins the same record and md5.
+    #: That copy carries EXACTLY HALF the true reciprocal calibration —
+    #: 0.013364 against 0.026728 Å⁻¹ per pixel — so every measured vector
+    #: reaches a template matcher at half its length, Ag {111} reads as
+    #: 0.21 Å⁻¹ instead of 0.42, and no crystal can be fitted to it. Nothing
+    #: raises; the overlay just draws simulated spots beside the measured ones.
+    #:
+    #: Record 21790591 ("Pyxem 4D STEM Demo Data", v10) has the corrected file.
+    #: Delete this and go back to ``pyxem.data.sped_ag()`` once its registry
+    #: points there.
+    _SPED_AG_SCALE = 0.02672830388733737     # Å⁻¹ per pixel, as published
+
     def _load_test_data_sped_ag(self) -> None:
-        """Test-only: load the REAL sped_ag 4-D STEM scan (pyxem.data.sped_ag —
-        208×64 patterns of 112×112, a strained Ag SPED dataset with genuine
-        diffraction spots). Unlike the synthetic disk fixtures this has a real
-        reciprocal lattice, so the orientation overlay's matched-template spots
-        land on actual diffraction peaks — needed to SEE the overlay working
-        (not just render). Downloads on first use (pooch-cached)."""
-        import pyxem.data as pxd
-        s = pxd.sped_ag(allow_download=True)
+        """Test-only: load the REAL sped_ag 4-D STEM scan (208×64 patterns of
+        112×112, a strained Ag SPED dataset with genuine diffraction spots).
+        Unlike the synthetic disk fixtures this has a real reciprocal lattice,
+        so the orientation overlay's matched-template spots land on actual
+        diffraction peaks — needed to SEE the overlay working (not just
+        render). Downloads on first use (pooch-cached)."""
+        import hyperspy.api as hs
+        import pooch
+
+        from spyde.external.emdatabase.sped_ag import DATASET
+
+        path = pooch.retrieve(
+            url=f"{DATASET['source']}/{DATASET['file']}",
+            known_hash=DATASET["checksum"],
+            fname="SPED-Ag-calibrated.zspy", path=pooch.os_cache("spyde"))
+        s = hs.load(path)
+        # The fixture is only worth anything if it is the calibrated copy; a
+        # silently halved axis is the exact failure this loader exists to avoid.
+        scale = float(s.axes_manager.signal_axes[0].scale)
+        if abs(scale - self._SPED_AG_SCALE) > 1e-6 * self._SPED_AG_SCALE:
+            raise RuntimeError(
+                f"SPED-Ag reciprocal scale is {scale} Å⁻¹/px, expected "
+                f"{self._SPED_AG_SCALE} — this is not the calibrated copy, and "
+                "template matching against it cannot work")
         try:
             s.set_signal_type("electron_diffraction")
         except Exception as e:

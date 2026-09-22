@@ -176,11 +176,9 @@ class TestClientSeam:
     def test_batch_cores_accept_client(self):
         from spyde.actions.find_vectors import _do_compute_vectors
         from spyde.actions.orientation_compute import _do_compute_orientations
-        from spyde.actions.vector_orientation import (
-            compute_vector_orientation_chunked,
-        )
-        for fn in (_do_compute_vectors, _do_compute_orientations,
-                   compute_vector_orientation_chunked):
+        # The vector orientation map is not in this list: it is matched with
+        # torch rather than farmed to dask, so it has no client to take.
+        for fn in (_do_compute_vectors, _do_compute_orientations):
             params = inspect.signature(fn).parameters
             assert "client" in params, f"{fn.__name__} lost the client= seam"
             assert params["client"].default is None

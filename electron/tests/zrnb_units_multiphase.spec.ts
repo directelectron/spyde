@@ -235,7 +235,7 @@ test('two-phase vector orientation reaches phase + strain windows', async () => 
   await page.getByTestId('ptable-add-phase').click()
   await page.getByTestId('phase-1-cif').click()
   await expect(page.getByTestId('phase-1-structure')).toContainText('beta_Nb')
-  await page.getByTestId('ptable-apply').click()
+  await page.getByTestId('ptable-done').click()
   const list = await page.getByTestId('vom-cif-list').innerText()
   console.log('[phase list]\n' + list)
   expect(list).toContain('Zr')
@@ -249,7 +249,7 @@ test('two-phase vector orientation reaches phase + strain windows', async () => 
   // race. Wait for the settled end of that sequence instead; reaching it at all
   // means the two-phase library built and fitted.
   await expect(page.getByTestId('status-text'))
-    .toContainText(/live IPF ready|library ready/, { timeout: 420_000 })
+    .toContainText(/Vector Orientation: ready|live IPF ready|library ready/, { timeout: 420_000 })
   await page.waitForTimeout(3000)
   await shot('06-library-ready')
 

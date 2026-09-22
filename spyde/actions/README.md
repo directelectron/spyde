@@ -50,6 +50,16 @@ and never pays its import cost. `install_hint(pkg)` gives the `pip install
 supports `type`, `default`, `min`/`max`/`step`, `options`, `tab`,
 `display_condition`, `file`).
 
+`beta: True` is NOT a gate — the action is offered exactly as any other. It
+rides along in the toolbar descriptor and the renderer draws a `β` badge on the
+button and a ribbon across the caret ("still under development, may change"),
+so what a user is promised about an action matches what we are willing to keep
+stable. Declare it once, here; the renderer reads the flag off the message and
+keeps no copy of its own, and `FloatingToolbar` supplies it to every caret
+through `BetaContext`, so a wizard needs no change to pick up the ribbon.
+Pinned by `test_beta_flag.py`. Remove the key when the action settles — it is a
+promise about churn, not a permanent label.
+
 **Path 2 — staged actions** (the wizard protocol). Registered in
 [`registry.py`](registry.py) `STAGED_HANDLERS` as `"module.function"` (lazy
 import), all with the uniform signature `fn(session, plot, payload)`.

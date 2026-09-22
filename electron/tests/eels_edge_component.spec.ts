@@ -84,9 +84,10 @@ test('the component picker offers EELS edges on an EELS signal', async () => {
     await page.locator('[data-testid="fit-edge-filter"]').fill('')
 
     // ── the composition seeds the suggestions ────────────────────────────
-    // `metadata.Sample.elements` is what Plot Control's Composition panel
-    // writes, so setting it must lead the list rather than needing more wiring.
-    await backendAction(page, 'set_composition', { elements: ['C', 'N', 'O'] })
+    // `metadata.Sample.elements` is the union of the phases Plot Control's
+    // Composition panel builds, so adding one must lead the list rather than
+    // needing more wiring.
+    await backendAction(page, 'add_phase', { elements: ['C', 'N', 'O'] })
     await page.waitForTimeout(500)
     // Reopen the caret so the catalogue is rebuilt against the new metadata.
     await page.locator('[data-testid="fit-close"]').click()

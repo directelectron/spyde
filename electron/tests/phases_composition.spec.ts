@@ -1,15 +1,12 @@
 /**
- * phases_composition.spec.ts — composition and phases in ONE popout.
+ * phases_composition.spec.ts — building a sample's phases from the dock,
+ * against the real backend, with the NAVIGATOR focused: on a scan the
+ * navigator is usually the focused window, and the dock follows it.
  *
- * They used to be apart: the dock held a flat element list, the orientation
- * wizards held .cif paths, and the COD search silently read the former to fill
- * the latter. That cannot describe a two-phase sample — COD matches the
- * elements EXACTLY, so a Cu/Nb sample searched as one composition asks for a
- * Cu-Nb compound and gets nothing, while fcc Cu and bcc Nb are one query each.
- *
- * So clicking elements builds the sample, selecting a phase first makes those
- * clicks build THAT phase, and each phase carries the structure that indexes
- * it. An element can also belong to the sample without belonging to any phase.
+ * A sample is a list of phases; the periodic table edits the selected one.
+ * The cases that have to hold: zirconia and alpha-Zr (Zr in both), a phase
+ * whose elements come from its .cif, and a trace element kept out of the
+ * structure search.
  */
 import { test, expect, _electron as electron, ElectronApplication, Page } from '@playwright/test'
 import { join } from 'path'
@@ -26,6 +23,7 @@ test.setTimeout(240_000)
 
 const shot = async (name: string) =>
   page.screenshot({ path: join(SHOTS, `${name}.png`) })
+const dockPhase = (index: number) => page.getByTestId(`composition-phase-${index}`)
 
 test.beforeAll(async () => {
   test.setTimeout(240_000)
@@ -44,72 +42,86 @@ test.beforeAll(async () => {
   await page.waitForFunction(
     () => document.querySelectorAll('[data-testid="subwindow"]').length >= 2,
     { timeout: 60_000 })
-  await page.waitForTimeout(1500)
+  const navigator = page.getByTestId('subwindow')
+    .filter({ has: page.getByTestId('window-breadcrumb').filter({ hasText: /^N-/ }) }).first()
+  await navigator.getByTestId('subwindow-titlebar').click()
 })
 
 test.afterAll(async () => { await app?.close() })
 
-test('clicking elements with a phase selected builds that phase', async () => {
-  // One popout, not two: the periodic table and the phases are the same widget,
-  // because a phase is a SUBSET of the composition.
+test('the first element clicked makes Phase 1, and the dock shows it', async () => {
+  await expect(page.getByTestId('composition-empty')).toBeVisible()
   await page.getByTestId('composition-edit').click()
   await expect(page.getByTestId('periodic-table')).toBeVisible()
-  await expect(page.getByTestId('ptable-phases')).toBeVisible()
-  await shot('01-editor')
-
-  await page.getByTestId('ptable-add-phase').click()
   await expect(page.getByTestId('phase-btn-0')).toHaveAttribute('data-active', 'true')
-  // Elements clicked now land in phase 1 AND in the sample.
-  await page.getByTestId('ptable-el-Cu').click()
-  await expect(page.getByTestId('phase-0-el-Cu')).toBeVisible()
-  await expect(page.getByTestId('ptable-selected')).toContainText('Cu')
+  await shot('01-empty')
 
-  // A second phase, built the same way.
+  // Two clicks without waiting: both land in the one new phase.
+  await page.getByTestId('ptable-el-Zr').click()
+  await page.getByTestId('ptable-el-O').click()
+  await expect(page.getByTestId('phase-0-el-Zr')).toBeVisible()
+  await expect(page.getByTestId('phase-0-el-O')).toBeVisible()
+  await expect(page.getByTestId('phase-btn-1')).toHaveCount(0)
+  await expect(dockPhase(0)).toContainText('Zr')
+  await expect(dockPhase(0)).toContainText('O')
+})
+
+test('an element can be in two phases', async () => {
   await page.getByTestId('ptable-add-phase').click()
   await expect(page.getByTestId('phase-btn-1')).toHaveAttribute('data-active', 'true')
-  await page.getByTestId('ptable-el-Nb').click()
-  await expect(page.getByTestId('phase-1-el-Nb')).toBeVisible()
-  await shot('02-two-phases')
+  await expect(dockPhase(1)).toContainText('no elements')
 
-  // Cu belongs to phase 1 only — selecting phase 2 must not show it.
-  await expect(page.getByTestId('phase-1-el-Cu')).toHaveCount(0)
+  // Zr is already in the zirconia; this click adds it to alpha-Zr and leaves
+  // the zirconia alone.
+  await page.getByTestId('ptable-el-Zr').click()
+  await expect(page.getByTestId('phase-1-el-Zr')).toBeVisible()
+  await expect(page.getByTestId('ptable-el-O')).not.toHaveAttribute('data-in-phase', 'true')
+  await expect(dockPhase(0)).toContainText('Zr')
+  await expect(dockPhase(0)).toContainText('O')
+  await expect(dockPhase(1)).toContainText('Zr')
+  await expect(dockPhase(1)).not.toContainText('O')
+  await shot('02-shared-element')
 })
 
-test('an element can belong to the sample without belonging to a phase', async () => {
-  // The extra oxygen that is in neither structure being indexed against.
-  await page.getByTestId('phase-btn-1').click()          // deselect (toggle off)
-  await expect(page.getByTestId('phase-btn-1')).not.toHaveAttribute('data-active', 'true')
-  await page.getByTestId('ptable-el-O').click()
-  await expect(page.getByTestId('ptable-selected')).toContainText('O')
-  // …and it joined no phase.
-  await page.getByTestId('phase-btn-1').click()
-  await expect(page.getByTestId('phase-1-el-O')).toHaveCount(0)
-  await shot('03-sample-only-element')
-})
-
-test('the COD search is scoped to the selected phase', async () => {
-  // COD matches the elements EXACTLY, so the query has to be one phase's.
+test('a percentage is kept as typed, in its own phase', async () => {
   await page.getByTestId('phase-btn-0').click()
-  await expect(page.getByTestId('phase-0-cod')).toHaveAttribute('title', /Cu structures/)
+  await page.getByTestId('phase-0-pct-Zr').fill('33.3')
   await page.getByTestId('phase-btn-1').click()
-  await expect(page.getByTestId('phase-1-cod')).toHaveAttribute('title', /Nb structures/)
+  await expect(page.getByTestId('phase-1-pct-Zr')).toHaveValue('')
+  await expect(page.getByTestId('composition-chip-0-Zr')).toContainText('33.3%')
+  await expect(page.getByTestId('composition-chip-1-Zr')).not.toContainText('%')
 })
 
 test('a phase takes its elements from a .cif, and the dock shows the structure', async () => {
-  // The file knows what it is made of; a phase with a structure but no elements
-  // reads as a mistake and has nothing to search COD with either.
   await page.getByTestId('ptable-add-phase').click()
   await expect(page.getByTestId('phase-row-2')).toContainText('Click elements above')
   await page.getByTestId('phase-2-cif').click()
   await expect(page.getByTestId('phase-2-structure')).toContainText('Silver__0011135')
   await expect(page.getByTestId('phase-2-el-Ag')).toBeVisible()
-  await shot('04-elements-from-cif')
-
-  await page.getByTestId('ptable-apply').click()
-  await expect(page.getByTestId('periodic-table')).toBeHidden()
-  // The structure is on the SAMPLE, so the dock shows it beside the chips —
-  // previously a picked .cif was visible nowhere outside the wizard.
   await expect(page.getByTestId('composition-structure-2')).toContainText('Silver__0011135')
+})
+
+test('a trace element counts for the sample but not for the structure search', async () => {
+  await page.getByTestId('ptable-el-O').click()
+  await expect(page.getByTestId('phase-2-el-O')).toBeVisible()
+  await expect(page.getByTestId('phase-2-cod')).toHaveAttribute('title', /Ag-O structures/)
+  await page.getByTestId('phase-2-trace-O').click()
+  await expect(page.getByTestId('phase-2-trace-O')).toHaveAttribute('data-on', 'true')
+  await expect(page.getByTestId('phase-2-cod')).toHaveAttribute('title', /for Ag structures/)
+  await expect(page.getByTestId('composition-chip-2-O')).toHaveAttribute('data-trace', 'true')
+  await shot('03-trace')
+})
+
+test('removing a phase removes only that phase', async () => {
+  await page.getByTestId('phase-btn-1').click()
+  await page.getByTestId('phase-1-remove').click()
+  await expect(page.getByTestId('phase-btn-2')).toHaveCount(0)
+  await expect(dockPhase(1)).toContainText('Ag')
+  await expect(page.getByTestId('composition-structure-1')).toContainText('Silver__0011135')
+  await expect(dockPhase(0)).toContainText('Zr')
+
+  await page.getByTestId('ptable-done').click()
+  await expect(page.getByTestId('periodic-table')).toBeHidden()
   await expect(page.getByTestId('composition-section')).toContainText('&')
-  await shot('05-dock')
+  await shot('04-dock')
 })

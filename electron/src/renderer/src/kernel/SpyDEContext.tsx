@@ -13,7 +13,9 @@ import type {
 } from '@de/shell-renderer'
 import { asPlotAppMessage } from './protocol'
 import type { ReportDocState, ReportCell } from './protocol'
-import { WINDOW_DRAG_MIME, FIGURE_DRAG_MIME, stashWindowDrag } from './dnd'
+import {
+  WINDOW_DRAG_MIME, FIGURE_DRAG_MIME, stashWindowDrag, stashMemberDrag,
+} from './dnd'
 import { dlog, dragDumpToConsole } from './dragDiag'
 import { EnvSetupOverlay } from '../components/EnvSetupOverlay'
 
@@ -52,6 +54,10 @@ export interface ToolbarAction {
   toggle: boolean
   parameters: Record<string, ParamSpec>
   subfunctions?: SubAction[]
+  /** `beta:` in the toolbar schema — the action works and is offered normally,
+   *  but its results or controls may still change. Drawn as a badge on the
+   *  button and a ribbon across its caret. */
+  beta?: boolean
 }
 
 export interface SpyDEWindow {
@@ -105,23 +111,23 @@ export interface ChunkInfo {
   signal_split: boolean
 }
 /** One phase of the sample: what it is made of, and the structure that indexes
- *  it. `cifPath` is null until one is chosen — a phase whose composition is
- *  known but whose structure is not is a normal state, and it is the state you
- *  search COD from. */
+ *  it. `cifPath` is null until one is chosen — a phase whose elements are
+ *  known but whose structure is not is what COD is searched from. `trace`
+ *  names the elements that count for EELS/EDS but are not the structure's. */
 export interface SamplePhase {
+  id: string
   elements: string[]
   percentages: Record<string, number>
+  trace: string[]
   cifPath: string | null
   label: string | null
   codId: string | null
 }
 
-/** `elements`/`percentages` are the flat union across phases — the
- *  HyperSpy-canonical fields that EELS edge suggestion and EDS quantification
- *  read. `phases` is how the sample is actually divided up. */
+/** The sample is its `phases`. `elements` is their union, computed by the
+ *  backend, for whatever only asks what the sample contains (the fit wizards). */
 export interface Composition {
   elements: string[]
-  percentages: Record<string, number>
   phases: SamplePhase[]
 }
 export interface Histogram {
@@ -667,6 +673,12 @@ interface SpyDEContextValue {
   stackDialogOpen: boolean
   openStackDialog: () => void
   closeStackDialog: () => void
+  // Multi-Angle 4D STEM loader (renderer-only UI state, opened from the File
+  // menu). Only whether the dialog is UP lives here — the acquisition itself
+  // is the backend's `maped_state` snapshot, which the dialog consumes direct.
+  multiAngleLoaderOpen: boolean
+  openMultiAngleLoader: () => void
+  closeMultiAngleLoader: () => void
   // Check for Updates / GPU Status dialogs (renderer-only UI state, opened
   // from the Help menu — both the native menu and MenuBar.tsx's HTML one).
   updateDialogOpen: boolean
@@ -765,6 +777,7 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
   reportRef.current = state.report
   const tileWindowsRef = useRef<(() => void) | null>(null)
   const [stackDialogOpen, setStackDialogOpen] = useState(false)
+  const [multiAngleLoaderOpen, setMultiAngleLoaderOpen] = useState(false)
   const [updateDialogOpen, setUpdateDialogOpen] = useState(false)
   const [gpuStatusDialogOpen, setGpuStatusDialogOpen] = useState(false)
   const [gpuHelpDialogOpen, setGpuHelpDialogOpen] = useState(false)
@@ -1040,13 +1053,14 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
             windowIds: msg.window_ids ?? [],
             composition: {
               elements: msg.elements ?? [],
-              percentages: msg.percentages ?? {},
-              phases: ((msg.phases ?? []) as Record<string, unknown>[]).map((p) => ({
-                elements: (p.elements ?? []) as string[],
-                percentages: (p.percentages ?? {}) as Record<string, number>,
-                cifPath: (p.cif_path ?? null) as string | null,
-                label: (p.label ?? null) as string | null,
-                codId: (p.cod_id ?? null) as string | null,
+              phases: (msg.phases ?? []).map((phase) => ({
+                id: phase.id,
+                elements: phase.elements,
+                percentages: phase.percentages,
+                trace: phase.trace,
+                cifPath: phase.cif_path,
+                label: phase.label,
+                codId: phase.cod_id,
               })),
             },
           })
@@ -1349,7 +1363,6 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
         case 'fv_models':
         case 'fv_calibration':
         case 'cod_results':
-        case 'cod_cif_ready':
         case 'gpu_status_result':
         case 'first_run_result':
         case 'console_node_bound':
@@ -1389,6 +1402,11 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
         case 'dpc_region':
         // Strain caret — the rotation/flip taken over from a DPC run.
         case 'strain_rotation':
+        // Multi-Angle 4D STEM loader — ONE snapshot of the whole acquisition
+        // (members, shells, reference, both alignment solves, can_commit),
+        // re-sent after every maped_* action. Consumed by MultiAngleLoader,
+        // which renders from it rather than keeping a copy of its own.
+        case 'maped_state':
         // Cluster telemetry — consumed by the StatusBar DaskMonitor HUD.
         case 'dask_stats':
         // Read-throughput readout — consumed by the StatusBar IoThroughput HUD.
@@ -1505,6 +1523,11 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
       setStackDialogOpen(true),
     )
 
+    // File → Load Multi-Angle 4D STEM… opens the tabbed MultiAngleLoader.
+    const disposeMultiAngleLoader = window.electron.onOpenMultiAngleLoader?.(() =>
+      setMultiAngleLoaderOpen(true),
+    )
+
     // Help → Check for Updates… / GPU Status… (native menu; MenuBar.tsx's HTML
     // dropdown on Windows/Linux calls openUpdateDialog/openGpuStatusDialog directly).
     const disposeUpdateDialog = window.electron.onOpenUpdateDialog(() =>
@@ -1551,6 +1574,7 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
       pendingLogs.current = []
       disposeStackDialog?.()
       disposeUpdateDialog?.()
+      disposeMultiAngleLoader?.()
       disposeGpuStatusDialog?.()
       disposeGpuHelpDialog?.()
       disposeReportDialog?.()
@@ -1695,6 +1719,7 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
       promoted = false
       setDragKind(null)
       stashWindowDrag(null)
+      stashMemberDrag(null)
     }
     window.addEventListener('dragstart', onDragStart)
     window.addEventListener('dragover', onDragOver)
@@ -1720,6 +1745,8 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
   const clearNavShapePrompt = () => dispatch({ type: 'NAV_SHAPE_PROMPT', prompt: null })
   const openStackDialog = () => setStackDialogOpen(true)
   const closeStackDialog = () => setStackDialogOpen(false)
+  const openMultiAngleLoader = () => setMultiAngleLoaderOpen(true)
+  const closeMultiAngleLoader = () => setMultiAngleLoaderOpen(false)
   const openUpdateDialog = () => setUpdateDialogOpen(true)
   const closeUpdateDialog = () => setUpdateDialogOpen(false)
   const openGpuStatusDialog = () => setGpuStatusDialogOpen(true)
@@ -1734,6 +1761,7 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
       state, iframeRefs, latestStates, sendAction, setActiveWindow, replayState,
       requestFigurePng, clearNavShapePrompt,
       stackDialogOpen, openStackDialog, closeStackDialog,
+      multiAngleLoaderOpen, openMultiAngleLoader, closeMultiAngleLoader,
       updateDialogOpen, openUpdateDialog, closeUpdateDialog,
       gpuStatusDialogOpen, openGpuStatusDialog, closeGpuStatusDialog,
       gpuHelpDialogOpen, openGpuHelpDialog, closeGpuHelpDialog,

@@ -10,6 +10,7 @@ verbatim on MPS/CUDA at runtime (validated on real hardware separately).
 from __future__ import annotations
 
 import numpy as np
+import pytest
 import torch
 from scipy.ndimage import gaussian_filter, zoom
 
@@ -122,3 +123,85 @@ class TestBuildInputStack:
         got = PT.pad_to_multiple_batch(x, 2).unsqueeze(1).numpy()
         assert got.shape == ref[:, None].shape
         assert np.max(np.abs(got[:, 0] - ref)) < 1e-2
+
+
+def _planted_disks(shape, diameter, spacing=84, seed=0):
+    """A lattice of disks of known diameter, with a brighter one at the centre."""
+    generator = np.random.default_rng(seed)
+    y, x = np.mgrid[0:shape[0], 0:shape[1]].astype(float)
+    frame = np.zeros(shape, float)
+    centre_y, centre_x = shape[0] / 2, shape[1] / 2
+    for step_y in (-2, -1, 0, 1, 2):
+        for step_x in (-2, -1, 0, 1, 2):
+            radius = np.hypot(y - (centre_y + step_y * spacing),
+                              x - (centre_x + step_x * spacing))
+            frame += (radius < diameter / 2) * (900 if (step_y or step_x) else 2600)
+    return frame + generator.poisson(3.0, shape)
+
+
+class TestDiskEstimateOnANonSquareDetector:
+    """The disk estimate sizes the canonical rescale, so it runs on EVERY frame.
+
+    It used to add the horizontal and vertical central-line profiles of the
+    autocorrelation, which only have the same length when the detector is
+    square. Anything else raised, and since this is the first thing the neural
+    detector does, it took the whole detector down — including on a composed
+    multi-angle pattern, which is non-square whenever its reciprocal offsets
+    differ between the axes.
+    """
+
+    @pytest.mark.parametrize("shape", [(507, 501), (501, 507), (400, 512),
+                                       (512, 400)])
+    def test_a_non_square_frame_is_measured(self, shape):
+        assert P.estimate_disk_diameter(_planted_disks(shape, 22)) > 0
+
+    def test_the_answer_does_not_depend_on_which_axis_is_longer(self):
+        wide = P.estimate_disk_diameter(_planted_disks((501, 507), 22))
+        tall = P.estimate_disk_diameter(_planted_disks((507, 501), 22))
+        assert abs(wide - tall) <= 1.0
+
+    @pytest.mark.parametrize("diameter", [12, 22, 30])
+    def test_it_tracks_the_planted_diameter(self, diameter):
+        square = P.estimate_disk_diameter(_planted_disks((512, 512), diameter))
+        oblong = P.estimate_disk_diameter(_planted_disks((507, 501), diameter))
+        # Within a tenth: the autocorrelation's sidelobes depend on where the
+        # lattice falls relative to the edges, which a different shape moves.
+        assert abs(square - oblong) <= 0.1 * square
+        # The half-max width of the autocorrelation peak, so it tracks the
+        # disk rather than equalling it; what matters is that it follows.
+        assert 0.5 * diameter <= square <= 1.5 * diameter
+
+    def test_a_square_frame_is_unchanged(self):
+        """Averaging the two WIDTHS, not the two profiles — identical when the
+        profiles were addable in the first place."""
+        for size in (256, 512):
+            for diameter in (12, 22, 30):
+                frame = _planted_disks((size, size), diameter)
+                autocorrelation = _old_square_estimate(frame)
+                assert P.estimate_disk_diameter(frame) == autocorrelation
+
+    def test_a_blank_frame_falls_back(self):
+        assert P.estimate_disk_diameter(
+            np.zeros((507, 501), dtype=np.float32)) == P.CANONICAL_DIAMETER
+
+
+def _old_square_estimate(frame, hp_sigma=20.0):
+    """What the square-only code computed, kept here as the parity reference."""
+    f = np.clip(frame.astype(np.float64), 0, None)
+    f = np.clip(f - gaussian_filter(f, hp_sigma), 0, None)
+    if f.max() <= 0:
+        return P.CANONICAL_DIAMETER
+    spectrum = np.fft.fft2(f)
+    autocorrelation = np.fft.fftshift(
+        np.real(np.fft.ifft2(spectrum * np.conj(spectrum))))
+    height, width = autocorrelation.shape
+    centre_y, centre_x = height // 2, width // 2
+    peak = autocorrelation[centre_y, centre_x]
+    profile = 0.5 * (autocorrelation[centre_y] / peak
+                     + autocorrelation[:, centre_x] / peak)
+    left = right = centre_x
+    while left > 0 and profile[left] > 0.5:
+        left -= 1
+    while right < width - 1 and profile[right] > 0.5:
+        right += 1
+    return float(max(right - left, 1))

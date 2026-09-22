@@ -55,6 +55,16 @@ class TestEDS:
         assert info["engine_supported"] is True
         assert tcomp.supports(spec) is True
 
+    def test_the_model_has_exactly_the_elements_given(self, eds):
+        """A node can still list an element the sample no longer has, with its
+        X-ray line — exspy would add that element back from the line."""
+        stale = eds.deepcopy()
+        stale.add_lines(["Cu_Ka"])
+        spec, info = model_for_composition(stale, ["Fe", "Ni"])
+        assert set(info["elements"]) == {"Fe", "Ni"}
+        names = [component.name for component in spec]
+        assert not any(name.startswith("Cu_") for name in names), names
+
     def test_only_lines_restricts_the_model(self, eds):
         """`add_lines` only APPENDS, so restricting needs `set_lines` — the
         obvious call silently leaves every default line in place."""
@@ -73,6 +83,13 @@ class TestEELS:
         kinds = [c.kind for c in spec]
         assert kinds.count("EELSCLEdge") == 3, kinds
         assert "PowerLaw" in kinds          # background
+
+    def test_the_model_has_exactly_the_elements_given(self, eels):
+        stale = eels.deepcopy()
+        stale.add_elements(["C", "N", "O"])
+        spec, info = model_for_composition(stale, ["C", "N"])
+        assert set(info["elements"]) == {"C", "N"}
+        assert [component.kind for component in spec].count("EELSCLEdge") == 2
 
     def test_edges_land_at_their_real_onsets(self, eels):
         from spyde.data.synthetic import EELS_EDGES

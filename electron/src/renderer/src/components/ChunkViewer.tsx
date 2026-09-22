@@ -16,6 +16,7 @@
  * than one abstract N-d block stack, and the verdict line says which case this
  * is.
  */
+import { formatBytes } from '../kernel/format'
 import React from 'react'
 import type { ChunkInfo } from '../kernel/SpyDEContext'
 import { CaretBox } from './CaretBox'
@@ -25,12 +26,7 @@ import { CaretBox } from './CaretBox'
  *  real number. */
 const MAX_LINES = 40
 
-const fmtBytes = (n: number) => {
-  if (!isFinite(n) || n <= 0) return '—'
-  const u = ['B', 'KB', 'MB', 'GB', 'TB']
-  const i = Math.min(u.length - 1, Math.floor(Math.log10(n) / 3))
-  return `${(n / 1000 ** i).toFixed(i === 0 ? 0 : 1)} ${u[i]}`
-}
+const fmtBytes = (n: number) => formatBytes(n, '—')
 
 /** Cumulative fractional offsets of the chunk boundaries along one axis. */
 function boundaries(sizes: number[], total: number, count: number): number[] {

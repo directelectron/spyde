@@ -3,14 +3,16 @@
  * chips, so you don't have to re-browse the file dialog every time.
  *
  * The list lives in the renderer's localStorage (most-recent-first, capped), so
- * it persists across sessions and needs no backend. Used by both the Orientation
- * and Vector-Orientation wizards.
+ * it persists across sessions and needs no backend. Used by the phase popout
+ * (PeriodicTable.tsx).
  */
 import React from 'react'
 
 const KEY = 'spyde:cif-recents'
 const MAX = 8
-const base = (p: string) => p.split(/[/\\]/).pop() || p
+
+/** The last part of a file path, on either platform. */
+export const fileName = (path: string) => path.split(/[/\\]/).pop() || path
 
 function load(): string[] {
   try {
@@ -45,9 +47,9 @@ export function RecentCifs({ recents, exclude = [], onPick }: {
     <div data-testid="cif-recents" style={S.wrap}>
       <span style={S.label}>Recent</span>
       <div style={S.chips}>
-        {shown.map((p) => (
-          <button key={p} data-testid={`cif-recent-${base(p)}`} title={p}
-            style={S.chip} onClick={() => onPick(p)}>{base(p)}</button>
+        {shown.map((path) => (
+          <button key={path} data-testid={`cif-recent-${fileName(path)}`} title={path}
+            style={S.chip} onClick={() => onPick(path)}>{fileName(path)}</button>
         ))}
       </div>
     </div>

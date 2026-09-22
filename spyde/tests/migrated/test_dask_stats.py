@@ -165,9 +165,18 @@ class TestMemoryTrim:
                 client = _FakeClient()
 
         ds.trim_cluster_memory(_FakeSession())
-        assert ran and ran[0][0] is ds._trim_process_memory
-        assert ran[0][1] is False        # fire-and-forget — a blocking run()
-                                         # across all workers wedged app close
+        assert ran and ran[0][1] is False   # fire-and-forget — a blocking
+                                            # run() across every worker wedged
+                                            # app close
+        # And fire-and-forget REQUIRES a coroutine: `Client.run` asserts
+        # `wait or is_coro` inside the worker, so a plain function raises
+        # there — per worker, in the worker's log, where the caller's own
+        # `except` never sees it. This assertion used to name the plain one,
+        # so it pinned a call that could not work.
+        from inspect import iscoroutinefunction
+        assert iscoroutinefunction(ran[0][0]), (
+            f"{ran[0][0].__name__} is not a coroutine, so every worker raises "
+            "'Combination not supported' and the trim never happens")
 
 
 class TestMemoryBackpressure:
@@ -257,3 +266,19 @@ class TestWorkerPriority:
                 raise AssertionError("priority touched despite opt-out")
 
         assert _lower_worker_priority(_FakeProc()) is False
+
+
+class TestTheClusterTrimActuallyRuns:
+    """The trim itself, beside the test that it reaches every worker."""
+
+    def test_the_coroutine_trims(self):
+        import asyncio
+
+        from spyde.backend.dask_stats import _trim_worker_memory
+        assert asyncio.run(_trim_worker_memory()) != 0
+
+    def test_a_cluster_that_is_not_there_is_not_an_error(self):
+        from spyde.backend.dask_stats import trim_cluster_memory
+
+        session = type("Session", (), {"dask_manager": None})()
+        trim_cluster_memory(session)      # must not raise

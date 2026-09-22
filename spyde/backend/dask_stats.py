@@ -96,6 +96,19 @@ def _trim_process_memory() -> int:
         return -1
 
 
+async def _trim_worker_memory() -> int:
+    """The same trim, as a coroutine, because fire-and-forget demands one.
+
+    ``Client.run(fn, wait=False)`` asserts ``wait or is_coro`` inside the
+    worker, so handing it a plain function raises there — once per worker, in
+    the worker's log, where the caller cannot see it and its own ``except``
+    never fires. The trim then never happened, which is worth more than the
+    noise: it is what is supposed to relieve the memory pressure that
+    provokes it, so the failure hid precisely when it mattered.
+    """
+    return _trim_process_memory()
+
+
 def trim_cluster_memory(session) -> None:
     """AUTOMATIC post-batch trim (no UI — user feedback: a manual "Trim
     memory" button second-guessing dask is odd). Why it runs at all: dask's
@@ -110,7 +123,7 @@ def trim_cluster_memory(session) -> None:
             # wait=False: fire-and-forget. A blocking run() across all workers
             # right at app close wedged teardown (the batch thread sat in the
             # RPC while shutdown killed the stdin tick).
-            client.run(_trim_process_memory, wait=False)
+            client.run(_trim_worker_memory, wait=False)
         _trim_process_memory()
     except Exception as e:
         log.debug("[dask-stats] post-batch trim failed: %s", e)

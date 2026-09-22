@@ -26,6 +26,8 @@ from spyde.backend._session_files import (
     _path_ext, _is_supported_dataset_path, _dataset_size_bytes,
     _apply_example_calibration,
 )
+from spyde.backend._session_multiangle import MultiAngleLoaderMixin
+from spyde.backend._session_multiangle_loader import MultiAngleLoaderStateMixin
 from spyde.backend._session_testharness import TestHarnessMixin
 from spyde.backend.tutorial_data import TutorialDataMixin
 from spyde.backend._session_windows import WindowManagerMixin
@@ -56,6 +58,8 @@ class Session(
     AxesEditorMixin,
     ActionRouterMixin,
     FileLoaderMixin,
+    MultiAngleLoaderMixin,
+    MultiAngleLoaderStateMixin,
     TestHarnessMixin,
     TutorialDataMixin,
     WindowManagerMixin,
@@ -320,7 +324,7 @@ class Session(
             log.debug("navigator options emit failed: %s", e)
         try:
             from spyde.actions.composition import emit_composition
-            emit_composition(tree, self._tree_window_ids(tree))
+            emit_composition(self, tree)
         except Exception as e:
             log.warning("composition emit failed: %s", e)
 

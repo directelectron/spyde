@@ -5,7 +5,7 @@ accuracy is capped by the sampling step: a 5-degree dictionary gives 5-degree
 answers. Refinement lifts that cap by optimising each orientation continuously,
 starting from its indexed match.
 
-This is the same shape of problem as ``actions/vector_orientation_gpu.py`` and
+This is the same shape of problem as ``spyde/torch_device.py`` and
 is solved the same way: **the whole field at once**. Every pattern's three
 Euler angles are one row of a ``(P, 3)`` tensor, the simulated patterns are one
 batched forward pass, and one Adam optimiser walks all P orientations
@@ -237,7 +237,8 @@ def refine_orientations(patterns, euler_start, *, simulator=None,
     # a long time — so hand the device back at the SAME cadence the UI yield
     # already uses (quiesce Metal, release, yield, re-acquire). A concurrent
     # preview then waits one yield window rather than the whole refinement.
-    # This mirrors compute_vector_orientation_gpu; see CLAUDE.md, GPU Computing.
+    # The vector orientation matcher does the same between its stages, and the
+    # spectrum fit between chunks. See CLAUDE.md, GPU Computing.
     yield_fn = on_yield
     if is_mps(device):
         def yield_fn():                                       # noqa: F811
