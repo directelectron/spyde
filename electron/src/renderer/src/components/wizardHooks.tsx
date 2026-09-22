@@ -28,7 +28,9 @@ export type SendAction = (
 ) => void
 
 export function useWizardLifecycle(opts: {
-  windowId: number
+  /** The window the caret is mounted on. Omitted by a caret that belongs to no
+   *  one window — the multi-angle loader is a modal over the whole app. */
+  windowId?: number
   sendAction: SendAction
   /** staged action fired on mount (e.g. 'strain_open'); null → fire nothing */
   openAction: string | null
@@ -36,11 +38,21 @@ export function useWizardLifecycle(opts: {
   openPayload?: () => Record<string, unknown>
   /** staged action fired on unmount (e.g. 'strain_close') */
   closeAction: string
+  /** Asked at unmount: true → the close is NOT sent. For an unmount that is
+   *  the CONSEQUENCE of a commit, where closing the session behind it would
+   *  tear down the work it just handed over. */
+  skipClose?: () => boolean
   /** re-run the open/close pair when these change (e.g. the CZB tab) */
   deps?: React.DependencyList
 }): void {
-  const { windowId, sendAction, openAction, openPayload, closeAction } = opts
+  // Through a ref, because a provider re-render hands down a fresh `sendAction`
+  // closure while this effect is deliberately pinned to `deps` — so the fire
+  // and the close use the CURRENT one rather than the one that happened to be
+  // in scope at mount.
+  const latest = React.useRef(opts)
+  latest.current = opts
   React.useEffect(() => {
+    const { windowId, sendAction, openAction, openPayload } = latest.current
     let fired = false
     const t = setTimeout(() => {
       fired = true
@@ -48,7 +60,8 @@ export function useWizardLifecycle(opts: {
     }, 0)
     return () => {
       clearTimeout(t)
-      if (fired) sendAction(closeAction, {}, windowId)
+      const now = latest.current
+      if (fired && !now.skipClose?.()) now.sendAction(now.closeAction, {}, now.windowId)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, opts.deps ?? [])
@@ -89,8 +102,13 @@ export function useKeyedDebounce(delay = 150): (key: string, fn: () => void) => 
   }, [delay])
 }
 
+/** Subscribe to a re-broadcast backend message, filtered to this window.
+ *
+ *  `windowId` is omitted by a caret that belongs to no one window (the
+ *  multi-angle loader is a modal over the whole app), which then hears every
+ *  such message — there is no window for one to be about. */
 export function useWizardEvent(
-  name: string, windowId: number,
+  name: string, windowId: number | undefined,
   handler: (detail: Record<string, unknown>) => void,
 ): void {
   const h = React.useRef(handler)
@@ -98,7 +116,7 @@ export function useWizardEvent(
   React.useEffect(() => {
     const on = (e: Event) => {
       const d = (e as CustomEvent).detail as Record<string, unknown>
-      if (d.window_id != null && d.window_id !== windowId) return
+      if (windowId != null && d.window_id != null && d.window_id !== windowId) return
       h.current(d)
     }
     window.addEventListener(name, on)

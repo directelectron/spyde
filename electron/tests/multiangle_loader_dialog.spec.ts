@@ -19,25 +19,23 @@
  * (Electron 44 removed `File.path`) has nothing to resolve — which is exactly
  * the case asserted below, that a pathless drop SAYS so instead of silently
  * doing nothing. That a genuine drag from Finder/Explorer yields real paths has
- * to be checked by hand in the running app.
+ * to be checked by hand in the running ctx.app.
  */
-import { test, expect, _electron as electron, ElectronApplication, Page } from '@playwright/test'
+import { test, expect, Page } from '@playwright/test'
 import { join } from 'path'
 import { deflateSync } from 'zlib'
 
-let app: ElectronApplication
+const { launchApp } = require('./_harness.cjs')
+
+let ctx: any
 let page: Page
 
 test.beforeAll(async () => {
-  app = await electron.launch({
-    args: [join(__dirname, '..', 'out', 'main', 'index.js')],
-    env: { ...process.env, SPYDE_NO_DASK: '1' },
-  })
-  page = await app.firstWindow()
-  await page.waitForLoadState('domcontentloaded')
+  ctx = await launchApp({ dask: false })
+  page = ctx.page
 })
 
-test.afterAll(async () => { await app?.close() })
+test.afterAll(async () => { await ctx?.app?.close() })
 
 /** Every spec starts from a closed dialog and an empty action log. The action
  *  channel's own listener is removed, so nothing here reaches Python — the
@@ -46,7 +44,7 @@ test.afterAll(async () => { await app?.close() })
 test.beforeEach(async () => {
   await page.reload()
   await page.waitForSelector('[data-testid="mdi-area"]')
-  await app.evaluate(({ ipcMain }) => {
+  await ctx.app.evaluate(({ ipcMain }) => {
     ;(globalThis as any).__sent = []
     ipcMain.removeAllListeners('spyde:action')
     ipcMain.on('spyde:action', (_e, action, payload) => {
@@ -56,7 +54,7 @@ test.beforeEach(async () => {
 })
 
 const sentActions = (): Promise<{ action: string; payload: any }[]> =>
-  app.evaluate(() => (globalThis as any).__sent)
+  ctx.app.evaluate(() => (globalThis as any).__sent)
 
 const sentNamed = async (name: string) =>
   (await sentActions()).filter((a) => a.action === name)
@@ -75,7 +73,7 @@ async function openLoader() {
  *  immutable, so reassigning window.electron.pickFiles silently no-ops (and a
  *  real native dialog would block the run). */
 async function stubPicker(paths: string[]) {
-  await app.evaluate(({ ipcMain }, p) => {
+  await ctx.app.evaluate(({ ipcMain }, p) => {
     ipcMain.removeHandler('spyde:pick-files')
     ipcMain.handle('spyde:pick-files', async () => p)
   }, paths)
@@ -378,7 +376,7 @@ test('a ring lays out empty spots, and removing it takes them away', async () =>
   }
   expect(await sentActions()).toEqual([{ action: 'maped_open_loader', payload: {} }])
 
-  await expect(page.getByTestId('maped-ring-chip-spec-1')).toContainText('1.0° × 6')
+  await expect(page.getByTestId('maped-ring-chip-spec-1')).toContainText('1° × 6')
   await page.getByTestId('maped-ring-remove-1').click()
   await expect(page.getByTestId('maped-slot-1.00-60')).toHaveCount(0)
   await expect(page.getByTestId('maped-tableau-load-empty')).toBeVisible()
@@ -440,7 +438,7 @@ test('the header states what the acquisition IS', async () => {
   await openLoader()
   await inject(LOADED)
   await expect(page.getByTestId('maped-summary'))
-    .toHaveText('10 angles · 2 shells · 1.0°, 0.5°')
+    .toHaveText('10 angles · 2 shells · 1°, 0.5°')
 })
 
 test('members land on rings taken from their own angles, each drawing its preview', async () => {
@@ -449,7 +447,7 @@ test('members land on rings taken from their own angles, each drawing its previe
   // No scaffolding was laid out, so the rings come from the data — one per
   // tilt, listed as such, and every member is on one of them.
   await expect(page.getByTestId('maped-ring-chip-data-0.500')).toContainText('0.5° × 4')
-  await expect(page.getByTestId('maped-ring-chip-data-1.000')).toContainText('1.0° × 6')
+  await expect(page.getByTestId('maped-ring-chip-data-1.000')).toContainText('1° × 6')
   await expect(page.getByTestId('maped-ring-chip-data-1.000')).toContainText('from data')
 
   const tableau = page.getByTestId('maped-tableau-load')
@@ -481,7 +479,7 @@ test('a scaffold ring keeps its empty spots and draws members at their TRUE azim
   await expect(page.getByTestId('maped-slot-1.00-270')).toBeVisible()
   await expect(page.getByTestId('maped-member-1'))
     .toHaveAttribute('title', /60° azimuth/)
-  await expect(page.getByTestId('maped-ring-chip-spec-1')).toContainText('1.0° × 8')
+  await expect(page.getByTestId('maped-ring-chip-spec-1')).toContainText('1° × 8')
 })
 
 test('a member with no angle waits in the tray, and dragging it onto a spot angles it', async () => {
@@ -762,7 +760,7 @@ test('each member opens into its four corner sums, each with its own extent', as
 
   const card = page.getByTestId('maped-corners-2')
   await expect(card).toContainText('angle02.mrc')
-  await expect(card).toContainText('1.0° · 120°')
+  await expect(card).toContainText('1° · 120°')
   for (let corner = 0; corner < 4; corner += 1) {
     await expect(card.getByTestId(`maped-corner-2-${corner}`).locator('img')).toBeVisible()
     expect(await card.getByTestId(`maped-corner-extent-2-${corner}`).inputValue()).toBe('4')

@@ -12,21 +12,19 @@
  * Screenshots land in electron/multiangle_shots/ because a green assertion here
  * does not prove the windows drew anything (CLAUDE.md).
  */
-import { test, expect, _electron as electron, ElectronApplication, Page } from '@playwright/test'
+import { test, expect, Page } from '@playwright/test'
 import { join } from 'path'
 
-let app: ElectronApplication
+const { launchApp } = require('./_harness.cjs')
+
+let ctx: any
 let page: Page
 
 const SHOTS = join(__dirname, '..', 'multiangle_shots')
 
 test.beforeAll(async () => {
-  app = await electron.launch({
-    args: [join(__dirname, '..', 'out', 'main', 'index.js')],
-    env: { ...process.env, SPYDE_NO_DASK: '1', SPYDE_LOG_LEVEL: 'INFO' },
-  })
-  page = await app.firstWindow()
-  await page.waitForLoadState('domcontentloaded')
+  ctx = await launchApp({ dask: false, env: { SPYDE_LOG_LEVEL: 'INFO' } })
+  page = ctx.page
   await page.waitForTimeout(1500)
   await page.evaluate(() =>
     window.electron.action('load_test_data_multiangle', { nav: 28, sig: 32 }),
@@ -39,7 +37,7 @@ test.beforeAll(async () => {
   await page.waitForTimeout(3000)
 })
 
-test.afterAll(async () => { await app?.close() })
+test.afterAll(async () => { await ctx?.app?.close() })
 
 test('a multi-angle acquisition opens on its summed node with the stack behind it', async () => {
   await expect(page.getByTestId('status-text'))

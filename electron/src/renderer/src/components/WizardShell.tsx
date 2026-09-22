@@ -95,8 +95,29 @@ export function Field({ label, children }: {
   )
 }
 
-export function NumInput({ value, onChange, step = 'any', width = 64, testid }: {
-  value: number; onChange: (n: number) => void; step?: string; width?: number; testid?: string
+export function NumInput({
+  value, onChange, onClear, step = 'any', width = 64, testid,
+  min, placeholder, accept, label, suffix, style,
+}: {
+  /** null is "no number yet" — the box shows `placeholder` instead. */
+  value: number | null
+  onChange: (n: number) => void
+  /** Told that the box was EMPTIED, for a value that has a meaningful "none"
+   *  (a cleared scan grid). Without it an empty box simply waits. */
+  onClear?: () => void
+  step?: string
+  /** Pixels, or any CSS width — '100%' for a box that fills its cell. */
+  width?: number | string
+  testid?: string
+  min?: number
+  placeholder?: string
+  /** A further condition a typed number must meet before it is sent upward
+   *  (e.g. a positive integer). Finiteness is always required. */
+  accept?: (n: number) => boolean
+  /** Text either side of the box: a name for the number, and its unit. */
+  label?: React.ReactNode
+  suffix?: React.ReactNode
+  style?: React.CSSProperties
 }) {
   // A bare `Number(e.target.value)` propagates NaN upward for a mid-edit or
   // malformed string (empty, "-", "1.", "e", …), which then flows into every
@@ -106,19 +127,29 @@ export function NumInput({ value, onChange, step = 'any', width = 64, testid }: 
   // (the last valid `value` from the parent stays authoritative) rather than
   // clobbering state with NaN. Valid input's behavior is unchanged.
   const [draft, setDraft] = React.useState<string | null>(null)
-  return (
+  const box = (
     <input
-      data-testid={testid} type="number" step={step}
-      value={draft ?? value}
-      style={{ ...S.num, width }}
+      data-testid={testid} type="number" step={step} min={min}
+      placeholder={placeholder}
+      value={draft ?? (value == null ? '' : String(value))}
+      style={{ ...S.num, width, ...style }}
       onChange={(e) => {
         const text = e.target.value
         setDraft(text)
+        if (text === '') { onClear?.(); return }
         const n = Number(text)
-        if (text !== '' && Number.isFinite(n)) onChange(n)
+        if (Number.isFinite(n) && (accept ? accept(n) : true)) onChange(n)
       }}
       onBlur={() => setDraft(null)}
     />
+  )
+  if (label == null && suffix == null) return box
+  return (
+    <label style={S.numField}>
+      {label != null && <span style={S.numLabel}>{label}</span>}
+      {box}
+      {suffix != null && <span style={S.numLabel}>{suffix}</span>}
+    </label>
   )
 }
 
@@ -184,6 +215,8 @@ export const S: Record<string, React.CSSProperties> = {
   fieldRow: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 6, flexWrap: 'wrap' },
   lbl: { fontSize: 10, color: '#a6adc8', whiteSpace: 'nowrap' },
   num: { background: '#11111b', color: '#cdd6f4', border: '1px solid #313244', borderRadius: 4, padding: '3px 5px', fontSize: 11 },
+  numField: { display: 'flex', alignItems: 'center', gap: 3 },
+  numLabel: { fontSize: 10, color: '#6c7086' },
   sel: { background: '#11111b', color: '#cdd6f4', border: '1px solid #313244', borderRadius: 4, padding: '3px 5px', fontSize: 11 },
   sliderRow: { display: 'flex', alignItems: 'center', gap: 4 },
   sliderVal: { fontSize: 10, color: '#cdd6f4', minWidth: 28, textAlign: 'right' },

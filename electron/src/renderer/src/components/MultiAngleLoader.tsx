@@ -34,7 +34,12 @@ import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { TabRow, Field, NumInput, Info, PrimaryButton } from './WizardShell'
 import { formatBytes } from '../kernel/format'
 import { Dropdown } from './Dropdown'
-import { useKeyedDebounce, type SendAction } from './wizardHooks'
+import {
+  useKeyedDebounce, useWizardEvent, useWizardLifecycle, type SendAction,
+} from './wizardHooks'
+import {
+  MEMBER_DRAG_MIME, pathsFromDrop, peekMemberDrag, stashMemberDrag,
+} from '../kernel/dnd'
 
 const ACCENT = '#89b4fa'
 const WARN = '#f9e2af'
@@ -47,6 +52,11 @@ const LABEL_COLOR = '#9aa4b2'
  *  coin toss at that member, and the user has to know rather than read a
  *  confident-looking integer. */
 const AMBIGUOUS_RESIDUAL_PX = 0.4
+
+/** Smallest half-width the zero-beam search square may be shrunk to. Below a
+ *  few detector pixels it can no longer hold a disk, so it would only ever
+ *  report the centre it started from. */
+const MIN_BEAM_ROI_HALF = 3
 
 /** Two tilts this close are the same ring. A shell groups tilts within a
  *  tolerance, so a scaffold ring at 1.0° must still claim a member the backend
@@ -339,12 +349,15 @@ function parseBeamRoi(raw: unknown): BeamRoi | null {
   return { cy, cx, half }
 }
 
-/** "1.0°", "0.5°", "1.25°" — always at least one decimal, so a whole-degree
- *  shell reads as an angle rather than a count. */
+/** "1°", "0.5°", "1.25°" — the shortest exact form, to two decimals. The SAME
+ *  rule as `_format_degrees` in spyde/actions/multiangle_navigator.py, which
+ *  labels the rings of the navigator this picture is a preview of: one ring
+ *  reading "1.0°" here and "1°" there is two names for one shell. A test parses
+ *  this line to keep them equal. */
 function formatDegrees(value: number | null): string {
   if (value == null || !Number.isFinite(value)) return '—'
-  const rounded = Math.round(value * 1000) / 1000
-  return `${Number.isInteger(rounded) ? rounded.toFixed(1) : String(rounded)}°`
+  const text = value.toFixed(2).replace(/0+$/, '').replace(/\.$/, '')
+  return `${text || '0'}°`
 }
 
 /** An azimuth label, where a trailing ".0" is noise: "60°", "17.5°". */
@@ -415,11 +428,13 @@ function azimuthDistance(a: number, b: number): number {
  * A label at a fixed azimuth lands on top of whichever member happens to sit
  * there, and at azimuth 0 it always does, since an acquisition that starts at
  * 0° is the normal case. In the widest gap it only ever collides when the ring
- * is genuinely full. (`_widest_gap` in multiangle_navigator.py, same idea.)
+ * is genuinely full. The SAME rule as `_widest_gap` in
+ * multiangle_navigator.py, down to where an EMPTY ring puts its label — a test
+ * parses that default to keep the two pictures alike.
  */
 function widestGapAzimuth(azimuths: number[]): number {
   const sorted = azimuths.map((a) => ((a % 360) + 360) % 360).sort((x, y) => x - y)
-  if (sorted.length === 0) return 45
+  if (sorted.length === 0) return 0
   if (sorted.length === 1) return sorted[0] + 180
   let best = 0
   let widest = -1
@@ -529,9 +544,10 @@ function layoutRings(specs: RingSpec[], members: MapedMember[]): {
     })
   }
 
-  // Radius is the tilt, as on the navigator — with a floor, because a 0.05°
-  // inner shell beside a 2° outer one would otherwise be a dot at the centre
-  // with its slots on top of each other.
+  // Radius is the tilt, as on the navigator — with a floor the navigator does
+  // not need, because a slot here is a fixed-size TILE: a 0.05° inner shell
+  // beside a 2° outer one would be a dot at the centre with its slots on top
+  // of each other, where the navigator's ring is just a small circle.
   rings.sort((a, b) => a.tilt - b.tilt)
   const maxTilt = rings.reduce((acc, r) => Math.max(acc, r.tilt), 0)
   const floor = rings.length > 1 ? 0.34 : 1
@@ -561,6 +577,19 @@ const RECIPROCAL_METHODS: readonly { value: ReciprocalMethod; label: string }[] 
  *  since a Dropdown's value is a string and the action's is null. */
 const COMPUTE_VI = '__compute__'
 
+/** The virtual images on offer, plus computing one — the same list everywhere a
+ *  virtual image is chosen (the real-space tab, and the pair view). */
+const virtualImageOptions = (
+  images: string[],
+): readonly { value: string; label: string }[] => [
+  ...images.map((name) => ({ value: name, label: name })),
+  { value: COMPUTE_VI, label: 'Compute from the data' },
+]
+
+/** …and back again, for the action that takes null. */
+const namedImage = (value: string): string | null =>
+  (value === COMPUTE_VI ? null : value)
+
 const FILE_FILTER = {
   name: 'EM Data',
   extensions: ['hspy', 'zspy', 'mrc', 'tif', 'tiff', 'de5'],
@@ -583,9 +612,21 @@ type ZoomTarget =
    *  coarse to place a 24 px region on a disk. */
   | { kind: 'panel'; src: string | null; caption: string; detector?: number[] | null }
 
-/** The drag type an internal slot-to-slot move carries — a member index, as
- *  opposed to a file coming in from the desktop. */
-const MEMBER_DRAG_TYPE = 'application/x-maped-member'
+/** Start an internal slot-to-slot move: the member index on the drag, and the
+ *  same index kept in-process for a drop whose `getData()` comes back empty
+ *  (see dnd.ts — a real OS drag in the packaged app can do that). */
+function startMemberDrag(e: React.DragEvent, index: number): void {
+  e.dataTransfer.setData(MEMBER_DRAG_MIME, String(index))
+  e.dataTransfer.effectAllowed = 'move'
+  stashMemberDrag(index)
+}
+
+/** The member a drop carries, or null for anything else. */
+function droppedMember(e: React.DragEvent): number | null {
+  const carried = e.dataTransfer.getData(MEMBER_DRAG_MIME)
+  if (carried !== '') return Number(carried)
+  return e.dataTransfer.types.includes(MEMBER_DRAG_MIME) ? peekMemberDrag() : null
+}
 
 export function MultiAngleLoader({ sendAction, onClose }: {
   sendAction: SendAction
@@ -612,9 +653,9 @@ export function MultiAngleLoader({ sendAction, onClose }: {
   const [dropNote, setDropNote] = useState('')
   const debounce = useKeyedDebounce(250)
 
-  // `sendAction` is a fresh closure on every provider render, so the deps-[]
-  // lifecycle effect below must read it through a ref or it would fire an open
-  // for a torn-down provider value.
+  // `sendAction` is a fresh closure on every provider render, so the
+  // snapshot-gated effect below reads it through a ref rather than capturing
+  // one render's value.
   const send = useRef(sendAction)
   send.current = sendAction
   // Set by the Open button: the commit must NOT be followed by a close that
@@ -627,27 +668,18 @@ export function MultiAngleLoader({ sendAction, onClose }: {
   // index in advance; this is the whole reason the map exists.
   const awaitingAngles = useRef(new Map<string, { tilt: number; azimuth: number }>())
 
-  // Mount → open, unmount → close. The deferred fire is what makes it
-  // StrictMode-safe: the synchronous mount→cleanup→remount cancels the first
-  // timer, so exactly one `maped_open_loader` reaches the backend.
-  useEffect(() => {
-    let fired = false
-    const timer = setTimeout(() => {
-      fired = true
-      send.current('maped_open_loader', {})
-    }, 0)
-    return () => {
-      clearTimeout(timer)
-      if (fired && !committed.current) send.current('maped_close_loader', {})
-    }
-  }, [])
+  // Mount → open, unmount → close, the same staged pair every wizard caret
+  // speaks — with no window id, because the loader is a modal over the whole
+  // app rather than a caret on one window.
+  useWizardLifecycle({
+    sendAction,
+    openAction: 'maped_open_loader',
+    closeAction: 'maped_close_loader',
+    skipClose: () => committed.current,
+  })
 
-  useEffect(() => {
-    const onState = (e: Event) =>
-      setState(parseMapedState((e as CustomEvent).detail as Record<string, unknown>))
-    window.addEventListener('spyde:maped_state', onState)
-    return () => window.removeEventListener('spyde:maped_state', onState)
-  }, [])
+  useWizardEvent('spyde:maped_state', undefined, (detail) =>
+    setState(parseMapedState(detail)))
 
   // The second half of a slot drop: the member the backend just added gets the
   // angles of the slot it was dropped on.
@@ -708,22 +740,10 @@ export function MultiAngleLoader({ sendAction, onClose }: {
     sendAction('maped_add_files', { paths: [path] })
   }
 
-  /** The OS paths behind a drop, or a note saying why there were none. */
+  /** The OS paths behind a drop, saying on screen why there were none. */
   const droppedPaths = (e: React.DragEvent): string[] => {
-    const files = Array.from(e.dataTransfer.files)
-    if (files.length === 0) { setDropNote('That drop carried no files.'); return [] }
-    // A sandboxed renderer has no File.path — the preload resolves each File to
-    // its OS path through webUtils.getPathForFile.
-    const paths = files
-      .map((f) => window.electron.pathForFile?.(f))
-      .filter((p): p is string => !!p)
-    if (paths.length === 0) {
-      setDropNote(`Could not read a file path from ${files.length} dropped item(s) — use Add datasets… instead.`)
-      return []
-    }
-    setDropNote(paths.length < files.length
-      ? `${files.length - paths.length} of ${files.length} dropped items had no readable path.`
-      : '')
+    const { paths, note } = pathsFromDrop(e)
+    setDropNote(note)
     return paths
   }
 
@@ -759,10 +779,12 @@ export function MultiAngleLoader({ sendAction, onClose }: {
         <div style={styles.zoomError}>⚠ {member.error}</div>
       )}
       <div style={styles.zoomAngles}>
-        <AngleInput testid={`maped-tilt-${member.index}`} label="tilt"
-          value={member.tilt} onChange={(tilt) => setMember(member.index, { tilt })} />
-        <AngleInput testid={`maped-azimuth-${member.index}`} label="az"
-          value={member.azimuth} onChange={(azimuth) => setMember(member.index, { azimuth })} />
+        <NumInput testid={`maped-tilt-${member.index}`} label="tilt" suffix="°"
+          width={58} value={member.tilt}
+          onChange={(tilt) => setMember(member.index, { tilt })} />
+        <NumInput testid={`maped-azimuth-${member.index}`} label="az" suffix="°"
+          width={58} value={member.azimuth}
+          onChange={(azimuth) => setMember(member.index, { azimuth })} />
         <label style={styles.zoomReference}>
           <input type="radio" name="maped-reference-zoom"
             data-testid={`maped-reference-${member.index}`}
@@ -945,12 +967,9 @@ export function MultiAngleLoader({ sendAction, onClose }: {
               <Field label="Virtual image">
                 <Dropdown<string>
                   value={state.virtual_image ?? COMPUTE_VI}
-                  options={[
-                    ...state.available_virtual_images.map((name) => ({ value: name, label: name })),
-                    { value: COMPUTE_VI, label: 'Compute from the data' },
-                  ]}
+                  options={virtualImageOptions(state.available_virtual_images)}
                   onChange={(v) => sendAction('maped_set_virtual_image',
-                    { name: v === COMPUTE_VI ? null : v })}
+                    { name: namedImage(v) })}
                   testid="maped-virtual-image" width={240}
                 />
               </Field>
@@ -1222,8 +1241,8 @@ function SlotTile({
     e.preventDefault()
     e.stopPropagation()
     setOver(false)
-    const dragged = e.dataTransfer.getData(MEMBER_DRAG_TYPE)
-    if (dragged !== '' && onDropMember) { onDropMember(Number(dragged)); return }
+    const dragged = droppedMember(e)
+    if (dragged != null && onDropMember) { onDropMember(dragged); return }
     onDropFiles?.(e)
   }
 
@@ -1240,11 +1259,7 @@ function SlotTile({
         ? `${member.name}\n${formatDegrees(tilt)} tilt · ${formatAzimuth(slot.azimuth)} azimuth`
         : `Empty — ${formatDegrees(tilt)} tilt · ${formatAzimuth(slot.azimuth)} azimuth`}
       draggable={!readOnly && member != null}
-      onDragStart={(e) => {
-        if (!member) return
-        e.dataTransfer.setData(MEMBER_DRAG_TYPE, String(member.index))
-        e.dataTransfer.effectAllowed = 'move'
-      }}
+      onDragStart={(e) => member && startMemberDrag(e, member.index)}
       onDragOver={readOnly ? undefined : (e) => {
         e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; setOver(true)
       }}
@@ -1371,10 +1386,7 @@ function UnplacedTray({ members, onZoom }: {
         {members.map((member) => (
           <div key={member.index} data-testid={`maped-unplaced-${member.index}`}
             draggable title={member.path}
-            onDragStart={(e) => {
-              e.dataTransfer.setData(MEMBER_DRAG_TYPE, String(member.index))
-              e.dataTransfer.effectAllowed = 'move'
-            }}
+            onDragStart={(e) => startMemberDrag(e, member.index)}
             onDoubleClick={() => onZoom(member)}
             style={{ ...styles.trayChip, ...(member.error ? styles.trayChipError : null) }}>
             {member.preview
@@ -1532,20 +1544,12 @@ function PairView({ pair, members, reference, images, offsets, solverOffsets,
           </span>
           <span style={{ flex: 1 }} />
           <span style={{ color: '#a6adc8', fontSize: 11 }}>Image</span>
-          <select
-            data-testid="maped-pair-image" style={styles.nudgeSelect}
+          <Dropdown<string>
             value={pair.image ?? COMPUTE_VI}
-            onChange={(e) => onImage(
-              e.target.value === COMPUTE_VI ? null : e.target.value)}
-          >
-            {[...images.map((name) => ({ value: name, label: name })),
-              { value: COMPUTE_VI, label: 'Compute from the data' }]
-              .map((option) => (
-                <option key={option.value} value={option.value}>
-                  {option.label}
-                </option>
-              ))}
-          </select>
+            options={virtualImageOptions(images)}
+            onChange={(v) => onImage(namedImage(v))}
+            testid="maped-pair-image" width={200}
+          />
           <button data-testid="maped-pair-close" style={styles.nudgeReset}
             onClick={onClose}>Close</button>
         </div>
@@ -1665,10 +1669,6 @@ function NudgePad({ members, reference, selected, offsets, solverOffsets,
   }
 
   const onKeyDown = (e: React.KeyboardEvent): void => {
-    // The member dropdown is inside the pad, so its own keydown bubbles here.
-    // Swallowing that would nudge instead of changing the member AND make the
-    // dropdown unreachable by keyboard.
-    if ((e.target as HTMLElement)?.tagName === 'SELECT') return
     const step = e.shiftKey ? NUDGE_BIG_STEP : NUDGE_STEP
     const moves: Record<string, [number, number]> = {
       ArrowUp: [-step, 0], ArrowDown: [step, 0],
@@ -1691,17 +1691,12 @@ function NudgePad({ members, reference, selected, offsets, solverOffsets,
     >
       <div style={styles.nudgeRow}>
         {movable.length > 1 && (
-          <select
-            data-testid="maped-nudge-member" value={String(index)}
-            onChange={(e) => onSelect(Number(e.target.value))}
-            style={styles.nudgeSelect}
-          >
-            {movable.map((m) => (
-              <option key={m.index} value={String(m.index)}>
-                {m.name.replace(/\.[^.]+$/, '')}
-              </option>
-            ))}
-          </select>
+          <Dropdown<string>
+            value={String(index)}
+            options={movable.map((m) => ({ value: String(m.index), label: stem(m.name) }))}
+            onChange={(v) => onSelect(Number(v))}
+            testid="maped-nudge-member" width={150}
+          />
         )}
         {movable.length <= 1 && (
           <span data-testid="maped-nudge-member" style={{ color: '#cdd6f4' }}>
@@ -1970,17 +1965,14 @@ function CornerTableau({ state, onExtent, onZoom, onBeamRoi }: {
             title="The zero beam is looked for inside this square. Drag the
  green box on any panel to place it.">
             <span style={styles.cornerAllLabel}>Zero-beam search ±px</span>
-            <input
-              data-testid="maped-beam-roi-half"
-              type="number" min={3} step={1}
+            <NumInput
+              testid="maped-beam-roi-half"
               value={Math.round(state.beam_roi.half)}
-              onChange={(e) => {
-                const half = Number(e.target.value)
-                if (Number.isFinite(half) && half >= 3 && state.beam_roi) {
-                  onBeamRoi({ ...state.beam_roi, half })
-                }
-              }}
-              style={{ ...styles.extentInput, width: 56 }}
+              step="1" min={MIN_BEAM_ROI_HALF}
+              accept={(half) => half >= MIN_BEAM_ROI_HALF}
+              onChange={(half) => state.beam_roi
+                && onBeamRoi({ ...state.beam_roi, half })}
+              width={56} style={styles.extentInput}
             />
           </label>
         )}
@@ -2040,30 +2032,22 @@ function CornerTableau({ state, onExtent, onZoom, onBeamRoi }: {
   )
 }
 
-/** A corner's extent in scan pixels. The raw text is held locally so a snapshot
- *  arriving mid-edit cannot rewrite what is being typed, and only a positive
- *  integer is ever sent. */
+/** A corner's extent in scan pixels: a positive whole number of them. */
+const isPositiveInteger = (n: number): boolean => Number.isInteger(n) && n > 0
+
+/** A corner's extent box — a `NumInput` sized to the panel it sits under. The
+ *  shared row gives a width in pixels; a per-corner box fills its panel. */
 function ExtentInput({ value, onChange, testid, width }: {
   value: number | null
   onChange: (v: number) => void
   testid: string
-  /** Fixed pixels for the shared row; the per-corner boxes fill their panel. */
   width?: number
 }) {
-  const [draft, setDraft] = useState<string | null>(null)
   return (
-    <input
-      data-testid={testid} type="number" step="1" min="1"
-      placeholder="—"
-      value={draft ?? (value == null ? '' : String(value))}
-      style={{ ...styles.extentInput, ...(width ? { width } : null) }}
-      onChange={(e) => {
-        const text = e.target.value
-        setDraft(text)
-        const parsed = Number(text)
-        if (text !== '' && Number.isInteger(parsed) && parsed > 0) onChange(parsed)
-      }}
-      onBlur={() => setDraft(null)}
+    <NumInput
+      testid={testid} value={value} onChange={onChange}
+      step="1" min={1} accept={isPositiveInteger} placeholder="—"
+      width={width ?? '100%'} style={styles.extentInput}
     />
   )
 }
@@ -2130,48 +2114,48 @@ function ScanShapeField({ value, onChange }: {
   value: number[] | null
   onChange: (v: number[] | null) => void
 }) {
-  // The two boxes are ONE value, so neither may be reset on blur the way a
-  // standalone field is: typing 32 and tabbing across would blur the first box,
-  // discard its text, and — since nothing has been sent yet, so no snapshot can
-  // supply it — leave the user watching what they just typed disappear. The
-  // typed text is therefore authoritative, and the snapshot is adopted only
-  // when the grid it carries actually CHANGES (a re-probe, or the echo of a
-  // grid someone else set).
-  const asText = (v: number[] | null) =>
-    ({ x: v?.[0] == null ? '' : String(v[0]), y: v?.[1] == null ? '' : String(v[1]) })
+  // The two boxes are ONE value, so what is typed in either has to outlive the
+  // other being filled in: a half-typed pair sends nothing, so no snapshot can
+  // hand the first box its own number back, and a box that dropped its draft on
+  // blur would leave the user watching what they just typed disappear as they
+  // tabbed across. The typed pair is therefore held HERE — each `NumInput`'s
+  // own draft only covers the box being typed in — and the snapshot is adopted
+  // only when the grid it carries actually CHANGES (a re-probe, or the echo of
+  // a grid someone else set).
   const gridKey = value == null ? '' : `${value[0]}x${value[1]}`
-  const [text, setText] = useState(() => asText(value))
+  const [typed, setTyped] = useState<{ x: number | null; y: number | null }>(
+    () => ({ x: value?.[0] ?? null, y: value?.[1] ?? null }))
   const seen = useRef(gridKey)
   useEffect(() => {
     if (gridKey === seen.current) return
     seen.current = gridKey
-    setText(asText(value))
+    setTyped({ x: value?.[0] ?? null, y: value?.[1] ?? null })
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [gridKey])
 
-  const edit = (axis: 'x' | 'y', typed: string): void => {
-    const next = { ...text, [axis]: typed }
-    setText(next)
-    if (next.x === '' && next.y === '') { onChange(null); return }
-    const x = Number(next.x)
-    const y = Number(next.y)
+  const edit = (axis: 'x' | 'y', n: number | null): void => {
+    const next = { ...typed, [axis]: n }
+    setTyped(next)
+    if (next.x == null && next.y == null) { onChange(null); return }
     // A half-typed pair is neither a grid nor a request to forget one.
-    if (Number.isInteger(x) && x > 0 && Number.isInteger(y) && y > 0) {
-      onChange([x, y])
-    }
+    if (next.x != null && next.y != null) onChange([next.x, next.y])
   }
+
+  const axis = (key: 'x' | 'y') => (
+    <NumInput
+      testid={`maped-scan-${key}`} value={typed[key]}
+      step="1" min={1} accept={isPositiveInteger} placeholder={key}
+      width={62} onChange={(n) => edit(key, n)} onClear={() => edit(key, null)}
+    />
+  )
 
   return (
     <div data-testid="maped-scan-shape" style={styles.scanShape}>
       <Field label={<>Scan grid <Info width={300} testid="maped-info-scan-shape" text={INFO.scanShape} /></>}>
         <span style={styles.scanInputs}>
-          <input data-testid="maped-scan-x" type="number" step="1" min="1"
-            placeholder="x" style={styles.scanInput}
-            value={text.x} onChange={(e) => edit('x', e.target.value)} />
+          {axis('x')}
           <span style={styles.scanTimes}>×</span>
-          <input data-testid="maped-scan-y" type="number" step="1" min="1"
-            placeholder="y" style={styles.scanInput}
-            value={text.y} onChange={(e) => edit('y', e.target.value)} />
+          {axis('y')}
         </span>
       </Field>
       <div style={styles.scanHint}>
@@ -2192,44 +2176,6 @@ const INFO = {
   scanShape: 'Scan grid, x × y. MRC records the frame count and detector size '
     + 'but not the scan grid. A Direct Electron _info.txt supplies it, so this '
     + 'is normally not needed.',
-}
-
-/**
- * An ⓘ that opens its text as a popover — the DpcWizard pattern.
- *
- * Not a hover tooltip: the text is a paragraph, and a paragraph that vanishes
- * when the pointer moves cannot be read. Absolutely positioned so it costs no
- * layout, and `whiteSpace: normal` because it sits inside a `Field` label,
- * which is nowrap so a control label never breaks mid-word.
- */
-/** A degrees field. The raw text is held locally until blur so a `maped_state`
- *  arriving mid-edit cannot rewrite what is being typed, and only a finite
- *  number is ever sent (a bare Number() would push NaN on "-" or "1."). */
-function AngleInput({ value, onChange, label, testid }: {
-  value: number | null
-  onChange: (v: number) => void
-  label: string
-  testid: string
-}) {
-  const [draft, setDraft] = useState<string | null>(null)
-  return (
-    <label style={styles.angle}>
-      <span style={styles.angleLabel}>{label}</span>
-      <input
-        data-testid={testid} type="number" step="any"
-        value={draft ?? (value == null ? '' : String(value))}
-        style={styles.angleInput}
-        onChange={(e) => {
-          const text = e.target.value
-          setDraft(text)
-          const parsed = Number(text)
-          if (text !== '' && Number.isFinite(parsed)) onChange(parsed)
-        }}
-        onBlur={() => setDraft(null)}
-      />
-      <span style={styles.angleUnit}>°</span>
-    </label>
-  )
 }
 
 /** The answer, including how trustworthy it is. The integer offsets are what
@@ -2521,10 +2467,6 @@ const styles: Record<string, React.CSSProperties> = {
     display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap',
     fontSize: 11.5,
   },
-  nudgeSelect: {
-    background: '#11111b', color: '#cdd6f4', border: '1px solid #45475a',
-    borderRadius: 4, fontSize: 11.5, padding: '1px 4px',
-  },
   nudgeKey: {
     background: '#313244', color: '#cdd6f4', border: '1px solid #45475a',
     borderRadius: 4, cursor: 'pointer', fontSize: 12,
@@ -2587,11 +2529,10 @@ const styles: Record<string, React.CSSProperties> = {
   },
   cornerImage: { width: '100%', height: '100%', objectFit: 'cover', display: 'block' },
   cornerGlyph: { fontSize: 11, color: '#585b70', letterSpacing: 1 },
+  // What a `NumInput` in a corner panel looks like on top of its own styling:
+  // smaller, centred, and sized to the cell rather than to its content.
   extentInput: {
-    width: '100%', boxSizing: 'border-box',
-    background: '#11111b', color: '#cdd6f4',
-    border: '1px solid #313244', borderRadius: 4,
-    padding: '2px 4px', fontSize: 10.5, textAlign: 'center',
+    boxSizing: 'border-box', padding: '2px 4px', fontSize: 10.5, textAlign: 'center',
   },
 
   // ── enlarged panel ──
@@ -2645,19 +2586,8 @@ const styles: Record<string, React.CSSProperties> = {
     borderRadius: 8, padding: '8px 12px',
   },
   scanInputs: { display: 'flex', alignItems: 'center', gap: 6 },
-  scanInput: {
-    width: 62, background: '#11111b', color: '#cdd6f4',
-    border: '1px solid #313244', borderRadius: 4, padding: '3px 5px', fontSize: 11,
-  },
   scanTimes: { fontSize: 11, color: '#6c7086' },
   scanHint: { fontSize: 10.5, color: '#6c7086', lineHeight: 1.4 },
-  angle: { display: 'flex', alignItems: 'center', gap: 3 },
-  angleLabel: { fontSize: 10, color: '#6c7086' },
-  angleInput: {
-    width: 58, background: '#181825', color: '#cdd6f4',
-    border: '1px solid #313244', borderRadius: 4, padding: '3px 5px', fontSize: 11,
-  },
-  angleUnit: { fontSize: 10, color: '#6c7086' },
   hint: { fontSize: 11.5, color: '#6c7086', fontStyle: 'italic' },
   result: { display: 'flex', flexDirection: 'column', gap: 6 },
   residual: { fontSize: 12.5, fontWeight: 600 },

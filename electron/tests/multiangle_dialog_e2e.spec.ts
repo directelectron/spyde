@@ -11,11 +11,13 @@
  * Screenshots land in electron/multiangle_dialog_shots/ because a green
  * assertion here says nothing about whether any of it drew (CLAUDE.md).
  */
-import { test, expect, _electron as electron, ElectronApplication, Page } from '@playwright/test'
+import { test, expect, Page } from '@playwright/test'
 import { join } from 'path'
 import { tmpdir } from 'os'
 
-let app: ElectronApplication
+const { launchApp } = require('./_harness.cjs')
+
+let ctx: any
 let page: Page
 
 const SHOTS = join(__dirname, '..', 'multiangle_dialog_shots')
@@ -34,18 +36,14 @@ const send = (action: string, payload: Record<string, unknown> = {}) =>
     [action, payload] as const)
 
 test.beforeAll(async () => {
-  app = await electron.launch({
-    args: [join(__dirname, '..', 'out', 'main', 'index.js')],
-    env: { ...process.env, SPYDE_NO_DASK: '1', SPYDE_LOG_LEVEL: 'INFO' },
-  })
-  page = await app.firstWindow()
-  await page.waitForLoadState('domcontentloaded')
+  ctx = await launchApp({ dask: false, env: { SPYDE_LOG_LEVEL: 'INFO' } })
+  page = ctx.page
   await page.waitForTimeout(1500)
   await send('write_test_multiangle_files', { nav: SCAN, sig: 32 })
   await page.waitForTimeout(2500)
 })
 
-test.afterAll(async () => { await app?.close() })
+test.afterAll(async () => { await ctx?.app?.close() })
 
 test('the loader walks load → real space → reciprocal → open', async () => {
   // Two real solves over five members on a live backend.

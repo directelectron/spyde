@@ -2201,3 +2201,29 @@ class TestTheRingAndTheShellsAgree:
             f"the TSX draws rings at {found.group(1)}° while the backend "
             f"counts shells at {DEFAULT_SHELL_TOLERANCE}°")
 
+    def test_the_tsx_labels_a_ring_the_way_the_navigator_does(self):
+        """Two more rules the tableau copies from the navigator, both of
+        which had drifted: an empty ring's label sits at azimuth 0, and a
+        tilt prints without trailing zeros ("1°", not "1.0°")."""
+        import pathlib
+        import re
+
+        from spyde.actions.multiangle_navigator import (
+            _format_degrees, _widest_gap,
+        )
+
+        assert _widest_gap([]) == 0.0
+        assert _format_degrees(1.0) == "1°"
+        path = (pathlib.Path(__file__).resolve().parents[3] / "electron"
+                / "src" / "renderer" / "src" / "components"
+                / "MultiAngleLoader.tsx")
+        text = path.read_text(encoding="utf-8")
+        gap = re.search(r"function widestGapAzimuth\([^)]*\)[^{]*\{(.*?)\n\}",
+                        text, re.S)
+        assert gap and re.search(r"length === 0\) return 0", gap.group(1)), (
+            "widestGapAzimuth no longer returns 0 for an empty ring")
+        fmt = re.search(r"function formatDegrees\([^)]*\)[^{]*\{(.*?)\n\}",
+                        text, re.S)
+        assert fmt and "replace(/0+$/, '')" in fmt.group(1), (
+            "formatDegrees no longer strips trailing zeros")
+

@@ -13,7 +13,9 @@ import type {
 } from '@de/shell-renderer'
 import { asPlotAppMessage } from './protocol'
 import type { ReportDocState, ReportCell } from './protocol'
-import { WINDOW_DRAG_MIME, FIGURE_DRAG_MIME, stashWindowDrag } from './dnd'
+import {
+  WINDOW_DRAG_MIME, FIGURE_DRAG_MIME, stashWindowDrag, stashMemberDrag,
+} from './dnd'
 import { dlog, dragDumpToConsole } from './dragDiag'
 import { EnvSetupOverlay } from '../components/EnvSetupOverlay'
 
@@ -1717,6 +1719,7 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
       promoted = false
       setDragKind(null)
       stashWindowDrag(null)
+      stashMemberDrag(null)
     }
     window.addEventListener('dragstart', onDragStart)
     window.addEventListener('dragover', onDragOver)
