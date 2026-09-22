@@ -332,9 +332,11 @@ test('double-click compares a member with the reference', async () => {
   await page.screenshot({ path: join(SHOTS, '09-pair-nudged.png') })
 
   // Switching the image here must not throw away the solve being edited.
-  const images = await pair.getByTestId('maped-pair-image')
-    .locator('option').count()
+  // A themed dropdown: its options exist only while it is open.
+  await pair.getByTestId('maped-pair-image').click()
+  const images = await page.locator('[data-testid^="maped-pair-image-opt-"]').count()
   expect(images, 'no images offered').toBeGreaterThan(0)
+  await pair.getByTestId('maped-pair-image').click()
 
   await page.keyboard.press('Escape')
   await expect(pair).toBeHidden({ timeout: 10_000 })
