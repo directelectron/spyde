@@ -15,7 +15,7 @@ Download
 
 .. spyde:download-table:start
 
-**Download SpyDE v0.5.1:** `all releases <https://github.com/directelectron/spyde/releases>`__
+**Download SpyDE v0.6.0-rc.1:** `all releases <https://github.com/directelectron/spyde/releases>`__
 
 .. list-table::
    :header-rows: 1
@@ -24,11 +24,11 @@ Download
    * - Platform
      - Download
    * - **Windows**
-     - `SpyDE-Setup-0.5.1.exe <https://github.com/directelectron/spyde/releases/download/v0.5.1/SpyDE-Setup-0.5.1.exe>`__
+     - `SpyDE-Setup-0.6.0-rc.1.exe <https://github.com/directelectron/spyde/releases/download/v0.6.0-rc.1/SpyDE-Setup-0.6.0-rc.1.exe>`__
    * - **macOS** (Apple Silicon)
-     - `SpyDE-0.5.1-arm64-mac.zip <https://github.com/directelectron/spyde/releases/download/v0.5.1/SpyDE-0.5.1-arm64-mac.zip>`__
+     - `SpyDE-0.6.0-rc.1-arm64-mac.zip <https://github.com/directelectron/spyde/releases/download/v0.6.0-rc.1/SpyDE-0.6.0-rc.1-arm64-mac.zip>`__
    * - **Linux**
-     - `SpyDE-0.5.1.AppImage <https://github.com/directelectron/spyde/releases/download/v0.5.1/SpyDE-0.5.1.AppImage>`__
+     - `SpyDE-0.6.0-rc.1.AppImage <https://github.com/directelectron/spyde/releases/download/v0.6.0-rc.1/SpyDE-0.6.0-rc.1.AppImage>`__
 
 .. spyde:download-table:end
 
