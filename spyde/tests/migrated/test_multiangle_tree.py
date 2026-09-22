@@ -322,7 +322,29 @@ class TestWhatTheWindowDisplays:
         _settle(session)
 
         assert plot.plot_state.current_signal is summed
-        assert np.array_equal(plot.current_data, _summed_frame(data, model))
+        # Waited for, not asserted after a fixed settle: the switch paints
+        # from the navigator dispatcher, and on a loaded Windows runner the
+        # frame landed after the settle twice.
+        expected = _summed_frame(data, model)
+        if not wait_until(
+                lambda: plot.current_data is not None
+                and np.array_equal(plot.current_data, expected), timeout=20.0):
+            # Say what the window holds instead: one member's frame means the
+            # root's paint landed after the switch back; the summed frame at
+            # another position means the selector moved; None means nothing
+            # painted at all. Each is a different bug.
+            shown = plot.current_data
+            members = [
+                member_index for member_index in range(model.n_members)
+                if shown is not None and np.array_equal(
+                    shown, _member_frame(data.members[member_index], model,
+                                         member_index))]
+            raise AssertionError(
+                "the summed frame never came back after switching away and "
+                f"back: the window shows {'nothing' if shown is None else shown.shape}"
+                f"{' — member ' + str(members) + chr(39) + 's own frame' if members else ''}; "
+                f"current_signal is summed: {plot.plot_state.current_signal is summed}")
+
 
 
 class TestTheNavigator:
