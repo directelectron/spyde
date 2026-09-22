@@ -399,6 +399,39 @@ class TestASingularPositionIsOneNaN:
         assert np.isnan(strain[0, 1]).all()
 
 
+class TestAnUnphysicalStrainIsNotAStrain:
+    """A real scan reported εxx of ±6303 %: positions whose paired peaks all
+    lay along one line of reflections. The normal matrix is rank one there,
+    the regularised inverse turns it into a huge map, and nothing downstream
+    refused it."""
+
+    def test_a_collinear_pairing_is_ill_conditioned(self):
+        import torch
+        from spyde.actions.vector_orientation_quantem import well_conditioned
+
+        spanning = torch.tensor([[[2.0, 0.1], [0.1, 1.5]]], dtype=torch.float64)
+        collinear = torch.tensor([[[2.0, 2.0], [2.0, 2.0]]], dtype=torch.float64)
+        nearly = torch.tensor([[[2.0, 0.0], [0.0, 1e-4]]], dtype=torch.float64)
+        empty = torch.zeros((1, 2, 2), dtype=torch.float64)
+        assert well_conditioned(spanning).tolist() == [True]
+        assert well_conditioned(collinear).tolist() == [False]
+        assert well_conditioned(nearly).tolist() == [False]
+        assert well_conditioned(empty).tolist() == [False]
+
+    def test_a_stretch_of_sixty_is_nan(self):
+        import torch
+        from spyde.actions.vector_orientation_quantem import _symmetric_strain
+
+        affine = torch.tensor([
+            [[1.02, 0.0], [0.0, 0.99]],     # 2 % — a strain
+            [[64.0, 0.0], [0.0, 1.0]],      # 6300 % — a failed pairing
+        ], dtype=torch.float64)
+        strain = _symmetric_strain(affine)
+        assert torch.isfinite(strain[0]).all()
+        assert abs(float(strain[0, 0]) - 0.02) < 1e-9
+        assert torch.isnan(strain[1]).all()
+
+
 class TestThePhaseMapAndItsChips:
     @staticmethod
     def _result(phase_idx, score):

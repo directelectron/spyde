@@ -306,12 +306,40 @@ def reciprocal_affine(orientation_map, match: int = 0,
         m1 = torch.einsum("bp,bpi,bpj->bij", weight, target, simulated)
         m2 = torch.einsum("bp,bpi,bpj->bij", weight, simulated, simulated)
         solved = m1 @ torch.linalg.inv(m2 + 1e-12 * eye)
-        enough = paired.sum(dim=1) >= min_pairs
+        # Enough pairs, and pairs that span the plane: four peaks along one
+        # row of reflections make m2 rank one, which the regularised inverse
+        # turns into a huge A rather than a refusal — strains of 60 on a
+        # real scan, all from positions whose pairing could not have
+        # determined the other direction.
+        enough = (paired.sum(dim=1) >= min_pairs) & well_conditioned(m2)
         affine[start:stop][enough] = solved[enough]
         pair_count[start:stop] = paired.sum(dim=1)
 
     return (affine.reshape(rows, columns, 2, 2),
             pair_count.reshape(rows, columns))
+
+
+#: The weakest direction of a pairing must carry at least this fraction of
+#: the strongest (the ratio of the normal matrix's eigenvalues) for the
+#: deformation to be solved from it.
+CONDITION_FLOOR = 0.05
+
+#: Beyond this magnitude a solved "strain" is a pairing failure, not a
+#: strain: no crystal in a microscope is stretched by half.
+MAX_STRAIN = 0.5
+
+
+def well_conditioned(normal, floor: float = CONDITION_FLOOR):
+    """``(B,)`` bool — whether each ``(B, 2, 2)`` symmetric normal matrix
+    ``sum w q qᵀ`` has its paired peaks spanning both directions of the
+    plane, i.e. its smaller eigenvalue is at least *floor* of the larger."""
+    import torch
+
+    trace = normal.diagonal(dim1=-2, dim2=-1).sum(-1)
+    determinant = torch.linalg.det(normal)
+    half_gap = (trace * trace / 4 - determinant).clamp_min(0).sqrt()
+    smallest, largest = trace / 2 - half_gap, trace / 2 + half_gap
+    return (largest > 0) & (smallest > floor * largest)
 
 
 def strain_from_orientation_map(orientation_map, match: int = 0,
@@ -401,8 +429,14 @@ def _symmetric_strain(affine):
     stretch = (vh.transpose(-1, -2) * singular[..., None, :]) @ vh
     identity = torch.eye(2, dtype=affine.dtype, device=affine.device)
     strain = stretch - identity
-    out[finite] = torch.stack(
+    components = torch.stack(
         (strain[..., 0, 0], strain[..., 1, 1], strain[..., 0, 1]), dim=-1)
+    # A pairing that solved to a stretch of more than half is a failed
+    # pairing that happened to be invertible; reported, it would set the
+    # colour scale of the whole map.
+    plausible = components.abs().amax(dim=-1) <= MAX_STRAIN
+    components[~plausible] = float("nan")
+    out[finite] = components
     return out
 
 
