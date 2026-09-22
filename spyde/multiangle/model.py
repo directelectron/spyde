@@ -131,6 +131,26 @@ def _region_slices(offsets, member_index: int, extent) -> tuple[slice, slice]:
     return (slice(start_y, start_y + height), slice(start_x, start_x + width))
 
 
+def pair_slices(offset, extent):
+    """The region a reference and ONE member displaced by *offset* share.
+
+    Returns ``(reference_slices, member_slices)``, each a ``(rows, columns)``
+    pair in that image's own coordinates. The same arithmetic a whole model
+    uses, on the two-member case — for showing one member against the
+    reference, where the region every member covers is not the question.
+
+    *extent* is the ``(height, width)`` both images are read within; give the
+    smaller of the two so neither is asked for a row it does not have. An
+    empty region comes back as zero-length slices rather than an exception:
+    two images can genuinely fail to overlap.
+    """
+    offsets = np.array([[0, 0], [int(offset[0]), int(offset[1])]],
+                       dtype=np.int64)
+    extent = _extent(extent, "extent", "shared")
+    return (_region_slices(offsets, 0, extent),
+            _region_slices(offsets, 1, extent))
+
+
 @dataclass
 class MultiAngleModel:
     """How the members of a multi-angle acquisition line up with one another.

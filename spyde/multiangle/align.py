@@ -135,6 +135,63 @@ def _high_pass(image, sigma: float = 8.0):
     return values - gaussian_filter(values, sigma)
 
 
+# ── how much structure a summed image holds ──────────────────────────────────
+
+#: Pixels ignored around the edge of a summed image when measuring how much
+#: structure survived. The members cover different regions, so every candidate
+#: alignment crops differently and leaves its own border — and a border is a
+#: step, which any sharpness measure scores highly.
+STRUCTURE_MARGIN = 12
+
+#: Scale of the background removed first. The specimen's own shape and the
+#: detector's illumination are smooth and large; they carry most of the
+#: variance and none of the information about whether the members landed on
+#: each other.
+STRUCTURE_BACKGROUND = 8.0
+
+
+def structure(image, *, margin: int = STRUCTURE_MARGIN,
+              background: float = STRUCTURE_BACKGROUND) -> float:
+    """How much fine detail an image holds, per unit brightness.
+
+    The number behind "sharpness x N", and the ONE measure every score here is
+    built from — the whole field's, which a caller supplies, and a patch's.
+
+    Gradient energy was the obvious choice and does not work here: it is won by
+    the border the crop creates, so a worse alignment that crops harder scores
+    higher — measured on a real four-member acquisition, an alignment that
+    visibly BLURRED the layers scored 1.5x, while the one that actually stacked
+    them scored 0.85x. It still fails after excluding the border, because a
+    smooth background ramp dominates what is left.
+
+    So: drop the background, ignore the edges, and measure contrast relative to
+    the mean. On the same acquisition this ranks the alignments the way the
+    specimen does — the layers' own periodicity going 43 -> 294 in
+    signal-to-noise as the score goes 0.88 -> 1.14.
+
+    *margin* is in pixels and so is a different fraction of a small image than
+    of a large one; ``0`` keeps every pixel (see :func:`_patch_sharpness`).
+
+    ``0.0`` when there is nothing to measure: no finite pixel, or a mean of
+    nothing to divide by.
+    """
+    from scipy.ndimage import gaussian_filter
+
+    values = np.asarray(image, dtype=np.float64)
+    margin = int(margin)
+    if margin and min(values.shape) > 3 * margin:
+        values = values[margin:-margin, margin:-margin]
+    finite = np.isfinite(values)
+    if not finite.any():
+        return 0.0
+    filled = np.where(finite, values, np.nanmean(values[finite]))
+    detail = filled - gaussian_filter(filled, float(background))
+    mean = float(np.mean(filled))
+    if not np.isfinite(mean) or abs(mean) < 1e-12:
+        return 0.0
+    return float(np.std(detail[finite]) / abs(mean))
+
+
 #: What the images are registered ON. Raw intensity is what a drift solver
 #: assumes and is the weakest assumption here for the reason `_local_contrast`
 #: gives. Measured on a four-member acquisition of a layered specimen, by how
@@ -292,9 +349,18 @@ def _patch_sharpness(patch):
     """How much structure the patch's members keep when summed at *offsets*.
 
     The score :func:`vote_real_space` is given belongs to the whole field, so
-    a patch needs its own; this is the same quantity over the patch alone.
+    a patch needs its own; this is :func:`structure`, the same measure, over
+    the patch alone — and with NO margin, which is the one thing a patch does
+    differently.
+
+    :data:`STRUCTURE_MARGIN` is 12 pixels, and a patch is a third of the field:
+    on a 256 px scan it takes 28% off each side of an 85 px window rather than
+    9% off a 256 px one, and it throws away half the pixels the patch votes
+    with. Measured on the four-member acquisition the agreement figures below
+    come from, trimming a patch collapsed the very distinction the vote exists
+    to draw — 72% of patches agreeing ACROSS the layers and 39% along them
+    became 42% and 42%, and the axis that was determined stopped being so.
     """
-    from scipy.ndimage import gaussian_filter
 
     def score(offsets):
         offsets = np.asarray(offsets, dtype=np.int64)
@@ -311,10 +377,10 @@ def _patch_sharpness(patch):
             total += image[high[0] - dy:high[0] - dy + height,
                            high[1] - dx:high[1] - dx + width]
         total /= len(patch)
-        mean = float(np.mean(total))
-        if not np.isfinite(mean) or abs(mean) < 1e-12:
-            return float("-inf")
-        return float(np.std(total - gaussian_filter(total, 6)) / abs(mean))
+        measured = structure(total, margin=0)
+        # A patch `structure` could not measure is not the best of anything;
+        # ranking it against real scores would let an empty window win.
+        return measured if measured > 0.0 else float("-inf")
 
     return score
 

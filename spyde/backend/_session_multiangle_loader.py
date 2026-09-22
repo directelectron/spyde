@@ -115,6 +115,8 @@ from spyde.backend._session_multiangle import (
 from spyde.corners import (
     CORNER_NAMES, DEFAULT_CORNER_FRACTION, corner_slice, plane_through,
 )
+from spyde.multiangle.align import structure
+from spyde.multiangle.model import pair_slices
 
 log = logging.getLogger(__name__)
 
@@ -805,22 +807,21 @@ def _pair_overlap(reference, member, offset):
     """*reference* and *member* cropped to the region THEY share.
 
     Its own overlap, not the one every member shares: a pair being compared
-    should not lose the ground some third member happens to miss.
+    should not lose the ground some third member happens to miss — so the
+    extent is the smaller of the two images rather than the composition's.
+
+    The crop is the composition's own, :func:`spyde.multiangle.model.
+    pair_slices`, which is where the sign convention is written down: reversing
+    it still produces a picture, and a plausible-looking one, but of twice the
+    error.
     """
-    dy, dx = int(offset[0]), int(offset[1])
-    height = min(reference.shape[0], member.shape[0]) - abs(dy)
-    width = min(reference.shape[1], member.shape[1]) - abs(dx)
-    if height < 2 or width < 2:
+    extent = (min(reference.shape[0], member.shape[0]),
+              min(reference.shape[1], member.shape[1]))
+    fixed, moved = pair_slices(offset, extent)
+    if (fixed[0].stop - fixed[0].start < 2
+            or fixed[1].stop - fixed[1].start < 2):
         return None, None
-    # An offset is what the member must have ADDED to land on the common grid
-    # (`spyde.multiangle.model`), so the member is READ at the shifted index
-    # and the reference is not. Reversing these still produces a picture, and
-    # a plausible-looking one, but of twice the error.
-    top, left = max(0, dy), max(0, dx)
-    moved_top, moved_left = max(0, -dy), max(0, -dx)
-    return (reference[top:top + height, left:left + width],
-            member[moved_top:moved_top + height,
-                   moved_left:moved_left + width])
+    return reference[fixed], member[moved]
 
 
 def _pair_evidence(reference, member, offset) -> dict | None:
@@ -831,7 +832,7 @@ def _pair_evidence(reference, member, offset) -> dict | None:
         return None
     # Measured over the SAME window as the aligned pair, not over the whole
     # frame. Cropping each case to its own overlap compares two pictures of
-    # different sizes, and `_structure` trims a fixed margin — so the ratio
+    # different sizes, and `structure` trims a fixed margin — so the ratio
     # then reports the crop as much as the alignment. On pure noise that error
     # inverted the answer: aligned 0.97, unaligned 1.00, when aligning two
     # copies of one field must give root two.
@@ -840,8 +841,8 @@ def _pair_evidence(reference, member, offset) -> dict | None:
     unmoved = np.asarray(member, dtype=np.float64)[:height, :width]
     gain = None
     if still.shape == unmoved.shape == fixed.shape:
-        before = _structure((still + unmoved) / 2.0)
-        after = _structure((fixed + moved) / 2.0)
+        before = structure((still + unmoved) / 2.0)
+        after = structure((fixed + moved) / 2.0)
         if before > 0:
             gain = float(after / before)
     return {
@@ -1403,52 +1404,6 @@ def _start_preview_fill(session, state: MultiAngleLoaderState) -> None:
 
 # ── the aligned-sum window ───────────────────────────────────────────────────
 
-#: Pixels ignored around the edge of a summed image when measuring how much
-#: structure survived. The members cover different regions, so every candidate
-#: alignment crops differently and leaves its own border — and a border is a
-#: step, which any sharpness measure scores highly.
-_STRUCTURE_MARGIN = 12
-
-#: Scale of the background removed first. The specimen's own shape and the
-#: detector's illumination are smooth and large; they carry most of the
-#: variance and none of the information about whether the members landed on
-#: each other.
-_STRUCTURE_BACKGROUND = 8.0
-
-
-def _structure(image) -> float:
-    """How much fine detail an image holds, per unit brightness.
-
-    The number behind "sharpness x N". Gradient energy was the obvious choice
-    and does not work here: it is won by the border the crop creates, so a
-    worse alignment that crops harder scores higher — measured on a real
-    four-member acquisition, an alignment that visibly BLURRED the layers
-    scored 1.5x, while the one that actually stacked them scored 0.85x. It
-    still fails after excluding the border, because a smooth background ramp
-    dominates what is left.
-
-    So: drop the background, ignore the edges, and measure contrast relative
-    to the mean. On the same acquisition this ranks the alignments the way the
-    specimen does — the layers' own periodicity going 43 -> 294 in
-    signal-to-noise as the score goes 0.88 -> 1.14.
-    """
-    from scipy.ndimage import gaussian_filter
-
-    values = np.asarray(image, dtype=np.float64)
-    margin = _STRUCTURE_MARGIN
-    if min(values.shape) > 3 * margin:
-        values = values[margin:-margin, margin:-margin]
-    finite = np.isfinite(values)
-    if not finite.any():
-        return 0.0
-    filled = np.where(finite, values, np.nanmean(values[finite]))
-    detail = filled - gaussian_filter(filled, _STRUCTURE_BACKGROUND)
-    mean = float(np.mean(filled))
-    if not np.isfinite(mean) or abs(mean) < 1e-12:
-        return 0.0
-    return float(np.std(detail[finite]) / abs(mean))
-
-
 def _alignment_evidence(images, model) -> dict | None:
     """The members summed with the solved offsets applied, and without.
 
@@ -1482,7 +1437,7 @@ def _alignment_evidence(images, model) -> dict | None:
     unaligned = np.mean(
         [np.asarray(image, dtype=np.float64)[reference_slices]
          for image in images], axis=0)
-    before, after = _structure(unaligned), _structure(aligned)
+    before, after = structure(unaligned), structure(aligned)
     return {"aligned": aligned, "unaligned": unaligned,
             "gain": (after / before) if before > 0 else float("nan")}
 
