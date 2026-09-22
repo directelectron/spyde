@@ -122,11 +122,14 @@ functions:
         type: int
         default: 0
   Center Zero Beam:
-    description: Centers the zero beam in diffraction patterns (Automatic / Manual).
+    description: >-
+      Centers the zero beam in diffraction patterns (Automatic / Manual). On a
+      vectors window it centres the vectors themselves: the beam is the
+      brightest vector in the box, a plane is fitted through it across the
+      scan, and every vector moves by centre minus plane.
     icon: drawing/toolbars/icons/center_zero_beam.svg
     function: spyde.actions.center_zero_beam.center_zero_beam
     signal_class: pyxem.signals.Diffraction2D
-    exclude_signal_types: [spyde_diffraction_vectors_image]
     plot_dim: [ 2 ]
     toolbar_side: bottom
     navigation: False

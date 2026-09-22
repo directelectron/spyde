@@ -93,8 +93,9 @@ class TestSchemaBackendLockstep:
     def test_vom_defaults(self):
         from spyde.actions import vector_orientation_om as vom
         schema = registry.wizard_parameters("vom")
-        for k in ("accelerating_voltage", "resolution", "minimum_intensity",
-                  "smooth"):
+        for k in ("accelerating_voltage", "resolution", "in_plane_resolution",
+                  "minimum_intensity", "smooth", "rescue_passes",
+                  "smooth_orientations", "grain_threshold_deg"):
             assert schema[k]["default"] == vom.DEFAULTS[k], \
                 f"vom schema/{k} drifted from vector_orientation_om.DEFAULTS"
 

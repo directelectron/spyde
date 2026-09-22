@@ -18,7 +18,7 @@
 import { test, expect, Page } from '@playwright/test'
 import { join } from 'path'
 // eslint-disable-next-line @typescript-eslint/no-var-requires
-const { launchApp, raiseWindow, backendAction, waitForSubwindowCount } = require('./_harness.cjs')
+const { launchApp, raiseWindow, backendAction, waitForSubwindowCount, titlebarGrabPoint } = require('./_harness.cjs')
 
 const SHOTS = join(__dirname, '..', 'ui_fixes_shots')
 let ctx: Awaited<ReturnType<typeof launchApp>>
@@ -141,6 +141,47 @@ test('4: wizard caret prefers below; flips beside the window near the bottom', a
   expect(cb3.y, 'caret should snap back below once there is room')
     .toBeGreaterThanOrEqual(wb3.y + wb3.height - 2)
   await page.getByTestId('czb-close').click()
+})
+
+test('4b: the VI sub-toolbar opens below the bar for a window near the bottom', async () => {
+  const win = dpWindow()
+  const area = (await page.getByTestId('mdi-area').boundingBox())!
+  const tb = win.getByTestId('subwindow-titlebar')
+  const dragBy = async (dy: number) => {
+    const grab = await titlebarGrabPoint(win)
+    await page.mouse.move(grab.x, grab.y)
+    await page.mouse.down()
+    await page.mouse.move(grab.x, grab.y + dy, { steps: 12 })
+    await page.mouse.up()
+    await page.waitForTimeout(300)
+  }
+  const bars = async () => ({
+    main: (await win.getByTestId('floating-toolbar').boundingBox())!,
+    sub: (await page.getByTestId('sub-toolbar').boundingBox())!,
+  })
+
+  // Park the window so its bottom edge sits ~150px above the area's: room for
+  // the ~40px sub-toolbar, none for the 320px an unmeasured caret is assumed
+  // to be. The sub-toolbar used to be that unmeasured caret, so any window in
+  // the lower third of the work area got its "+" bar above the window instead.
+  const wb0 = (await win.boundingBox())!
+  await dragBy(area.y + area.height - 150 - (wb0.y + wb0.height))
+  await tb.hover()
+  await win.getByTestId('action-btn-Virtual Imaging').click()
+  await expect(page.getByTestId('sub-toolbar')).toBeVisible()
+  const b1 = await bars()
+  expect(b1.sub.y, 'sub-toolbar should open below the bar when it fits')
+    .toBeGreaterThanOrEqual(b1.main.y + b1.main.height - 2)
+  await shot('04c-subbar-below-near-bottom.png')
+
+  // Close the sub-toolbar and put the window back where test 4 left it.
+  await tb.hover()
+  await win.getByTestId('action-btn-Virtual Imaging').click()
+  await expect(page.getByTestId('sub-toolbar')).toBeHidden()
+  const wb2 = (await win.boundingBox())!
+  await dragBy(area.y + 40 - wb2.y)
+  expect((await win.boundingBox())!.y, 'window should be back near the top')
+    .toBeLessThan(area.y + 60)
 })
 
 test('5: the Workflow panel is present in the dock without any toolbar toggle', async () => {

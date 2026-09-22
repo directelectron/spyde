@@ -138,7 +138,11 @@ class TestVectorOrientationOM:
                 value = reader_for_overlay(vplot, node).read_frame(
                     (int(ys[0]), int(xs[0])))
                 assert value["measured"].shape[0] >= 5
-                assert value["template"].shape[1] == 2   # a matched pattern
+                template = value["template"]
+                assert template["data"].shape[1] == 2   # a matched pattern
+                # Each spot draws at its own intensity, as an alpha.
+                assert len(template["edgecolors"]) == template["data"].shape[0]
+                assert all(c.startswith("rgba(48,255,96,") for c in template["edgecolors"])
 
             # Generate stops at the library and the previews. It does NOT fit
             # the field: that is a scan's compute before the user has chosen
@@ -153,11 +157,20 @@ class TestVectorOrientationOM:
             #    figures emitted into the same window, not new signal trees) ──
             n_before = len(session.signal_trees)
             vom_run(session, vplot, {"smooth": False})
+            # The orientation window opens BEFORE the fit (blank, to fill in
+            # band by band), so a new tree proves nothing; the result landing
+            # on it does.
             assert _wait(lambda: len(session.signal_trees) >= n_before + 1,
-                         timeout=90), "strain window never opened"
-            ipf_tree = next((t for t in session.signal_trees
-                             if getattr(t, "vector_orientation", None) is not None), None)
-            assert ipf_tree is not None
+                         timeout=90), "orientation window never opened"
+
+            def _ipf_tree():
+                return next((t for t in session.signal_trees
+                             if getattr(t, "vector_orientation", None) is not None),
+                            None)
+
+            assert _wait(lambda: _ipf_tree() is not None, timeout=90), \
+                "orientation map never landed"
+            ipf_tree = _ipf_tree()
             res = ipf_tree.vector_orientation
             assert res.nav_shape == tuple(vtree.diffraction_vectors.nav_shape)
             assert res.strain.shape[-1] == 3
@@ -258,6 +271,236 @@ class TestVectorOrientationOM:
                        {"pair_distance": 0.07, "sigma_excitation": 0.03})
         assert seen["params"] == {"pair_distance": 0.07, "sigma_excitation": 0.03}
 
+
+
+class TestTheMatchIsBanded:
+    """The whole-field match runs a band of rows at a time so the map fills
+    in as it goes. The match is per position, so this must be the same answer
+    the scan gives matched whole — banding is a display affordance, not a
+    different fit."""
+
+    @staticmethod
+    def _vectors(ny=3, nx=4):
+        """A scan of one silver-like pattern: six spots at Ag {111}/{200}
+        radii (Å⁻¹), the same at every position, so every band has peaks to
+        match."""
+        from spyde.signals.diffraction_vectors import (
+            SpyDEDiffractionVectors, N_COLS,
+        )
+        angles = np.deg2rad(np.arange(0, 360, 60))
+        spots = [(0.0, 0.0)] + [(0.42 * np.cos(a), 0.42 * np.sin(a))
+                                for a in angles]
+        rows, offsets = [], [0]
+        for iy in range(ny):
+            for ix in range(nx):
+                for kx, ky in spots:
+                    rows.append([ix, iy, kx, ky, -1.0, 1.0])
+                offsets.append(len(rows))
+        flat = np.asarray(rows, dtype=np.float32).reshape(-1, N_COLS)
+        off = np.asarray(offsets, dtype=np.int64)
+        return SpyDEDiffractionVectors(
+            flat_buffer=flat, nav_offsets=[np.arange(ny + 1) * nx, off],
+            nav_shape=(ny, nx), full_nav_shape=(ny, nx), sig_shape=(64, 64),
+            sig_axes=None, kernel_radius_px=1.0, kernel_radius_data=0.02,
+            offsets=off)
+
+    def test_banded_equals_whole(self):
+        from orix.crystal_map import Phase
+
+        from spyde.actions.vector_orientation_quantem import (
+            compute_vector_orientation_quantem,
+        )
+
+        vectors = self._vectors()
+        phases = [Phase.from_cif(CIF)]
+        bands = []
+
+        def run(band_rows, on_band=None):
+            return compute_vector_orientation_quantem(
+                vectors, phases, energy_ev=200e3, k_max=1.2,
+                angle_step_zone_axis_deg=12.0, device="cpu",
+                band_rows=band_rows, on_band=on_band, ramp=False)
+
+        whole = run(band_rows=vectors.nav_shape[0])
+        banded = run(band_rows=1, on_band=lambda *a: bands.append(a))
+
+        assert whole is not None and banded is not None
+        np.testing.assert_array_equal(banded.phase_idx, whole.phase_idx)
+        np.testing.assert_allclose(banded.coarse_score, whole.coarse_score,
+                                   rtol=1e-6, atol=1e-6)
+        np.testing.assert_allclose(banded.quats, whole.quats, rtol=1e-5, atol=1e-5)
+        np.testing.assert_allclose(banded.strain, whole.strain,
+                                   rtol=1e-5, atol=1e-5, equal_nan=True)
+
+        # One band per row, each carrying that row's orientations.
+        assert [(a[0], a[1]) for a in bands] == [(r, r + 1) for r in range(3)]
+        for row_start, row_stop, quats, phase_index in bands:
+            assert quats.shape == (1, 4, 4)
+            assert phase_index.shape == (1, 4)
+
+    def test_progress_counts_positions(self):
+        """The count moves with the bands — 'fitting… 33%' for a whole
+        minute was the match stage reporting nothing until it finished."""
+        from orix.crystal_map import Phase
+
+        from spyde.actions.vector_orientation_quantem import (
+            compute_vector_orientation_quantem,
+        )
+
+        seen = []
+        compute_vector_orientation_quantem(
+            self._vectors(), [Phase.from_cif(CIF)], energy_ev=200e3, k_max=1.2,
+            angle_step_zone_axis_deg=12.0, device="cpu", band_rows=1,
+            progress=lambda done, total: seen.append((done, total)))
+        done = [d for d, _ in seen]
+        assert done == sorted(done), "progress must not go backwards"
+        # Three bands of four positions matched, then the refinement.
+        assert done[:3] == [4, 8, 12]
+        assert seen[-1][0] == seen[-1][1]
+
+
+class TestASingularPositionIsOneNaN:
+    """One position whose paired peaks are degenerate must not take the
+    scan's strain down. It used to: the batch inverse raised on the one
+    singular member ("batch element 1552 … The input matrix is singular")
+    and Compute Maps failed as a whole."""
+
+    def test_real_space_deformation_skips_the_singular_member(self):
+        import torch
+        from spyde.actions.vector_orientation_quantem import real_space_deformation
+
+        affine = torch.tensor([
+            [[1.02, 0.01], [0.00, 0.98]],       # a fine map
+            [[1.00, 2.00], [0.50, 1.00]],       # rank one: singular
+            [[float("nan"), 0.0], [0.0, 1.0]],  # too few pairs
+            [[1e-3, 0.0], [0.0, 1e-3]],         # small but well conditioned
+        ], dtype=torch.float64)
+        real = real_space_deformation(affine)
+        expected = torch.linalg.inv(affine[0]).T
+        assert torch.allclose(real[0], expected)
+        assert torch.isnan(real[1]).all()
+        assert torch.isnan(real[2]).all()
+        assert torch.allclose(real[3], torch.linalg.inv(affine[3]).T)
+
+    def test_the_field_strain_carries_on_past_it(self, monkeypatch):
+        import torch
+        import spyde.actions.vector_orientation_quantem as quantem
+
+        affine = torch.full((2, 3, 2, 2), float("nan"), dtype=torch.float64)
+        affine[0, 0] = torch.eye(2, dtype=torch.float64) * 1.01
+        affine[1, 2] = torch.tensor([[1.0, 2.0], [0.5, 1.0]])   # singular
+        pairs = torch.full((2, 3), 6, dtype=torch.long)
+        monkeypatch.setattr(quantem, "reciprocal_affine",
+                            lambda *a, **k: (affine, pairs))
+        strain, _ = quantem.strain_from_orientation_map(object())
+        assert strain.shape == (2, 3, 3)
+        assert np.isfinite(strain[0, 0]).all()
+        assert np.isnan(strain[1, 2]).all(), "the singular position is NaN"
+        assert np.isnan(strain[0, 1]).all()
+
+
+class TestTheBandsRampUp:
+    def test_the_first_bands_are_one_two_four_rows(self):
+        from spyde.actions.vector_orientation_quantem import band_schedule
+        assert band_schedule(64, 8) == [(0, 1), (1, 3), (3, 7), (7, 15), (15, 23),
+                                        (23, 31), (31, 39), (39, 47), (47, 55),
+                                        (55, 63), (63, 64)]
+        assert band_schedule(3, 8) == [(0, 1), (1, 3)]
+        assert band_schedule(3, 1) == [(0, 1), (1, 2), (2, 3)]
+        assert band_schedule(5, 8, ramp=False) == [(0, 5)]
+
+    def test_the_stage_is_named(self):
+        from orix.crystal_map import Phase
+        from spyde.actions.vector_orientation_quantem import (
+            compute_vector_orientation_quantem,
+        )
+        stages = []
+        compute_vector_orientation_quantem(
+            TestTheMatchIsBanded._vectors(), [Phase.from_cif(CIF)], energy_ev=200e3,
+            k_max=1.2, angle_step_zone_axis_deg=12.0, device="cpu", band_rows=1,
+            stage=stages.append)
+        assert stages[0].startswith("building the correlation plan")
+        assert any(s.startswith("matching rows 1-1") for s in stages)
+        assert stages[-1].startswith("refining")
+
+
+class TestAnUnphysicalStrainIsNotAStrain:
+    """A real scan reported εxx of ±6303 %: positions whose paired peaks all
+    lay along one line of reflections. The normal matrix is rank one there,
+    the regularised inverse turns it into a huge map, and nothing downstream
+    refused it."""
+
+    def test_a_collinear_pairing_is_ill_conditioned(self):
+        import torch
+        from spyde.actions.vector_orientation_quantem import well_conditioned
+
+        spanning = torch.tensor([[[2.0, 0.1], [0.1, 1.5]]], dtype=torch.float64)
+        collinear = torch.tensor([[[2.0, 2.0], [2.0, 2.0]]], dtype=torch.float64)
+        nearly = torch.tensor([[[2.0, 0.0], [0.0, 1e-4]]], dtype=torch.float64)
+        empty = torch.zeros((1, 2, 2), dtype=torch.float64)
+        assert well_conditioned(spanning).tolist() == [True]
+        assert well_conditioned(collinear).tolist() == [False]
+        assert well_conditioned(nearly).tolist() == [False]
+        assert well_conditioned(empty).tolist() == [False]
+
+    def test_a_stretch_of_sixty_is_nan(self):
+        import torch
+        from spyde.actions.vector_orientation_quantem import _symmetric_strain
+
+        affine = torch.tensor([
+            [[1.02, 0.0], [0.0, 0.99]],     # 2 % — a strain
+            [[64.0, 0.0], [0.0, 1.0]],      # 6300 % — a failed pairing
+        ], dtype=torch.float64)
+        strain = _symmetric_strain(affine)
+        assert torch.isfinite(strain[0]).all()
+        assert abs(float(strain[0, 0]) - 0.02) < 1e-9
+        assert torch.isnan(strain[1]).all()
+
+
+class TestThePhaseMapAndItsChips:
+    @staticmethod
+    def _result(phase_idx, score):
+        from spyde.signals.orientation_map import VectorOrientationResult
+        phase_idx = np.asarray(phase_idx, np.int16)
+        ny, nx = phase_idx.shape
+        return VectorOrientationResult(
+            quats=np.tile(np.array([1, 0, 0, 0], np.float32), (ny, nx, 1)),
+            phase_idx=phase_idx, theta=np.zeros((ny, nx), np.float32),
+            strain=np.full((ny, nx, 3), np.nan, np.float32),
+            residual=np.full((ny, nx), np.nan, np.float32),
+            friedel_asym=np.full((ny, nx), np.nan, np.float32),
+            n_matched=np.zeros((ny, nx), np.int16),
+            coarse_score=np.asarray(score, np.float32),
+            phases_meta=[{"name": "Cu", "point_group": "m-3m"},
+                         {"name": "Nb", "point_group": "m-3m"}],
+            nav_shape=(ny, nx))
+
+    def test_a_matched_position_is_coloured_by_its_phase(self):
+        """The matcher reports no residual; a position with a correlation is
+        fitted. Keyed on the residual alone, every position was grey."""
+        from spyde.actions.vector_orientation_om import phase_map_rgb, _PHASE_COLORS, _UNFIT_COLOR
+        result = self._result([[0, 1], [1, 0]], [[0.9, 0.8], [0.0, 0.7]])
+        rgb = phase_map_rgb(result)
+        assert tuple(rgb[0, 0]) == _PHASE_COLORS[0]
+        assert tuple(rgb[0, 1]) == _PHASE_COLORS[1]
+        assert tuple(rgb[1, 0]) == _UNFIT_COLOR, "no correlation, no phase"
+
+    def test_each_phase_gets_its_own_map(self):
+        from spyde.actions.vector_orientation_om import phase_views, _UNFIT_COLOR
+        result = self._result([[0, 1], [1, 0]], [[0.9, 0.8], [0.0, 0.7]])
+        ipf = np.full((2, 2, 3), 200, np.uint8)
+        views = dict(phase_views(result, ipf))
+        assert list(views) == ["Phase", "Cu", "Nb"]
+        assert tuple(views["Cu"][0, 0]) == (200, 200, 200)
+        assert tuple(views["Cu"][0, 1]) == _UNFIT_COLOR
+        assert tuple(views["Nb"][0, 1]) == (200, 200, 200)
+        assert tuple(views["Nb"][1, 0]) == _UNFIT_COLOR, "unfit is nobody's"
+
+    def test_one_phase_has_no_chips(self):
+        from spyde.actions.vector_orientation_om import phase_views
+        result = self._result([[0, 0]], [[0.9, 0.8]])
+        result.phases_meta = result.phases_meta[:1]
+        assert phase_views(result, np.zeros((1, 2, 3), np.uint8)) == []
 
 
 class TestRefineIpfTogglesWithTheAction:

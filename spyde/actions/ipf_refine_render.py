@@ -152,6 +152,9 @@ def build_refine_figure(infos: list[dict], *, cmap: str = _CMAP):
         xy.plot(tri[:, 0], tri[:, 1], color="#ffffff", linewidth=1.4)
         for (lx, ly), txt in zip(np.asarray(info["label_xy"], float), info["labels"]):
             xy.text(float(lx), float(ly), str(txt), color="#ffffff", fontsize=11)
+        # The library's sampled orientations, shown while there is a library
+        # and no heat map yet (see ipf_panel); hidden by the first heat map.
+        points = xy.scatter([], [], s=2, c="#9399b2")
         # Best-match marker (top), initially empty. s = marker radius in px.
         best = xy.scatter([], [], s=9, c="#ff3030", edgecolors="#ffffff")
 
@@ -163,7 +166,8 @@ def build_refine_figure(infos: list[dict], *, cmap: str = _CMAP):
 
         panels.append({"xy": xy, "plot2d": xy, "info": info, "raster": raster,
                        "outside": outside, "grid_n": grid_n,
-                       "circle_grp": circ, "best": best, "lut": lut})
+                       "circle_grp": circ, "best": best, "points": points,
+                       "points_shown": False, "lut": lut})
 
     fig_id = _electron.register(fig)
     html = finalize_figure_html(fig, fig_id)
@@ -179,6 +183,14 @@ def update_panels(panels, corr_global, circles_per_phase, best_xy_per_phase=None
     best_xy_per_phase = best_xy_per_phase or {}
     for panel in panels:
         info = panel["info"]
+        if panel.get("points_shown"):
+            # The heat map is the sampled orientations coloured by how well
+            # they fit; the points that stood for them are in its way now.
+            try:
+                panel["points"].set(offsets=[])
+            except Exception as e:
+                log.debug("hiding the sampled-orientation points failed: %s", e)
+            panel["points_shown"] = False
         vals = interp_grid(corr_global, info)
         rgba = _corr_rgba(vals, panel["outside"], panel["lut"])
         try:
@@ -268,9 +280,20 @@ class RefineIpfController:
                     "normalize": self.normalize, "rot_mask": None},
             on_value=self.draw,
         )
+        self.bind_panels(self.panels)
+        return self
+
+    def bind_panels(self, panels) -> None:
+        """Draw into *panels* from now on — the IPF window was rebuilt (shown
+        again after a hide), or closed (an empty list)."""
+        self.panels = list(panels)
         for panel in self.panels:
             self._wire_double_click(panel)
-        return self
+
+    def redraw(self) -> None:
+        """Re-evaluate the current position, so a window shown again is not
+        blank until the next navigator move."""
+        self._replace_static(gamma=self.gamma, normalize=self.normalize)
 
     def draw(self, value) -> None:
         """Recolour every phase panel from one position's correlation. Runs on

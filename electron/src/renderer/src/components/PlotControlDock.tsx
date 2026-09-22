@@ -613,11 +613,14 @@ export function PlotControlDock() {
   const tree = activeId != null ? state.signalTrees.get(activeId) : undefined
   // Only the ACTIVE signal tree's selectors are listed — every window of a
   // tree receives the same signal_tree payload, so two windows belong to the
-  // same tree iff their trees share a root signal_id. With no tree context
-  // (e.g. a bare result window is focused) fall back to showing all.
+  // same tree iff their trees share a root signal_id. A bare result window
+  // (an IPF Refine heat map, a strain window) has no tree, and lists none:
+  // it used to fall back to every navigator in the app, which read as the
+  // dock having lost track of which window it was for. With no window
+  // focused at all, every selector is still offered.
   const activeTreeRoot = tree?.signal_id
   const navSelectors = Array.from(state.selectors.values()).filter(s => {
-    if (activeTreeRoot == null) return true
+    if (activeTreeRoot == null) return activeId == null
     return state.signalTrees.get(s.windowId)?.signal_id === activeTreeRoot
   })
   const axes = activeId != null ? state.axes.get(activeId) : undefined

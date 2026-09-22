@@ -216,13 +216,15 @@ class WindowManagerMixin:
             self.mdi_manager.remove_plot_window(window_id)
         except Exception as e:
             log.debug("pruning plot window from MDIManager failed: %s", e)
-        # Drop any action-artifact entries that source from or output to this
-        # window so a re-run starts clean and a closed output isn't "active".
-        for k in [k for k, v in self._action_artifacts.items()
-                  if k[0] == window_id or window_id in v.get("out_wids", [])]:
-            self._action_artifacts.pop(k, None)
-            # Tell the source window's toolbar to un-highlight the action.
-            ipc.emit({"type": "action_active", "window_id": k[0], "name": k[1], "active": False})
+        # Retire any action artifact that sources from or outputs to this
+        # window, the same way deselecting the action would: the ROI comes
+        # off the source, the chip comes off the sub-toolbar, and the toolbar
+        # un-highlights — so a closed output is not still "on".
+        for key in [k for k, v in self._action_artifacts.items()
+                    if k[0] == window_id or window_id in v.get("out_wids", [])]:
+            art = self._action_artifacts.pop(key, None)
+            if art is not None:
+                self._retire_artifact(key, art)
         ipc.emit({"type": "window_closed", "window_id": window_id})
 
     def _resize_figure(self, window_id: int, width: int | None, height: int | None) -> None:

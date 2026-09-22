@@ -117,6 +117,24 @@ const hasParams = (a: ToolbarAction) => Object.keys(a.parameters || {}).length >
 const hasSubs = (a: ToolbarAction) => (a.subfunctions?.length ?? 0) > 0
 const hasPopout = (a: ToolbarAction) => hasParams(a) || hasSubs(a)
 
+/** The box a caret really occupies: its own border box plus whatever is
+ *  absolutely positioned out of it. The per-VI caret hangs BELOW the
+ *  sub-toolbar, so the sub-toolbar's own box under-reports by the caret's
+ *  whole height; the wizards' only overhang is their 8px pointer. */
+function extentOf(el: HTMLElement): { w: number; h: number } | null {
+  let top = Infinity, left = Infinity, bottom = -Infinity, right = -Infinity
+  const grow = (r: DOMRect) => {
+    if (r.width <= 0 || r.height <= 0) return
+    top = Math.min(top, r.top); left = Math.min(left, r.left)
+    bottom = Math.max(bottom, r.bottom); right = Math.max(right, r.right)
+  }
+  grow(el.getBoundingClientRect())
+  el.querySelectorAll<HTMLElement>('*').forEach((node) => {
+    if (getComputedStyle(node).position === 'absolute') grow(node.getBoundingClientRect())
+  })
+  return top < bottom ? { w: right - left, h: bottom - top } : null
+}
+
 export function FloatingToolbar({
   actions, windowId, onAction, visible = true, onHoverShow, onHoverHide,
   winRect, areaSize, inside = false, onCaretRectChange,
@@ -174,8 +192,8 @@ export function FloatingToolbar({
     if (!openName) { reportCaretRect(null); return }
     const el = caretWrapRef.current?.firstElementChild as HTMLElement | null
     if (el) {
-      const r = el.getBoundingClientRect()
-      if (r.width > 0 && r.height > 0) caretBox.current = { w: r.width, h: r.height }
+      const box = extentOf(el)
+      if (box) caretBox.current = box
     }
     const cw = caretBox.current?.w ?? 240
     const ch = caretBox.current?.h ?? 320
@@ -457,19 +475,20 @@ export function FloatingToolbar({
             onClose={() => setOpenName(null)}
           />
         )}
+        {openAction && !hasParams(openAction) && hasSubs(openAction) && (
+          <SubToolbar
+            action={openAction}
+            up={placement !== 'below'}
+            items={state.subItems.get(windowId)?.get(openAction.name) ?? []}
+            onLayout={() => place.current()}
+            onSub={(sub) => { onAction(sub.name, windowId, defaultsOf(sub.parameters)) }}
+            onUpdate={(name, params) => sendAction('update_vi', { name, params }, windowId)}
+            onRemove={(itemName) => sendAction('set_action_active', { name: itemName, active: false }, windowId)}
+            onCommit={(itemName) => sendAction('vi_commit', { name: itemName }, windowId)}
+          />
+        )}
       </div>
       </BetaContext.Provider>
-      {openAction && !hasParams(openAction) && hasSubs(openAction) && (
-        <SubToolbar
-          action={openAction}
-          up={placement !== 'below'}
-          items={state.subItems.get(windowId)?.get(openAction.name) ?? []}
-          onSub={(sub) => { onAction(sub.name, windowId, defaultsOf(sub.parameters)) }}
-          onUpdate={(name, params) => sendAction('update_vi', { name, params }, windowId)}
-          onRemove={(itemName) => sendAction('set_action_active', { name: itemName, active: false }, windowId)}
-          onCommit={(itemName) => sendAction('vi_commit', { name: itemName }, windowId)}
-        />
-      )}
     </div>
   )
 }
@@ -540,11 +559,19 @@ type ViItem = { name: string; color: string; vtype?: string; calculation?: strin
 /** The second floating toolbar (Qt PopoutToolBar), below the main bar (flips
  *  above it when there is no room below the window): a "＋" to add, then one
  *  colour-coded detector-shape icon per virtual image. Clicking a VI icon opens
- *  its own parameter caret (detector type / calc). */
-function SubToolbar({ action, up, items, onSub, onUpdate, onRemove, onCommit }: {
+ *  its own parameter caret (detector type / calc).
+ *
+ *  It is rendered inside the toolbar's measured wrapper so placement sees its
+ *  REAL height (~40px, plus the per-VI caret when one is open) rather than the
+ *  320px fallback assumed for an unmeasured caret — which flipped the bar above
+ *  the window for any window in the lower third of the work area. */
+function SubToolbar({ action, up, items, onLayout, onSub, onUpdate, onRemove, onCommit }: {
   action: ToolbarAction
   up: boolean
   items: ViItem[]
+  /** Called when the bar's extent changes for a reason the parent cannot see
+   *  (a per-VI caret opening or closing is this component's own state). */
+  onLayout?: () => void
   onSub: (sub: SubAction) => void
   onUpdate: (name: string, params: Record<string, unknown>) => void
   onRemove: (name: string) => void
@@ -561,6 +588,7 @@ function SubToolbar({ action, up, items, onSub, onUpdate, onRemove, onCommit }: 
     if (items.length > prevCount.current) setOpenVi(items[items.length - 1].name)
     prevCount.current = items.length
   }, [items])
+  React.useLayoutEffect(() => { onLayout?.() }, [openVi, items.length])
 
   return (
     <div data-testid="sub-toolbar" style={up ? styles.subBarUp : styles.subBar}>

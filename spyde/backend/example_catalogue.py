@@ -88,6 +88,9 @@ def datasets() -> list[tuple[str, object]]:
         obj = getattr(data, name, None)
         if not inspect.isclass(obj) or obj is base or not issubclass(obj, base):
             continue
+        replacement = SUPERSEDED.get(name)
+        if replacement is not None and getattr(data, replacement, None) is not None:
+            continue
         try:
             out.append((name, obj()))
         except Exception as e:
@@ -95,11 +98,23 @@ def datasets() -> list[tuple[str, object]]:
     return sorted(out, key=lambda kv: kv[0].lower())
 
 
+#: A dataset em-database ships in a form that cannot be used, and the entry
+#: that stands in for it. The menu lists only the replacement, and the old key
+#: still loads — it just loads the usable copy — so a tutorial or a saved
+#: session that names the old key keeps working. SPEDAg's packaged copy has
+#: half the true reciprocal calibration; see ``spyde.external.emdatabase``.
+SUPERSEDED = {"SPEDAg": "SPEDAgCalibrated"}
+
+
 def resolve(key: str):
     """The dataset object for a catalogue key, or None."""
     try:
         import em_database.data as data
-        obj = getattr(data, str(key), None)
+        key = str(key)
+        replacement = SUPERSEDED.get(key)
+        if replacement is not None and getattr(data, replacement, None) is not None:
+            key = replacement
+        obj = getattr(data, key, None)
         return obj() if inspect.isclass(obj) else None
     except Exception as e:
         log.debug("resolving example %r failed: %s", key, e)

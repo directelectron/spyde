@@ -603,6 +603,9 @@ class TestComputeCancellation:
                                   "own future — orientation_action registers it",
         "composition.py": "queries the structure database over the network; no "
                           "signal tree in scope and no dataset is read",
+        "ipf_panel.py": "reads the sample's .cif files off disk to draw their "
+                        "triangles; no dataset is read, and a panel that has "
+                        "gone is a no-op for the phases that land",
     }
 
     def test_a_dispatched_compute_registers_a_cancel_token(self):

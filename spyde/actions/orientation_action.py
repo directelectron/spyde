@@ -138,27 +138,23 @@ def _overlay_template_on_source(src_tree, dp_plot, src, sim, gamma) -> None:
 
 
 def _open_refine_ipf(session, signal, sim, cache, tree):
-    """Open the live per-phase IPF correlation-heatmap window for refine and wire
-    a controller to the navigator. Returns the controller (or None)."""
+    """Put the live per-phase IPF correlation heat map into the wizard's IPF
+    window (see :mod:`spyde.actions.ipf_panel`) and wire a controller to the
+    navigator. Returns the controller (or None)."""
     try:
+        from spyde.actions.ipf_panel import ensure_panel
         from spyde.actions.ipf_refine import build_phase_ipf
-        from spyde.actions.ipf_refine_render import (
-            build_refine_figure, emit_refine_window, RefineIpfController,
-        )
+        from spyde.actions.ipf_refine_render import RefineIpfController
         infos = build_phase_ipf(sim)
         if not infos:
             return None
-        _fig, fig_id, html, panels = build_refine_figure(infos)
-        base = signal.metadata.get_item("General.title", "Signal")
-        wid = emit_refine_window(session, _fig, fig_id, html,
-                                 title=f"{base} — IPF Refine")
+        panel = ensure_panel(session, tree, "om", signal)
+        panel.set_library(infos)
+        panel.show()
         ctrl = RefineIpfController(
-            signal, sim, cache, infos, panels,
+            signal, sim, cache, infos, panel.panels,
             gamma=DEFAULTS["gamma"], normalize=False).attach(tree)
-        # Give the bare-figure refine window a dispatch/teardown identity so
-        # ✕-closing it unhooks the navigator controller (see registry.py).
-        if ctrl is not None:
-            session.register_window_controller(wid, ctrl)
+        panel.controller = ctrl
         return ctrl
     except Exception as e:
         log.debug("refine IPF window failed: %s", e)
@@ -283,6 +279,12 @@ class OmWizard(WizardController):
         self._closed = True
         remove_overlay_node(self.tree, self.overlay)
         self.overlay = None
+        # The IPF window outlives the wizard (a regenerated library gets it
+        # back); only the heat map that was drawing into it goes.
+        from spyde.actions.ipf_panel import panel_for
+        panel = panel_for(self.tree, "om")
+        if panel is not None and panel.controller is self.refine_ipf:
+            panel.controller = None
         if self.refine_ipf is not None:
             try:
                 self.refine_ipf.remove()
@@ -324,8 +326,19 @@ def om_generate_library(session, plot, payload) -> None:
             src_root = _current_signal(src) or tree.root
             phases = [Phase.from_cif(p) for p in cif_paths]
             recip_r = _reciprocal_radius(src_root)
-            sim = generate_library_from_phases(phases, voltage, resolution,
-                                               min_int, recip_r)
+            # The IPF window shows the phases' triangles filling in while the
+            # library builds — see ipf_panel.
+            from spyde.actions.ipf_panel import ensure_panel
+            panel = ensure_panel(session, tree, "om", src_root)
+            panel.controller = None
+            panel.set_phases(phases)
+            panel.show()
+            panel.start_filling()
+            try:
+                sim = generate_library_from_phases(phases, voltage, resolution,
+                                                   min_int, recip_r)
+            finally:
+                panel.stop_filling()
             n_templates = int(template_tables(sim)[0].shape[0])
 
             # A regenerated library replaces the previous wizard wholesale —

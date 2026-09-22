@@ -759,8 +759,34 @@ def quantem_orientation_fit(*, rows, pixels: DetectorPixels, fitter,
     if fit is None:
         return {"measured": measured_px, "template": None, "fit": None}
     return {"measured": measured_px,
-            "template": pixels.inverse_angstrom_to_pixels(fit.spots),
+            "template": {"data": pixels.inverse_angstrom_to_pixels(fit.spots),
+                         "edgecolors": intensity_edgecolors(fit.intensities)},
             "fit": fit}
+
+
+#: The matched pattern's colour, and how faint its weakest reflection draws.
+TEMPLATE_COLOR = (48, 255, 96)
+TEMPLATE_MIN_ALPHA = 0.2
+
+
+def intensity_edgecolors(intensities, color=TEMPLATE_COLOR,
+                         floor: float = TEMPLATE_MIN_ALPHA) -> list:
+    """One ``rgba(...)`` per simulated spot, its alpha by relative intensity.
+
+    A simulated pattern carries every excited reflection at equal weight when
+    drawn as plain circles, so a strong low-order spot and a barely-excited
+    one read the same and the eye pairs the wrong ones. Fading each circle by
+    its intensity shows which spots the match actually rests on — which is
+    also what tells two candidate phases apart on a pattern both nearly fit.
+    """
+    values = np.asarray(intensities, dtype=float).reshape(-1)
+    if values.size == 0:
+        return []
+    top = float(np.nanmax(values)) if np.isfinite(values).any() else 0.0
+    relative = values / top if top > 0 else np.ones_like(values)
+    alphas = floor + (1.0 - floor) * np.clip(np.nan_to_num(relative), 0.0, 1.0)
+    red, green, blue = color
+    return [f"rgba({red},{green},{blue},{alpha:.2f})" for alpha in alphas]
 
 
 def attach_quantem_orientation_overlay(vecs, fitter, tree, *, params=None,

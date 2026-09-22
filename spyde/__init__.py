@@ -37,6 +37,7 @@ _ORIENTATION_MODULES = (
     "orientation_action", "orientation_compute",
     "vector_orientation_om", "vector_orientation_quantem", "vector_refine_ipf",
     "ipf_density", "ipf_refine", "ipf_refine_render", "ipf_view", "ipf_window",
+    "ipf_panel", "orientation_smooth",
 )
 
 _LOG_AREA_RULES = (

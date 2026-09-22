@@ -175,6 +175,77 @@ class PeaksAdapter:
         return np.array([len(cell.array) for cell in self._cells], dtype=int)
 
 
+class _RowBand:
+    """A horizontal band of a scan's peaks, as the matcher reads a scan.
+
+    The match is per position, so matching the scan a band at a time against
+    the one plan gives the same answer as matching it whole — and lets the
+    band's orientations be shown, and the count reported, while the rest is
+    still running. The refinement is NOT banded: its neighbour rescue looks
+    across positions, so it runs on the whole reassembled map.
+    """
+
+    fields = list(PEAK_FIELDS)
+
+    def __init__(self, peaks: PeaksAdapter, row_start: int, row_stop: int):
+        self._peaks = peaks
+        self._row_start = int(row_start)
+        self.shape = (int(row_stop) - int(row_start), peaks.shape[1])
+        self.metadata = peaks.metadata
+
+    def __getitem__(self, index) -> _Cell:
+        row, column = index
+        return self._peaks[row + self._row_start, column]
+
+    def select_fields(self, *names) -> "_RowBand":
+        if tuple(names) != PEAK_FIELDS:
+            raise NotImplementedError(
+                f"the adapter carries {PEAK_FIELDS}, not {names}")
+        return self
+
+    def flatten(self) -> np.ndarray:
+        rows, columns = self.shape
+        return np.vstack([self[row, column].array
+                          for row in range(rows) for column in range(columns)])
+
+    @property
+    def peak_counts(self) -> np.ndarray:
+        rows, columns = self.shape
+        return np.array([len(self[row, column].array)
+                         for row in range(rows) for column in range(columns)],
+                        dtype=int)
+
+
+#: Rows matched per band by :func:`compute_vector_orientation_quantem`. Small
+#: enough that the map visibly fills, large enough that a band is still a
+#: batch: 8 rows of a 64-wide scan is 512 patterns, four of the matcher's
+#: own batches.
+BAND_ROWS = 8
+
+
+def band_schedule(rows: int, band_rows: int, ramp: bool = True) -> list:
+    """``[(row_start, row_stop), ...]`` covering *rows*. With *ramp* the bands
+    start at one row and double up to *band_rows*, so the first rows are on
+    screen after one row's match rather than after eight — on a wide scan the
+    difference between seeing the map start and staring at grey."""
+    band_rows = max(1, int(band_rows or rows))
+    bands, start, size = [], 0, (1 if ramp else band_rows)
+    while start < rows:
+        stop = min(rows, start + min(size, band_rows))
+        bands.append((start, stop))
+        start, size = stop, size * 2
+    return bands
+
+#: The tensors :meth:`OrientationMap.match_orientations` writes, in the order
+#: they are reassembled from the bands.
+_MATCH_FIELDS = ("quats", "corr", "corr_second", "reliability", "mirror")
+
+#: How many times the neighbour rescue may run over the field. Upstream runs
+#: it once; a mis-indexed patch wider than one position needs a pass per
+#: position of depth, and each pass stops early when it changes nothing.
+RESCUE_PASSES = 3
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Strain
 # ─────────────────────────────────────────────────────────────────────────────
@@ -249,12 +320,40 @@ def reciprocal_affine(orientation_map, match: int = 0,
         m1 = torch.einsum("bp,bpi,bpj->bij", weight, target, simulated)
         m2 = torch.einsum("bp,bpi,bpj->bij", weight, simulated, simulated)
         solved = m1 @ torch.linalg.inv(m2 + 1e-12 * eye)
-        enough = paired.sum(dim=1) >= min_pairs
+        # Enough pairs, and pairs that span the plane: four peaks along one
+        # row of reflections make m2 rank one, which the regularised inverse
+        # turns into a huge A rather than a refusal — strains of 60 on a
+        # real scan, all from positions whose pairing could not have
+        # determined the other direction.
+        enough = (paired.sum(dim=1) >= min_pairs) & well_conditioned(m2)
         affine[start:stop][enough] = solved[enough]
         pair_count[start:stop] = paired.sum(dim=1)
 
     return (affine.reshape(rows, columns, 2, 2),
             pair_count.reshape(rows, columns))
+
+
+#: The weakest direction of a pairing must carry at least this fraction of
+#: the strongest (the ratio of the normal matrix's eigenvalues) for the
+#: deformation to be solved from it.
+CONDITION_FLOOR = 0.05
+
+#: Beyond this magnitude a solved "strain" is a pairing failure, not a
+#: strain: no crystal in a microscope is stretched by half.
+MAX_STRAIN = 0.5
+
+
+def well_conditioned(normal, floor: float = CONDITION_FLOOR):
+    """``(B,)`` bool — whether each ``(B, 2, 2)`` symmetric normal matrix
+    ``sum w q qᵀ`` has its paired peaks spanning both directions of the
+    plane, i.e. its smaller eigenvalue is at least *floor* of the larger."""
+    import torch
+
+    trace = normal.diagonal(dim1=-2, dim2=-1).sum(-1)
+    determinant = torch.linalg.det(normal)
+    half_gap = (trace * trace / 4 - determinant).clamp_min(0).sqrt()
+    smallest, largest = trace / 2 - half_gap, trace / 2 + half_gap
+    return (largest > 0) & (smallest > floor * largest)
 
 
 def strain_from_orientation_map(orientation_map, match: int = 0,
@@ -293,10 +392,33 @@ def strain_from_orientation_map(orientation_map, match: int = 0,
     rows, columns = affine.shape[:2]
     affine = affine.reshape(-1, 2, 2)
     if not reciprocal:
-        # real space is the inverse transpose of the reciprocal-space map
-        affine = torch.linalg.inv(affine).transpose(-1, -2)
+        affine = real_space_deformation(affine)
     strain = _symmetric_strain(affine).reshape(rows, columns, 3).cpu().numpy()
     return strain.astype(np.float32), pair_count.cpu().numpy()
+
+
+def real_space_deformation(affine):
+    """``(B, 2, 2)`` reciprocal-space maps → their real-space deformations, the
+    inverse transpose, NaN where a map is missing or singular.
+
+    Inverting the batch in one call raised on a single singular member — a
+    position whose paired peaks all lie on one line through the origin has a
+    rank-one map — and took the whole scan's strain down with it ("batch
+    element 1552 … The input matrix is singular"). One bad position is one
+    NaN, like a position with too few pairs.
+    """
+    import torch
+
+    finite = torch.isfinite(affine).all(dim=(-2, -1))
+    clean = torch.nan_to_num(affine)
+    # Singular relative to the map's own magnitude, so a well-conditioned map
+    # of small entries is not mistaken for a degenerate one.
+    scale = clean.abs().amax(dim=(-2, -1)).clamp_min(1e-12) ** 2
+    invertible = finite & (torch.linalg.det(clean).abs() > 1e-8 * scale)
+    out = torch.full_like(affine, float("nan"))
+    if bool(invertible.any()):
+        out[invertible] = torch.linalg.inv(affine[invertible]).transpose(-1, -2)
+    return out
 
 
 def _symmetric_strain(affine):
@@ -321,8 +443,14 @@ def _symmetric_strain(affine):
     stretch = (vh.transpose(-1, -2) * singular[..., None, :]) @ vh
     identity = torch.eye(2, dtype=affine.dtype, device=affine.device)
     strain = stretch - identity
-    out[finite] = torch.stack(
+    components = torch.stack(
         (strain[..., 0, 0], strain[..., 1, 1], strain[..., 0, 1]), dim=-1)
+    # A pairing that solved to a stretch of more than half is a failed
+    # pairing that happened to be invertible; reported, it would set the
+    # colour scale of the whole map.
+    plausible = components.abs().amax(dim=-1) <= MAX_STRAIN
+    components[~plausible] = float("nan")
+    out[finite] = components
     return out
 
 
@@ -690,6 +818,7 @@ class GpuRefineOrientationMap:
         reports it as one.
         """
         rescue = kwargs.pop("neighbor_rescue", True)
+        passes = int(kwargs.pop("rescue_passes", 1))
         batched = kwargs.get("batched", True)
         refine_tilt = kwargs.get("refine_tilt", False)
         # Falling back leaves upstream wholly in charge, rescue included.
@@ -698,11 +827,23 @@ class GpuRefineOrientationMap:
             return super().refine_orientations(
                 *args, neighbor_rescue=rescue, **kwargs)
 
+        import torch
+
         self._refine_state = None
         result = super().refine_orientations(*args, neighbor_rescue=False, **kwargs)
         if self._refine_state is not None:
-            self._rescue_batched(float(kwargs.get("rescue_threshold_deg", 2.0)))
+            threshold = float(kwargs.get("rescue_threshold_deg", 2.0))
+            # One pass rescues a position from the neighbours it has NOW; a
+            # position two steps into a mis-indexed patch only gets a good
+            # neighbour once the first pass has fixed the one between. Repeat
+            # until a pass changes nothing, up to ``rescue_passes``.
+            for _ in range(max(1, passes)):
+                before = self.quats.clone()
+                self._rescue_batched(threshold)
+                if torch.equal(before, self.quats):
+                    break
             self.metadata["refine"]["neighbor_rescue"] = True
+            self.metadata["refine"]["rescue_passes"] = int(max(1, passes))
         return result
 
     def _rescue_batched(self, threshold_deg: float) -> None:
@@ -934,6 +1075,25 @@ def to_result(orientation_map, phases_meta: list,
 # The whole field
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _band_winner(parts, convention: str = "conjugate"):
+    """The best phase and its orientation at every position of the band just
+    matched — ``parts[phase]`` is that phase's match tensors for the band.
+
+    The same comparison :func:`combine_phases` makes for the finished scan;
+    here it is made early so the band can be shown. A position no phase
+    matched gets phase ``-1``.
+    """
+    correlation = np.stack(
+        [np.asarray(part["corr"][..., 0].numpy(), float) for part in parts])
+    winner = correlation.argmax(axis=0)
+    best = np.take_along_axis(correlation, winner[None], axis=0)[0]
+    quats = np.stack([
+        quantem_quats_to_orix(part["quats"][..., 0, :].numpy(), convention)
+        for part in parts])
+    chosen = np.take_along_axis(quats, winner[None, ..., None], axis=0)[0]
+    return chosen.astype(np.float32), np.where(best > 0, winner, -1).astype(np.int16)
+
+
 def compute_vector_orientation_quantem(
         vectors, phases, energy_ev: float, k_max: float,
         inverse_angstrom_factor: float = 1.0,
@@ -941,84 +1101,130 @@ def compute_vector_orientation_quantem(
         angle_step_in_plane_deg: float = 5.0,
         device: str = "cuda", t: Optional[int] = None,
         progress=None, stopped_flag=None,
-        params: Optional[dict] = None) -> Optional[VectorOrientationResult]:
+        params: Optional[dict] = None,
+        on_band=None, band_rows: int = BAND_ROWS, ramp: bool = True,
+        stage=None,
+        ) -> Optional[VectorOrientationResult]:
     """Orientation, phase and strain for every position, by correlation match.
 
     One plan per phase, each matched and refined over the whole scan and then
     combined per position on the correlation — see :func:`combine_phases` for
     why comparing them is legitimate.
 
+    The match runs in bands of ``band_rows`` scan rows against the plans built
+    once up front, and ``on_band(row_start, row_stop, quats, phase_index)`` is
+    called as each band lands with its best orientation per position, so the
+    map can be shown filling in. The match is per position, so this is the
+    same answer the whole scan gives in one call; the refinement, whose
+    neighbour rescue looks across positions, runs on the reassembled map.
+
     The correlation runs on ``device`` and the refinement on the same one
     through the override in this module; both are worth accelerating at scan
     scale, which is the opposite of the single-pattern case, where a batch of
     one is launch-overhead bound and the CPU wins.
 
-    ``progress(done, total)`` is called between stages, and ``stopped_flag`` is
-    polled at each, so closing the tree stops the run rather than leaving a
-    scan's compute to finish into nothing.
+    ``progress(done, total)`` counts positions: each is matched once and
+    refined once per phase; ``stage(text)`` is told which stage is running
+    (plan, match, refine), since the count stands still through the plan
+    build and the refinement and a still count reads as a hang.
+    ``stopped_flag`` is polled between bands and stages, so closing the tree
+    stops the run rather than leaving a scan's compute to finish into nothing.
+    With *ramp* the first bands are one, two, four rows — see
+    :func:`band_schedule`.
     """
     import torch
+
+    def _stage(text: str) -> None:
+        log.info("[vom] %s", text)
+        if stage is not None:
+            stage(text)
 
     peaks = PeaksAdapter(vectors, inverse_angstrom_factor=inverse_angstrom_factor,
                          t=t)
     rows, columns = peaks.shape
     total = rows * columns
-    stages = max(1, len(phases)) * 3
+    total_units = 2 * max(1, len(phases)) * total
     done = [0]
 
-    def _advance():
-        done[0] += 1
+    def _advance(positions: int):
+        done[0] += int(positions)
         if progress is not None:
-            progress(int(total * done[0] / stages), total)
+            progress(done[0], total_units)
 
     def _stopped() -> bool:
         return bool(stopped_flag is not None and stopped_flag[0])
 
-    maps, strains = [], []
-    for phase in phases:
+    # The Refine tab's settings, so the map is of what the preview showed.
+    settings = dict(params or {})
+    pair_distance = settings.get("pair_distance")
+    sigma_excitation = settings.get("sigma_excitation")
+    rescue_passes = int(settings.get("rescue_passes", RESCUE_PASSES))
+
+    maps = []
+    for index, phase in enumerate(phases):
         if _stopped():
             return None
+        _stage(f"building the correlation plan for phase {index + 1} of "
+               f"{len(phases)} ({getattr(phase, 'name', '') or 'phase'})…")
         crystal = phase_to_crystal(phase)
         with accelerator_lock(torch.device(device)):
-            orientation_map = build_orientation_map(
-            peaks, crystal, energy_ev=energy_ev, k_max=k_max,
-            angle_step_zone_axis_deg=angle_step_zone_axis_deg,
-            angle_step_in_plane_deg=angle_step_in_plane_deg,
-                device=device, refine_device=device)
-        _advance()
+            maps.append(build_orientation_map(
+                peaks, crystal, energy_ev=energy_ev, k_max=k_max,
+                angle_step_zone_axis_deg=angle_step_zone_axis_deg,
+                angle_step_in_plane_deg=angle_step_in_plane_deg,
+                device=device, refine_device=device))
+    if not maps:
+        return None
 
+    parts = [[] for _ in maps]
+    for row_start, row_stop in band_schedule(rows, band_rows, ramp):
         if _stopped():
             return None
-        with accelerator_lock(torch.device(device)):
-            orientation_map.match_orientations(progress_bar=False)
-        _advance()
+        _stage(f"matching rows {row_start + 1}-{row_stop} of {rows}…")
+        band = _RowBand(peaks, row_start, row_stop)
+        for orientation_map, phase_parts in zip(maps, parts):
+            orientation_map.peaks = band
+            with accelerator_lock(torch.device(device)):
+                orientation_map.match_orientations(progress_bar=False)
+            phase_parts.append({name: getattr(orientation_map, name)
+                                for name in _MATCH_FIELDS})
+            _advance(band.shape[0] * columns)
+        if on_band is not None:
+            quats, phase_index = _band_winner(
+                [phase_parts[-1] for phase_parts in parts])
+            on_band(row_start, row_stop, quats, phase_index)
 
+    strains = []
+    for index, (orientation_map, phase_parts) in enumerate(zip(maps, parts)):
         if _stopped():
             return None
-        # The Refine tab's settings, so the map is of what the preview showed.
-        settings = dict(params or {})
-        pair_distance = settings.get("pair_distance")
-        sigma_excitation = settings.get("sigma_excitation")
+        _stage(f"refining phase {index + 1} of {len(maps)} and solving strain…")
+        orientation_map.peaks = peaks
+        for name in _MATCH_FIELDS:
+            setattr(orientation_map, name,
+                    torch.cat([part[name] for part in phase_parts], dim=0))
         with accelerator_lock(torch.device(device)):
+            # Upstream's own refinement (the CPU path) rescues once and takes
+            # no pass count; the batched override does.
+            passes = ({"rescue_passes": rescue_passes}
+                      if isinstance(orientation_map, GpuRefineOrientationMap) else {})
             orientation_map.refine_orientations(
                 progress_bar=False, pair_distance=pair_distance,
-                sigma_excitation=sigma_excitation)
+                sigma_excitation=sigma_excitation, **passes)
             strain, _pairs = strain_from_orientation_map(
                 orientation_map, device=device, pair_distance=pair_distance,
                 sigma_excitation=sigma_excitation)
-        _advance()
-
-        maps.append(orientation_map)
         strains.append(strain)
+        _advance(total)
 
-    if _stopped() or not maps:
+    if _stopped():
         return None
     from spyde.signals.orientation_map import phase_to_dict
 
     result = combine_phases(maps, [phase_to_dict(p) for p in phases],
                             strains=strains, params=dict(params or {}))
     if progress is not None:
-        progress(total, total)
+        progress(total_units, total_units)
     return result
 
 
@@ -1291,9 +1497,7 @@ class SinglePatternFitter:
                 sigma_excitation=self.sigma_excitation)
             deformation = affine[0, 0]
             strain = _symmetric_strain(
-                torch.linalg.inv(deformation[None]).transpose(-1, -2)
-            )[0].cpu().numpy() if bool(torch.isfinite(deformation).all()) else \
-                np.full(3, np.nan, np.float32)
+                real_space_deformation(deformation[None]))[0].cpu().numpy()
             pattern = orientation_map.generate_pattern(0, 0)
 
         spots = torch.stack((pattern["qx"], pattern["qy"]), dim=1).to(torch.float64)

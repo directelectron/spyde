@@ -354,6 +354,13 @@ def _apply_structure(session, plot, payload, structure_elements, create) -> None
     phase["cod_id"] = str(payload["cod_id"]) if payload.get("cod_id") else None
     phase["structure_elements"] = list(structure_elements) if path else None
     _store(session, tree, phases, _numbered(phases, phase))
+    # An orientation wizard's IPF window shows the phases' triangles as soon
+    # as they have a structure — see ipf_panel.
+    from spyde.actions.ipf_panel import phases_changed
+    try:
+        phases_changed(session, tree)
+    except Exception as e:
+        log.debug("updating the IPF panel phases failed: %s", e)
 
 
 def set_phase_structure(session, plot, payload) -> None:

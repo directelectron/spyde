@@ -33,8 +33,12 @@ log = logging.getLogger(__name__)
 DEFAULTS = dict(
     accelerating_voltage=200.0,
     resolution=1.0,
+    in_plane_resolution=5.0,
     minimum_intensity=1e-4,
     smooth=False,
+    rescue_passes=3,
+    smooth_orientations=False,
+    grain_threshold_deg=5.0,
 )
 
 from de_shell.actions.wizard import WizardController
@@ -69,6 +73,13 @@ class VomWizard(WizardController):
             "name": "Angle res (°)", "type": "float", "default": 1.0,
             "min": 0.1, "max": 10.0, "step": 0.1, "tab": "Library",
         },
+        # The plan's step around the beam. The in-plane angle is an FFT axis
+        # of the correlation, so a finer step costs plan size and memory, not
+        # a longer match; the refinement then moves off the grid either way.
+        "in_plane_resolution": {
+            "name": "In-plane res (°)", "type": "float", "default": 5.0,
+            "min": 0.5, "max": 15.0, "step": 0.5, "tab": "Library",
+        },
         "minimum_intensity": {
             "name": "Min intensity", "type": "float", "default": 1e-4,
             "min": 0.0, "max": 0.05, "step": 0.0005, "tab": "Library",
@@ -96,6 +107,25 @@ class VomWizard(WizardController):
             "name": "Smooth strain (TV)", "type": "bool", "default": False,
             "tab": "Run",
         },
+        # How many times the neighbour rescue runs over the field: a position
+        # whose orientation disagrees with all its neighbours is re-fitted
+        # from theirs, and a mis-indexed patch two positions wide needs two
+        # passes. Each pass stops early when it changes nothing.
+        "rescue_passes": {
+            "name": "Rescue passes", "type": "int", "default": 3,
+            "min": 1, "max": 10, "tab": "Run",
+        },
+        # The within-grain mean (orientation_smooth): tilt noise inside a
+        # grain averages out, a boundary stays where it was. Off by default,
+        # like the strain smoothing — the raw field is what was measured.
+        "smooth_orientations": {
+            "name": "Smooth orientations", "type": "bool", "default": False,
+            "tab": "Run",
+        },
+        "grain_threshold_deg": {
+            "name": "Grain threshold (°)", "type": "float", "default": 5.0,
+            "min": 0.5, "max": 20.0, "step": 0.5, "tab": "Run",
+        },
     }
 
     def __init__(self, session, tree, *, phases, overlay,
@@ -112,6 +142,9 @@ class VomWizard(WizardController):
         self.overlay = overlay
         self.voltage = voltage
         self.recip_r = recip_r
+        #: The plan's in-plane step, kept so Compute Maps builds its plans
+        #: the way the preview's were built.
+        self.in_plane_resolution = float(DEFAULTS["in_plane_resolution"])
         # Refine's live matcher settings; None means the plan's own values.
         self.pair_distance = None
         self.sigma_excitation = None
@@ -148,6 +181,12 @@ class VomWizard(WizardController):
         # Everything this wizard put on the tree comes off with it, the heat
         # map's own overlay included — leaving it behind would keep correlating
         # against a library that no longer exists.
+        # The IPF window outlives the wizard (a regenerated library gets it
+        # back); only the heat map that was drawing into it goes.
+        from spyde.actions.ipf_panel import panel_for
+        panel = panel_for(self.tree, "vom")
+        if panel is not None and panel.controller is self.refine_ipf:
+            panel.controller = None
         if self.refine_ipf is not None:
             try:
                 self.refine_ipf.remove()
@@ -192,6 +231,7 @@ def vom_generate_library(session, plot, payload) -> None:
         return
     voltage = float(payload.get("accelerating_voltage", DEFAULTS["accelerating_voltage"]))
     resolution = float(payload.get("resolution", DEFAULTS["resolution"]))
+    in_plane = float(payload.get("in_plane_resolution", DEFAULTS["in_plane_resolution"]))
     min_int = float(payload.get("minimum_intensity", DEFAULTS["minimum_intensity"]))
     emit_status("Vector Orientation: generating template library…")
     # Warm the CUDA autograd engine on this (dispatch) thread so the batched GPU
@@ -232,6 +272,14 @@ def vom_generate_library(session, plot, payload) -> None:
             fitter = None
             n_orientations = 0
             wid = getattr(src, "window_id", None)
+            # The IPF window shows the phases' triangles filling in while the
+            # plans build — see ipf_panel.
+            from spyde.actions.ipf_panel import ensure_panel
+            panel = ensure_panel(session, tree, "vom", root)
+            panel.controller = None
+            panel.set_phases(phases)
+            panel.show()
+            panel.start_filling()
             try:
                 # The live preview is the quantem correlation matcher: it
                 # returns a continuous orientation rather than the nearest
@@ -248,7 +296,8 @@ def vom_generate_library(session, plot, payload) -> None:
                     PeaksAdapter(vecs, inverse_angstrom_factor=factor),
                     energy_ev=float(voltage) * 1e3, k_max=float(recip_r),
                     inverse_angstrom_factor=factor,
-                    angle_step_zone_axis_deg=float(resolution))
+                    angle_step_zone_axis_deg=float(resolution),
+                    angle_step_in_plane_deg=float(in_plane))
                 overlay = attach_quantem_orientation_overlay(
                     vecs, fitter, tree, on_fit=lambda fit: _emit_vom_fit(wid, fit))
                 n_orientations = sum(int(m.zone_axes.shape[0])
@@ -256,6 +305,8 @@ def vom_generate_library(session, plot, payload) -> None:
             except Exception as e:
                 import logging
                 logging.getLogger(__name__).debug("vom overlay attach failed: %s", e)
+            finally:
+                panel.stop_filling()
 
             # The correlation surface the matcher picks its answer off, one
             # triangle per phase. A single best number cannot say whether the
@@ -272,6 +323,8 @@ def vom_generate_library(session, plot, payload) -> None:
                 voltage=voltage, recip_r=recip_r,
                 refine_ipf=refine_ipf, fitter=fitter,
             )
+            wiz.in_plane_resolution = float(in_plane)
+            wiz.resolution = float(resolution)
             tree._vom_wizard = wiz
             phase_names = ", ".join(str(p.name) for p in phases)
             # Generate builds the library and turns on the live preview, and
@@ -299,19 +352,96 @@ def vom_generate_library(session, plot, payload) -> None:
     run_on_worker(session, _work, name="vom-generate-library")
 
 
-def _build_ipf_heatmap(session, src, result, title="Orientation (IPF-Z, live)"):
-    """Open just the IPF-Z map window (the live refine heatmap) + its 3-D
-    explorer. The strain windows are added later by Compute Maps."""
-    from spyde.actions.commit import commit_result_tree
+def _ipf_title(src, title: str) -> str:
     base = src.metadata.get_item("General.title", "Signal")
+    return f"{base} — {title}"
+
+
+def _open_ipf_window(session, src, nav_shape, title="Orientation (IPF-Z)"):
+    """Open the IPF-Z window before the fit, every position in the unfit
+    grey, so the map has somewhere to fill in. :func:`_build_ipf_heatmap`
+    finishes it once the result exists."""
+    from spyde.actions.commit import commit_result_tree
+    ny, nx = nav_shape
+    blank = np.empty((ny, nx, 3), np.uint8)
+    blank[...] = _UNFIT_COLOR
+    return commit_result_tree(
+        session, title=_ipf_title(src, title), primary=blank,
+        provenance={"action": "Vector Orientation Mapping",
+                    "source_title": src.metadata.get_item(
+                        "General.title", "Signal")},
+        source_signal=src,
+    )
+
+
+class _BandPainter:
+    """Paints each matched band of rows into the early IPF window.
+
+    Holds the whole map, grey where nothing has landed, and repaints it as
+    each band arrives; the paint is marshalled onto the main loop because the
+    bands come off the fit's worker thread.
+    """
+
+    def __init__(self, session, tree, nav_shape, phases):
+        self.session = session
+        self.tree = tree
+        self.phases = list(phases)
+        ny, nx = nav_shape
+        self.rgb = np.empty((ny, nx, 3), np.uint8)
+        self.rgb[...] = _UNFIT_COLOR
+
+    def on_band(self, row_start, row_stop, quats, phase_index) -> None:
+        from spyde.signals.orientation_map import ipf_rgb
+        band = np.empty((row_stop - row_start,) + self.rgb.shape[1:], np.uint8)
+        band[...] = _UNFIT_COLOR
+        for index, phase in enumerate(self.phases):
+            mask = phase_index == index
+            if mask.any():
+                band[mask] = ipf_rgb(quats[mask], phase, "z")
+        self.rgb[row_start:row_stop] = band
+        snapshot = self.rgb.copy()
+
+        def _paint():
+            from spyde.actions.lifecycle import paint_signal_plots
+            paint_signal_plots(self.tree, snapshot)
+
+        dispatch = getattr(self.session, "_dispatch_to_main", None)
+        if dispatch is not None:
+            dispatch(_paint)
+        else:
+            _paint()
+
+
+def _build_ipf_heatmap(session, src, result, title="Orientation (IPF-Z, live)",
+                       tree=None):
+    """Open just the IPF-Z map window (the live refine heatmap) + its 3-D
+    explorer. The strain windows are added later by Compute Maps.
+
+    With *tree* — the window :func:`_open_ipf_window` opened before the fit —
+    that window is finished instead: the final map painted, the result
+    attached, the explorers wired."""
+    from spyde.actions.commit import commit_result_tree
 
     def _attach(tree):
         from spyde.actions.ipf_view import attach_ipf_3d, attach_ipf_point_selector
         attach_ipf_3d(tree, result, "z", session=session)
         attach_ipf_point_selector(tree, result, "z")
 
+    if tree is not None:
+        from spyde.actions.lifecycle import paint_signal_plots
+        tree.vector_orientation = result
+        rgb = result.ipf_color_map("z")
+        paint_signal_plots(tree, rgb)
+        try:
+            _attach(tree)
+        except Exception as e:
+            log.debug("attaching the IPF explorers failed: %s", e)
+        _add_phase_chips(tree, src, result, rgb)
+        return tree
+
+    base = src.metadata.get_item("General.title", "Signal")
     return commit_result_tree(
-        session, title=f"{base} — {title}",
+        session, title=_ipf_title(src, title),
         primary=result.ipf_color_map("z"),
         attrs={"vector_orientation": result},
         provenance={"action": "Vector Orientation Mapping",
@@ -417,6 +547,12 @@ def vom_run(session, plot, payload) -> None:
         value = payload.get(key, getattr(wiz, key, None))
         if value is not None:
             fit_params[key] = float(value)
+    fit_params["rescue_passes"] = int(
+        payload.get("rescue_passes", DEFAULTS["rescue_passes"]))
+    smooth_orientations = bool(payload.get("smooth_orientations",
+                                           DEFAULTS["smooth_orientations"]))
+    grain_threshold = float(payload.get("grain_threshold_deg",
+                                        DEFAULTS["grain_threshold_deg"]))
     emit_status("Vector Orientation: fitting the field…")
 
     # Initialise the CUDA autograd engine on THIS (dispatch) thread before the
@@ -428,16 +564,28 @@ def vom_run(session, plot, payload) -> None:
     except Exception as e:
         log.debug("CUDA autograd warmup failed: %s", e)
 
+    # The orientation window opens NOW, blank, and fills in a band of rows at
+    # a time as the match lands — the same early window every other long
+    # compute here opens, instead of a status line and then everything at once.
+    ipf_tree = _open_ipf_window(session, tree.root, vecs.nav_shape)
+    painter = _BandPainter(session, ipf_tree, vecs.nav_shape, wiz.phases)
+
     def _work():
         try:
-            result = _fit_field(vecs, wiz, fit_params, tree=tree)
+            result = _fit_field(vecs, wiz, fit_params, tree=tree,
+                                on_band=painter.on_band)
             if result is None:
                 # None also means "cancelled" (tree closed mid-fit) — no toast.
                 if not getattr(tree, "_spyde_closed", False):
                     emit_error("Vector Orientation: fit returned no result")
                 return
+            if smooth_orientations:
+                from spyde.actions.orientation_smooth import smooth_orientation_field
+                emit_status("Vector Orientation: smoothing orientations…")
+                result = smooth_orientation_field(result, threshold_deg=grain_threshold)
             tree.vector_orientation = result
-            _build_result_windows(session, tree.root, result, smooth=smooth)
+            _build_result_windows(session, tree.root, result, smooth=smooth,
+                                  ipf_tree=ipf_tree)
             emit_status("Vector Orientation map complete")
         except Exception as e:
             emit_error(f"Compute Maps failed: {e}")
@@ -447,7 +595,7 @@ def vom_run(session, plot, payload) -> None:
     run_on_worker(session, _work, name="vom-run")
 
 
-def _fit_field(vecs, wiz, params, *, tree=None):
+def _fit_field(vecs, wiz, params, *, tree=None, on_band=None):
     """Whole-field fit: orientation, phase and strain, by correlation match.
 
     The same matcher the crosshair preview uses, run over every position — so
@@ -463,13 +611,26 @@ def _fit_field(vecs, wiz, params, *, tree=None):
 
     ``tree`` (when given) registers a stopped_flag, so closing the tree mid-fit
     stops the run rather than leaving a scan's compute to finish into nothing.
+    ``on_band`` receives each band of rows as it is matched — see
+    :func:`compute_vector_orientation_quantem`.
     """
     ny, nx = vecs.nav_shape
     total = ny * nx
 
+    state = {"stage": "fitting", "done": 0, "total": 0}
+
+    def _say():
+        percent = (f" {int(100 * state['done'] / state['total'])}%"
+                   if state["total"] else "")
+        emit_status(f"Vector Orientation: {state['stage']}{percent}")
+
     def _progress(done, total_):
-        if total_:
-            emit_status(f"Vector Orientation: fitting… {int(100 * done / total_)}%")
+        state["done"], state["total"] = done, total_
+        _say()
+
+    def _stage(text):
+        state["stage"] = text
+        _say()
 
     stopped_flag = [False]
     if tree is not None and hasattr(tree, "register_cancel"):
@@ -490,8 +651,12 @@ def _fit_field(vecs, wiz, params, *, tree=None):
         return compute_vector_orientation_quantem(
             vecs, wiz.phases, energy_ev=float(wiz.voltage) * 1e3,
             k_max=float(wiz.recip_r), inverse_angstrom_factor=factor,
-            device=device_name, progress=_progress,
-            stopped_flag=stopped_flag, params=params)
+            angle_step_zone_axis_deg=float(getattr(
+                wiz, "resolution", DEFAULTS["resolution"])),
+            angle_step_in_plane_deg=float(getattr(
+                wiz, "in_plane_resolution", DEFAULTS["in_plane_resolution"])),
+            device=device_name, progress=_progress, stage=_stage,
+            stopped_flag=stopped_flag, params=params, on_band=on_band)
     finally:
         if tree is not None and hasattr(tree, "unregister_cancel"):
             tree.unregister_cancel(flag=stopped_flag)
@@ -512,6 +677,17 @@ _PHASE_COLORS = (
 _UNFIT_COLOR = (0x55, 0x58, 0x60)
 
 
+def fitted_positions(result) -> np.ndarray:
+    """``(ny, nx)`` bool — where a template was actually matched.
+
+    The correlation matcher reports no residual (that is the pose fit's
+    diagnostic), so a position is fitted where it has a correlation. Reading
+    the residual alone painted every position of a matcher's result grey."""
+    residual = np.isfinite(np.asarray(result.residual, dtype=float))
+    score = np.asarray(getattr(result, "coarse_score", np.nan), dtype=float)
+    return residual | (np.nan_to_num(score) > 0)
+
+
 def phase_map_rgb(result) -> np.ndarray:
     """``(ny, nx, 3)`` uint8 — which crystal structure best explains each pattern.
 
@@ -524,7 +700,7 @@ def phase_map_rgb(result) -> np.ndarray:
     phase_idx = np.asarray(result.phase_idx, dtype=int)
     rgb = np.empty(phase_idx.shape + (3,), dtype=np.uint8)
     rgb[...] = _UNFIT_COLOR
-    fitted = np.isfinite(np.asarray(result.residual, dtype=float))
+    fitted = fitted_positions(result)
     for index in range(len(getattr(result, "phases_meta", None) or [1])):
         selected = fitted & (phase_idx == index)
         if selected.any():
@@ -532,12 +708,33 @@ def phase_map_rgb(result) -> np.ndarray:
     return rgb
 
 
+def phase_views(result, ipf_rgb) -> list:
+    """The chips a multi-phase orientation window carries beside its map:
+    the phase map, then the map restricted to each phase — one crystal's
+    grains alone, the rest in the unfit grey — so a phase can be looked at
+    on its own. Empty for a single phase, whose phase map says nothing."""
+    metas = list(getattr(result, "phases_meta", None) or [])
+    if len(metas) < 2:
+        return []
+    ipf_rgb = np.asarray(ipf_rgb)
+    phase_idx = np.asarray(result.phase_idx, dtype=int)
+    fitted = fitted_positions(result)
+    views = [("Phase", phase_map_rgb(result))]
+    for index, meta in enumerate(metas):
+        only = np.empty_like(ipf_rgb)
+        only[...] = _UNFIT_COLOR
+        selected = fitted & (phase_idx == index)
+        only[selected] = ipf_rgb[selected]
+        views.append((str(meta.get("name", f"phase {index}")), only))
+    return views
+
+
 def _phase_legend(result) -> list[dict]:
     """``[{name, color, fraction}]`` — what each phase colour means and how much
     of the scan it claims, for the status line and the window's provenance."""
 
     phase_idx = np.asarray(result.phase_idx, dtype=int)
-    fitted = np.isfinite(np.asarray(result.residual, dtype=float))
+    fitted = fitted_positions(result)
     total = max(int(fitted.sum()), 1)
     legend = []
     for index, meta in enumerate(getattr(result, "phases_meta", None) or []):
@@ -549,25 +746,39 @@ def _phase_legend(result) -> list[dict]:
     return legend
 
 
-def _build_result_windows(session, src, result, *, smooth=False) -> None:
-    """Commit the fitted field: an IPF-Z orientation window (RGB), a strain
-    window (εxx signal plot + εyy/εxy as chip-selectable views), and a phase map
-    when more than one structure was in the library."""
-    from spyde.actions.commit import commit_result_tree
-    base = src.metadata.get_item("General.title", "Signal")
+def _add_phase_chips(tree, src, result, ipf_rgb) -> None:
+    """Put the phase map and the per-phase orientation maps on the window
+    as chips beside the IPF-X/Y/Z projections (see :func:`phase_views`).
+    Appended AFTER the explorer's own chips, so neither erases the other."""
+    from spyde.actions.commit import navigation_extent
+    from spyde.actions.views import emit_view_figure, register_views
 
-    _build_ipf_heatmap(session, src, result, title="Orientation (IPF-Z)")
+    views = phase_views(result, ipf_rgb)
+    if not views:
+        return
+    signal_plot = next(iter(getattr(tree, "signal_plots", []) or []), None)
+    window_id = getattr(signal_plot, "window_id", None)
+    if window_id is None:
+        return
+    axes = navigation_extent(src, np.asarray(ipf_rgb).shape[:2])
+    register_views(window_id, views, append=True, axes=axes)
+    for label, image in views:
+        emit_view_figure(window_id, image, label, kind="2d", axes=axes)
+
+
+def _build_result_windows(session, src, result, *, smooth=False,
+                          ipf_tree=None) -> None:
+    """Commit the fitted field: an IPF-Z orientation window (RGB, with the
+    phase map and the per-phase maps as chips when more than one structure
+    was in the library) and a strain window (εxx signal plot + εyy/εxy as
+    chip-selectable views). *ipf_tree* is the orientation window opened
+    before the fit, finished here rather than opened again."""
+    _build_ipf_heatmap(session, src, result, title="Orientation (IPF-Z)",
+                       tree=ipf_tree)
 
     # One phase is the whole scan by construction, so a map of it says nothing.
     if len(getattr(result, "phases_meta", None) or []) > 1:
         legend = _phase_legend(result)
-        commit_result_tree(
-            session, title=f"{base} — Phase",
-            primary=phase_map_rgb(result), primary_label="Phase",
-            source_signal=src,
-            provenance={"action": "Vector Orientation Mapping",
-                        "source_title": base, "params": {"phases": legend}},
-        )
         emit_status("Phase: " + ", ".join(
             f"{entry['name']} {entry['fraction']:.0%}" for entry in legend))
 

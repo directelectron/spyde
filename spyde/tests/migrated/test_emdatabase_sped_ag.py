@@ -69,12 +69,15 @@ class TestTheCatalogueOffersIt:
         if not sped_ag.apply():
             pytest.skip("em-database is not installed (it needs Python >= 3.12)")
 
-    def test_it_appears_beside_the_original(self):
+    def test_it_takes_the_originals_place_in_the_menu(self):
+        """One SPED-Ag in the menu, and it is the usable one. Listing both
+        left the half-scale copy one click away under the familiar name, and
+        that is the one that got clicked."""
         from spyde.backend import example_catalogue
 
         names = [key for key, _ in example_catalogue.datasets()]
         assert sped_ag.NAME in names
-        assert "SPEDAg" in names, "the original must not be displaced"
+        assert "SPEDAg" not in names, "the stale copy must not be offered"
 
     def test_it_resolves_to_the_calibrated_record(self):
         from spyde.backend import example_catalogue
@@ -84,13 +87,23 @@ class TestTheCatalogueOffersIt:
         assert dataset.source == sped_ag.DATASET["source"]
         assert dataset.checksum == sped_ag.DATASET["checksum"]
 
+    def test_the_old_key_loads_the_calibrated_record(self):
+        """A tutorial or saved session that names SPEDAg keeps working, and
+        gets the copy a crystal can be fitted to."""
+        from spyde.backend import example_catalogue
+
+        dataset = example_catalogue.resolve("SPEDAg")
+        assert dataset is not None
+        assert dataset.source == sped_ag.DATASET["source"]
+
     def test_the_original_still_points_at_the_stale_record(self):
         """Not a complaint — a tripwire. When em-database repoints SPEDAg this
         fails, which is the signal that this whole module can be deleted.
         """
-        from spyde.backend import example_catalogue
+        import em_database.data as data
 
-        original = example_catalogue.resolve("SPEDAg")
+        cls = getattr(data, "SPEDAg", None)
+        original = cls() if cls is not None else None
         if original is None:
             pytest.skip("em-database no longer ships SPEDAg")
         assert "21790591" not in original.source, (

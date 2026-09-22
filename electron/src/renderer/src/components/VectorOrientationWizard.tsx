@@ -39,9 +39,10 @@ interface VomFit {
 // built template library on the tree, so we must NOT make the user regenerate it
 // (a ~1 min rebuild) just because the React caret was torn down and remounted.
 interface VomSaved {
-  tab: Tab; voltage: number; resolution: number; minInt: number
+  tab: Tab; voltage: number; resolution: number; inPlaneResolution: number; minInt: number
   pairDistance: number; sigmaExcitation: number
-  smooth: boolean; libReady: boolean
+  smooth: boolean; rescuePasses: number
+  smoothOrientations: boolean; grainThreshold: number; libReady: boolean
 }
 const _vomStore = new Map<number, VomSaved>()
 
@@ -51,10 +52,14 @@ export function VectorOrientationWizard({ caretPos, windowId, sendAction, onClos
   const phases = useSamplePhases(windowId)
   const [voltage, setVoltage] = React.useState(saved?.voltage ?? 200)
   const [resolution, setResolution] = React.useState(saved?.resolution ?? 1.0)
+  const [inPlaneResolution, setInPlaneResolution] = React.useState(saved?.inPlaneResolution ?? 5.0)
   const [minInt, setMinInt] = React.useState(saved?.minInt ?? 0.0001)
   const [pairDistance, setPairDistance] = React.useState(saved?.pairDistance ?? 0.05)        // Å⁻¹
   const [sigmaExcitation, setSigmaExcitation] = React.useState(saved?.sigmaExcitation ?? 0.04)  // Å⁻¹
   const [smooth, setSmooth] = React.useState(saved?.smooth ?? true)
+  const [rescuePasses, setRescuePasses] = React.useState(saved?.rescuePasses ?? 3)
+  const [smoothOrientations, setSmoothOrientations] = React.useState(saved?.smoothOrientations ?? false)
+  const [grainThreshold, setGrainThreshold] = React.useState(saved?.grainThreshold ?? 5.0)
   const [libReady, setLibReady] = React.useState(saved?.libReady ?? false)
   const [fit, setFit] = React.useState<VomFit | null>(null)
   const [status, setStatus] = React.useState(
@@ -63,10 +68,11 @@ export function VectorOrientationWizard({ caretPos, windowId, sendAction, onClos
 
   // Persist the state for this window on every change so reopening restores it.
   React.useEffect(() => {
-    _vomStore.set(windowId, { tab, voltage, resolution, minInt,
-      pairDistance, sigmaExcitation, smooth, libReady })
-  }, [windowId, tab, voltage, resolution, minInt, pairDistance,
-      sigmaExcitation, smooth, libReady])
+    _vomStore.set(windowId, { tab, voltage, resolution, inPlaneResolution, minInt,
+      pairDistance, sigmaExcitation, smooth, rescuePasses,
+      smoothOrientations, grainThreshold, libReady })
+  }, [windowId, tab, voltage, resolution, inPlaneResolution, minInt, pairDistance,
+      sigmaExcitation, smooth, rescuePasses, smoothOrientations, grainThreshold, libReady])
 
   // Debounced live refine — a pending refine is cancelled on unmount so
   // vom_refine can't fire at a torn-down preview mid-debounce.
@@ -96,7 +102,8 @@ export function VectorOrientationWizard({ caretPos, windowId, sendAction, onClos
     setStatus(missingStructures(phases)
       ?? 'Generating library… (this can take ~1 min for a full library)')
     sendAction('vom_generate_library', {
-      cif_paths: paths, accelerating_voltage: voltage, resolution, minimum_intensity: minInt,
+      cif_paths: paths, accelerating_voltage: voltage, resolution,
+      in_plane_resolution: inPlaneResolution, minimum_intensity: minInt,
     }, windowId)
     setLibReady(true)
     setTab('Refine')
@@ -114,7 +121,9 @@ export function VectorOrientationWizard({ caretPos, windowId, sendAction, onClos
   }
   const compute = () => {
     setStatus('Computing orientation + strain maps…')
-    sendAction('vom_run', { pair_distance: pairDistance, sigma_excitation: sigmaExcitation, smooth }, windowId)
+    sendAction('vom_run', { pair_distance: pairDistance, sigma_excitation: sigmaExcitation, smooth,
+      rescue_passes: rescuePasses, smooth_orientations: smoothOrientations,
+      grain_threshold_deg: grainThreshold }, windowId)
   }
 
   const pct = (v?: number) => (v === undefined ? '—' : `${(v * 100).toFixed(2)}%`)
@@ -135,6 +144,10 @@ export function VectorOrientationWizard({ caretPos, windowId, sendAction, onClos
       {tab === 'Library' && (
         <div style={S.page}>
           <Field label="Angle res (°)"><NumInput value={resolution} onChange={setResolution} step="0.1" width={60} /></Field>
+          <Field label="In-plane res (°)">
+            <NumInput testid="vom-in-plane-resolution" value={inPlaneResolution}
+              onChange={setInPlaneResolution} step="0.5" width={60} />
+          </Field>
           <Field label="Min intensity"><NumInput value={minInt} onChange={setMinInt} step="0.0001" width={74} /></Field>
           <button data-testid="vom-generate" style={S.primary} onClick={generate}>Generate Library</button>
         </div>
@@ -172,6 +185,25 @@ export function VectorOrientationWizard({ caretPos, windowId, sendAction, onClos
           <div style={S.hint}>Fits every position with the settings from Refine,
             then opens the orientation map and the strain maps.</div>
           <Check testid="vom-smooth" checked={smooth} onChange={setSmooth} label="Smooth strain (TV)" />
+          <Check testid="vom-smooth-orientations" checked={smoothOrientations}
+            onChange={setSmoothOrientations} label="Smooth orientations" />
+          {smoothOrientations && (
+            <Field label="Grain threshold (°)">
+              <NumInput testid="vom-grain-threshold" value={grainThreshold}
+                onChange={setGrainThreshold} step="0.5" width={60} />
+            </Field>
+          )}
+          <div style={S.hint}>Smoothing averages each position with the neighbours
+            within the grain threshold of it, so tilt noise inside a grain
+            settles and a boundary stays put. The raw field is kept.</div>
+          <Field label="Rescue passes">
+            <NumInput testid="vom-rescue-passes" value={rescuePasses} min={1} step="1" width={60}
+              onChange={(n) => setRescuePasses(Math.max(1, Math.round(n)))} />
+          </Field>
+          <div style={S.hint}>A position whose orientation disagrees with all its
+            neighbours is re-fitted from theirs; a mis-indexed patch two
+            positions wide needs two passes. More passes clean grains up, at
+            the cost of a refinement per pass.</div>
           <button data-testid="vom-compute" style={S.primary} onClick={compute}>Compute Maps</button>
         </div>
       )}
