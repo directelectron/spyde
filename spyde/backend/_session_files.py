@@ -1065,6 +1065,53 @@ class FileLoaderMixin:
             name=f"save-{name}",
         ).start()
 
+    def _export_numpy(self, path: str | None, plot, window_id=None) -> None:
+        """File → Export to NumPy: the maps the focused window shows, as one
+        ``.npz`` (or the shown map alone as ``.npy``). See
+        :mod:`spyde.actions.export_numpy` for what a window contributes.
+
+        The menu sends no window id, so the window is the active one; a
+        bare-figure window (the live Strain window) has no Plot and is
+        reached through its controller."""
+        if path is None:
+            emit_error("Export: no path given")
+            return
+        from spyde.actions.export_numpy import collect, write
+
+        plot = self._resolve_save_plot(plot)
+        if window_id is None:
+            window_id = self._active_window_id
+        if plot is None and window_id is None:
+            emit_error("Export: click a window first, then Export to NumPy.")
+            return
+        export = collect(self, plot, window_id)
+        if export is None:
+            emit_error("Export: the active window has nothing to export yet.")
+            return
+        name = os.path.basename(path)
+        # Compressing a few maps is quick; a 4k×4k RGB picture is not, and the
+        # arrays are already copied out of the plots, so the write goes off
+        # the loop the way Save does.
+        ipc.emit({"type": "loading", "busy": True, "text": f"Exporting {name}…"})
+        threading.Thread(
+            target=self._export_numpy_thread, args=(export, path, name),
+            daemon=True, name=f"export-{name}",
+        ).start()
+
+    def _export_numpy_thread(self, export, path: str, name: str) -> None:
+        from spyde.actions.export_numpy import write
+        try:
+            t0 = time.time()
+            written = write(export, path)
+            ipc.emit({"type": "loading", "busy": False, "text": ""})
+            ipc.emit({"type": "saved", "path": written})
+            count = len(export.arrays)
+            emit_status(f"Exported {count} array{'s' if count != 1 else ''} to "
+                        f"{os.path.basename(written)} ({time.time() - t0:.1f}s)")
+        except Exception as e:
+            ipc.emit({"type": "loading", "busy": False, "text": ""})
+            emit_error(f"Export failed: {e}")
+
     def _save_signal_thread(self, signal, path: str, name: str) -> None:
         """Write *signal* to *path* off the loop, then say so.
 
