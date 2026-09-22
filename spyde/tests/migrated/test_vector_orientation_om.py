@@ -273,6 +273,47 @@ class TestVectorOrientationOM:
 
 
 
+class TestALibraryThatCannotBuildSaysSo:
+    """A .cif that yields no plan used to report 'ready (0 orientations)': the
+    failure was logged at debug and Generate carried on to the ready status.
+    An empty library is a failure, and the caret is told so."""
+
+    def test_a_plan_failure_is_an_error_not_a_ready_library(self, monkeypatch):
+        import spyde.actions.vector_orientation_quantem as quantem
+        from spyde.actions.vector_orientation_om import vom_generate_library
+
+        def boom(*args, **kwargs):
+            raise ValueError("No such item: _cell_length_b")
+
+        monkeypatch.setattr(quantem, "SinglePatternFitter", boom)
+        session = make_session()
+        try:
+            vtree = _make_vectors_tree(session)
+            vplot = _signal_plot(session, vtree)
+            messages = []
+            import spyde.actions.vector_orientation_om as vom
+            monkeypatch.setattr(vom, "emit", lambda m: messages.append(m))
+            errors = []
+            monkeypatch.setattr(vom, "emit_error", lambda text: errors.append(text))
+            statuses = []
+            monkeypatch.setattr(vom, "emit_status", lambda text: statuses.append(text))
+
+            vom_generate_library(session, vplot, {
+                "cif_path": CIF, "accelerating_voltage": 200.0,
+                "resolution": 12.0, "minimum_intensity": 1e-4,
+            })
+            assert _wait(lambda: any(m.get("type") == "vom_library_ready"
+                                     for m in messages)), "the caret was never told"
+            ready = next(m for m in messages if m.get("type") == "vom_library_ready")
+            assert ready["ok"] is False
+            assert "_cell_length_b" in ready["error"]
+            assert any("building the library failed" in e for e in errors)
+            assert not any("ready (" in s for s in statuses), \
+                "a failed library must not report itself ready"
+        finally:
+            close_session(session)
+
+
 class TestTheMatchIsBanded:
     """The whole-field match runs a band of rows at a time so the map fills
     in as it goes. The match is per position, so this must be the same answer
