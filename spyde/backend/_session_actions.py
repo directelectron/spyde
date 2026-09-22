@@ -410,6 +410,14 @@ class ActionRouterMixin:
         self._action_artifacts[(src_wid, name)] = art
         ipc.emit({"type": "action_active", "window_id": src_wid, "name": name, "active": True})
 
+    def _set_ipf_panel_visible(self, tree, name: str, visible: bool) -> None:
+        """The wizard's IPF window follows its caret (see ipf_panel)."""
+        from spyde.actions.ipf_panel import set_visible
+        try:
+            set_visible(self, tree, name, visible)
+        except Exception as e:
+            log.debug("showing/hiding the IPF panel failed: %s", e)
+
     def _set_overlay(self, plot, name: str, visible: bool) -> None:
         """Show/hide the live pattern overlay(s) tied to a toolbar action. A
         marker overlay is drawn only while its action (caret) is SELECTED;
@@ -429,7 +437,9 @@ class ActionRouterMixin:
             wiz = getattr(tree, "_om_wizard", None)
             if wiz is not None:
                 nodes.append(getattr(wiz, "overlay", None))
+            self._set_ipf_panel_visible(tree, name, visible)
         elif name == "Vector Orientation Mapping":
+            self._set_ipf_panel_visible(tree, name, visible)
             wiz = getattr(tree, "_vom_wizard", None)
             if wiz is not None:
                 nodes.append(getattr(wiz, "overlay", None))

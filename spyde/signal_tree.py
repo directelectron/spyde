@@ -1438,7 +1438,8 @@ class BaseSignalTree:
             if hasattr(self, attr):
                 setattr(self, attr, None)
         for wiz_attr in ("_om_wizard", "_vom_wizard", "_ebsd_wizard",
-                         "_seg_wizard", "_drift_wizard"):
+                         "_seg_wizard", "_drift_wizard",
+                         "_om_ipf_panel", "_vom_ipf_panel"):
             wiz = getattr(self, wiz_attr, None)
             if wiz is not None and hasattr(wiz, "remove"):
                 try:

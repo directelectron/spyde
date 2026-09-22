@@ -60,6 +60,58 @@ def build_phase_ipf(sim) -> list[dict]:
     return build_phase_ipf_for(quats, phase_of, sim_phases_list(sim))
 
 
+def _panel_geometry(phase) -> dict:
+    """Everything about a phase's panel that does not depend on which
+    orientations were sampled: the triangle, its corner labels, the bounds
+    that hold both, and the interpolation grid over those bounds."""
+    from matplotlib.path import Path
+
+    tri_xy, label_xy, labels = _triangle_xy(phase)
+    # Bound the panel by the triangle AND the corner labels (so labels, which
+    # sit OUTSIDE the vertices, aren't clipped) + a margin. A label is
+    # drawn CENTRED on its anchor, so the anchors bound only its middle:
+    # the margin has to hold half a "[1 0 1]" sideways, which at the
+    # panel's size is about an eighth of its width, and less vertically.
+    bound_xy = np.vstack([tri_xy, label_xy]) if len(label_xy) else tri_xy
+    mins, maxs = bound_xy.min(0), bound_xy.max(0)
+    pad = np.array([0.14, 0.08]) * (maxs - mins + 1e-9)
+    mins, maxs = mins - pad, maxs + pad
+    gx = np.linspace(mins[0], maxs[0], GRID_N)
+    gy = np.linspace(mins[1], maxs[1], GRID_N)
+    xx, yy = np.meshgrid(gx, gy)
+    flat = np.vstack((xx.ravel(), yy.ravel())).T
+    try:
+        inside_triangle = Path(tri_xy).contains_points(flat)
+    except Exception as e:
+        log.debug("triangle-polygon clip failed: %s", e)
+        inside_triangle = np.ones(flat.shape[0], dtype=bool)
+    return dict(tri_xy=tri_xy, label_xy=label_xy, labels=labels,
+                mins=mins, maxs=maxs, grid_n=GRID_N, flat=flat,
+                inside_triangle=inside_triangle)
+
+
+def build_phase_ipf_geometry(phases) -> list[dict]:
+    """Per-phase panel geometry with NO orientations: the triangle and its
+    labels, nothing inside. What the wizard's IPF window shows between a
+    phase being loaded and its library being built; the same dict shape as
+    :func:`build_phase_ipf_for`, so the same panels take a library later."""
+    infos: list[dict] = []
+    for p, phase in enumerate(phases):
+        geometry = _panel_geometry(phase)
+        group = getattr(phase, "point_group", None)
+        infos.append(dict(
+            phase_index=p,
+            name=(getattr(phase, "name", None) or f"phase {p}"),
+            point_group=str(getattr(group, "name", group)),
+            lib_idx=np.empty(0, dtype=int), xs=np.empty(0), ys=np.empty(0),
+            tri_xy=geometry["tri_xy"], label_xy=geometry["label_xy"],
+            labels=geometry["labels"], mins=geometry["mins"],
+            maxs=geometry["maxs"], grid_n=GRID_N,
+            verts=None, weights=None, outside=~geometry["inside_triangle"],
+        ))
+    return infos
+
+
 def build_phase_ipf_for(quats, phase_of, phases) -> list[dict]:
     """Per-phase IPF geometry (geometry-only → compute ONCE per library): each
     phase's orientation stereographic positions, global indices, triangle
@@ -74,7 +126,6 @@ def build_phase_ipf_for(quats, phase_of, phases) -> list[dict]:
     from orix.vector import Vector3d
     from orix.projections import StereographicProjection
     from scipy.spatial import Delaunay
-    from matplotlib.path import Path
 
     quats = np.asarray(quats, float)
     phase_of = np.asarray(phase_of)
@@ -89,21 +140,8 @@ def build_phase_ipf_for(quats, phase_of, phases) -> list[dict]:
         xs, ys = sp.vector2xy(vecs)
         xs = np.atleast_1d(np.array(xs, float))
         ys = np.atleast_1d(np.array(ys, float))
-        tri_xy, label_xy, labels = _triangle_xy(phase)
-
-        # Bound the panel by the triangle AND the corner labels (so labels, which
-        # sit OUTSIDE the vertices, aren't clipped) + a margin. A label is
-        # drawn CENTRED on its anchor, so the anchors bound only its middle:
-        # the margin has to hold half a "[1 0 1]" sideways, which at the
-        # panel's size is about an eighth of its width, and less vertically.
-        bound_xy = np.vstack([tri_xy, label_xy]) if len(label_xy) else tri_xy
-        mins, maxs = bound_xy.min(0), bound_xy.max(0)
-        pad = np.array([0.14, 0.08]) * (maxs - mins + 1e-9)
-        mins, maxs = mins - pad, maxs + pad
-        gx = np.linspace(mins[0], maxs[0], GRID_N)
-        gy = np.linspace(mins[1], maxs[1], GRID_N)
-        xx, yy = np.meshgrid(gx, gy)
-        flat = np.vstack((xx.ravel(), yy.ravel())).T
+        geometry = _panel_geometry(phase)
+        flat = geometry["flat"]
 
         verts = weights = None
         outside = np.ones(flat.shape[0], dtype=bool)
@@ -120,17 +158,15 @@ def build_phase_ipf_for(quats, phase_of, phases) -> list[dict]:
             outside = ~inside_hull
         except Exception as e:
             log.debug("Delaunay barycentric setup failed (using fallback): %s", e)
-        try:                                              # also clip to the triangle polygon
-            outside = outside | (~Path(tri_xy).contains_points(flat))
-        except Exception as e:
-            log.debug("triangle-polygon clip failed: %s", e)
+        outside = outside | ~geometry["inside_triangle"]
 
         infos.append(dict(
             phase_index=p,
             name=(getattr(phase, "name", None) or f"phase {p}"),
             lib_idx=lib, xs=xs, ys=ys,
-            tri_xy=tri_xy, label_xy=label_xy, labels=labels,
-            mins=mins, maxs=maxs, grid_n=GRID_N,
+            tri_xy=geometry["tri_xy"], label_xy=geometry["label_xy"],
+            labels=geometry["labels"], mins=geometry["mins"],
+            maxs=geometry["maxs"], grid_n=GRID_N,
             verts=verts, weights=weights, outside=outside,
         ))
     return infos

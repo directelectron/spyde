@@ -148,6 +148,12 @@ class VomWizard(WizardController):
         # Everything this wizard put on the tree comes off with it, the heat
         # map's own overlay included — leaving it behind would keep correlating
         # against a library that no longer exists.
+        # The IPF window outlives the wizard (a regenerated library gets it
+        # back); only the heat map that was drawing into it goes.
+        from spyde.actions.ipf_panel import panel_for
+        panel = panel_for(self.tree, "vom")
+        if panel is not None and panel.controller is self.refine_ipf:
+            panel.controller = None
         if self.refine_ipf is not None:
             try:
                 self.refine_ipf.remove()
@@ -232,6 +238,14 @@ def vom_generate_library(session, plot, payload) -> None:
             fitter = None
             n_orientations = 0
             wid = getattr(src, "window_id", None)
+            # The IPF window shows the phases' triangles filling in while the
+            # plans build — see ipf_panel.
+            from spyde.actions.ipf_panel import ensure_panel
+            panel = ensure_panel(session, tree, "vom", root)
+            panel.controller = None
+            panel.set_phases(phases)
+            panel.show()
+            panel.start_filling()
             try:
                 # The live preview is the quantem correlation matcher: it
                 # returns a continuous orientation rather than the nearest
@@ -256,6 +270,8 @@ def vom_generate_library(session, plot, payload) -> None:
             except Exception as e:
                 import logging
                 logging.getLogger(__name__).debug("vom overlay attach failed: %s", e)
+            finally:
+                panel.stop_filling()
 
             # The correlation surface the matcher picks its answer off, one
             # triangle per phase. A single best number cannot say whether the

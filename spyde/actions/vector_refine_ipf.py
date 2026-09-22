@@ -111,9 +111,20 @@ class VectorRefineIpfController:
             static={"fitter": self.fitter},
             on_value=self.draw,
         )
+        self.bind_panels(self.panels)
+        return self
+
+    def bind_panels(self, panels) -> None:
+        """Draw into *panels* from now on — the IPF window was rebuilt (shown
+        again after a hide), or closed (an empty list)."""
+        self.panels = list(panels)
         for panel in self.panels:
             self._wire_double_click(panel)
-        return self
+
+    def redraw(self) -> None:
+        """Re-evaluate the current position, so a window shown again is not
+        blank until the next navigator move."""
+        self._reevaluate(self.node)
 
     # ── restricting the match to part of the triangle ────────────────────────
     def toggle_circle(self, phase_index: int, x: float, y: float) -> None:
@@ -239,7 +250,13 @@ class VectorRefineIpfController:
 
 def open_refine_ipf(session, signal, fitter, phases, vectors, tree,
                     fit_overlay=None):
-    """Open the heat-map window and wire it to the navigator.
+    """Put the heat map into the wizard's IPF window and wire it to the
+    navigator.
+
+    The window is the action's (see :mod:`spyde.actions.ipf_panel`): it was
+    showing the phase's triangle, then the library filling in, and from here
+    on it shows the correlation. Closing it hides it; re-selecting the action
+    brings it back with this controller still drawing into it.
 
     ``fit_overlay`` is the matched-pattern overlay node, so a mask drawn here
     also redraws the pattern it restricts.
@@ -248,23 +265,18 @@ def open_refine_ipf(session, signal, fitter, phases, vectors, tree,
     must not cost the library that was just built.
     """
     try:
-        from spyde.actions.ipf_refine_render import (
-            build_refine_figure, emit_refine_window,
-        )
+        from spyde.actions.ipf_panel import ensure_panel
 
         infos = build_zone_ipf(fitter, phases)
         if not infos:
             return None
-        figure, figure_id, html, panels = build_refine_figure(infos)
-        base = signal.metadata.get_item("General.title", "Signal")
-        window_id = emit_refine_window(session, figure, figure_id, html,
-                                       title=f"{base} — IPF Refine")
+        panel = ensure_panel(session, tree, "vom", signal)
+        panel.phases = list(phases)
+        panel.set_library(infos)
+        panel.show()
         controller = VectorRefineIpfController(
-            vectors, fitter, infos, panels, fit_overlay=fit_overlay).attach(tree)
-        # Give the bare-figure window a teardown identity, so closing it with ✕
-        # unhooks the navigator overlay instead of leaving it evaluating.
-        if controller is not None:
-            session.register_window_controller(window_id, controller)
+            vectors, fitter, infos, panel.panels, fit_overlay=fit_overlay).attach(tree)
+        panel.controller = controller
         return controller
     except Exception as e:
         log.debug("vector refine IPF window failed: %s", e)
