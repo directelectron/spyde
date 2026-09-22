@@ -8,11 +8,11 @@
  * zip archive (what np.savez writes) and the menu is screenshotted, so a
  * missing row would be visible, not just a failed locator.
  */
-import { test, expect, _electron as electron, ElectronApplication, Page } from '@playwright/test'
+import { test, expect, ElectronApplication, Page } from '@playwright/test'
 import { join } from 'path'
 import { tmpdir } from 'os'
 import { existsSync, mkdirSync, readFileSync, rmSync } from 'fs'
-import { raiseWindow, sigWindow } from './_harness.cjs'
+import { backendAction, launchApp, raiseWindow, sigWindow, waitForSubwindowCount } from './_harness.cjs'
 
 let app: ElectronApplication
 let page: Page
@@ -32,12 +32,7 @@ const dialogCalls = () =>
 test.beforeAll(async () => {
   rmSync(target, { force: true })
   mkdirSync(shots, { recursive: true })
-  app = await electron.launch({
-    args: [join(__dirname, '..', 'out', 'main', 'index.js')],
-    env: { ...process.env, SPYDE_NO_DASK: '1' },
-  })
-  page = await app.firstWindow()
-  await page.waitForLoadState('domcontentloaded')
+  ;({ app, page } = await launchApp({ env: { SPYDE_NO_DASK: '1' } }))
   await app.evaluate(({ dialog }, path) => {
     ;(globalThis as any).__saveDialogs = []
     dialog.showSaveDialog = (async (_owner: unknown, options: { defaultPath: string }) => {
@@ -45,10 +40,8 @@ test.beforeAll(async () => {
       return { canceled: false, filePath: path }
     }) as typeof dialog.showSaveDialog
   }, target)
-  await page.evaluate(() => window.electron.action('load_test_data', {}))
-  await page.waitForFunction(
-    () => document.querySelectorAll('[data-testid="subwindow"]').length >= 2,
-    { timeout: 60_000 })
+  await backendAction(page, 'load_test_data')
+  await waitForSubwindowCount(page, 2)
 })
 
 test.afterAll(async () => {

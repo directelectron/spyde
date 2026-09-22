@@ -45,6 +45,12 @@ def display_component(field: StrainField, component: str) -> np.ndarray:
     return np.asarray(raw, dtype=np.float64) * STRAIN_DISPLAY_SCALE[component]
 
 
+def display_maps(field: StrainField) -> dict[str, np.ndarray]:
+    """Every component of *field* in display units, by component name — what
+    the window shows, what Commit freezes, what Export writes."""
+    return {c: display_component(field, c) for c in _COMPONENTS}
+
+
 def _auto_clim(arr: np.ndarray) -> tuple[float, float]:
     """Symmetric colour limits — every strain component's zero is meaningful."""
     return robust_map_limits(arr, symmetric=True)
