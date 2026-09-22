@@ -92,10 +92,13 @@ def build_phase_ipf_for(quats, phase_of, phases) -> list[dict]:
         tri_xy, label_xy, labels = _triangle_xy(phase)
 
         # Bound the panel by the triangle AND the corner labels (so labels, which
-        # sit OUTSIDE the vertices, aren't clipped) + a small margin.
+        # sit OUTSIDE the vertices, aren't clipped) + a margin. A label is
+        # drawn CENTRED on its anchor, so the anchors bound only its middle:
+        # the margin has to hold half a "[1 0 1]" sideways, which at the
+        # panel's size is about an eighth of its width, and less vertically.
         bound_xy = np.vstack([tri_xy, label_xy]) if len(label_xy) else tri_xy
         mins, maxs = bound_xy.min(0), bound_xy.max(0)
-        pad = 0.05 * (maxs - mins + 1e-9)
+        pad = np.array([0.14, 0.08]) * (maxs - mins + 1e-9)
         mins, maxs = mins - pad, maxs + pad
         gx = np.linspace(mins[0], maxs[0], GRID_N)
         gy = np.linspace(mins[1], maxs[1], GRID_N)
