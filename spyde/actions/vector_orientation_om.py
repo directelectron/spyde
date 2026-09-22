@@ -33,9 +33,12 @@ log = logging.getLogger(__name__)
 DEFAULTS = dict(
     accelerating_voltage=200.0,
     resolution=1.0,
+    in_plane_resolution=5.0,
     minimum_intensity=1e-4,
     smooth=False,
     rescue_passes=3,
+    smooth_orientations=False,
+    grain_threshold_deg=5.0,
 )
 
 from de_shell.actions.wizard import WizardController
@@ -69,6 +72,13 @@ class VomWizard(WizardController):
         "resolution": {
             "name": "Angle res (°)", "type": "float", "default": 1.0,
             "min": 0.1, "max": 10.0, "step": 0.1, "tab": "Library",
+        },
+        # The plan's step around the beam. The in-plane angle is an FFT axis
+        # of the correlation, so a finer step costs plan size and memory, not
+        # a longer match; the refinement then moves off the grid either way.
+        "in_plane_resolution": {
+            "name": "In-plane res (°)", "type": "float", "default": 5.0,
+            "min": 0.5, "max": 15.0, "step": 0.5, "tab": "Library",
         },
         "minimum_intensity": {
             "name": "Min intensity", "type": "float", "default": 1e-4,
@@ -105,6 +115,17 @@ class VomWizard(WizardController):
             "name": "Rescue passes", "type": "int", "default": 3,
             "min": 1, "max": 10, "tab": "Run",
         },
+        # The within-grain mean (orientation_smooth): tilt noise inside a
+        # grain averages out, a boundary stays where it was. Off by default,
+        # like the strain smoothing — the raw field is what was measured.
+        "smooth_orientations": {
+            "name": "Smooth orientations", "type": "bool", "default": False,
+            "tab": "Run",
+        },
+        "grain_threshold_deg": {
+            "name": "Grain threshold (°)", "type": "float", "default": 5.0,
+            "min": 0.5, "max": 20.0, "step": 0.5, "tab": "Run",
+        },
     }
 
     def __init__(self, session, tree, *, phases, overlay,
@@ -121,6 +142,9 @@ class VomWizard(WizardController):
         self.overlay = overlay
         self.voltage = voltage
         self.recip_r = recip_r
+        #: The plan's in-plane step, kept so Compute Maps builds its plans
+        #: the way the preview's were built.
+        self.in_plane_resolution = float(DEFAULTS["in_plane_resolution"])
         # Refine's live matcher settings; None means the plan's own values.
         self.pair_distance = None
         self.sigma_excitation = None
@@ -207,6 +231,7 @@ def vom_generate_library(session, plot, payload) -> None:
         return
     voltage = float(payload.get("accelerating_voltage", DEFAULTS["accelerating_voltage"]))
     resolution = float(payload.get("resolution", DEFAULTS["resolution"]))
+    in_plane = float(payload.get("in_plane_resolution", DEFAULTS["in_plane_resolution"]))
     min_int = float(payload.get("minimum_intensity", DEFAULTS["minimum_intensity"]))
     emit_status("Vector Orientation: generating template library…")
     # Warm the CUDA autograd engine on this (dispatch) thread so the batched GPU
@@ -271,7 +296,8 @@ def vom_generate_library(session, plot, payload) -> None:
                     PeaksAdapter(vecs, inverse_angstrom_factor=factor),
                     energy_ev=float(voltage) * 1e3, k_max=float(recip_r),
                     inverse_angstrom_factor=factor,
-                    angle_step_zone_axis_deg=float(resolution))
+                    angle_step_zone_axis_deg=float(resolution),
+                    angle_step_in_plane_deg=float(in_plane))
                 overlay = attach_quantem_orientation_overlay(
                     vecs, fitter, tree, on_fit=lambda fit: _emit_vom_fit(wid, fit))
                 n_orientations = sum(int(m.zone_axes.shape[0])
@@ -297,6 +323,8 @@ def vom_generate_library(session, plot, payload) -> None:
                 voltage=voltage, recip_r=recip_r,
                 refine_ipf=refine_ipf, fitter=fitter,
             )
+            wiz.in_plane_resolution = float(in_plane)
+            wiz.resolution = float(resolution)
             tree._vom_wizard = wiz
             phase_names = ", ".join(str(p.name) for p in phases)
             # Generate builds the library and turns on the live preview, and
@@ -521,6 +549,10 @@ def vom_run(session, plot, payload) -> None:
             fit_params[key] = float(value)
     fit_params["rescue_passes"] = int(
         payload.get("rescue_passes", DEFAULTS["rescue_passes"]))
+    smooth_orientations = bool(payload.get("smooth_orientations",
+                                           DEFAULTS["smooth_orientations"]))
+    grain_threshold = float(payload.get("grain_threshold_deg",
+                                        DEFAULTS["grain_threshold_deg"]))
     emit_status("Vector Orientation: fitting the field…")
 
     # Initialise the CUDA autograd engine on THIS (dispatch) thread before the
@@ -547,6 +579,10 @@ def vom_run(session, plot, payload) -> None:
                 if not getattr(tree, "_spyde_closed", False):
                     emit_error("Vector Orientation: fit returned no result")
                 return
+            if smooth_orientations:
+                from spyde.actions.orientation_smooth import smooth_orientation_field
+                emit_status("Vector Orientation: smoothing orientations…")
+                result = smooth_orientation_field(result, threshold_deg=grain_threshold)
             tree.vector_orientation = result
             _build_result_windows(session, tree.root, result, smooth=smooth,
                                   ipf_tree=ipf_tree)
@@ -604,6 +640,10 @@ def _fit_field(vecs, wiz, params, *, tree=None, on_band=None):
         return compute_vector_orientation_quantem(
             vecs, wiz.phases, energy_ev=float(wiz.voltage) * 1e3,
             k_max=float(wiz.recip_r), inverse_angstrom_factor=factor,
+            angle_step_zone_axis_deg=float(getattr(
+                wiz, "resolution", DEFAULTS["resolution"])),
+            angle_step_in_plane_deg=float(getattr(
+                wiz, "in_plane_resolution", DEFAULTS["in_plane_resolution"])),
             device=device_name, progress=_progress,
             stopped_flag=stopped_flag, params=params, on_band=on_band)
     finally:
