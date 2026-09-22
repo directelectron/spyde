@@ -1,13 +1,15 @@
 """
-export_numpy.py — File → Export to NumPy: the maps a window shows, as a .npz.
+export_numpy.py — File → Export to NumPy: what a window shows, as .npz / .csv.
 
-A strain map, an orientation map, a DPC field or a virtual image is a small
-result the user wants in a notebook, and the ``.zspy`` Save writes the whole
-signal tree for that. This writes one ``.npz`` holding every map the window
-carries, keyed by a plain identifier (``exx``, ``eyy``, ``Bx``,
-``Virtual_Image_1_red``), plus the calibrated axes and a ``meta_json`` record
-saying what each key is (its label, its ``Signal.quantity``) and where it came
-from (the commit provenance). ``np.load(path)`` is the whole reader.
+A strain map, an orientation map, a DPC field, a virtual image, a spectrum or
+a line profile is a small result the user wants in a notebook, and the
+``.zspy`` Save writes the whole signal tree for that. This writes one ``.npz``
+holding every map and trace the window carries, keyed by a plain identifier
+(``exx``, ``eyy``, ``Bx``, ``Virtual_Image_1_red``, ``Line_Profile``), plus
+the calibrated axes and a ``meta_json`` record saying what each key is (its
+label, its ``Signal.quantity``) and where it came from (the commit
+provenance). ``np.load(path)`` is the whole reader. A ``.csv`` holds the
+traces as columns against their axis, or one map as rows.
 
 What goes in, in this order (a later source never overwrites an earlier key):
 
@@ -148,14 +150,15 @@ def _collect_plot(session, plot) -> Export | None:
     shown = getattr(plot, "current_data", None)
     shown = np.asarray(shown) if hasattr(shown, "__array__") else None
 
-    if node is not None and _is_map(node.signal):
+    if node is not None and _is_map_or_trace(node.signal):
         # A result window: the shown node first (its painted array — an RGB
         # IPF map is painted over a zeros root), then every sibling map.
         export.primary = export.add(_node_label(node, tree), _painted_or(shown, node.signal),
                                     label=_node_label(node, tree),
                                     quantity=_quantity(node.signal), source="node")
         for other in tree.walk():
-            if other is node or getattr(other, "overlay", False) or not _is_map(other.signal):
+            if (other is node or getattr(other, "overlay", False)
+                    or not _is_map_or_trace(other.signal)):
                 continue
             export.add(_node_label(other, tree), other.signal.data,
                        label=_node_label(other, tree),
@@ -163,8 +166,9 @@ def _collect_plot(session, plot) -> Export | None:
         _add_axes(export, node.signal)
         export.meta["title"] = _title(tree.root_node.signal)
     elif shown is not None:
-        # A window on a dataset, or a live output (a virtual image) whose
-        # signal is a placeholder outside its tree: the shown frame only.
+        # A window on a dataset, or a live output (a virtual image, a line
+        # profile) whose signal is a placeholder outside its tree: the shown
+        # frame or trace only.
         label = _artifact_name(session, getattr(plot, "window_id", None)) or "frame"
         export.primary = export.add(label, shown, label=label,
                                     quantity=_quantity(signal), source="displayed")
@@ -188,16 +192,16 @@ def _collect_plot(session, plot) -> Export | None:
     return export if export.arrays else None
 
 
-def _is_map(signal) -> bool:
-    """An in-memory image: no navigation axes, 2-D or RGB, not lazy. Anything
-    else is a dataset, and a dataset is never exported here."""
+def _is_map_or_trace(signal) -> bool:
+    """An in-memory image or trace: no navigation axes, 1-D, 2-D or RGB, not
+    lazy. Anything else is a dataset, and a dataset is never exported here."""
     try:
         if getattr(signal, "_lazy", False):
             return False
         if signal.axes_manager.navigation_dimension != 0:
             return False
         data = signal.data
-        return hasattr(data, "shape") and data.ndim in (2, 3) and not _is_lazy_array(data)
+        return hasattr(data, "shape") and data.ndim in (1, 2, 3) and not _is_lazy_array(data)
     except Exception:
         return False
 
@@ -210,7 +214,8 @@ def _painted_or(shown, signal):
     """The array on screen when it is the node's picture (same height and
     width — the RGB paint of an IPF window), else the node's own data."""
     data = signal.data
-    if shown is not None and shown.shape[:2] == tuple(data.shape[:2]):
+    extent = min(data.ndim, 2)
+    if shown is not None and shown.shape[:extent] == tuple(data.shape[:extent]):
         return shown
     return data
 
@@ -363,12 +368,15 @@ def write(export: Export, path: str) -> str:
 
     ``.npz`` holds every array plus ``meta_json`` (a UTF-8 byte array, the
     convention :meth:`SpyDEOrientationMap.save` uses); ``.npy`` holds the
-    primary array alone. No extension means ``.npz``."""
+    primary array alone; ``.csv`` is :func:`write_csv`. No extension means
+    ``.npz``."""
     extension = os.path.splitext(path)[1].lower()
+    key = export.primary or next(iter(export.arrays))
     if extension == ".npy":
-        key = export.primary or next(iter(export.arrays))
         np.save(path, export.arrays[key])
         return path
+    if extension == ".csv":
+        return write_csv(export, path)
     if extension != ".npz":
         path = path + ".npz"
     meta = dict(export.meta)
@@ -384,3 +392,35 @@ def read_meta(path: str) -> dict:
     """The ``meta_json`` record of an exported ``.npz``."""
     with np.load(path) as archive:
         return json.loads(bytes(archive["meta_json"]).decode("utf-8"))
+
+
+def write_csv(export: Export, path: str) -> str:
+    """A ``.csv`` for a spreadsheet: when the primary is a trace, one column
+    per trace of its length (a spectrum, a line profile), the calibrated axis
+    first and the keys as the header row; when it is a map, the map alone,
+    one row per image row, its key in a comment line. A picture (RGB) has no
+    CSV form; the ``.npz`` holds it."""
+    key = export.primary or next(iter(export.arrays))
+    primary = export.arrays[key]
+    if primary.ndim == 1:
+        columns, header = [], []
+        axis = export.arrays.get("x_axis")
+        if axis is not None and axis.shape == primary.shape:
+            units = (export.meta.get("axis_units") or {}).get("x", "")
+            columns.append(axis)
+            header.append(f"x ({units})" if units else "x")
+        for name, array in export.arrays.items():
+            if name.endswith("_axis") or array.ndim != 1 or array.shape != primary.shape:
+                continue
+            columns.append(array)
+            header.append(name)
+        np.savetxt(path, np.column_stack(columns), delimiter=",",
+                   header=",".join(header), comments="")
+        return path
+    if primary.ndim != 2:
+        raise ValueError(f"{key} is a picture {primary.shape}; save it as .npz")
+    label = export.labels.get(key, {})
+    np.savetxt(path, primary, delimiter=",",
+               header=f"{key}: {label.get('quantity') or label.get('label') or key}, "
+                      f"{primary.shape[0]} rows x {primary.shape[1]} columns")
+    return path

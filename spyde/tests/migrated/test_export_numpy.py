@@ -41,7 +41,7 @@ def _calibrated_scan(ny=4, nx=5, scale=2.5, units="nm"):
 def _exported(session, path, plot=None, window_id=None, timeout=20.0):
     """Run the export the way the menu does and wait for the file."""
     session._export_numpy(str(path), plot, window_id)
-    written = str(path) if str(path).endswith((".npz", ".npy")) else str(path) + ".npz"
+    written = str(path) if str(path).endswith((".npz", ".npy", ".csv")) else str(path) + ".npz"
     deadline = time.time() + timeout
     while time.time() < deadline:
         if os.path.exists(written) and os.path.getsize(written) > 0:
@@ -319,3 +319,86 @@ class TestBareWindow:
 
     def test_collect_returns_none_without_a_window(self, window):
         assert collect(window["window"], None, None) is None
+
+
+class TestTraces:
+    """A spectrum under the navigator, a line profile, a plain 1-D signal."""
+
+    def _spectrum_image(self, session):
+        from spyde.data import eels_si
+        from spyde.tests.migrated.conftest import _load
+        _load(session, eels_si(nav=(2, 2), n_channels=64))
+
+    def test_a_spectrum_frame_exports_against_its_energy_axis(self, window, tmp_path):
+        session = window["window"]
+        self._spectrum_image(session)
+        plot = _signal_plot(session)
+        shown = np.asarray(plot.current_data)
+        assert shown.ndim == 1
+
+        path = _exported(session, tmp_path / "spectrum.npz", plot)
+        with np.load(path) as archive:
+            assert np.array_equal(archive["frame"], shown)
+            assert archive["x_axis"].shape == shown.shape
+            assert archive["x_axis"][0] == pytest.approx(200.0)
+        assert read_meta(path)["axis_units"]["x"] == "eV"
+
+    def test_csv_puts_the_axis_and_the_trace_in_columns(self, window, tmp_path):
+        session = window["window"]
+        self._spectrum_image(session)
+        plot = _signal_plot(session)
+        shown = np.asarray(plot.current_data)
+
+        path = _exported(session, tmp_path / "spectrum.csv", plot)
+        with open(path, encoding="utf-8") as handle:
+            header = handle.readline().strip()
+        assert header == "x (eV),frame"
+        table = np.loadtxt(path, delimiter=",", skiprows=1)
+        assert table.shape == (64, 2)
+        assert np.allclose(table[:, 1], shown)
+        assert table[0, 0] == pytest.approx(200.0)
+
+    def test_a_line_profile_exports_its_trace(self, tem_2d_dataset, tmp_path):
+        session = tem_2d_dataset["window"]
+        source = _signal_plot(session)
+        session._dispatch_toolbar_action(source, "Line Profile", {})
+        _settle(session)
+        artifact = session._action_artifacts[(source.window_id, "Line Profile")]
+        out_plot = session._plot_by_window_id(artifact["out_wids"][0])
+        shown = np.asarray(out_plot.current_data)
+        assert shown.ndim == 1 and shown.size > 1
+
+        path = _exported(session, tmp_path / "profile.npz", out_plot)
+        with np.load(path) as archive:
+            assert np.array_equal(archive["Line_Profile"], shown)
+        assert read_meta(path)["primary"] == "Line_Profile"
+
+    def test_a_plain_one_dimensional_signal_is_a_node(self, window, tmp_path):
+        import hyperspy.api as hs
+        from spyde.tests.migrated.conftest import _load
+        session = window["window"]
+        trace = hs.signals.Signal1D(np.linspace(0.0, 1.0, 50, dtype=np.float32))
+        trace.metadata.General.title = "Trace"
+        trace.axes_manager[0].scale, trace.axes_manager[0].units = 0.5, "nm"
+        _load(session, trace)
+        plot = _signal_plot(session)
+
+        path = _exported(session, tmp_path / "trace.csv", plot)
+        table = np.loadtxt(path, delimiter=",", skiprows=1)
+        assert table.shape == (50, 2)
+        assert np.allclose(table[:, 0], np.arange(50) * 0.5)
+        assert np.allclose(table[:, 1], trace.data)
+
+    def test_csv_of_a_map_is_the_map_in_rows(self, window, tmp_path):
+        session = window["window"]
+        maps = np.arange(20, dtype=np.float32).reshape(4, 5)
+        tree = commit_result_tree(session, title="Map", primary=maps, primary_label="m")
+        _settle(session)
+        path = _exported(session, tmp_path / "map.csv", _signal_plot(session, tree))
+        assert np.array_equal(np.loadtxt(path, delimiter=","), maps)
+
+    def test_csv_refuses_a_picture(self, tmp_path):
+        export = Export()
+        export.primary = export.add("IPF-Z", np.zeros((4, 5, 3), np.uint8))
+        with pytest.raises(ValueError, match="picture"):
+            write(export, str(tmp_path / "picture.csv"))
