@@ -875,15 +875,17 @@ ipcMain.handle('spyde:pick-file', async (_e, opts: { name?: string; extensions?:
   return result.canceled || !result.filePaths.length ? null : result.filePaths[0]
 })
 
-/** Export the focused window's maps (a strain / orientation / DPC result, a
- *  virtual image) as a .npz — or the shown map alone as .npy. The backend
- *  picks the window (the active one) and what it contributes. */
+/** Export what the focused window shows (a strain / orientation / DPC result,
+ *  a virtual image, a spectrum, a line profile) as a .npz — or the shown array
+ *  alone as .npy, or as .csv columns. The backend picks the window (the active
+ *  one) and what it contributes. */
 async function exportNumpyDialog(): Promise<void> {
   const result = await dialog.showSaveDialog(win!, {
     defaultPath: 'maps.npz',
     filters: [
       { name: 'NumPy archive (.npz)', extensions: ['npz'] },
       { name: 'NumPy array (.npy)', extensions: ['npy'] },
+      { name: 'CSV (.csv)', extensions: ['csv'] },
     ],
   })
   if (!result.canceled && result.filePath) {
