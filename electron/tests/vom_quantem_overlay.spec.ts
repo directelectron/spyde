@@ -29,7 +29,7 @@ const SHOTS = join(__dirname, '..', 'vom_quantem_shots')
 
 let ctx: any
 
-test.setTimeout(600_000)
+test.setTimeout(1_200_000)
 
 test.beforeAll(async () => {
   ctx = await launchApp({ dask: true, env: { SPYDE_LOG_LEVEL: 'INFO' } })
@@ -63,7 +63,10 @@ test('the matched pattern lands on the measured peaks and follows the crosshair'
   await expect.poll(() => page.getByTestId('subwindow').count(), {
     timeout: 300_000, message: 'vectors result window never opened',
   }).toBeGreaterThan(before)
-  await ctx.backend.waitForLog('[fv-batch] finalized', 300_000)
+  // Finding vectors over the 13k-pattern sped_ag scan on a CPU-only runner
+  // has taken more than five minutes; the wait is sized for that, not for
+  // this box.
+  await ctx.backend.waitForLog('[fv-batch] finalized', 540_000)
   await page.waitForTimeout(2000)
 
   // ── orientation-map the vectors ──────────────────────────────────────────
