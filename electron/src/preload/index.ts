@@ -108,6 +108,11 @@ contextBridge.exposeInMainWorld('electron', {
   clipboardWritePng: (dataUrl: string): Promise<{ ok: boolean; error?: string }> =>
     ipcRenderer.invoke('clipboard:write-png', dataUrl),
 
+  /** Ask where to save a PNG data URL (native dialog), then write it. */
+  savePng: (dataUrl: string, suggestedName: string): Promise<{
+    ok: boolean; path?: string; canceled?: boolean; error?: string
+  }> => ipcRenderer.invoke('spyde:save-png', dataUrl, suggestedName),
+
   /** Reveal a local DIRECTORY in the OS file manager (Examples → Show Example
    *  Data Directory). Separate from openExternal, which allowlists web/mail
    *  protocols so it can never open a local path; main verifies the target is

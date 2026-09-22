@@ -788,7 +788,16 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
   // takes an explicit target (a figure mounted in both the report sidebar and
   // a presented slide registers twice under one figId, and a freshly-loaded
   // frame must serve itself rather than whichever mount won the map).
-  const replayState = figureBridge.replay
+  //
+  // Each frame is also told, as it loads, that SpyDE saves exported PNGs
+  // itself: a figure's "Save PNG…" then hands its image to the listener below
+  // instead of showing a "right-click → Save image as…" preview, a menu
+  // Electron does not have.
+  const replayState = React.useCallback((figId: string, target?: HTMLIFrameElement) => {
+    figureBridge.replay(figId, target)
+    const frame = target ?? iframeRefs.current.get(figId)
+    frame?.contentWindow?.postMessage({ type: 'anyplotlib_host', savesPng: true }, '*')
+  }, [figureBridge, iframeRefs])
 
   /**
    * What a figure would replay into a freshly-mounted iframe.
@@ -860,6 +869,29 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
     },
     [],
   )
+
+  // A figure's own "Save PNG…" posts its image here with no requestId. Only a
+  // frame in this window is listened to; the main process checks the bytes are
+  // a PNG and asks where to save them.
+  useEffect(() => {
+    const onMessage = (event: MessageEvent) => {
+      const data = event.data
+      if (data?.type !== 'anyplotlib_export_png_result' || data.requestId != null) return
+      if (typeof data.dataUrl !== 'string') return
+      const fromFigure = Array.from(document.querySelectorAll('iframe'))
+        .some((frame) => frame.contentWindow === event.source)
+      if (!fromFigure) return
+      void window.electron.savePng(data.dataUrl, String(data.filename ?? 'figure.png'))
+        .then((result) => {
+          if (result.ok) dispatch({ type: 'STATUS', text: `Saved ${result.path}` })
+          else if (!result.canceled) {
+            dispatch({ type: 'STATUS', text: `⚠ Could not save the PNG: ${result.error}` })
+          }
+        })
+    }
+    window.addEventListener('message', onMessage)
+    return () => window.removeEventListener('message', onMessage)
+  }, [])
 
   // ── Python → Renderer message dispatch ──────────────────────────────────
 

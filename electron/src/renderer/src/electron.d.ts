@@ -29,6 +29,9 @@ declare global {
       reportExportDialog: (kind: 'html' | 'pdf' | 'folder' | 'mp4', defaultName?: string) => Promise<string | null>
       reportExportPdf: (htmlPath: string, pdfPath: string) => Promise<{ ok: boolean; error?: string }>
       clipboardWritePng: (dataUrl: string) => Promise<{ ok: boolean; error?: string }>
+      savePng: (dataUrl: string, suggestedName: string) => Promise<{
+        ok: boolean; path?: string; canceled?: boolean; error?: string
+      }>
       startRecording: (ext: 'mp4' | 'webm') => Promise<string | null>
       recordChunk: (bytes: Uint8Array) => Promise<void>
       pathForFile?: (file: File) => string | null
