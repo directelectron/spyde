@@ -303,10 +303,27 @@ def vom_generate_library(session, plot, payload) -> None:
                 n_orientations = sum(int(m.zone_axes.shape[0])
                                      for m in fitter._maps)
             except Exception as e:
-                import logging
-                logging.getLogger(__name__).debug("vom overlay attach failed: %s", e)
+                # A plan that cannot be built is the library failing, and it
+                # has to say so: logged at debug and carried on, a stub .cif
+                # with one cell length reported "ready (0 orientations)" and
+                # left the user staring at an empty triangle.
+                log.exception("Vector Orientation: building the library failed")
+                emit_error(f"Vector Orientation: building the library failed: {e}")
+                emit({"type": "vom_library_ready",
+                      "window_id": getattr(src, "window_id", None),
+                      "ok": False, "error": str(e)})
+                return
             finally:
                 panel.stop_filling()
+            if n_orientations == 0:
+                message = ("the plan sampled no orientations — check the .cif "
+                           "has a full cell and space group, and the pattern's "
+                           "reciprocal radius")
+                emit_error(f"Vector Orientation: {message}")
+                emit({"type": "vom_library_ready",
+                      "window_id": getattr(src, "window_id", None),
+                      "ok": False, "error": message})
+                return
 
             # The correlation surface the matcher picks its answer off, one
             # triangle per phase. A single best number cannot say whether the
