@@ -481,16 +481,33 @@ class ActionRouterMixin:
             for it in items:
                 self._set_action_active(window_id, it.get("name"), False)
             return
+        # Taken off the table FIRST: closing the output plots below runs
+        # _forget_window, which retires any artifact still listed against the
+        # window, and this one is being retired here.
+        self._action_artifacts.pop(key, None)
         # Closing each output plot also cleans its source ROI (parent_selector).
         for wid in art.get("out_wids", []):
             p = self._plot_by_window_id(wid)
             if p is not None:
                 self._close_plot(p)
+        self._retire_artifact(key, art)
+
+    def _retire_artifact(self, key, art) -> None:
+        """An action's live output is gone: close its ROI on the source, drop
+        its chip, and tell the source window's toolbar so the action and the
+        sub-toolbar un-highlight.
+
+        The one teardown for both ways an output goes: deselecting the action
+        (:meth:`_set_action_active`) and closing the output window with its
+        own box (:meth:`_forget_window`). The second used to un-highlight the
+        chip's name only, leaving the chip listed and its parent button lit
+        with nothing behind it.
+        """
+        window_id, name = key
         try:
             art["selector"].close()
         except Exception as e:
             log.debug("closing action selector failed: %s", e)
-        self._action_artifacts.pop(key, None)
         ipc.emit({"type": "action_active", "window_id": window_id, "name": name, "active": False})
         # If this was a virtual-image chip, drop it from the source plot's list
         # and tell its OWN sub-toolbar (raw or vector VI) to remove the chip.

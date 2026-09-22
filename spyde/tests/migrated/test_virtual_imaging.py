@@ -110,6 +110,33 @@ class TestVirtualImagingSubToolbar:
         _settle(session)
         assert art["action"]._selector is sel_after_type
 
+    def test_closing_the_output_window_drops_the_chip_too(self, stem_4d_dataset):
+        """The output window's own close box must retire the item the way
+        deselecting it does. It used to un-highlight the item's name only, so
+        the chip stayed listed and the Virtual Imaging button stayed lit with
+        nothing behind it, and the ROI stayed on the pattern."""
+        session = stem_4d_dataset["window"]
+        msgs = stem_4d_dataset["messages"]
+        src = _signal_plot(session)
+        _add_vi(session, src)
+        vi = src._vi_items[0]
+        art = session._action_artifacts[(src.window_id, vi["name"])]
+        out_wids = list(art["out_wids"])
+        selector = art["selector"]
+        assert out_wids
+
+        msgs.clear()
+        session._close_window(out_wids[0])          # the window's ✕
+        _settle(session)
+
+        assert any(m.get("type") == "sub_item" and m.get("active") is False
+                   and m.get("name") == vi["name"] for m in msgs),             "the sub-toolbar was not told the chip is gone"
+        assert any(m.get("type") == "action_active" and m.get("active") is False
+                   and m.get("name") == vi["name"] for m in msgs)
+        assert src._vi_items == []
+        assert (src.window_id, vi["name"]) not in session._action_artifacts
+        assert getattr(selector, "_closed", True) or not getattr(selector, "active", True),             "the ROI on the source was left live"
+
     def test_remove_chip_closes_window_and_drops_it(self, stem_4d_dataset):
         session = stem_4d_dataset["window"]
         msgs = stem_4d_dataset["messages"]
