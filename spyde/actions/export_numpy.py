@@ -42,15 +42,20 @@ from typing import Any
 
 import numpy as np
 
+from spyde.backend.console import _sanitize_identifier
+
 log = logging.getLogger(__name__)
+
+#: Keys the archive itself uses: ``np.savez``'s own parameters, the record,
+#: and the calibration. A label that slugs to one of these gets a suffix.
+_RESERVED_KEYS = frozenset({"file", "allow_pickle", "meta_json", "x_axis", "y_axis"})
 
 #: Symbols a map label uses that have no place in a numpy key. ``|B|`` is
 #: handled by :func:`slug` before this table applies.
 _TRANSLITERATE = {"ε": "e", "ω": "omega", "θ": "theta", "φ": "phi", "°": "deg",
-                  "µ": "u", "μ": "u", "Å": "A", "—": "_", "–": "_"}
+                  "µ": "u", "μ": "u", "Å": "A", "—": " ", "–": " "}
 _UNIT_SUFFIX = re.compile(r"\s*\([^()]*\)\s*$")
 _ABS = re.compile(r"\|([^|]+)\|")
-_NOT_IDENTIFIER = re.compile(r"[^0-9A-Za-z_]+")
 
 
 def slug(label: str) -> str:
@@ -58,19 +63,16 @@ def slug(label: str) -> str:
     ``"|B| (mrad)"`` → ``abs_B``, ``"Virtual Image 1 (red)"`` →
     ``Virtual_Image_1_red``. The units are dropped only when the whole
     remainder is a unit parenthetical on a symbol; the meta record keeps the
-    original label."""
+    original label. The last step is the console's own identifier rule, so
+    a title binds to the same name in a notebook as in the console."""
     text = str(label).strip()
     text = _ABS.sub(lambda m: f"abs_{m.group(1)}", text)
     if _UNIT_SUFFIX.search(text) and not _looks_like_a_name(text):
         text = _UNIT_SUFFIX.sub("", text)
     for symbol, ascii_form in _TRANSLITERATE.items():
         text = text.replace(symbol, ascii_form)
-    text = re.sub(r"_+", "_", _NOT_IDENTIFIER.sub("_", text)).strip("_")
-    if not text:
-        return "array"
-    if text[0].isdigit():
-        text = "_" + text
-    return text if len(text) <= 60 else text[:60].rstrip("_")
+    text = _sanitize_identifier(text[:60], fallback="array")
+    return text
 
 
 def _looks_like_a_name(text: str) -> bool:
@@ -94,15 +96,20 @@ class Export:
     def add(self, key: str, array, *, label: str = "", quantity: str = "",
             source: str = "") -> str | None:
         """Add *array* under *key* (a slug of it), returning the key used, or
-        None when *array* is not an array or the key is already taken."""
+        None when *array* is not an array or the key is already taken. A key
+        the archive itself uses is suffixed rather than refused."""
         if array is None or not hasattr(array, "__array__"):
             return None
+        label = label or str(key)
         key = slug(key)
+        if key in _RESERVED_KEYS:
+            key = next(f"{key}_{n}" for n in range(2, 1000)
+                       if f"{key}_{n}" not in self.arrays)
         if key in self.arrays:
             log.debug("export: %r already present, keeping the first", key)
             return None
         self.arrays[key] = np.asarray(array)
-        self.labels[key] = {"label": str(label or key), "quantity": str(quantity or ""),
+        self.labels[key] = {"label": str(label), "quantity": str(quantity or ""),
                             "source": source}
         return key
 
@@ -111,7 +118,11 @@ class Export:
 
 def collect(session, plot=None, window_id=None) -> Export | None:
     """The :class:`Export` for *plot*, or for the bare-figure *window_id* when
-    there is no plot. None when the window holds nothing exportable."""
+    there is no plot. None when the window holds nothing exportable. A
+    controller's ``export_arrays()`` maps a label to an array, or to an
+    ``(array, quantity)`` pair; its failure propagates to the caller, which
+    reports it — a window with a map on screen must never be reported as
+    having nothing."""
     if plot is not None:
         return _collect_plot(session, plot)
     if window_id is None:
@@ -120,13 +131,12 @@ def collect(session, plot=None, window_id=None) -> Export | None:
     controller = _controller(session, window_id)
     exporter = getattr(controller, "export_arrays", None)
     if callable(exporter):
-        try:
-            for label, array in dict(exporter()).items():
-                key = export.add(label, array, label=label, source="controller")
-                if export.primary is None:
-                    export.primary = key
-        except Exception as e:
-            log.debug("controller export_arrays failed: %s", e)
+        for label, value in dict(exporter()).items():
+            array, quantity = value if isinstance(value, tuple) else (value, "")
+            key = export.add(label, array, label=label, quantity=quantity,
+                             source="controller")
+            if export.primary is None:
+                export.primary = key
     _add_registered_views(export, window_id)
     export.meta.setdefault("title", str(getattr(controller, "title", "") or ""))
     return export if export.arrays else None
@@ -165,6 +175,15 @@ def _collect_plot(session, plot) -> Export | None:
                        quantity=_quantity(other.signal), source="node")
         _add_axes(export, node.signal)
         export.meta["title"] = _title(tree.root_node.signal)
+        # The chip views and the result object belong to the RESULT window.
+        # A fit stamps its result on the source scan's tree too, and that
+        # tree is shared with the scan's own windows and with every live
+        # output cut from it: none of those is asking for the fit.
+        _add_registered_views(export, getattr(plot, "window_id", None))
+        _add_result_objects(export, tree)
+        provenance = getattr(tree, "_commit_provenance", None)
+        if provenance:
+            export.meta["provenance"] = dict(provenance)
     elif shown is not None:
         # A window on a dataset, or a live output (a virtual image, a line
         # profile) whose signal is a placeholder outside its tree: the shown
@@ -175,20 +194,15 @@ def _collect_plot(session, plot) -> Export | None:
         if label == "frame":
             # A frame of the dataset: its own signal axes, and where it is.
             _add_axes(export, signal)
-            export.meta["navigation_index"] = _navigation_index(plot)
+            index = _navigation_index(tree)
+            if index is not None:
+                export.meta["navigation_index"] = index
         elif tree is not None:
             # A virtual image is a picture over the SCAN, so it carries the
             # scan's navigation calibration, not its placeholder's pixels.
             _add_navigation_axes(export, tree.root_node.signal, shown.shape[:2])
         if tree is not None:
             export.meta["title"] = _title(tree.root_node.signal)
-
-    _add_registered_views(export, getattr(plot, "window_id", None))
-    if tree is not None:
-        _add_result_objects(export, tree)
-        provenance = getattr(tree, "_commit_provenance", None)
-        if provenance:
-            export.meta["provenance"] = dict(provenance)
     return export if export.arrays else None
 
 
@@ -244,26 +258,18 @@ def _title(signal) -> str:
 
 
 def _add_axes(export: Export, signal) -> None:
-    """The calibrated coordinate of every pixel column and row, so a map
-    replots on the scan's scale, plus the units in the record."""
+    """The calibrated coordinate of every pixel column and row of a map or
+    trace (its signal axes), so it replots on its own scale."""
     try:
         axes = list(signal.axes_manager.signal_axes)
     except Exception:
         return
-    units = {}
-    for name, axis in zip(("x", "y"), axes):
-        try:
-            export.arrays.setdefault(f"{name}_axis", np.asarray(axis.axis, dtype=np.float64))
-            units[name] = str(axis.units or "")
-        except Exception as e:
-            log.debug("export: reading the %s axis failed: %s", name, e)
-    if units:
-        export.meta["axis_units"] = units
+    _put_axes(export, axes)
 
 
 def _add_navigation_axes(export: Export, signal, shape) -> None:
-    """The scan's calibrated navigation coordinates, when the map is over the
-    scan grid (its height and width match the two spatial navigation axes)."""
+    """The scan's navigation coordinates for a picture drawn over the scan
+    (its height and width match the two spatial navigation axes)."""
     from spyde.actions.commit import spatial_navigation_axes
     axes = spatial_navigation_axes(signal)
     if len(axes) != 2:
@@ -271,17 +277,48 @@ def _add_navigation_axes(export: Export, signal, shape) -> None:
     x, y = axes
     if (int(y.size), int(x.size)) != tuple(int(n) for n in shape):
         return
-    export.arrays.setdefault("x_axis", np.asarray(x.axis, dtype=np.float64))
-    export.arrays.setdefault("y_axis", np.asarray(y.axis, dtype=np.float64))
-    export.meta["axis_units"] = {"x": str(x.units or ""), "y": str(y.units or "")}
+    _put_axes(export, [x, y])
 
 
-def _navigation_index(plot) -> list | None:
-    try:
-        index = plot.plot_state.current_signal.axes_manager.indices
-        return [int(i) for i in index]
-    except Exception:
-        return None
+def _put_axes(export: Export, axes) -> None:
+    """``x_axis`` / ``y_axis`` from up to two hyperspy axes, and their units
+    as the plots show them: cleaned of LaTeX, blank where hyperspy's
+    ``<undefined>`` sentinel stands in for none. The first writer wins."""
+    from spyde.drawing.plots.plot import _clean_units
+    if "x_axis" in export.arrays:
+        return
+    units = {}
+    for name, axis in zip(("x", "y"), axes):
+        try:
+            export.arrays[f"{name}_axis"] = np.asarray(axis.axis, dtype=np.float64)
+            raw = str(axis.units or "")
+            units[name] = "" if raw == "<undefined>" else _clean_units(raw)
+        except Exception as e:
+            log.debug("export: reading the %s axis failed: %s", name, e)
+    if units:
+        export.meta["axis_units"] = units
+
+
+def _navigation_index(tree) -> list | None:
+    """Where the exported frame sits in the scan, in DATA order (row first),
+    read from the navigator's selector: the axes manager's own index is never
+    moved by a navigator drag. The position committed by the last move, or
+    the widget's selection before any. An integrating region reports its
+    centre."""
+    from spyde.drawing.update_functions import _prepare_nav_indices
+    manager = getattr(tree, "navigator_plot_manager", None)
+    for selector in getattr(manager, "all_navigation_selectors", None) or ():
+        try:
+            indices = getattr(selector, "current_indices", None)
+            if indices is None:
+                indices = selector.get_selected_indices()
+            prepared = _prepare_nav_indices(tree.root, indices, integrating=False)
+        except Exception as e:
+            log.debug("export: reading the navigation index failed: %s", e)
+            continue
+        if prepared is not None:
+            return [int(v) for v in np.atleast_1d(np.asarray(prepared)).ravel()]
+    return None
 
 
 def _artifact_name(session, window_id) -> str | None:
@@ -313,6 +350,7 @@ def _add_registered_views(export: Export, window_id) -> None:
             export.primary = key
     axes = entry.get("axes")
     if axes and "x_axis" not in export.arrays:
+        # commit.navigation_extent's (x, y, units): already cleaned.
         try:
             x, y, units = axes
             export.arrays["x_axis"] = np.asarray(x, dtype=np.float64)

@@ -9,7 +9,7 @@ the scan it was cut from — both share a tree with the raw data.
 from __future__ import annotations
 
 import os
-import time
+import threading
 
 import numpy as np
 import pytest
@@ -39,16 +39,18 @@ def _calibrated_scan(ny=4, nx=5, scale=2.5, units="nm"):
 
 
 def _exported(session, path, plot=None, window_id=None, timeout=20.0):
-    """Run the export the way the menu does and wait for the file."""
+    """Run the export the way the menu does and join its writer thread."""
     session._export_numpy(str(path), plot, window_id)
+    for thread in threading.enumerate():
+        if thread.name.startswith("export-"):
+            thread.join(timeout)
     written = str(path) if str(path).endswith((".npz", ".npy", ".csv")) else str(path) + ".npz"
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if os.path.exists(written) and os.path.getsize(written) > 0:
-            time.sleep(0.1)
-            return written
-        time.sleep(0.05)
-    raise AssertionError(f"Export never produced {written}")
+    assert os.path.exists(written), f"Export never produced {written}"
+    return written
+
+
+def _errors(messages):
+    return [m.get("text", "") for m in messages if m.get("type") == "error"]
 
 
 class TestKeys:
@@ -65,6 +67,8 @@ class TestKeys:
         ("Si — Strain", "Si_Strain"),
         ("", "array"),
         ("2theta", "_2theta"),
+        ("class", "class_"),
+        ("Sample — Rebin (2×)", "Sample_Rebin_2"),
     ])
     def test_labels_become_identifiers(self, label, key):
         assert slug(label) == key
@@ -74,6 +78,18 @@ class TestKeys:
         assert export.add("εxx (%)", np.ones(3)) == "exx"
         assert export.add("exx", np.zeros(3)) is None
         assert export.arrays["exx"].sum() == 3
+
+    @pytest.mark.parametrize("label", ["file", "allow_pickle", "meta_json", "x_axis"])
+    def test_a_label_the_archive_uses_is_suffixed(self, label, tmp_path):
+        """np.savez's own parameters and the calibration keys: a title that
+        slugs to one used to raise, or silently drop the array, or replace
+        the real axis."""
+        export = Export()
+        assert export.add(label, np.ones(3)) == f"{label}_2"
+        path = write(export, str(tmp_path / "reserved.npz"))
+        with np.load(path) as archive:
+            assert np.array_equal(archive[f"{label}_2"], np.ones(3))
+        assert read_meta(path)["arrays"][f"{label}_2"]["label"] == label
 
 
 class TestCommittedStrainTree:
@@ -271,6 +287,46 @@ class TestDatasetWindow:
             assert archive["x_axis"].shape == (16,)
         assert "navigation_index" in read_meta(path)
 
+    def test_a_focused_navigator_exports_the_data_window(self, stem_4d_dataset, tmp_path):
+        """The navigator is a picture OF the scan. Focusing it to move the
+        crosshair is the ordinary state of a 4-D window, and Export from
+        there must write the pattern under the crosshair, not the overview."""
+        session = stem_4d_dataset["window"]
+        navigator = next(p for p in session._plots if getattr(p, "is_navigator", False))
+        data_plot = _signal_plot(session)
+        session._active_window_id = navigator.window_id
+
+        path = _exported(session, tmp_path / "from_nav.npz")
+        with np.load(path) as archive:
+            assert np.array_equal(archive["frame"], np.asarray(data_plot.current_data))
+            assert archive["frame"].shape == (16, 16), "the overview, not a pattern"
+
+    def test_the_navigation_index_is_the_crosshair_position(self, stem_4d_dataset, tmp_path):
+        """The selector holds the position; the axes manager never moves."""
+        session = stem_4d_dataset["window"]
+        tree = session.signal_trees[0]
+        selector = tree.navigator_plot_manager.all_navigation_selectors[0]
+        # The composite delegates to its inner selector; park it there, the
+        # way test_console_preview does (no real widget moves in this suite).
+        inner = getattr(selector, "selector", selector)
+        inner.current_indices = np.array([[3, 2]])   # widget order: x, y
+
+        path = _exported(session, tmp_path / "at.npz", _signal_plot(session))
+        assert read_meta(path)["navigation_index"] == [2, 3]   # data order: row, column
+
+    def test_a_fit_stamped_on_the_scan_stays_out_of_a_frame_export(self, stem_4d_dataset, tmp_path):
+        """Vector orientation and EBSD leave their result on the SOURCE tree.
+        The scan's own window still exports one pattern."""
+        session = stem_4d_dataset["window"]
+        tree = session.signal_trees[0]
+        tree.vector_orientation = TestOrientationResult()._result()
+        plot = _signal_plot(session)
+
+        path = _exported(session, tmp_path / "dp.npz", plot)
+        with np.load(path) as archive:
+            assert "quats" not in archive.files
+            assert max(archive[key].ndim for key in archive.files) == 2
+
     def test_a_plain_image_is_exported_whole(self, tem_2d_dataset, tmp_path):
         session = tem_2d_dataset["window"]
         plot = _signal_plot(session)
@@ -307,15 +363,45 @@ class TestBareWindow:
             assert np.allclose(archive["omega"], 1.0)
             assert np.allclose(archive["strain_exx"], 0.012)
             assert np.all(archive["coverage"] == 1)
+        # The record says what the numbers are, as a committed tree's does.
+        assert read_meta(path)["arrays"]["exx"]["quantity"] == "εxx (%)"
+        assert read_meta(path)["arrays"]["omega"]["quantity"] == "ω (°)"
         session._window_controllers.pop(4242, None)
+
+    def test_a_focused_bare_window_wins_over_the_sole_plot(self, window, tmp_path):
+        """One committed map tree open (a single signal plot, no navigator)
+        and a bare window focused: the bare window is what exports."""
+        session = window["window"]
+        commit_result_tree(session, title="Map", primary=np.zeros((4, 5), np.float32))
+        _settle(session)
+        controller = type("Bare", (), {
+            "export_arrays": lambda self: {"heat": np.ones((3, 3))}})()
+        session.register_window_controller(777, controller)
+        session._active_window_id = 777
+
+        path = _exported(session, tmp_path / "bare.npz")
+        with np.load(path) as archive:
+            assert set(archive.files) == {"meta_json", "heat"}
+        session._window_controllers.pop(777, None)
+
+    def test_a_controller_that_fails_is_reported_not_hidden(self, window):
+        session = window["window"]
+        messages = window["messages"]
+
+        def broken(self):
+            raise RuntimeError("component X has no map")
+        session.register_window_controller(778, type("Bare", (), {"export_arrays": broken})())
+        messages.clear()
+        session._export_numpy("broken.npz", None, 778)
+        assert any("component X has no map" in text for text in _errors(messages))
+        session._window_controllers.pop(778, None)
 
     def test_a_window_with_nothing_says_so(self, window):
         session = window["window"]
         messages = window["messages"]
         messages.clear()
         session._export_numpy("nothing.npz", None, 9999)
-        errors = [m for m in messages if m.get("type") == "error"]
-        assert errors and "nothing to export" in errors[0].get("message", errors[0].get("text", ""))
+        assert any("nothing to export" in text for text in _errors(messages))
 
     def test_collect_returns_none_without_a_window(self, window):
         assert collect(window["window"], None, None) is None
