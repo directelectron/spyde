@@ -617,9 +617,20 @@ def _fit_field(vecs, wiz, params, *, tree=None, on_band=None):
     ny, nx = vecs.nav_shape
     total = ny * nx
 
+    state = {"stage": "fitting", "done": 0, "total": 0}
+
+    def _say():
+        percent = (f" {int(100 * state['done'] / state['total'])}%"
+                   if state["total"] else "")
+        emit_status(f"Vector Orientation: {state['stage']}{percent}")
+
     def _progress(done, total_):
-        if total_:
-            emit_status(f"Vector Orientation: fitting… {int(100 * done / total_)}%")
+        state["done"], state["total"] = done, total_
+        _say()
+
+    def _stage(text):
+        state["stage"] = text
+        _say()
 
     stopped_flag = [False]
     if tree is not None and hasattr(tree, "register_cancel"):
@@ -644,7 +655,7 @@ def _fit_field(vecs, wiz, params, *, tree=None, on_band=None):
                 wiz, "resolution", DEFAULTS["resolution"])),
             angle_step_in_plane_deg=float(getattr(
                 wiz, "in_plane_resolution", DEFAULTS["in_plane_resolution"])),
-            device=device_name, progress=_progress,
+            device=device_name, progress=_progress, stage=_stage,
             stopped_flag=stopped_flag, params=params, on_band=on_band)
     finally:
         if tree is not None and hasattr(tree, "unregister_cancel"):

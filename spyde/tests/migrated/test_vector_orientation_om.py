@@ -319,7 +319,7 @@ class TestTheMatchIsBanded:
             return compute_vector_orientation_quantem(
                 vectors, phases, energy_ev=200e3, k_max=1.2,
                 angle_step_zone_axis_deg=12.0, device="cpu",
-                band_rows=band_rows, on_band=on_band)
+                band_rows=band_rows, on_band=on_band, ramp=False)
 
         whole = run(band_rows=vectors.nav_shape[0])
         banded = run(band_rows=1, on_band=lambda *a: bands.append(a))
@@ -397,6 +397,31 @@ class TestASingularPositionIsOneNaN:
         assert np.isfinite(strain[0, 0]).all()
         assert np.isnan(strain[1, 2]).all(), "the singular position is NaN"
         assert np.isnan(strain[0, 1]).all()
+
+
+class TestTheBandsRampUp:
+    def test_the_first_bands_are_one_two_four_rows(self):
+        from spyde.actions.vector_orientation_quantem import band_schedule
+        assert band_schedule(64, 8) == [(0, 1), (1, 3), (3, 7), (7, 15), (15, 23),
+                                        (23, 31), (31, 39), (39, 47), (47, 55),
+                                        (55, 63), (63, 64)]
+        assert band_schedule(3, 8) == [(0, 1), (1, 3)]
+        assert band_schedule(3, 1) == [(0, 1), (1, 2), (2, 3)]
+        assert band_schedule(5, 8, ramp=False) == [(0, 5)]
+
+    def test_the_stage_is_named(self):
+        from orix.crystal_map import Phase
+        from spyde.actions.vector_orientation_quantem import (
+            compute_vector_orientation_quantem,
+        )
+        stages = []
+        compute_vector_orientation_quantem(
+            TestTheMatchIsBanded._vectors(), [Phase.from_cif(CIF)], energy_ev=200e3,
+            k_max=1.2, angle_step_zone_axis_deg=12.0, device="cpu", band_rows=1,
+            stage=stages.append)
+        assert stages[0].startswith("building the correlation plan")
+        assert any(s.startswith("matching rows 1-1") for s in stages)
+        assert stages[-1].startswith("refining")
 
 
 class TestAnUnphysicalStrainIsNotAStrain:

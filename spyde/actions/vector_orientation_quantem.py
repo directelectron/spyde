@@ -222,6 +222,20 @@ class _RowBand:
 #: own batches.
 BAND_ROWS = 8
 
+
+def band_schedule(rows: int, band_rows: int, ramp: bool = True) -> list:
+    """``[(row_start, row_stop), ...]`` covering *rows*. With *ramp* the bands
+    start at one row and double up to *band_rows*, so the first rows are on
+    screen after one row's match rather than after eight — on a wide scan the
+    difference between seeing the map start and staring at grey."""
+    band_rows = max(1, int(band_rows or rows))
+    bands, start, size = [], 0, (1 if ramp else band_rows)
+    while start < rows:
+        stop = min(rows, start + min(size, band_rows))
+        bands.append((start, stop))
+        start, size = stop, size * 2
+    return bands
+
 #: The tensors :meth:`OrientationMap.match_orientations` writes, in the order
 #: they are reassembled from the bands.
 _MATCH_FIELDS = ("quats", "corr", "corr_second", "reliability", "mirror")
@@ -1088,7 +1102,8 @@ def compute_vector_orientation_quantem(
         device: str = "cuda", t: Optional[int] = None,
         progress=None, stopped_flag=None,
         params: Optional[dict] = None,
-        on_band=None, band_rows: int = BAND_ROWS,
+        on_band=None, band_rows: int = BAND_ROWS, ramp: bool = True,
+        stage=None,
         ) -> Optional[VectorOrientationResult]:
     """Orientation, phase and strain for every position, by correlation match.
 
@@ -1109,11 +1124,20 @@ def compute_vector_orientation_quantem(
     one is launch-overhead bound and the CPU wins.
 
     ``progress(done, total)`` counts positions: each is matched once and
-    refined once per phase. ``stopped_flag`` is polled between bands and
-    stages, so closing the tree stops the run rather than leaving a scan's
-    compute to finish into nothing.
+    refined once per phase; ``stage(text)`` is told which stage is running
+    (plan, match, refine), since the count stands still through the plan
+    build and the refinement and a still count reads as a hang.
+    ``stopped_flag`` is polled between bands and stages, so closing the tree
+    stops the run rather than leaving a scan's compute to finish into nothing.
+    With *ramp* the first bands are one, two, four rows — see
+    :func:`band_schedule`.
     """
     import torch
+
+    def _stage(text: str) -> None:
+        log.info("[vom] %s", text)
+        if stage is not None:
+            stage(text)
 
     peaks = PeaksAdapter(vectors, inverse_angstrom_factor=inverse_angstrom_factor,
                          t=t)
@@ -1137,9 +1161,11 @@ def compute_vector_orientation_quantem(
     rescue_passes = int(settings.get("rescue_passes", RESCUE_PASSES))
 
     maps = []
-    for phase in phases:
+    for index, phase in enumerate(phases):
         if _stopped():
             return None
+        _stage(f"building the correlation plan for phase {index + 1} of "
+               f"{len(phases)} ({getattr(phase, 'name', '') or 'phase'})…")
         crystal = phase_to_crystal(phase)
         with accelerator_lock(torch.device(device)):
             maps.append(build_orientation_map(
@@ -1150,12 +1176,11 @@ def compute_vector_orientation_quantem(
     if not maps:
         return None
 
-    band_rows = max(1, int(band_rows or rows))
     parts = [[] for _ in maps]
-    for row_start in range(0, rows, band_rows):
+    for row_start, row_stop in band_schedule(rows, band_rows, ramp):
         if _stopped():
             return None
-        row_stop = min(rows, row_start + band_rows)
+        _stage(f"matching rows {row_start + 1}-{row_stop} of {rows}…")
         band = _RowBand(peaks, row_start, row_stop)
         for orientation_map, phase_parts in zip(maps, parts):
             orientation_map.peaks = band
@@ -1170,9 +1195,10 @@ def compute_vector_orientation_quantem(
             on_band(row_start, row_stop, quats, phase_index)
 
     strains = []
-    for orientation_map, phase_parts in zip(maps, parts):
+    for index, (orientation_map, phase_parts) in enumerate(zip(maps, parts)):
         if _stopped():
             return None
+        _stage(f"refining phase {index + 1} of {len(maps)} and solving strain…")
         orientation_map.peaks = peaks
         for name in _MATCH_FIELDS:
             setattr(orientation_map, name,
