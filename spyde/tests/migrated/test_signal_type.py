@@ -74,3 +74,29 @@ class TestSignalType:
                 "Signal.signal_type", default="") or "") == ""
         finally:
             session.shutdown()
+
+
+class TestSignalTypeFromNavigator:
+    """The dropdown acts on the dataset whichever of its windows has focus."""
+
+    def test_set_from_navigator_recasts_the_dataset(self, stem_4d_dataset):
+        session = stem_4d_dataset["window"]
+        messages = stem_4d_dataset["messages"]
+        tree = session.signal_trees[-1]
+        navigator = next(p for p in session._plots
+                         if p.signal_tree is tree and p.is_navigator)
+        navigator_image = navigator.plot_state.current_signal
+        navigator_type = navigator_image.metadata.get_item(
+            "Signal.signal_type", default="")
+        messages.clear()
+
+        session._set_signal_type(navigator, "")
+        _settle(session)
+
+        assert (tree.root.metadata.get_item("Signal.signal_type", default="")
+                or "") == "", "the dataset kept its type"
+        assert navigator_image.metadata.get_item(
+            "Signal.signal_type", default="") == navigator_type, \
+            "the navigator image was re-typed instead of the dataset"
+        info = _msgs(messages, "signal_type_info")
+        assert info and info[-1]["current"] == ""
