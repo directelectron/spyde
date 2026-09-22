@@ -175,6 +175,58 @@ class PeaksAdapter:
         return np.array([len(cell.array) for cell in self._cells], dtype=int)
 
 
+class _RowBand:
+    """A horizontal band of a scan's peaks, as the matcher reads a scan.
+
+    The match is per position, so matching the scan a band at a time against
+    the one plan gives the same answer as matching it whole — and lets the
+    band's orientations be shown, and the count reported, while the rest is
+    still running. The refinement is NOT banded: its neighbour rescue looks
+    across positions, so it runs on the whole reassembled map.
+    """
+
+    fields = list(PEAK_FIELDS)
+
+    def __init__(self, peaks: PeaksAdapter, row_start: int, row_stop: int):
+        self._peaks = peaks
+        self._row_start = int(row_start)
+        self.shape = (int(row_stop) - int(row_start), peaks.shape[1])
+        self.metadata = peaks.metadata
+
+    def __getitem__(self, index) -> _Cell:
+        row, column = index
+        return self._peaks[row + self._row_start, column]
+
+    def select_fields(self, *names) -> "_RowBand":
+        if tuple(names) != PEAK_FIELDS:
+            raise NotImplementedError(
+                f"the adapter carries {PEAK_FIELDS}, not {names}")
+        return self
+
+    def flatten(self) -> np.ndarray:
+        rows, columns = self.shape
+        return np.vstack([self[row, column].array
+                          for row in range(rows) for column in range(columns)])
+
+    @property
+    def peak_counts(self) -> np.ndarray:
+        rows, columns = self.shape
+        return np.array([len(self[row, column].array)
+                         for row in range(rows) for column in range(columns)],
+                        dtype=int)
+
+
+#: Rows matched per band by :func:`compute_vector_orientation_quantem`. Small
+#: enough that the map visibly fills, large enough that a band is still a
+#: batch: 8 rows of a 64-wide scan is 512 patterns, four of the matcher's
+#: own batches.
+BAND_ROWS = 8
+
+#: The tensors :meth:`OrientationMap.match_orientations` writes, in the order
+#: they are reassembled from the bands.
+_MATCH_FIELDS = ("quats", "corr", "corr_second", "reliability", "mirror")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Strain
 # ─────────────────────────────────────────────────────────────────────────────
@@ -934,6 +986,25 @@ def to_result(orientation_map, phases_meta: list,
 # The whole field
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _band_winner(parts, convention: str = "conjugate"):
+    """The best phase and its orientation at every position of the band just
+    matched — ``parts[phase]`` is that phase's match tensors for the band.
+
+    The same comparison :func:`combine_phases` makes for the finished scan;
+    here it is made early so the band can be shown. A position no phase
+    matched gets phase ``-1``.
+    """
+    correlation = np.stack(
+        [np.asarray(part["corr"][..., 0].numpy(), float) for part in parts])
+    winner = correlation.argmax(axis=0)
+    best = np.take_along_axis(correlation, winner[None], axis=0)[0]
+    quats = np.stack([
+        quantem_quats_to_orix(part["quats"][..., 0, :].numpy(), convention)
+        for part in parts])
+    chosen = np.take_along_axis(quats, winner[None, ..., None], axis=0)[0]
+    return chosen.astype(np.float32), np.where(best > 0, winner, -1).astype(np.int16)
+
+
 def compute_vector_orientation_quantem(
         vectors, phases, energy_ev: float, k_max: float,
         inverse_angstrom_factor: float = 1.0,
@@ -941,21 +1012,31 @@ def compute_vector_orientation_quantem(
         angle_step_in_plane_deg: float = 5.0,
         device: str = "cuda", t: Optional[int] = None,
         progress=None, stopped_flag=None,
-        params: Optional[dict] = None) -> Optional[VectorOrientationResult]:
+        params: Optional[dict] = None,
+        on_band=None, band_rows: int = BAND_ROWS,
+        ) -> Optional[VectorOrientationResult]:
     """Orientation, phase and strain for every position, by correlation match.
 
     One plan per phase, each matched and refined over the whole scan and then
     combined per position on the correlation — see :func:`combine_phases` for
     why comparing them is legitimate.
 
+    The match runs in bands of ``band_rows`` scan rows against the plans built
+    once up front, and ``on_band(row_start, row_stop, quats, phase_index)`` is
+    called as each band lands with its best orientation per position, so the
+    map can be shown filling in. The match is per position, so this is the
+    same answer the whole scan gives in one call; the refinement, whose
+    neighbour rescue looks across positions, runs on the reassembled map.
+
     The correlation runs on ``device`` and the refinement on the same one
     through the override in this module; both are worth accelerating at scan
     scale, which is the opposite of the single-pattern case, where a batch of
     one is launch-overhead bound and the CPU wins.
 
-    ``progress(done, total)`` is called between stages, and ``stopped_flag`` is
-    polled at each, so closing the tree stops the run rather than leaving a
-    scan's compute to finish into nothing.
+    ``progress(done, total)`` counts positions: each is matched once and
+    refined once per phase. ``stopped_flag`` is polled between bands and
+    stages, so closing the tree stops the run rather than leaving a scan's
+    compute to finish into nothing.
     """
     import torch
 
@@ -963,42 +1044,63 @@ def compute_vector_orientation_quantem(
                          t=t)
     rows, columns = peaks.shape
     total = rows * columns
-    stages = max(1, len(phases)) * 3
+    total_units = 2 * max(1, len(phases)) * total
     done = [0]
 
-    def _advance():
-        done[0] += 1
+    def _advance(positions: int):
+        done[0] += int(positions)
         if progress is not None:
-            progress(int(total * done[0] / stages), total)
+            progress(done[0], total_units)
 
     def _stopped() -> bool:
         return bool(stopped_flag is not None and stopped_flag[0])
 
-    maps, strains = [], []
+    # The Refine tab's settings, so the map is of what the preview showed.
+    settings = dict(params or {})
+    pair_distance = settings.get("pair_distance")
+    sigma_excitation = settings.get("sigma_excitation")
+
+    maps = []
     for phase in phases:
         if _stopped():
             return None
         crystal = phase_to_crystal(phase)
         with accelerator_lock(torch.device(device)):
-            orientation_map = build_orientation_map(
-            peaks, crystal, energy_ev=energy_ev, k_max=k_max,
-            angle_step_zone_axis_deg=angle_step_zone_axis_deg,
-            angle_step_in_plane_deg=angle_step_in_plane_deg,
-                device=device, refine_device=device)
-        _advance()
+            maps.append(build_orientation_map(
+                peaks, crystal, energy_ev=energy_ev, k_max=k_max,
+                angle_step_zone_axis_deg=angle_step_zone_axis_deg,
+                angle_step_in_plane_deg=angle_step_in_plane_deg,
+                device=device, refine_device=device))
+    if not maps:
+        return None
 
+    band_rows = max(1, int(band_rows or rows))
+    parts = [[] for _ in maps]
+    for row_start in range(0, rows, band_rows):
         if _stopped():
             return None
-        with accelerator_lock(torch.device(device)):
-            orientation_map.match_orientations(progress_bar=False)
-        _advance()
+        row_stop = min(rows, row_start + band_rows)
+        band = _RowBand(peaks, row_start, row_stop)
+        for orientation_map, phase_parts in zip(maps, parts):
+            orientation_map.peaks = band
+            with accelerator_lock(torch.device(device)):
+                orientation_map.match_orientations(progress_bar=False)
+            phase_parts.append({name: getattr(orientation_map, name)
+                                for name in _MATCH_FIELDS})
+            _advance(band.shape[0] * columns)
+        if on_band is not None:
+            quats, phase_index = _band_winner(
+                [phase_parts[-1] for phase_parts in parts])
+            on_band(row_start, row_stop, quats, phase_index)
 
+    strains = []
+    for orientation_map, phase_parts in zip(maps, parts):
         if _stopped():
             return None
-        # The Refine tab's settings, so the map is of what the preview showed.
-        settings = dict(params or {})
-        pair_distance = settings.get("pair_distance")
-        sigma_excitation = settings.get("sigma_excitation")
+        orientation_map.peaks = peaks
+        for name in _MATCH_FIELDS:
+            setattr(orientation_map, name,
+                    torch.cat([part[name] for part in phase_parts], dim=0))
         with accelerator_lock(torch.device(device)):
             orientation_map.refine_orientations(
                 progress_bar=False, pair_distance=pair_distance,
@@ -1006,19 +1108,17 @@ def compute_vector_orientation_quantem(
             strain, _pairs = strain_from_orientation_map(
                 orientation_map, device=device, pair_distance=pair_distance,
                 sigma_excitation=sigma_excitation)
-        _advance()
-
-        maps.append(orientation_map)
         strains.append(strain)
+        _advance(total)
 
-    if _stopped() or not maps:
+    if _stopped():
         return None
     from spyde.signals.orientation_map import phase_to_dict
 
     result = combine_phases(maps, [phase_to_dict(p) for p in phases],
                             strains=strains, params=dict(params or {}))
     if progress is not None:
-        progress(total, total)
+        progress(total_units, total_units)
     return result
 
 

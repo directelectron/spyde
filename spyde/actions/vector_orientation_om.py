@@ -299,19 +299,94 @@ def vom_generate_library(session, plot, payload) -> None:
     run_on_worker(session, _work, name="vom-generate-library")
 
 
-def _build_ipf_heatmap(session, src, result, title="Orientation (IPF-Z, live)"):
-    """Open just the IPF-Z map window (the live refine heatmap) + its 3-D
-    explorer. The strain windows are added later by Compute Maps."""
-    from spyde.actions.commit import commit_result_tree
+def _ipf_title(src, title: str) -> str:
     base = src.metadata.get_item("General.title", "Signal")
+    return f"{base} — {title}"
+
+
+def _open_ipf_window(session, src, nav_shape, title="Orientation (IPF-Z)"):
+    """Open the IPF-Z window before the fit, every position in the unfit
+    grey, so the map has somewhere to fill in. :func:`_build_ipf_heatmap`
+    finishes it once the result exists."""
+    from spyde.actions.commit import commit_result_tree
+    ny, nx = nav_shape
+    blank = np.empty((ny, nx, 3), np.uint8)
+    blank[...] = _UNFIT_COLOR
+    return commit_result_tree(
+        session, title=_ipf_title(src, title), primary=blank,
+        provenance={"action": "Vector Orientation Mapping",
+                    "source_title": src.metadata.get_item(
+                        "General.title", "Signal")},
+        source_signal=src,
+    )
+
+
+class _BandPainter:
+    """Paints each matched band of rows into the early IPF window.
+
+    Holds the whole map, grey where nothing has landed, and repaints it as
+    each band arrives; the paint is marshalled onto the main loop because the
+    bands come off the fit's worker thread.
+    """
+
+    def __init__(self, session, tree, nav_shape, phases):
+        self.session = session
+        self.tree = tree
+        self.phases = list(phases)
+        ny, nx = nav_shape
+        self.rgb = np.empty((ny, nx, 3), np.uint8)
+        self.rgb[...] = _UNFIT_COLOR
+
+    def on_band(self, row_start, row_stop, quats, phase_index) -> None:
+        from spyde.signals.orientation_map import ipf_rgb
+        band = np.empty((row_stop - row_start,) + self.rgb.shape[1:], np.uint8)
+        band[...] = _UNFIT_COLOR
+        for index, phase in enumerate(self.phases):
+            mask = phase_index == index
+            if mask.any():
+                band[mask] = ipf_rgb(quats[mask], phase, "z")
+        self.rgb[row_start:row_stop] = band
+        snapshot = self.rgb.copy()
+
+        def _paint():
+            from spyde.actions.lifecycle import paint_signal_plots
+            paint_signal_plots(self.tree, snapshot)
+
+        dispatch = getattr(self.session, "_dispatch_to_main", None)
+        if dispatch is not None:
+            dispatch(_paint)
+        else:
+            _paint()
+
+
+def _build_ipf_heatmap(session, src, result, title="Orientation (IPF-Z, live)",
+                       tree=None):
+    """Open just the IPF-Z map window (the live refine heatmap) + its 3-D
+    explorer. The strain windows are added later by Compute Maps.
+
+    With *tree* — the window :func:`_open_ipf_window` opened before the fit —
+    that window is finished instead: the final map painted, the result
+    attached, the explorers wired."""
+    from spyde.actions.commit import commit_result_tree
 
     def _attach(tree):
         from spyde.actions.ipf_view import attach_ipf_3d, attach_ipf_point_selector
         attach_ipf_3d(tree, result, "z", session=session)
         attach_ipf_point_selector(tree, result, "z")
 
+    if tree is not None:
+        from spyde.actions.lifecycle import paint_signal_plots
+        tree.vector_orientation = result
+        paint_signal_plots(tree, result.ipf_color_map("z"))
+        try:
+            _attach(tree)
+        except Exception as e:
+            log.debug("attaching the IPF explorers failed: %s", e)
+        return tree
+
+    base = src.metadata.get_item("General.title", "Signal")
     return commit_result_tree(
-        session, title=f"{base} — {title}",
+        session, title=_ipf_title(src, title),
         primary=result.ipf_color_map("z"),
         attrs={"vector_orientation": result},
         provenance={"action": "Vector Orientation Mapping",
@@ -428,16 +503,24 @@ def vom_run(session, plot, payload) -> None:
     except Exception as e:
         log.debug("CUDA autograd warmup failed: %s", e)
 
+    # The orientation window opens NOW, blank, and fills in a band of rows at
+    # a time as the match lands — the same early window every other long
+    # compute here opens, instead of a status line and then everything at once.
+    ipf_tree = _open_ipf_window(session, tree.root, vecs.nav_shape)
+    painter = _BandPainter(session, ipf_tree, vecs.nav_shape, wiz.phases)
+
     def _work():
         try:
-            result = _fit_field(vecs, wiz, fit_params, tree=tree)
+            result = _fit_field(vecs, wiz, fit_params, tree=tree,
+                                on_band=painter.on_band)
             if result is None:
                 # None also means "cancelled" (tree closed mid-fit) — no toast.
                 if not getattr(tree, "_spyde_closed", False):
                     emit_error("Vector Orientation: fit returned no result")
                 return
             tree.vector_orientation = result
-            _build_result_windows(session, tree.root, result, smooth=smooth)
+            _build_result_windows(session, tree.root, result, smooth=smooth,
+                                  ipf_tree=ipf_tree)
             emit_status("Vector Orientation map complete")
         except Exception as e:
             emit_error(f"Compute Maps failed: {e}")
@@ -447,7 +530,7 @@ def vom_run(session, plot, payload) -> None:
     run_on_worker(session, _work, name="vom-run")
 
 
-def _fit_field(vecs, wiz, params, *, tree=None):
+def _fit_field(vecs, wiz, params, *, tree=None, on_band=None):
     """Whole-field fit: orientation, phase and strain, by correlation match.
 
     The same matcher the crosshair preview uses, run over every position — so
@@ -463,6 +546,8 @@ def _fit_field(vecs, wiz, params, *, tree=None):
 
     ``tree`` (when given) registers a stopped_flag, so closing the tree mid-fit
     stops the run rather than leaving a scan's compute to finish into nothing.
+    ``on_band`` receives each band of rows as it is matched — see
+    :func:`compute_vector_orientation_quantem`.
     """
     ny, nx = vecs.nav_shape
     total = ny * nx
@@ -491,7 +576,7 @@ def _fit_field(vecs, wiz, params, *, tree=None):
             vecs, wiz.phases, energy_ev=float(wiz.voltage) * 1e3,
             k_max=float(wiz.recip_r), inverse_angstrom_factor=factor,
             device=device_name, progress=_progress,
-            stopped_flag=stopped_flag, params=params)
+            stopped_flag=stopped_flag, params=params, on_band=on_band)
     finally:
         if tree is not None and hasattr(tree, "unregister_cancel"):
             tree.unregister_cancel(flag=stopped_flag)
@@ -549,14 +634,18 @@ def _phase_legend(result) -> list[dict]:
     return legend
 
 
-def _build_result_windows(session, src, result, *, smooth=False) -> None:
+def _build_result_windows(session, src, result, *, smooth=False,
+                          ipf_tree=None) -> None:
     """Commit the fitted field: an IPF-Z orientation window (RGB), a strain
     window (εxx signal plot + εyy/εxy as chip-selectable views), and a phase map
-    when more than one structure was in the library."""
+    when more than one structure was in the library. *ipf_tree* is the
+    orientation window opened before the fit, finished here rather than
+    opened again."""
     from spyde.actions.commit import commit_result_tree
     base = src.metadata.get_item("General.title", "Signal")
 
-    _build_ipf_heatmap(session, src, result, title="Orientation (IPF-Z)")
+    _build_ipf_heatmap(session, src, result, title="Orientation (IPF-Z)",
+                       tree=ipf_tree)
 
     # One phase is the whole scan by construction, so a map of it says nothing.
     if len(getattr(result, "phases_meta", None) or []) > 1:

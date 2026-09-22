@@ -65,9 +65,12 @@ class VectorRefineIpfController:
     every committed position and its value recolours the panels on the painter
     thread — the same arrangement the dense refine heat map uses.
 
-    Runs inline rather than on the overlay lane: this is the correlation only,
-    without the refinement or the strain solve that make the matched-pattern
-    overlay expensive.
+    Runs on the overlay lane, like the matched-pattern overlay. It is only the
+    correlation, about 26 ms, but inline that was 26 ms added to every
+    navigator step before the pattern under the crosshair could be read and
+    painted — the drag felt heavy the moment the heat map opened. On the lane
+    a superseded position is dropped and the surface is drawn for the position
+    the user rests on, which is the one worth looking at.
 
     Double-clicking a triangle adds or removes a circle that RESTRICTS the
     match to the orientations inside it, the same gesture and the same meaning
@@ -103,7 +106,7 @@ class VectorRefineIpfController:
         self.tree = tree
         self.node = _add_overlay(
             tree, tree.root, zone_correlations_overlay, name="vom_refine_ipf",
-            groups={}, source=False, expensive=False,
+            groups={}, source=False, expensive=True,
             iterating={"rows": VectorRows(self.vectors)},
             static={"fitter": self.fitter},
             on_value=self.draw,

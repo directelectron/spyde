@@ -153,11 +153,20 @@ class TestVectorOrientationOM:
             #    figures emitted into the same window, not new signal trees) ──
             n_before = len(session.signal_trees)
             vom_run(session, vplot, {"smooth": False})
+            # The orientation window opens BEFORE the fit (blank, to fill in
+            # band by band), so a new tree proves nothing; the result landing
+            # on it does.
             assert _wait(lambda: len(session.signal_trees) >= n_before + 1,
-                         timeout=90), "strain window never opened"
-            ipf_tree = next((t for t in session.signal_trees
-                             if getattr(t, "vector_orientation", None) is not None), None)
-            assert ipf_tree is not None
+                         timeout=90), "orientation window never opened"
+
+            def _ipf_tree():
+                return next((t for t in session.signal_trees
+                             if getattr(t, "vector_orientation", None) is not None),
+                            None)
+
+            assert _wait(lambda: _ipf_tree() is not None, timeout=90), \
+                "orientation map never landed"
+            ipf_tree = _ipf_tree()
             res = ipf_tree.vector_orientation
             assert res.nav_shape == tuple(vtree.diffraction_vectors.nav_shape)
             assert res.strain.shape[-1] == 3
@@ -258,6 +267,92 @@ class TestVectorOrientationOM:
                        {"pair_distance": 0.07, "sigma_excitation": 0.03})
         assert seen["params"] == {"pair_distance": 0.07, "sigma_excitation": 0.03}
 
+
+
+class TestTheMatchIsBanded:
+    """The whole-field match runs a band of rows at a time so the map fills
+    in as it goes. The match is per position, so this must be the same answer
+    the scan gives matched whole — banding is a display affordance, not a
+    different fit."""
+
+    @staticmethod
+    def _vectors(ny=3, nx=4):
+        """A scan of one silver-like pattern: six spots at Ag {111}/{200}
+        radii (Å⁻¹), the same at every position, so every band has peaks to
+        match."""
+        from spyde.signals.diffraction_vectors import (
+            SpyDEDiffractionVectors, N_COLS,
+        )
+        angles = np.deg2rad(np.arange(0, 360, 60))
+        spots = [(0.0, 0.0)] + [(0.42 * np.cos(a), 0.42 * np.sin(a))
+                                for a in angles]
+        rows, offsets = [], [0]
+        for iy in range(ny):
+            for ix in range(nx):
+                for kx, ky in spots:
+                    rows.append([ix, iy, kx, ky, -1.0, 1.0])
+                offsets.append(len(rows))
+        flat = np.asarray(rows, dtype=np.float32).reshape(-1, N_COLS)
+        off = np.asarray(offsets, dtype=np.int64)
+        return SpyDEDiffractionVectors(
+            flat_buffer=flat, nav_offsets=[np.arange(ny + 1) * nx, off],
+            nav_shape=(ny, nx), full_nav_shape=(ny, nx), sig_shape=(64, 64),
+            sig_axes=None, kernel_radius_px=1.0, kernel_radius_data=0.02,
+            offsets=off)
+
+    def test_banded_equals_whole(self):
+        from orix.crystal_map import Phase
+
+        from spyde.actions.vector_orientation_quantem import (
+            compute_vector_orientation_quantem,
+        )
+
+        vectors = self._vectors()
+        phases = [Phase.from_cif(CIF)]
+        bands = []
+
+        def run(band_rows, on_band=None):
+            return compute_vector_orientation_quantem(
+                vectors, phases, energy_ev=200e3, k_max=1.2,
+                angle_step_zone_axis_deg=12.0, device="cpu",
+                band_rows=band_rows, on_band=on_band)
+
+        whole = run(band_rows=vectors.nav_shape[0])
+        banded = run(band_rows=1, on_band=lambda *a: bands.append(a))
+
+        assert whole is not None and banded is not None
+        np.testing.assert_array_equal(banded.phase_idx, whole.phase_idx)
+        np.testing.assert_allclose(banded.coarse_score, whole.coarse_score,
+                                   rtol=1e-6, atol=1e-6)
+        np.testing.assert_allclose(banded.quats, whole.quats, rtol=1e-5, atol=1e-5)
+        np.testing.assert_allclose(banded.strain, whole.strain,
+                                   rtol=1e-5, atol=1e-5, equal_nan=True)
+
+        # One band per row, each carrying that row's orientations.
+        assert [(a[0], a[1]) for a in bands] == [(r, r + 1) for r in range(3)]
+        for row_start, row_stop, quats, phase_index in bands:
+            assert quats.shape == (1, 4, 4)
+            assert phase_index.shape == (1, 4)
+
+    def test_progress_counts_positions(self):
+        """The count moves with the bands — 'fitting… 33%' for a whole
+        minute was the match stage reporting nothing until it finished."""
+        from orix.crystal_map import Phase
+
+        from spyde.actions.vector_orientation_quantem import (
+            compute_vector_orientation_quantem,
+        )
+
+        seen = []
+        compute_vector_orientation_quantem(
+            self._vectors(), [Phase.from_cif(CIF)], energy_ev=200e3, k_max=1.2,
+            angle_step_zone_axis_deg=12.0, device="cpu", band_rows=1,
+            progress=lambda done, total: seen.append((done, total)))
+        done = [d for d, _ in seen]
+        assert done == sorted(done), "progress must not go backwards"
+        # Three bands of four positions matched, then the refinement.
+        assert done[:3] == [4, 8, 12]
+        assert seen[-1][0] == seen[-1][1]
 
 
 class TestRefineIpfTogglesWithTheAction:

@@ -32,6 +32,20 @@ def _direction_vector(direction: str):
     return Vector3d.zvector()
 
 
+def ipf_rgb(quats, phase, direction: str = "z") -> np.ndarray:
+    """(N, 3) uint8 IPF colours of (N, 4) orix-convention quaternions, all of
+    one orix *phase*, for the sample *direction*."""
+    from orix.plot import IPFColorKeyTSL
+    from orix.quaternion import Orientation, Rotation
+
+    key = IPFColorKeyTSL(phase.point_group.laue,
+                         direction=_direction_vector(direction))
+    orientations = Orientation(Rotation(np.asarray(quats, float)),
+                               symmetry=phase.point_group)
+    return np.clip(key.orientation2color(orientations) * 255.0,
+                   0, 255).astype(np.uint8)
+
+
 def orix_phase_from_dict(meta: dict):
     """Rebuild a minimal orix Phase from {'name', 'point_group'}."""
     from orix.crystal_map import Phase
@@ -153,23 +167,14 @@ class SpyDEOrientationMap:
         Multi-phase: each position is colored by its matched phase's color
         key — same direction for all phases.
         """
-        from orix.plot import IPFColorKeyTSL
-        from orix.quaternion import Orientation, Rotation
-
         ny, nx = self.nav_shape
         rgb = np.zeros((ny, nx, 3), dtype=np.uint8)
         best_phase = self.phase_idx[..., 0]
-        d = _direction_vector(direction)
         for i in range(self.n_phases):
             mask = best_phase == i
             if not mask.any():
                 continue
-            phase = self.orix_phase(i)
-            key = IPFColorKeyTSL(phase.point_group.laue, direction=d)
-            ori = Orientation(Rotation(self.quats[mask, 0]),
-                              symmetry=phase.point_group)
-            colors = key.orientation2color(ori)
-            rgb[mask] = np.clip(colors * 255.0, 0, 255).astype(np.uint8)
+            rgb[mask] = ipf_rgb(self.quats[mask, 0], self.orix_phase(i), direction)
         return rgb
 
     def ipf_sphere_points(self, direction: str = "z", max_points: int = 1_000_000):
