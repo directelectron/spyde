@@ -2220,7 +2220,7 @@ class TestTheRingAndTheShellsAgree:
         text = path.read_text(encoding="utf-8")
         gap = re.search(r"function widestGapAzimuth\([^)]*\)[^{]*\{(.*?)\n\}",
                         text, re.S)
-        assert gap and re.search(r"length === 0\) return 0", gap.group(1)), (
+        assert gap and re.search(r"length === 0\) return 0\b", gap.group(1)), (
             "widestGapAzimuth no longer returns 0 for an empty ring")
         fmt = re.search(r"function formatDegrees\([^)]*\)[^{]*\{(.*?)\n\}",
                         text, re.S)
