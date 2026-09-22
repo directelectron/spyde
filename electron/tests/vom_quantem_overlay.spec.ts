@@ -175,7 +175,13 @@ test('the matched pattern lands on the measured peaks and follows the crosshair'
   // has to appear where the click was, and the matched pattern has to be
   // redrawn from the restricted match rather than left where it was.
   await expect(heatMap()).toHaveCount(1)
-  await heatMap().getByTestId('subwindow-titlebar').click()
+  // Raised through the focus message, not a titlebar click: the diffraction
+  // window's iframe can sit over that titlebar and swallow the click (it did,
+  // on CI, three runs out of three).
+  const heatId = await heatMap().locator('iframe').first().getAttribute('data-testid')
+  await page.evaluate(
+    (id: string) => window.postMessage({ type: 'spyde_focus', figId: id }, '*'),
+    heatId!.replace('figure-', ''))
   await page.waitForTimeout(300)
   await page.screenshot({ path: join(SHOTS, '05-heat-map-before-mask.png') })
 
