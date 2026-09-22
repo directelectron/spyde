@@ -226,6 +226,11 @@ BAND_ROWS = 8
 #: they are reassembled from the bands.
 _MATCH_FIELDS = ("quats", "corr", "corr_second", "reliability", "mirror")
 
+#: How many times the neighbour rescue may run over the field. Upstream runs
+#: it once; a mis-indexed patch wider than one position needs a pass per
+#: position of depth, and each pass stops early when it changes nothing.
+RESCUE_PASSES = 3
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Strain
@@ -765,6 +770,7 @@ class GpuRefineOrientationMap:
         reports it as one.
         """
         rescue = kwargs.pop("neighbor_rescue", True)
+        passes = int(kwargs.pop("rescue_passes", 1))
         batched = kwargs.get("batched", True)
         refine_tilt = kwargs.get("refine_tilt", False)
         # Falling back leaves upstream wholly in charge, rescue included.
@@ -773,11 +779,23 @@ class GpuRefineOrientationMap:
             return super().refine_orientations(
                 *args, neighbor_rescue=rescue, **kwargs)
 
+        import torch
+
         self._refine_state = None
         result = super().refine_orientations(*args, neighbor_rescue=False, **kwargs)
         if self._refine_state is not None:
-            self._rescue_batched(float(kwargs.get("rescue_threshold_deg", 2.0)))
+            threshold = float(kwargs.get("rescue_threshold_deg", 2.0))
+            # One pass rescues a position from the neighbours it has NOW; a
+            # position two steps into a mis-indexed patch only gets a good
+            # neighbour once the first pass has fixed the one between. Repeat
+            # until a pass changes nothing, up to ``rescue_passes``.
+            for _ in range(max(1, passes)):
+                before = self.quats.clone()
+                self._rescue_batched(threshold)
+                if torch.equal(before, self.quats):
+                    break
             self.metadata["refine"]["neighbor_rescue"] = True
+            self.metadata["refine"]["rescue_passes"] = int(max(1, passes))
         return result
 
     def _rescue_batched(self, threshold_deg: float) -> None:
@@ -1082,6 +1100,7 @@ def compute_vector_orientation_quantem(
     settings = dict(params or {})
     pair_distance = settings.get("pair_distance")
     sigma_excitation = settings.get("sigma_excitation")
+    rescue_passes = int(settings.get("rescue_passes", RESCUE_PASSES))
 
     maps = []
     for phase in phases:
@@ -1125,9 +1144,13 @@ def compute_vector_orientation_quantem(
             setattr(orientation_map, name,
                     torch.cat([part[name] for part in phase_parts], dim=0))
         with accelerator_lock(torch.device(device)):
+            # Upstream's own refinement (the CPU path) rescues once and takes
+            # no pass count; the batched override does.
+            passes = ({"rescue_passes": rescue_passes}
+                      if isinstance(orientation_map, GpuRefineOrientationMap) else {})
             orientation_map.refine_orientations(
                 progress_bar=False, pair_distance=pair_distance,
-                sigma_excitation=sigma_excitation)
+                sigma_excitation=sigma_excitation, **passes)
             strain, _pairs = strain_from_orientation_map(
                 orientation_map, device=device, pair_distance=pair_distance,
                 sigma_excitation=sigma_excitation)

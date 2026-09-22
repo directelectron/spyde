@@ -41,7 +41,7 @@ interface VomFit {
 interface VomSaved {
   tab: Tab; voltage: number; resolution: number; minInt: number
   pairDistance: number; sigmaExcitation: number
-  smooth: boolean; libReady: boolean
+  smooth: boolean; rescuePasses: number; libReady: boolean
 }
 const _vomStore = new Map<number, VomSaved>()
 
@@ -55,6 +55,7 @@ export function VectorOrientationWizard({ caretPos, windowId, sendAction, onClos
   const [pairDistance, setPairDistance] = React.useState(saved?.pairDistance ?? 0.05)        // Å⁻¹
   const [sigmaExcitation, setSigmaExcitation] = React.useState(saved?.sigmaExcitation ?? 0.04)  // Å⁻¹
   const [smooth, setSmooth] = React.useState(saved?.smooth ?? true)
+  const [rescuePasses, setRescuePasses] = React.useState(saved?.rescuePasses ?? 3)
   const [libReady, setLibReady] = React.useState(saved?.libReady ?? false)
   const [fit, setFit] = React.useState<VomFit | null>(null)
   const [status, setStatus] = React.useState(
@@ -64,9 +65,9 @@ export function VectorOrientationWizard({ caretPos, windowId, sendAction, onClos
   // Persist the state for this window on every change so reopening restores it.
   React.useEffect(() => {
     _vomStore.set(windowId, { tab, voltage, resolution, minInt,
-      pairDistance, sigmaExcitation, smooth, libReady })
+      pairDistance, sigmaExcitation, smooth, rescuePasses, libReady })
   }, [windowId, tab, voltage, resolution, minInt, pairDistance,
-      sigmaExcitation, smooth, libReady])
+      sigmaExcitation, smooth, rescuePasses, libReady])
 
   // Debounced live refine — a pending refine is cancelled on unmount so
   // vom_refine can't fire at a torn-down preview mid-debounce.
@@ -114,7 +115,8 @@ export function VectorOrientationWizard({ caretPos, windowId, sendAction, onClos
   }
   const compute = () => {
     setStatus('Computing orientation + strain maps…')
-    sendAction('vom_run', { pair_distance: pairDistance, sigma_excitation: sigmaExcitation, smooth }, windowId)
+    sendAction('vom_run', { pair_distance: pairDistance, sigma_excitation: sigmaExcitation, smooth,
+      rescue_passes: rescuePasses }, windowId)
   }
 
   const pct = (v?: number) => (v === undefined ? '—' : `${(v * 100).toFixed(2)}%`)
@@ -172,6 +174,14 @@ export function VectorOrientationWizard({ caretPos, windowId, sendAction, onClos
           <div style={S.hint}>Fits every position with the settings from Refine,
             then opens the orientation map and the strain maps.</div>
           <Check testid="vom-smooth" checked={smooth} onChange={setSmooth} label="Smooth strain (TV)" />
+          <Field label="Rescue passes">
+            <NumInput testid="vom-rescue-passes" value={rescuePasses} min={1} step="1" width={60}
+              onChange={(n) => setRescuePasses(Math.max(1, Math.round(n)))} />
+          </Field>
+          <div style={S.hint}>A position whose orientation disagrees with all its
+            neighbours is re-fitted from theirs; a mis-indexed patch two
+            positions wide needs two passes. More passes clean grains up, at
+            the cost of a refinement per pass.</div>
           <button data-testid="vom-compute" style={S.primary} onClick={compute}>Compute Maps</button>
         </div>
       )}

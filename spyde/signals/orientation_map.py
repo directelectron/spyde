@@ -46,6 +46,35 @@ def ipf_rgb(quats, phase, direction: str = "z") -> np.ndarray:
                    0, 255).astype(np.uint8)
 
 
+#: The IPF colour of a position nothing matched, and how dark the least
+#: confident matched position is drawn.
+UNFIT_RGB = (0x55, 0x58, 0x60)
+CONFIDENCE_FLOOR = 0.25
+
+
+def confidence_weighted(rgb, score, floor: float = CONFIDENCE_FLOOR) -> np.ndarray:
+    """Scale an ``(ny, nx, 3)`` colour map by a per-position *score*.
+
+    A score at or above the map's own 98th percentile draws at full colour and
+    lower ones darken linearly to *floor*, so a scan whose best correlation
+    is 0.6 is not uniformly dim. A score of zero or less means nothing was
+    matched there, and the position is grey rather than dark: dark still
+    reads as an orientation."""
+    rgb = np.asarray(rgb)
+    score = np.nan_to_num(np.asarray(score, float))
+    matched = score > 0
+    out = np.empty_like(rgb)
+    out[...] = UNFIT_RGB
+    if not matched.any():
+        return out
+    top = float(np.percentile(score[matched], 98))
+    relative = np.clip(score / top, 0.0, 1.0) if top > 0 else np.ones_like(score)
+    weight = floor + (1.0 - floor) * relative
+    scaled = np.clip(rgb.astype(float) * weight[..., None], 0, 255).astype(np.uint8)
+    out[matched] = scaled[matched]
+    return out
+
+
 def orix_phase_from_dict(meta: dict):
     """Rebuild a minimal orix Phase from {'name', 'point_group'}."""
     from orix.crystal_map import Phase
@@ -133,6 +162,12 @@ class SpyDEOrientationMap:
     # Provenance record ({"action", "params", "spyde_version"}) — same dict
     # convention as commit._stamp_provenance (script/app interchangeable).
     provenance: Optional[dict] = field(default=None)
+    #: Draw the IPF maps by confidence: each position's colour scaled by its
+    #: correlation, and grey where nothing matched. The vector matcher's
+    #: correlation is a cosine similarity comparable across positions, so it
+    #: is a confidence; the dense matcher's is not normalised that way and
+    #: keeps the flat map.
+    display_confidence: bool = False
     _phase_cache: dict = field(default_factory=dict, repr=False)
 
     # ── Basic properties ──────────────────────────────────────────────────────
@@ -161,11 +196,18 @@ class SpyDEOrientationMap:
 
     # ── Navigator images ──────────────────────────────────────────────────────
 
-    def ipf_color_map(self, direction: str = "z") -> np.ndarray:
+    def ipf_color_map(self, direction: str = "z", confidence=None) -> np.ndarray:
         """(ny, nx, 3) uint8 IPF color map (best match per position).
 
         Multi-phase: each position is colored by its matched phase's color
         key — same direction for all phases.
+
+        With *confidence* (default: :attr:`display_confidence`) a position's
+        colour is scaled by its correlation and a position with none is the
+        unfit grey — see :func:`confidence_weighted`. Without it an amorphous
+        region, whose best match is as good as any, paints as loudly as a
+        grain, and a position nothing matched paints as the identity
+        orientation (pure red in IPF-X).
         """
         ny, nx = self.nav_shape
         rgb = np.zeros((ny, nx, 3), dtype=np.uint8)
@@ -175,6 +217,10 @@ class SpyDEOrientationMap:
             if not mask.any():
                 continue
             rgb[mask] = ipf_rgb(self.quats[mask, 0], self.orix_phase(i), direction)
+        if confidence is None:
+            confidence = self.display_confidence
+        if confidence:
+            rgb = confidence_weighted(rgb, np.asarray(self.corr[..., 0], float))
         return rgb
 
     def ipf_sphere_points(self, direction: str = "z", max_points: int = 1_000_000):
@@ -452,6 +498,7 @@ class VectorOrientationResult:
             mirror=np.ones((ny, nx, 1), np.int8),
             phases=self.phases_meta,
             params=dict(self.params),
+            display_confidence=True,
         )
 
     def ipf_color_map(self, direction: str = "z") -> np.ndarray:

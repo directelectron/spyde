@@ -35,6 +35,7 @@ DEFAULTS = dict(
     resolution=1.0,
     minimum_intensity=1e-4,
     smooth=False,
+    rescue_passes=3,
 )
 
 from de_shell.actions.wizard import WizardController
@@ -95,6 +96,14 @@ class VomWizard(WizardController):
         "smooth": {
             "name": "Smooth strain (TV)", "type": "bool", "default": False,
             "tab": "Run",
+        },
+        # How many times the neighbour rescue runs over the field: a position
+        # whose orientation disagrees with all its neighbours is re-fitted
+        # from theirs, and a mis-indexed patch two positions wide needs two
+        # passes. Each pass stops early when it changes nothing.
+        "rescue_passes": {
+            "name": "Rescue passes", "type": "int", "default": 3,
+            "min": 1, "max": 10, "tab": "Run",
         },
     }
 
@@ -510,6 +519,8 @@ def vom_run(session, plot, payload) -> None:
         value = payload.get(key, getattr(wiz, key, None))
         if value is not None:
             fit_params[key] = float(value)
+    fit_params["rescue_passes"] = int(
+        payload.get("rescue_passes", DEFAULTS["rescue_passes"]))
     emit_status("Vector Orientation: fitting the field…")
 
     # Initialise the CUDA autograd engine on THIS (dispatch) thread before the

@@ -82,6 +82,39 @@ class TestContainer:
         assert rgb.dtype == np.uint8
         assert rgb.max() > 0  # not all black
 
+    def test_confidence_weighting_dims_and_greys(self):
+        """A vector result's map is drawn by confidence: a weak correlation
+        darkens the colour and no correlation at all is the unfit grey, so an
+        amorphous region no longer paints as loudly as a grain and an unmatched
+        position no longer paints as the identity orientation."""
+        from spyde.signals.orientation_map import UNFIT_RGB
+        om = _make_map()
+        flat = om.ipf_color_map("z")
+        corr = np.full(om.corr.shape, 0.9, np.float32)
+        corr[0, 0] = 0.0            # nothing matched here
+        corr[1, 1] = 0.3            # a poor match
+        om.corr = corr
+        weighted = om.ipf_color_map("z", confidence=True)
+        assert tuple(weighted[0, 0]) == UNFIT_RGB
+        assert (weighted[1, 1].astype(int) < flat[1, 1].astype(int)).any()
+        assert (weighted[1, 1].astype(int) <= flat[1, 1].astype(int)).all()
+        assert np.array_equal(weighted[2, 2], flat[2, 2]), "a confident position keeps its colour"
+        assert np.array_equal(om.ipf_color_map("z"), flat), "off unless asked for"
+
+    def test_a_vector_result_asks_for_confidence(self):
+        from spyde.signals.orientation_map import UNFIT_RGB, VectorOrientationResult
+        result = VectorOrientationResult(
+            quats=np.tile(np.array([1, 0, 0, 0], np.float32), (2, 2, 1)),
+            phase_idx=np.zeros((2, 2), np.int16), theta=np.zeros((2, 2), np.float32),
+            strain=np.full((2, 2, 3), np.nan, np.float32),
+            residual=np.full((2, 2), np.nan, np.float32),
+            friedel_asym=np.full((2, 2), np.nan, np.float32),
+            n_matched=np.zeros((2, 2), np.int16),
+            coarse_score=np.array([[0.9, 0.0], [0.9, 0.9]], np.float32),
+            phases_meta=[{"name": "Ag", "point_group": "m-3m"}], nav_shape=(2, 2))
+        assert result.to_orientation_map().display_confidence is True
+        assert tuple(result.ipf_color_map("z")[0, 1]) == UNFIT_RGB
+
     def test_color_map_directions_differ(self):
         om = _make_map(seed=7)
         rz = om.ipf_color_map("z")
