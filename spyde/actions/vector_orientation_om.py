@@ -393,11 +393,13 @@ def _build_ipf_heatmap(session, src, result, title="Orientation (IPF-Z, live)",
     if tree is not None:
         from spyde.actions.lifecycle import paint_signal_plots
         tree.vector_orientation = result
-        paint_signal_plots(tree, result.ipf_color_map("z"))
+        rgb = result.ipf_color_map("z")
+        paint_signal_plots(tree, rgb)
         try:
             _attach(tree)
         except Exception as e:
             log.debug("attaching the IPF explorers failed: %s", e)
+        _add_phase_chips(tree, src, result, rgb)
         return tree
 
     base = src.metadata.get_item("General.title", "Signal")
@@ -613,6 +615,17 @@ _PHASE_COLORS = (
 _UNFIT_COLOR = (0x55, 0x58, 0x60)
 
 
+def fitted_positions(result) -> np.ndarray:
+    """``(ny, nx)`` bool — where a template was actually matched.
+
+    The correlation matcher reports no residual (that is the pose fit's
+    diagnostic), so a position is fitted where it has a correlation. Reading
+    the residual alone painted every position of a matcher's result grey."""
+    residual = np.isfinite(np.asarray(result.residual, dtype=float))
+    score = np.asarray(getattr(result, "coarse_score", np.nan), dtype=float)
+    return residual | (np.nan_to_num(score) > 0)
+
+
 def phase_map_rgb(result) -> np.ndarray:
     """``(ny, nx, 3)`` uint8 — which crystal structure best explains each pattern.
 
@@ -625,7 +638,7 @@ def phase_map_rgb(result) -> np.ndarray:
     phase_idx = np.asarray(result.phase_idx, dtype=int)
     rgb = np.empty(phase_idx.shape + (3,), dtype=np.uint8)
     rgb[...] = _UNFIT_COLOR
-    fitted = np.isfinite(np.asarray(result.residual, dtype=float))
+    fitted = fitted_positions(result)
     for index in range(len(getattr(result, "phases_meta", None) or [1])):
         selected = fitted & (phase_idx == index)
         if selected.any():
@@ -633,12 +646,33 @@ def phase_map_rgb(result) -> np.ndarray:
     return rgb
 
 
+def phase_views(result, ipf_rgb) -> list:
+    """The chips a multi-phase orientation window carries beside its map:
+    the phase map, then the map restricted to each phase — one crystal's
+    grains alone, the rest in the unfit grey — so a phase can be looked at
+    on its own. Empty for a single phase, whose phase map says nothing."""
+    metas = list(getattr(result, "phases_meta", None) or [])
+    if len(metas) < 2:
+        return []
+    ipf_rgb = np.asarray(ipf_rgb)
+    phase_idx = np.asarray(result.phase_idx, dtype=int)
+    fitted = fitted_positions(result)
+    views = [("Phase", phase_map_rgb(result))]
+    for index, meta in enumerate(metas):
+        only = np.empty_like(ipf_rgb)
+        only[...] = _UNFIT_COLOR
+        selected = fitted & (phase_idx == index)
+        only[selected] = ipf_rgb[selected]
+        views.append((str(meta.get("name", f"phase {index}")), only))
+    return views
+
+
 def _phase_legend(result) -> list[dict]:
     """``[{name, color, fraction}]`` — what each phase colour means and how much
     of the scan it claims, for the status line and the window's provenance."""
 
     phase_idx = np.asarray(result.phase_idx, dtype=int)
-    fitted = np.isfinite(np.asarray(result.residual, dtype=float))
+    fitted = fitted_positions(result)
     total = max(int(fitted.sum()), 1)
     legend = []
     for index, meta in enumerate(getattr(result, "phases_meta", None) or []):
@@ -650,29 +684,39 @@ def _phase_legend(result) -> list[dict]:
     return legend
 
 
+def _add_phase_chips(tree, src, result, ipf_rgb) -> None:
+    """Put the phase map and the per-phase orientation maps on the window
+    as chips beside the IPF-X/Y/Z projections (see :func:`phase_views`).
+    Appended AFTER the explorer's own chips, so neither erases the other."""
+    from spyde.actions.commit import navigation_extent
+    from spyde.actions.views import emit_view_figure, register_views
+
+    views = phase_views(result, ipf_rgb)
+    if not views:
+        return
+    signal_plot = next(iter(getattr(tree, "signal_plots", []) or []), None)
+    window_id = getattr(signal_plot, "window_id", None)
+    if window_id is None:
+        return
+    axes = navigation_extent(src, np.asarray(ipf_rgb).shape[:2])
+    register_views(window_id, views, append=True, axes=axes)
+    for label, image in views:
+        emit_view_figure(window_id, image, label, kind="2d", axes=axes)
+
+
 def _build_result_windows(session, src, result, *, smooth=False,
                           ipf_tree=None) -> None:
-    """Commit the fitted field: an IPF-Z orientation window (RGB), a strain
-    window (εxx signal plot + εyy/εxy as chip-selectable views), and a phase map
-    when more than one structure was in the library. *ipf_tree* is the
-    orientation window opened before the fit, finished here rather than
-    opened again."""
-    from spyde.actions.commit import commit_result_tree
-    base = src.metadata.get_item("General.title", "Signal")
-
+    """Commit the fitted field: an IPF-Z orientation window (RGB, with the
+    phase map and the per-phase maps as chips when more than one structure
+    was in the library) and a strain window (εxx signal plot + εyy/εxy as
+    chip-selectable views). *ipf_tree* is the orientation window opened
+    before the fit, finished here rather than opened again."""
     _build_ipf_heatmap(session, src, result, title="Orientation (IPF-Z)",
                        tree=ipf_tree)
 
     # One phase is the whole scan by construction, so a map of it says nothing.
     if len(getattr(result, "phases_meta", None) or []) > 1:
         legend = _phase_legend(result)
-        commit_result_tree(
-            session, title=f"{base} — Phase",
-            primary=phase_map_rgb(result), primary_label="Phase",
-            source_signal=src,
-            provenance={"action": "Vector Orientation Mapping",
-                        "source_title": base, "params": {"phases": legend}},
-        )
         emit_status("Phase: " + ", ".join(
             f"{entry['name']} {entry['fraction']:.0%}" for entry in legend))
 

@@ -138,7 +138,11 @@ class TestVectorOrientationOM:
                 value = reader_for_overlay(vplot, node).read_frame(
                     (int(ys[0]), int(xs[0])))
                 assert value["measured"].shape[0] >= 5
-                assert value["template"].shape[1] == 2   # a matched pattern
+                template = value["template"]
+                assert template["data"].shape[1] == 2   # a matched pattern
+                # Each spot draws at its own intensity, as an alpha.
+                assert len(template["edgecolors"]) == template["data"].shape[0]
+                assert all(c.startswith("rgba(48,255,96,") for c in template["edgecolors"])
 
             # Generate stops at the library and the previews. It does NOT fit
             # the field: that is a scan's compute before the user has chosen
@@ -353,6 +357,92 @@ class TestTheMatchIsBanded:
         # Three bands of four positions matched, then the refinement.
         assert done[:3] == [4, 8, 12]
         assert seen[-1][0] == seen[-1][1]
+
+
+class TestASingularPositionIsOneNaN:
+    """One position whose paired peaks are degenerate must not take the
+    scan's strain down. It used to: the batch inverse raised on the one
+    singular member ("batch element 1552 … The input matrix is singular")
+    and Compute Maps failed as a whole."""
+
+    def test_real_space_deformation_skips_the_singular_member(self):
+        import torch
+        from spyde.actions.vector_orientation_quantem import real_space_deformation
+
+        affine = torch.tensor([
+            [[1.02, 0.01], [0.00, 0.98]],       # a fine map
+            [[1.00, 2.00], [0.50, 1.00]],       # rank one: singular
+            [[float("nan"), 0.0], [0.0, 1.0]],  # too few pairs
+            [[1e-3, 0.0], [0.0, 1e-3]],         # small but well conditioned
+        ], dtype=torch.float64)
+        real = real_space_deformation(affine)
+        expected = torch.linalg.inv(affine[0]).T
+        assert torch.allclose(real[0], expected)
+        assert torch.isnan(real[1]).all()
+        assert torch.isnan(real[2]).all()
+        assert torch.allclose(real[3], torch.linalg.inv(affine[3]).T)
+
+    def test_the_field_strain_carries_on_past_it(self, monkeypatch):
+        import torch
+        import spyde.actions.vector_orientation_quantem as quantem
+
+        affine = torch.full((2, 3, 2, 2), float("nan"), dtype=torch.float64)
+        affine[0, 0] = torch.eye(2, dtype=torch.float64) * 1.01
+        affine[1, 2] = torch.tensor([[1.0, 2.0], [0.5, 1.0]])   # singular
+        pairs = torch.full((2, 3), 6, dtype=torch.long)
+        monkeypatch.setattr(quantem, "reciprocal_affine",
+                            lambda *a, **k: (affine, pairs))
+        strain, _ = quantem.strain_from_orientation_map(object())
+        assert strain.shape == (2, 3, 3)
+        assert np.isfinite(strain[0, 0]).all()
+        assert np.isnan(strain[1, 2]).all(), "the singular position is NaN"
+        assert np.isnan(strain[0, 1]).all()
+
+
+class TestThePhaseMapAndItsChips:
+    @staticmethod
+    def _result(phase_idx, score):
+        from spyde.signals.orientation_map import VectorOrientationResult
+        phase_idx = np.asarray(phase_idx, np.int16)
+        ny, nx = phase_idx.shape
+        return VectorOrientationResult(
+            quats=np.tile(np.array([1, 0, 0, 0], np.float32), (ny, nx, 1)),
+            phase_idx=phase_idx, theta=np.zeros((ny, nx), np.float32),
+            strain=np.full((ny, nx, 3), np.nan, np.float32),
+            residual=np.full((ny, nx), np.nan, np.float32),
+            friedel_asym=np.full((ny, nx), np.nan, np.float32),
+            n_matched=np.zeros((ny, nx), np.int16),
+            coarse_score=np.asarray(score, np.float32),
+            phases_meta=[{"name": "Cu", "point_group": "m-3m"},
+                         {"name": "Nb", "point_group": "m-3m"}],
+            nav_shape=(ny, nx))
+
+    def test_a_matched_position_is_coloured_by_its_phase(self):
+        """The matcher reports no residual; a position with a correlation is
+        fitted. Keyed on the residual alone, every position was grey."""
+        from spyde.actions.vector_orientation_om import phase_map_rgb, _PHASE_COLORS, _UNFIT_COLOR
+        result = self._result([[0, 1], [1, 0]], [[0.9, 0.8], [0.0, 0.7]])
+        rgb = phase_map_rgb(result)
+        assert tuple(rgb[0, 0]) == _PHASE_COLORS[0]
+        assert tuple(rgb[0, 1]) == _PHASE_COLORS[1]
+        assert tuple(rgb[1, 0]) == _UNFIT_COLOR, "no correlation, no phase"
+
+    def test_each_phase_gets_its_own_map(self):
+        from spyde.actions.vector_orientation_om import phase_views, _UNFIT_COLOR
+        result = self._result([[0, 1], [1, 0]], [[0.9, 0.8], [0.0, 0.7]])
+        ipf = np.full((2, 2, 3), 200, np.uint8)
+        views = dict(phase_views(result, ipf))
+        assert list(views) == ["Phase", "Cu", "Nb"]
+        assert tuple(views["Cu"][0, 0]) == (200, 200, 200)
+        assert tuple(views["Cu"][0, 1]) == _UNFIT_COLOR
+        assert tuple(views["Nb"][0, 1]) == (200, 200, 200)
+        assert tuple(views["Nb"][1, 0]) == _UNFIT_COLOR, "unfit is nobody's"
+
+    def test_one_phase_has_no_chips(self):
+        from spyde.actions.vector_orientation_om import phase_views
+        result = self._result([[0, 0]], [[0.9, 0.8]])
+        result.phases_meta = result.phases_meta[:1]
+        assert phase_views(result, np.zeros((1, 2, 3), np.uint8)) == []
 
 
 class TestRefineIpfTogglesWithTheAction:

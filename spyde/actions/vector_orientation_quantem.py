@@ -345,10 +345,33 @@ def strain_from_orientation_map(orientation_map, match: int = 0,
     rows, columns = affine.shape[:2]
     affine = affine.reshape(-1, 2, 2)
     if not reciprocal:
-        # real space is the inverse transpose of the reciprocal-space map
-        affine = torch.linalg.inv(affine).transpose(-1, -2)
+        affine = real_space_deformation(affine)
     strain = _symmetric_strain(affine).reshape(rows, columns, 3).cpu().numpy()
     return strain.astype(np.float32), pair_count.cpu().numpy()
+
+
+def real_space_deformation(affine):
+    """``(B, 2, 2)`` reciprocal-space maps → their real-space deformations, the
+    inverse transpose, NaN where a map is missing or singular.
+
+    Inverting the batch in one call raised on a single singular member — a
+    position whose paired peaks all lie on one line through the origin has a
+    rank-one map — and took the whole scan's strain down with it ("batch
+    element 1552 … The input matrix is singular"). One bad position is one
+    NaN, like a position with too few pairs.
+    """
+    import torch
+
+    finite = torch.isfinite(affine).all(dim=(-2, -1))
+    clean = torch.nan_to_num(affine)
+    # Singular relative to the map's own magnitude, so a well-conditioned map
+    # of small entries is not mistaken for a degenerate one.
+    scale = clean.abs().amax(dim=(-2, -1)).clamp_min(1e-12) ** 2
+    invertible = finite & (torch.linalg.det(clean).abs() > 1e-8 * scale)
+    out = torch.full_like(affine, float("nan"))
+    if bool(invertible.any()):
+        out[invertible] = torch.linalg.inv(affine[invertible]).transpose(-1, -2)
+    return out
 
 
 def _symmetric_strain(affine):
@@ -1391,9 +1414,7 @@ class SinglePatternFitter:
                 sigma_excitation=self.sigma_excitation)
             deformation = affine[0, 0]
             strain = _symmetric_strain(
-                torch.linalg.inv(deformation[None]).transpose(-1, -2)
-            )[0].cpu().numpy() if bool(torch.isfinite(deformation).all()) else \
-                np.full(3, np.nan, np.float32)
+                real_space_deformation(deformation[None]))[0].cpu().numpy()
             pattern = orientation_map.generate_pattern(0, 0)
 
         spots = torch.stack((pattern["qx"], pattern["qy"]), dim=1).to(torch.float64)
