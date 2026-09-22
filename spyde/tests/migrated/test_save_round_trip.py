@@ -331,23 +331,12 @@ class TestAMultiAngleAcquisitionReopensWhole:
     """
 
     def _stack(self, members=4, shells=(0, 0, 1, 1)):
-        from spyde.signals.multiangle import MULTIANGLE_METADATA
+        from spyde.multiangle.synthetic import saved_stack
 
-        generator = np.random.default_rng(7)
-        data = generator.integers(
-            0, 400, (members, 5, 6, 4, 4), dtype=np.uint16)
-        signal = hs.signals.Signal2D(data)
-        signal.metadata.set_item(MULTIANGLE_METADATA, {
-            "n_members": members,
-            "n_shells": len(set(shells)),
-            "tilts": [1.0 if shell else 0.5 for shell in shells],
-            "azimuths": [i * 90.0 for i in range(members)],
-            "shell_ids": list(shells),
-            "reference": 0,
-            "member_signal_type": "electron_diffraction",
-        })
-        signal.set_signal_type("electron_diffraction")
-        return signal, np.asarray(data)
+        signal, data = saved_stack(members=members, shells=shells, seed=7)
+        signal.metadata.set_item(
+            "Acquisition.multiangle.member_signal_type", "electron_diffraction")
+        return signal, data
 
     def test_a_stack_is_recognised_and_a_sum_is_not(self):
         from spyde.signals.multiangle import is_multiangle_stack
@@ -455,16 +444,10 @@ class TestTheAngleRingComesBackToo:
             MULTIANGLE_METADATA, MULTIANGLE_SIGNAL_TYPE,
         )
 
-        data = np.random.default_rng(7).integers(
-            0, 400, (4, 5, 6, 4, 4), dtype=np.uint16)
-        signal = hs.signals.Signal2D(data)
-        signal.metadata.set_item(MULTIANGLE_METADATA, {
-            "n_members": 4, "n_shells": 2, "tilts": [0.5, 0.5, 1.0, 1.0],
-            "azimuths": [0.0, 90.0, 180.0, 270.0], "shell_ids": [0, 0, 1, 1],
-            "reference": 0, "nav_offsets": [[0, 0]] * 4,
-            "dp_offsets": [[0, 0]] * 4, "paths": ["a", "b", "c", "d"],
-            "member_signal_type": "electron_diffraction"})
-        signal.set_signal_type(MULTIANGLE_SIGNAL_TYPE)
+        from spyde.multiangle.synthetic import saved_stack
+
+        signal, _data = saved_stack(shells=(0, 0, 1, 1), seed=7,
+                                    stack_type=True)
         path = tmp_path / "acquisition.zspy"
         signal.save(str(path))
         return path
@@ -547,16 +530,11 @@ class TestAWideStackStillReopensWhole:
     the only word of it went to the log."""
 
     def _stack(self, dtype):
-        from spyde.signals.multiangle import MULTIANGLE_METADATA
+        from spyde.multiangle.synthetic import saved_stack
 
-        generator = np.random.default_rng(11)
-        data = generator.integers(0, 400, (4, 5, 6, 4, 4)).astype(dtype)
-        signal = hs.signals.Signal2D(data)
-        signal.metadata.set_item(MULTIANGLE_METADATA, {
-            "n_members": 4, "n_shells": 1, "tilts": [1.0] * 4,
-            "azimuths": [0.0, 90.0, 180.0, 270.0], "shell_ids": [0] * 4,
-            "reference": 0, "member_signal_type": "electron_diffraction"})
-        signal.set_signal_type("electron_diffraction")
+        signal, data = saved_stack(shells=(0, 0, 0, 0), seed=11, dtype=dtype)
+        signal.metadata.set_item(
+            "Acquisition.multiangle.member_signal_type", "electron_diffraction")
         return signal, data
 
     def _open(self, session, path, needs_summed=True):
@@ -668,13 +646,14 @@ class TestASumIsNeverAStack:
     their ordinary dataset could not be re-expanded."""
 
     def _stack(self):
-        from spyde.signals.multiangle import MULTIANGLE_METADATA, MULTIANGLE_SIGNAL_TYPE
+        """Members that carried no type: the record has no member type and
+        the stack has the multi-angle one, the case the sum inherited."""
+        from spyde.multiangle.synthetic import saved_stack
+        from spyde.signals.multiangle import MULTIANGLE_SIGNAL_TYPE
 
-        signal = hs.signals.Signal2D(np.ones((3, 4, 5, 6, 6), dtype=np.uint16))
-        signal.metadata.set_item(MULTIANGLE_METADATA, {
-            "n_members": 3, "n_shells": 1, "tilts": [1.0] * 3,
-            "azimuths": [0.0, 120.0, 240.0], "shell_ids": [0] * 3,
-            "reference": 0})
+        signal, _data = saved_stack(members=3, shells=(0, 0, 0),
+                                    scan_shape=(4, 5), detector_shape=(6, 6),
+                                    fill=1, signal_type="")
         signal.set_signal_type(MULTIANGLE_SIGNAL_TYPE)
         return signal
 
@@ -740,21 +719,11 @@ class TestAReopenedTreeIsTheComposedOne:
     """Whatever the compose path gives, the reopen path gives too."""
 
     def _saved(self, tmp_path, planes=True, shells=(0, 0, 1, 1)):
-        from spyde.signals.multiangle import MULTIANGLE_METADATA
+        from spyde.multiangle.synthetic import saved_stack
 
-        generator = np.random.default_rng(5)
-        data = generator.integers(0, 400, (4, 6, 8, 4, 4), dtype=np.uint16)
-        signal = hs.signals.Signal2D(data)
-        record = {
-            "n_members": 4, "n_shells": len(set(shells)),
-            "tilts": [1.0 if shell else 0.5 for shell in shells],
-            "azimuths": [0.0, 90.0, 180.0, 270.0], "shell_ids": list(shells),
-            "reference": 0, "nav_offsets": [[0, 0], [1, -1], [0, 2], [-1, 0]],
-            "dp_offsets": [[0, 0]] * 4, "paths": ["a", "b", "c", "d"]}
-        if planes:
-            record["navigator_planes"] = data.sum(axis=(3, 4)).astype(np.float32)
-        signal.metadata.set_item(MULTIANGLE_METADATA, record)
-        signal.set_signal_type("electron_diffraction")
+        signal, data = saved_stack(
+            shells=shells, scan_shape=(6, 8), seed=5, planes=planes,
+            nav_offsets=[[0, 0], [1, -1], [0, 2], [-1, 0]])
         path = tmp_path / "acquisition.zspy"
         signal.save(str(path))
         return path, data

@@ -537,16 +537,9 @@ class TestTheRingOnAReopenedAcquisition:
     angles": every member lit, no handle, a node switch on every pick."""
 
     def _saved(self, tmp_path):
-        from spyde.signals.multiangle import MULTIANGLE_METADATA
+        from spyde.multiangle.synthetic import saved_stack
 
-        data = np.random.default_rng(3).integers(
-            0, 400, (4, 5, 6, 4, 4), dtype=np.uint16)
-        signal = hs.signals.Signal2D(data)
-        signal.metadata.set_item(MULTIANGLE_METADATA, {
-            "n_members": 4, "n_shells": 1, "tilts": [1.0] * 4,
-            "azimuths": [0.0, 90.0, 180.0, 270.0], "shell_ids": [0] * 4,
-            "reference": 0})
-        signal.set_signal_type("electron_diffraction")
+        signal, _data = saved_stack(shells=(0, 0, 0, 0), seed=3)
         path = tmp_path / "acquisition.zspy"
         signal.save(str(path))
         return path

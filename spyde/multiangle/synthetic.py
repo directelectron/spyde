@@ -302,3 +302,73 @@ def make_multiangle(
         images=images,
         patterns=patterns,
     )
+
+
+def saved_stack(*, members: int = 4, shells=(0, 0, 1, 1), scan_shape=(5, 6),
+                detector_shape=(4, 4), seed: int = 7, dtype=np.uint16,
+                tilts=None, nav_offsets=None, dp_offsets=None, planes=False,
+                signal_type: str = "electron_diffraction",
+                stack_type: bool = False, fill=None):
+    """A 5-D stack signal with its acquisition recorded the way a real
+    composition records it, for tests that save and reopen one.
+
+    Returns ``(signal, data)``. The record goes through
+    :func:`spyde.multiangle.signals._carry_metadata` — the ONE writer of
+    ``Acquisition.multiangle`` — so a change to what a composition records
+    cannot leave a test fixture describing a file no build produces. Eight
+    tests had each written the dict by hand, and no two agreed on its keys.
+
+    *tilts* default to 1° for every member of a single shell, and 0.5° / 1°
+    for the members of shell 0 / the rest otherwise. *stack_type* gives the
+    signal the multi-angle type the way :func:`build_stack_signal` does, with
+    the members' type recorded beside it; otherwise the signal keeps
+    *signal_type*, which is what a file composed before the type existed
+    carries. *fill* fixes every pixel to one value instead of noise.
+    """
+    import hyperspy.api as hs
+
+    from spyde.multiangle.model import MultiAngleModel
+    from spyde.multiangle.signals import _carry_metadata
+    from spyde.signals.multiangle import (
+        MULTIANGLE_METADATA, MULTIANGLE_SIGNAL_TYPE,
+    )
+
+    shells = [int(shell) for shell in shells]
+    if len(shells) != members:
+        raise ValueError(f"{len(shells)} shell ids for {members} members")
+    if tilts is None:
+        tilts = ([1.0] * members if len(set(shells)) == 1
+                 else [1.0 if shell else 0.5 for shell in shells])
+    zeros = np.zeros((members, 2), dtype=np.int64)
+    model = MultiAngleModel(
+        paths=[f"member{index}" for index in range(members)],
+        tilts=np.asarray(tilts, dtype=np.float64),
+        azimuths=np.array([index * 360.0 / members for index in range(members)]),
+        shell_ids=np.asarray(shells, dtype=np.int64),
+        nav_offsets=zeros if nav_offsets is None else np.asarray(nav_offsets, dtype=np.int64),
+        dp_offsets=zeros if dp_offsets is None else np.asarray(dp_offsets, dtype=np.int64),
+        reference=0)
+
+    shape = (members, *scan_shape, *detector_shape)
+    if fill is not None:
+        data = np.full(shape, fill).astype(dtype)
+    else:
+        data = np.random.default_rng(seed).integers(0, 400, shape).astype(dtype)
+    signal = hs.signals.Signal2D(data)
+    # The reference member the record is taken from: a stand-in carrying
+    # only the type, which is what a composition inherits from it.
+    reference = hs.signals.Signal2D(np.zeros((1, 1), dtype=np.uint8))
+    reference.set_signal_type(signal_type)
+    _carry_metadata(signal, [reference] * members, model)
+    if planes:
+        signal.metadata.set_item(
+            f"{MULTIANGLE_METADATA}.navigator_planes",
+            data.sum(axis=(3, 4)).astype(np.float32))
+    if stack_type:
+        signal.metadata.set_item(
+            f"{MULTIANGLE_METADATA}.member_signal_type", signal_type)
+        signal.set_signal_type(MULTIANGLE_SIGNAL_TYPE)
+    else:
+        signal.set_signal_type(signal_type)
+    return signal, np.asarray(data)
+
