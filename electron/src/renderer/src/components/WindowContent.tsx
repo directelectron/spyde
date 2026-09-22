@@ -74,6 +74,9 @@ if (typeof document !== 'undefined' && !document.getElementById('spyde-compute-p
 // All iframes stay MOUNTED; only the active one is shown (instant switch). A
 // ResizeObserver keeps the visible figure sized to its box (the single sizing
 // authority — handles window resize and the view-bar height).
+/** Least time between two resize messages to the backend during a drag. */
+const RESIZE_INTERVAL_MS = 100
+
 export function WindowContent({ win, iframeRefs, replayState, sendAction }: Props) {
   const id = String(win.windowId)
   const figs = win.figures
@@ -295,18 +298,34 @@ export function WindowContent({ win, iframeRefs, replayState, sendAction }: Prop
 
   // Resize the visible figure to its real box (window resize / bar height / the
   // view swap that revealed a previously-hidden iframe).
+  //
+  // Throttled, not per frame. A resize message round-trips through the Python
+  // backend, and the figure answers each one by re-sending EVERY plot's state
+  // to the iframe — for a map that is the whole image, base64, per step of the
+  // drag. Sent every frame, a corner drag on an orientation map queued dozens
+  // of full-image pushes behind the navigator's own traffic and the window
+  // lagged its cursor. At most one message per RESIZE_INTERVAL_MS, and always
+  // a trailing one, so the figure settles at the final size the box reads
+  // when the timer fires.
   const boxRef = useRef<HTMLDivElement | null>(null)
   useEffect(() => {
+    let last = 0
+    let timer: number | undefined
     const fit = () => {
+      last = performance.now()
       if (!shownId) return
       const el = iframeRefs.current.get(shownId)
       if (el && el.clientWidth && el.clientHeight)
         window.electron.resizeFigure(shownId, Math.max(80, el.clientWidth), Math.max(80, el.clientHeight))
     }
-    let raf = requestAnimationFrame(fit)
-    const ro = new ResizeObserver(() => { cancelAnimationFrame(raf); raf = requestAnimationFrame(fit) })
+    const schedule = () => {
+      window.clearTimeout(timer)
+      timer = window.setTimeout(fit, Math.max(0, RESIZE_INTERVAL_MS - (performance.now() - last)))
+    }
+    const raf = requestAnimationFrame(fit)
+    const ro = new ResizeObserver(schedule)
     if (boxRef.current) ro.observe(boxRef.current)
-    return () => { cancelAnimationFrame(raf); ro.disconnect() }
+    return () => { cancelAnimationFrame(raf); window.clearTimeout(timer); ro.disconnect() }
   }, [shownId, iframeRefs])
 
   const showBar = hasChips || hasIpfViews || !!strainComponents || hasNavChips
