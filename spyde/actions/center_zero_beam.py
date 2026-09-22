@@ -200,6 +200,72 @@ def _czb_show_found(src, tree, signal, beam_xy) -> None:
         log.debug("czb found-centre marker failed: %s", e)
 
 
+def _run_on_vectors(session, src, tree, signal, vectors, half_width_px: int,
+                    *, plane: bool, constant_shift=None) -> None:
+    """Centre a VECTORS tree: the beam is the brightest vector in the search
+    box at each position, one plane is fitted through it across the scan, and
+    every vector moves by centre minus plane — see ``vectors_center``. The
+    result is a new vectors tree beside the source, like a Find Vectors run.
+
+    ``constant_shift`` (the Manual tab's ``centre − picked``, in the axes'
+    units) skips the search and moves every vector by it.
+    """
+    from spyde.actions.vectors_center import center_vectors, shifted_vectors
+
+    # The vectors are in the units they were found in, which the window's
+    # axes may since have been converted from (a 1/nm scan reads in Å⁻¹), so
+    # the box is placed on the vectors' own axis records when they carry any.
+    sig_ax = list(getattr(vectors, "sig_axes", None) or signal.axes_manager.signal_axes)
+    scale_x, scale_y = float(sig_ax[0].scale), float(sig_ax[1].scale)
+    centre = (float(sig_ax[0].offset) + int(sig_ax[0].size) / 2.0 * scale_x,
+              float(sig_ax[1].offset) + int(sig_ax[1].size) / 2.0 * scale_y)
+    # A full-frame box (half-width 0) searches the whole pattern.
+    half = (half_width_px if half_width_px > 0
+            else max(int(sig_ax[0].size), int(sig_ax[1].size))) * abs(scale_x)
+    emit_status("Centering zero beam on the vectors…")
+
+    def _work():
+        try:
+            ny, nx = vectors.nav_shape
+            if constant_shift is not None:
+                shift = np.tile(np.asarray(constant_shift, float), (ny, nx, 1))
+                centred = shifted_vectors(vectors, shift)
+                found = None
+            else:
+                centred, shift, beam = center_vectors(vectors, centre, half, plane=plane)
+                found = int(np.isfinite(beam[..., 0]).sum())
+                if found == 0:
+                    emit_error("Center Zero Beam: no vector inside the box at "
+                               "any position — widen the box")
+                    return
+            from spyde.actions.find_vectors_action import build_vectors_result_tree
+            base = tree.root.metadata.get_item("General.title", "Vectors")
+            new_tree = build_vectors_result_tree(
+                session, centred, title=f"{base} — Centered")
+            provenance = getattr(new_tree.root.metadata, "Spyde", None)
+            if provenance is not None:
+                try:
+                    new_tree.root.metadata.set_item(
+                        "Spyde.provenance.params",
+                        {"half_width_px": int(half_width_px), "plane": bool(plane),
+                         "mean_shift": [float(v) for v in np.nanmean(shift, axis=(0, 1))]})
+                except Exception as e:
+                    log.debug("stamping the vectors centring params failed: %s", e)
+            mean = np.nanmean(shift, axis=(0, 1))
+            emit_status(f"Zero beam centered on the vectors (mean shift "
+                        f"{mean[0]:+.3g}, {mean[1]:+.3g} {sig_ax[0].units}"
+                        + (f", beam found at {found}/{ny * nx} positions)"
+                           if found is not None else ")"))
+            emit({"type": "czb_done", "window_id": getattr(src, "window_id", None),
+                  "mode": "auto" if constant_shift is None else "manual"})
+        except Exception as e:
+            emit_error(f"Center Zero Beam (vectors) failed: {e}")
+            log.exception("Center Zero Beam (vectors) failed")
+
+    from spyde.actions.lifecycle import run_on_worker
+    run_on_worker(session, _work, name="czb-vectors")
+
+
 def _display(src, tree, new_signal) -> None:
     """Switch the source DP to the new (centered) node, re-slice from the
     navigator, and refresh the Workflow panel (the shared lifecycle helper)."""
@@ -236,6 +302,10 @@ def czb_run(session, plot, payload) -> None:
     if live_hw is not None:
         hw = live_hw
     flat = bool(payload.get("make_flat_field", False))
+    vectors = getattr(tree, "diffraction_vectors", None)
+    if vectors is not None:
+        _run_on_vectors(session, src, tree, signal, vectors, hw, plane=flat)
+        return
     emit_status("Centering zero beam…")
 
     from spyde.actions.lifecycle import supersede
@@ -361,6 +431,19 @@ def czb_pick(session, plot, payload) -> None:
         cx, cy = payload.get("cx"), payload.get("cy")
     if cx is None or cy is None:
         emit_error("Center Zero Beam: place the crosshair first")
+        return
+
+    vectors = getattr(tree, "diffraction_vectors", None)
+    if vectors is not None:
+        # In the vectors' own units — see _run_on_vectors. The pick is in
+        # image pixels, so it converts through the same records.
+        sig_ax = list(getattr(vectors, "sig_axes", None) or signal.axes_manager.signal_axes)
+        centre_x = float(sig_ax[0].offset) + int(sig_ax[0].size) / 2.0 * float(sig_ax[0].scale)
+        centre_y = float(sig_ax[1].offset) + int(sig_ax[1].size) / 2.0 * float(sig_ax[1].scale)
+        picked_x = float(sig_ax[0].offset) + float(cx) * float(sig_ax[0].scale)
+        picked_y = float(sig_ax[1].offset) + float(cy) * float(sig_ax[1].scale)
+        _run_on_vectors(session, src, tree, signal, vectors, 0, plane=True,
+                        constant_shift=(centre_x - picked_x, centre_y - picked_y))
         return
 
     from spyde.actions.lifecycle import supersede
