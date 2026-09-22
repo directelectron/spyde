@@ -279,6 +279,8 @@ class ActionRouterMixin:
                 self._apply_focus_budgets(wid)
         elif action == "save_signal":
             self._save_signal(payload.get("path"), plot)
+        elif action == "export_numpy":
+            self._export_numpy(payload.get("path"), plot, window_id)
         elif action == "set_colormap":
             # Controller fallback: bare-figure windows (strain map, IPF views…)
             # have no Plot, but their controller may duck-type set_colormap /

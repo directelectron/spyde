@@ -539,6 +539,27 @@ class StrainController(WizardController):
                 self.overlay.set_reference(self.ref_yx, self._g_ref_full)
         self._recompute()
 
+    def export_arrays(self) -> dict:
+        """The live window's maps for File → Export to NumPy: the four
+        components as shown (percent, degrees) under their labels, and the
+        fit's own fractional field and coverage under plain names. An empty
+        dict before the first fit."""
+        if self.field is None:
+            return {}
+        from spyde.actions._common import STRAIN_TITLES
+        from spyde.actions.strain_display import display_component
+        out = {STRAIN_TITLES[c]: display_component(self.field, c) for c in _COMPONENTS}
+        out.update({
+            "strain_exx": self.field.exx, "strain_eyy": self.field.eyy,
+            "strain_exy": self.field.exy, "rotation_rad": self.field.omega,
+            "coverage": self.field.coverage,
+        })
+        for name in ("residual", "n_matched"):
+            value = getattr(self.field, name, None)
+            if value is not None:
+                out[name] = value
+        return out
+
     def commit(self):
         """Freeze the current strain field as a NEW SignalTree — εxx is the signal
         plot, εyy / εxy / ω ride along as chip-selectable view figures (same shape
