@@ -183,6 +183,11 @@ export function MenuBar({ onStartGuide, onShowInfo }: {
       },
       { separator: true },
       { label: 'Save Signal…', onClick: () => window.electron.saveDialog() },
+      {
+        label: 'Export to NumPy…',
+        testId: 'menu-export-numpy',
+        onClick: () => window.electron.exportNumpyDialog(),
+      },
       { separator: true },
       { label: 'Quit', onClick: () => window.electron.quit() },
     ],

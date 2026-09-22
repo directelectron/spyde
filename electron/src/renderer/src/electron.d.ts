@@ -21,6 +21,7 @@ declare global {
       openZarrFolder: () => Promise<void>
       quit: () => Promise<void>
       saveDialog: () => Promise<void>
+      exportNumpyDialog: () => Promise<void>
       pickFile: (opts: { name?: string; extensions?: string[] }) => Promise<string | null>
       pickFiles: (opts?: { name?: string; extensions?: string[] }) => Promise<string[]>
       pickFolders: () => Promise<string[]>

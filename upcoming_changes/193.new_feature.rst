@@ -1,0 +1,1 @@
+File → Export to NumPy… wrote what the focused window shows — a committed strain, DPC or orientation map with every component and the fit behind it, a virtual image, a line profile, or the spectrum under the navigator — to a ``.npz`` (or ``.npy`` / ``.csv``) with its calibrated axes and a record of each array's label, units and provenance.
