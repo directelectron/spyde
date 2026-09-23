@@ -13,7 +13,8 @@ as strain's εxx/εyy/εxy strip):
                           selector (so the DP follows whichever panel you drag):
 
       – 2-D navigator (4D-STEM): TILE side by side (``subplots(1, N)``,
-        sharex/sharey → linked pan/zoom) with a crosshair on every panel.
+        sharex/sharey → linked pan/zoom) with a copy of every navigation
+        selector's crosshair on every panel, each following its selector.
       – 1-D navigator (in-situ MOVIE / time series): STACK as rows
         (``subplots(N, 1, sharex=True)`` → one shared time axis) with a single
         logical time cursor — one draggable vertical line per row, all kept in
@@ -94,7 +95,8 @@ def select_navigator(session, plot, payload) -> None:
     if not names or mgr is None:
         return
     if len(names) == 1:
-        _teardown_stacked(session, plot)
+        _tiled_navigators(session).pop(getattr(plot, "window_id", None), None)
+        _teardown_view_cursors(session, plot)
         _switch_navigator(tree, plot, names[0])
         emit_navigator_options(tree)
     elif _tree_nav_is_1d(tree):
@@ -135,15 +137,46 @@ def _switch_navigator(tree, plot, name: str) -> None:
               getattr(plot, "window_id", None))
 
 
+def _tiled_navigators(session) -> dict:
+    """window_id → the navigator names currently tiled in that window."""
+    if not hasattr(session, "_tiled_navigators"):
+        session._tiled_navigators = {}
+    return session._tiled_navigators
+
+
+def refresh_tiled_navigators(session, plot_window) -> None:
+    """Rebuild the tiled figure of a navigator window that is currently tiled,
+    so it carries one crosshair per selector after a selector is added or
+    removed. A no-op for a window that is not tiled."""
+    names = _tiled_navigators(session).get(getattr(plot_window, "window_id", None))
+    if not names:
+        return
+    mgr = getattr(plot_window, "multiplot_manager", None)
+    plot = _nav_plot_for_window(mgr, plot_window) if mgr is not None else None
+    tree = getattr(plot, "signal_tree", None) if plot is not None else None
+    if tree is not None:
+        _tile_navigators(session, plot, tree, names)
+
+
+def _crosshair_widget(selector):
+    """The crosshair widget of a 2-D navigation selector (the composite's point
+    sub-selector, or the selector itself when it is a bare crosshair)."""
+    return getattr(getattr(selector, "_crosshair_selector", selector), "_widget", None)
+
+
 def _tile_navigators(session, plot, tree, names) -> None:
     """Build ONE figure with the selected navigators side by side: sharex/sharey
-    (linked pan/zoom) + a crosshair on every panel, linked together AND wired to
-    the tree's real navigation selector so dragging any panel drives the DP."""
+    (linked pan/zoom) and, on every panel, one crosshair per navigation selector
+    of this window.
+
+    Each selector's own crosshair on the live navigator is the MASTER: a panel's
+    crosshair only forwards a drag to it, and every panel mirrors it back (see
+    ``_LinkedNavCursor``), so all copies of one selector agree on one position."""
     import anyplotlib as apl
     import anyplotlib._electron as _electron
     from spyde.drawing.plots.plot import finalize_figure_html
     from de_shell.actions.figure_registry import keep_alive
-    from spyde.actions.views import _link_crosshairs, TILED_LABEL
+    from spyde.actions.views import TILED_LABEL
     from de_shell.ipc import emit
 
     wid = getattr(plot, "window_id", None)
@@ -158,21 +191,34 @@ def _tile_navigators(session, plot, tree, names) -> None:
         pairs.append((name, np.nan_to_num(np.asarray(sig.data, np.float32))))
     if len(pairs) < 2:
         return
+    _tiled_navigators(session)[int(wid)] = list(names)
+    _teardown_view_cursors(session, plot)
+    mgr = tree.navigator_plot_manager
+    selectors = [
+        sel for sel in mgr.navigation_selectors.get(getattr(plot, "plot_window", None), [])
+        if _crosshair_widget(sel) is not None
+    ]
 
     try:
         fig, axes = apl.subplots(1, len(pairs), sharex=True, sharey=True)
         arr_axes = np.array(axes, dtype=object).ravel()
-        widgets = []
+        copies = {id(sel): [] for sel in selectors}
         for ax, (name, img) in zip(arr_axes, pairs):
             p = ax.imshow(img, cmap="gray")
             try:
                 ax.set_title(name)
             except Exception as e:
                 log.debug("set_title on tiled navigator failed: %s", e)
-            h, w = img.shape[:2]
-            widgets.append(p.add_crosshair_widget(cx=w / 2.0, cy=h / 2.0))
-        _link_crosshairs(widgets)
-        _wire_to_real_selector(session, wid, widgets)
+            for sel in selectors:
+                master = _crosshair_widget(sel)
+                copies[id(sel)].append(p.add_crosshair_widget(
+                    cx=float(master.cx), cy=float(master.cy),
+                    color=getattr(sel, "color", None) or "green"))
+        _view_cursors(session)[int(wid)] = [
+            _LinkedNavCursor(session, sel, _crosshair_widget(sel),
+                             copies[id(sel)], ("cx", "cy"))
+            for sel in selectors
+        ]
 
         fig_id = _electron.register(fig)
         html = finalize_figure_html(fig, fig_id)
@@ -228,150 +274,128 @@ def _selector_axis(sel):
         return 1.0, 0.0
 
 
-class _StackedNavCursor:
-    """One shared, linked time cursor across the stacked 1-D navigator rows.
+class _LinkedNavCursor:
+    """Display copies of ONE navigation selector's widget, linked to it.
 
-    Owns the per-row VLine widgets, the reference to the tree's REAL 1-D
-    navigation selector, and a single re-entrancy guard that covers BOTH
-    directions of the loop:
+    The selector's own widget on the live navigator is the MASTER and the only
+    holder of the position. Each copy (a stacked row's line, a tiled panel's
+    crosshair):
 
-      • a DRAG on any row's line → write the position onto the real selector's
-        VLine and fire ``delayed_update_data(force=True)`` (the normal nav
-        cascade repaints the signal/image plot), then mirror it to the other
-        rows;
-      • a PROGRAMMATIC selector move (playback clock, chain re-fire) → the real
-        selector commits a new index and fires this cursor's ``index_hook``,
-        which sets every row's line ``x`` to match.
+      • forwards a drag to the master — the master's normal update path then
+        drives the signal plot — and mirrors it onto the other copies;
+      • follows the master whenever the selector commits a position, from any
+        source (a drag on the live navigator, playback stepping, a 5-D chain
+        re-fire): an ``index_hook`` on the selector copies the master's
+        position onto every copy.
 
-    The guard (``_busy``) stops the ``set → pointer_move → handler → set`` echo
-    (widget ``.set`` fires ``pointer_move``) AND the drive→hook→drive loop.
-    Position writes to widgets are UI updates, so when the sync originates on the
-    ``_NavDispatcher`` thread (the index_hook) they are marshalled onto the
-    asyncio main thread via ``session._dispatch_to_main``."""
+    Every write to a copy passes ``_notify=False`` so it cannot echo back as a
+    drag. The hook runs on the navigation dispatcher thread, so the widget
+    writes are marshalled onto the main thread, and they read the master's
+    position at that moment rather than the committed index: the dispatcher
+    lags a drag, and an older index would pull the dragged copy backwards."""
 
-    def __init__(self, session, window_id: int, widgets, sel):
+    def __init__(self, session, sel, master, widgets, fields):
         self.session = session
-        self.window_id = int(window_id)
-        self.widgets = list(widgets)
         self.sel = sel
-        self._busy = False
-        self._handlers: list = []  # keep wrapper refs alive (weak registration)
+        self.master = master
+        self.widgets = list(widgets)
+        self.fields = tuple(fields)
+        self._handlers: list = []  # widget callbacks are held weakly
         self._closed = False
-        self._wire_drag()
-        self._install_index_hook()
-
-    # ── row line dragged → drive the real selector + mirror the other rows ──
-    def _wire_drag(self) -> None:
-        for w in self.widgets:
-            h = self._make_drag_handler(w)
-            self._handlers.append(h)
-            for et in ("pointer_move", "pointer_up"):
+        for widget in self.widgets:
+            handler = self._make_drag_handler(widget)
+            self._handlers.append(handler)
+            for event_type in ("pointer_move", "pointer_up"):
                 try:
-                    w.add_event_handler(h, et)
+                    widget.add_event_handler(handler, event_type)
                 except Exception as e:
-                    log.debug("wiring stacked cursor %s handler failed: %s", et, e)
+                    log.debug("wiring linked cursor %s handler failed: %s", event_type, e)
+        self._index_hook = self._on_selector_index
+        try:
+            self.sel.index_hooks.append(self._index_hook)
+        except Exception as e:
+            log.debug("installing linked cursor index hook failed: %s", e)
 
-    def _make_drag_handler(self, src):
+    def _position(self, widget) -> dict:
+        return {field: float(widget.get(field)) for field in self.fields}
+
+    def _make_drag_handler(self, source):
         def handler(_ev=None):
-            if self._busy:
+            if self._closed:
                 return
-            self._busy = True
+            position = self._position(source)
+            for widget in self.widgets:
+                if widget is not source:
+                    self._set_quietly(widget, position)
             try:
-                x = float(src.get("x"))
-                # Mirror to the other rows so the cursor is one logical line.
-                for w in self.widgets:
-                    if w is src:
-                        continue
-                    try:
-                        w.set(x=x)
-                    except Exception as e:
-                        log.debug("mirroring stacked cursor line failed: %s", e)
-                # Drive the tree's REAL 1-D navigation selector (same path a
-                # normal drag on the live navigator takes).
-                widget = _selector_vline_widget(self.sel)
-                if widget is not None:
-                    try:
-                        widget.x = x
-                    except Exception as e:
-                        log.debug("writing real selector x failed: %s", e)
-                try:
-                    self.sel.delayed_update_data(force=True)
-                except Exception as e:
-                    log.debug("driving real selector from stacked cursor failed: %s", e)
-            finally:
-                self._busy = False
+                self.master.set(**position)
+                self.sel.delayed_update_data(force=True)
+            except Exception as e:
+                log.debug("driving the navigation selector from a copy failed: %s", e)
         return handler
 
-    # ── selector moved (any source) → sync every row's line ──────────────
-    def _install_index_hook(self) -> None:
-        """Hang the sync off the SELECTOR's generic update path so ANY move —
-        drag, playback (translate_pixels + delayed_update_data), 5-D chain
-        re-fire — moves the lines. ``index_hooks`` fire in ``_run_update`` on
-        the ``_NavDispatcher`` thread with the committed indices."""
-        hook = self._on_selector_index
-        self._index_hook = hook
-        try:
-            self.sel.index_hooks.append(hook)
-        except Exception as e:
-            log.debug("installing stacked cursor index hook failed: %s", e)
+    def _on_selector_index(self, _indices) -> None:
+        if not self._closed:
+            self.session._dispatch_to_main(self._follow_master)
 
-    def _on_selector_index(self, indices) -> None:
+    def _follow_master(self) -> None:
         if self._closed:
             return
-        try:
-            idx = int(np.asarray(indices).ravel()[0])
-        except Exception:
-            return
-        scale, offset = _selector_axis(self.sel)
-        x = idx * scale + offset
-        # Marshal the widget writes onto the main thread (the hook runs on the
-        # nav-dispatcher thread).
-        self.session._dispatch_to_main(lambda: self._set_all_lines(x))
+        position = self._position(self.master)
+        for widget in self.widgets:
+            self._set_quietly(widget, position)
 
-    def _set_all_lines(self, x: float) -> None:
-        if self._closed or self._busy:
+    @staticmethod
+    def _set_quietly(widget, position: dict) -> None:
+        if all(widget.get(field) == value for field, value in position.items()):
             return
-        self._busy = True
         try:
-            for w in self.widgets:
-                try:
-                    w.set(x=float(x))
-                except Exception as e:
-                    log.debug("syncing stacked cursor line failed: %s", e)
-        finally:
-            self._busy = False
+            # A widget-only update never reaches the panel's stored state, which
+            # the renderer restores after a drag in another panel — a tiled
+            # copy snapped back to where it was built. So push the whole panel
+            # when its pixels travel separately (an image), which keeps that
+            # push small; a 1-D panel would resend its whole trace every frame.
+            panel = widget._plot
+            if getattr(panel, "_GEOM_KEYS", None):
+                widget.set(_notify=False, _push=False, **position)
+                panel._push()
+            else:
+                widget.set(_notify=False, **position)
+        except Exception as e:
+            log.debug("syncing a linked cursor copy failed: %s", e)
 
     def close(self) -> None:
-        """Tear down: detach the index hook so a torn-down stacked view can't
-        keep syncing (and can be GC'd). Called on chip switch-back / window
-        close."""
+        """Detach from the selector so a torn-down view stops following it."""
         self._closed = True
         try:
             if self._index_hook in self.sel.index_hooks:
                 self.sel.index_hooks.remove(self._index_hook)
         except Exception as e:
-            log.debug("removing stacked cursor index hook failed: %s", e)
+            log.debug("removing linked cursor index hook failed: %s", e)
         self.widgets = []
 
 
-def _stacked_cursors(session) -> dict:
-    if not hasattr(session, "_stacked_nav_cursors"):
-        session._stacked_nav_cursors = {}
-    return session._stacked_nav_cursors
+def _view_cursors(session) -> dict:
+    """window_id → the ``_LinkedNavCursor``s of that window's stacked or tiled
+    navigator figure."""
+    if not hasattr(session, "_nav_view_cursors"):
+        session._nav_view_cursors = {}
+    return session._nav_view_cursors
 
 
-def _teardown_stacked(session, plot) -> None:
-    """Remove any stacked cursor previously built for this navigator window (its
-    index hook detaches from the real selector). Idempotent."""
-    wid = getattr(plot, "window_id", None)
-    if wid is None:
-        return
-    cursor = _stacked_cursors(session).pop(int(wid), None)
-    if cursor is not None:
+def close_view_cursors(session, window_id) -> None:
+    """Close every linked cursor of a navigator window. Idempotent."""
+    for cursor in _view_cursors(session).pop(window_id, []):
         try:
             cursor.close()
         except Exception as e:
-            log.debug("tearing down stacked cursor failed: %s", e)
+            log.debug("closing linked nav cursor failed: %s", e)
+
+
+def _teardown_view_cursors(session, plot) -> None:
+    window_id = getattr(plot, "window_id", None)
+    if window_id is not None:
+        close_view_cursors(session, int(window_id))
 
 
 def _stack_navigators(session, plot, tree, names) -> None:
@@ -400,18 +424,13 @@ def _stack_navigators(session, plot, tree, names) -> None:
         return
 
     sel = _real_nav_selector(session, int(wid))
+    master = _selector_vline_widget(sel) if sel is not None else None
     scale, offset = _selector_axis(sel) if sel is not None else (1.0, 0.0)
-    # Current frame index → the cursor starts on the live selector position.
-    cur_idx = 0
-    if sel is not None and getattr(sel, "current_indices", None) is not None:
-        try:
-            cur_idx = int(np.asarray(sel.current_indices).ravel()[0])
-        except Exception:
-            cur_idx = 0
-    cur_x = cur_idx * scale + offset
+    # The rows start on the live selector position.
+    cur_x = float(master.get("x")) if master is not None else offset
 
-    # Tear down any previous stacked cursor on this window before rebuilding.
-    _teardown_stacked(session, plot)
+    _tiled_navigators(session).pop(int(wid), None)
+    _teardown_view_cursors(session, plot)
 
     try:
         fig, axes = apl.subplots(len(pairs), 1, sharex=True)
@@ -426,13 +445,13 @@ def _stack_navigators(session, plot, tree, names) -> None:
             except Exception as e:
                 log.debug("set_title on stacked navigator failed: %s", e)
             try:
-                widgets.append(p.add_vline_widget(x=float(cur_x), color="#ff9100"))
+                widgets.append(p.add_vline_widget(x=cur_x, color="#ff9100"))
             except Exception as e:
                 log.debug("adding vline to stacked navigator failed: %s", e)
 
-        if len(widgets) >= 2 and sel is not None:
-            cursor = _StackedNavCursor(session, int(wid), widgets, sel)
-            _stacked_cursors(session)[int(wid)] = cursor
+        if len(widgets) >= 2 and master is not None:
+            _view_cursors(session)[int(wid)] = [
+                _LinkedNavCursor(session, sel, master, widgets, ("x",))]
 
         fig_id = _electron.register(fig)
         html = finalize_figure_html(fig, fig_id)
@@ -521,34 +540,3 @@ def extract_navigator(session, plot, payload) -> None:
         on_tree=_calibrate,
     )
     emit_status(f"Extracted navigator {name!r} to a new signal tree")
-
-
-def _wire_to_real_selector(session, window_id: int, widgets) -> None:
-    """Each tiled crosshair drives the tree's REAL navigation selector (the one
-    on the live navigator plot), so navigation keeps working while tiled."""
-    sel = getattr(session, "_nav_selectors", {}).get(window_id)
-    if sel is None:
-        return
-    cross = getattr(sel, "_crosshair_selector", sel)
-    widget = getattr(cross, "_widget", None)
-    if widget is None:
-        return
-
-    def make(w):
-        def handler(_ev=None):
-            try:
-                cx, cy = w.get("cx"), w.get("cy")
-                widget.cx = float(cx)
-                widget.cy = float(cy)
-                sel.delayed_update_data(force=True)
-            except Exception as e:
-                log.debug("driving real selector from tiled navigator failed: %s", e)
-        return handler
-
-    for w in widgets:
-        h = make(w)
-        for et in ("pointer_move", "pointer_up"):
-            try:
-                w.add_event_handler(h, et)
-            except Exception as e:
-                log.debug("wiring tiled navigator %s handler failed: %s", et, e)

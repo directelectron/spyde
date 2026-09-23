@@ -95,7 +95,7 @@ class TestStackedBuild:
         assert fig["is_navigator"] is True
 
         # The cursor object is registered for this navigator window.
-        cursor = session._stacked_nav_cursors.get(wid)
+        cursor = session._nav_view_cursors.get(wid, [None])[0]
         assert cursor is not None
         # One VLine widget per stacked row (2 navigators → 2 rows/lines).
         assert len(cursor.widgets) == 2
@@ -113,7 +113,7 @@ class TestStackedBuild:
         _settle(session, sel)
 
         nv.select_navigator(session, plot, {"names": ["base", "peak"], "window_id": wid})
-        cursor = session._stacked_nav_cursors[wid]
+        cursor = session._nav_view_cursors[wid][0]
         # Each row's line starts on the live frame (x = index * scale).
         for w in cursor.widgets:
             assert abs(float(w.get("x")) - 3 * 0.1) < 1e-6
@@ -130,7 +130,7 @@ class TestStackedBuild:
         stacked = [m for m in msgs if m.get("type") == "figure"
                    and m.get("view_kind") == "stacked"]
         assert not stacked
-        assert session._stacked_nav_cursors.get(wid) is None
+        assert not session._nav_view_cursors.get(wid)
 
 
 # ── (b) dragging a row's line drives the real selector ───────────────────────
@@ -144,7 +144,7 @@ class TestStackedDrag:
         sel = _real_selector(session)
 
         nv.select_navigator(session, plot, {"names": ["base", "peak"], "window_id": wid})
-        cursor = session._stacked_nav_cursors[wid]
+        cursor = session._nav_view_cursors[wid][0]
         assert len(cursor.widgets) == 2
 
         # Simulate a drag on ROW 2's line: set its x to frame 5 (x = 5 * 0.1),
@@ -169,7 +169,7 @@ class TestStackedDrag:
         sel = _real_selector(session)
 
         nv.select_navigator(session, plot, {"names": ["base", "peak"], "window_id": wid})
-        cursor = session._stacked_nav_cursors[wid]
+        cursor = session._nav_view_cursors[wid][0]
 
         row1, row2 = cursor.widgets
         row2.set(x=4 * 0.1)      # drag row 2
@@ -189,7 +189,7 @@ class TestStackedProgrammaticSync:
         sel = _real_selector(session)
 
         nv.select_navigator(session, plot, {"names": ["base", "peak"], "window_id": wid})
-        cursor = session._stacked_nav_cursors[wid]
+        cursor = session._nav_view_cursors[wid][0]
 
         # This is exactly what the playback clock does: translate the real
         # selector's pixel position then request an update. The stacked cursor is
@@ -215,7 +215,7 @@ class TestStackedProgrammaticSync:
         sel = _real_selector(session)
 
         nv.select_navigator(session, plot, {"names": ["base", "peak"], "window_id": wid})
-        cursor = session._stacked_nav_cursors[wid]
+        cursor = session._nav_view_cursors[wid][0]
         assert cursor._index_hook in sel.index_hooks
 
 
@@ -230,14 +230,14 @@ class TestStackedTeardown:
         sel = _real_selector(session)
 
         nv.select_navigator(session, plot, {"names": ["base", "peak"], "window_id": wid})
-        cursor = session._stacked_nav_cursors[wid]
+        cursor = session._nav_view_cursors[wid][0]
         hook = cursor._index_hook
         assert hook in sel.index_hooks
 
         # Click a single chip → back to one navigator; the cursor is gone and its
         # index hook is detached from the real selector.
         nv.select_navigator(session, plot, {"names": ["base"], "window_id": wid})
-        assert session._stacked_nav_cursors.get(wid) is None
+        assert not session._nav_view_cursors.get(wid)
         assert hook not in sel.index_hooks
         assert cursor._closed is True
 
@@ -249,12 +249,12 @@ class TestStackedTeardown:
         sel = _real_selector(session)
 
         nv.select_navigator(session, plot, {"names": ["base", "peak"], "window_id": wid})
-        cursor = session._stacked_nav_cursors[wid]
+        cursor = session._nav_view_cursors[wid][0]
         hook = cursor._index_hook
         assert hook in sel.index_hooks
 
         session._forget_window(wid)
-        assert session._stacked_nav_cursors.get(wid) is None
+        assert not session._nav_view_cursors.get(wid)
         assert hook not in sel.index_hooks
 
     def test_rebuild_replaces_the_prior_cursor(self, movie_dataset):
@@ -266,14 +266,14 @@ class TestStackedTeardown:
         sel = _real_selector(session)
 
         nv.select_navigator(session, plot, {"names": ["base", "peak"], "window_id": wid})
-        first = session._stacked_nav_cursors[wid]
+        first = session._nav_view_cursors[wid][0]
         first_hook = first._index_hook
 
         # Re-⇧-click a different set → the old cursor is torn down, a new one built
         # (no leaked/duplicated index hooks on the real selector).
         nv.select_navigator(session, plot,
                             {"names": ["base", "peak", "peak2"], "window_id": wid})
-        second = session._stacked_nav_cursors[wid]
+        second = session._nav_view_cursors[wid][0]
         assert second is not first
         assert first._closed is True
         assert first_hook not in sel.index_hooks
