@@ -74,7 +74,7 @@ test('dask_stats shows the HUD; click opens the per-worker popover', async () =>
   await expect(page.getByTestId('dask-worker-1')).toContainText('97%')
   await expect(page.getByTestId('dask-worker-1')).toContainText('3+5')
   await expect(page.getByTestId('dask-worker-0')).toContainText('–')  // idle worker
-  await expect(page.getByTestId('dask-gpu-row')).toContainText('2.9/8.0')
+  await expect(page.getByTestId('dask-gpu-row')).toContainText('3.1 GB/8.6 GB')
   // No manual Trim button (removed — the backend trims automatically post-batch).
   await expect(page.getByTestId('dask-trim')).toHaveCount(0)
 

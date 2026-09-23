@@ -48,6 +48,7 @@ import { COLORMAPS } from '../kernel/colormaps'
 import { useKeyedDebounce } from './wizardHooks'
 import { CellChrome } from './CellChrome'
 import { AddFigureMenu } from './AddFigureMenu'
+import { NumInput } from './WizardShell'
 import {
   ComposeZones, ZONE_TILE, hoverZoneAt, panelLabel, PANEL_LETTERS,
   type ComposeMode, type HoverZone,
@@ -1079,10 +1080,8 @@ function scalarOf(val: unknown, fallback: number): number {
   return Number.isFinite(n) && n > 0 ? n : fallback
 }
 
-// A tiny labelled number input. Local draft (so partial typing like "1." isn't
-// clobbered by the round-trip), resynced when the upstream value moves; every
-// parseable change commits CLAMPED so the backend never sees an out-of-range
-// width/size.
+// A tiny labelled number input that sends only values inside [min, max], so the
+// backend never sees an out-of-range width/size.
 function NumBox({ value, min, max, step, testid, label, onCommit }: {
   value: number
   min: number
@@ -1092,26 +1091,10 @@ function NumBox({ value, min, max, step, testid, label, onCommit }: {
   label: string
   onCommit: (v: number) => void
 }) {
-  const [draft, setDraft] = React.useState(String(value))
-  React.useEffect(() => { setDraft(String(value)) }, [value])
   return (
-    <span style={styles.numWrap}>
-      <span style={styles.hint}>{label}</span>
-      <input
-        type="number"
-        data-testid={testid}
-        style={styles.numInput}
-        min={min} max={max} step={step}
-        value={draft}
-        onChange={(e) => {
-          setDraft(e.target.value)
-          const v = Number(e.target.value)
-          if (e.target.value !== '' && Number.isFinite(v)) {
-            onCommit(Math.min(max, Math.max(min, v)))
-          }
-        }}
-      />
-    </span>
+    <NumInput value={value} min={min} max={max} step={String(step)} testid={testid}
+      label={label} style={styles.numInput} onChange={onCommit}
+      accept={(v) => v >= min && v <= max} />
   )
 }
 
@@ -2295,7 +2278,6 @@ const styles: Record<string, React.CSSProperties> = {
     border: '1px solid rgba(0,0,0,0.45)', cursor: 'pointer',
   },
   presetDotActive: { boxShadow: '0 0 0 2px #89b4fa' },
-  numWrap: { display: 'flex', alignItems: 'center', gap: 3 },
   numInput: {
     width: 42, background: '#11111b', color: '#cdd6f4',
     border: '1px solid #313244', borderRadius: 4, padding: '1px 4px',
