@@ -90,6 +90,10 @@ function TreeNodes({ nodes, depth, activeId, windowId, onPick }:
 // UNLESS the caller has no value at all (the axes table's null scale/offset),
 // signalled by passing "" — that still renders as "—" via the placeholder
 // branch below.
+//
+// Not `NumInput`, which sends every keystroke: typing a scale of 0.05 would
+// send 0 first, and the backend rescales the offset with the scale, so the
+// offset would be lost.
 function EditableCell({ value, display, editable, onCommit, testid }:
   { value: string; display?: React.ReactNode; editable: boolean
     onCommit: (v: string) => void; testid: string }) {
