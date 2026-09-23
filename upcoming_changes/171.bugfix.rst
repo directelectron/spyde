@@ -1,0 +1,1 @@
+Side-by-side navigators now keep every panel's crosshair on the navigator's one position: dragging a crosshair in one panel moves the others to it without them snapping back, the panels start where the navigator already was, and a selector added while the navigators are tiled shows its crosshair on every panel.
