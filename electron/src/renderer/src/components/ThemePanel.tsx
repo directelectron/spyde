@@ -21,6 +21,7 @@
 import React, { useRef, useState } from 'react'
 import { useSpyDE } from '../kernel/SpyDEContext'
 import { DECK_THEME_DEFAULTS, type DeckTheme } from '../kernel/protocol'
+import { formatBytes } from '../kernel/format'
 
 /** Cap an embedded logo. It rides in the document AND in every report_state
  *  broadcast, so a 10 MB PNG would bloat both for a 30 px-tall mark. */
@@ -114,7 +115,7 @@ export function ThemePanel({ theme, onClose }: {
 
   const pickLogo = async (file: File) => {
     if (file.size > LOGO_MAX_BYTES) {
-      setNote(`That image is ${(file.size / 1e6).toFixed(1)} MB — keep a logo under 2 MB.`)
+      setNote(`That image is ${formatBytes(file.size)} — keep a logo under 2 MB.`)
       return
     }
     const dataUrl = await new Promise<string>((resolve, reject) => {

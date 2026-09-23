@@ -16,6 +16,7 @@ import React from 'react'
 import { useSpyDE } from '../kernel/SpyDEContext'
 import type { DaskStatsMessage } from '../kernel/protocol'
 import { Dropdown } from './Dropdown'
+import { formatBytes } from '../kernel/format'
 
 const RAM_OPTS = [
   { value: '0.4', label: '40% of RAM' }, { value: '0.5', label: '50% of RAM' },
@@ -48,7 +49,10 @@ const STALE_MS = 7_000          // hide after ~3 missed samples
 const pctColor = (p: number) =>
   p >= 95 ? '#f38ba8' : p >= 80 ? '#f9e2af' : '#a6e3a1'
 
-const fmtGB = (bytes: number) => (bytes / 1024 ** 3).toFixed(1)
+/** "1.9 GB/7.5 GB" — memory used, out of its limit when there is one. */
+const usage = (used: number, limit: number) =>
+  formatBytes(used, '0 B') + (limit > 0 ? `/${formatBytes(limit)}` : '')
+const MEBIBYTE = 2 ** 20  // nvidia-smi reports memory in MiB
 
 export function DaskMonitor() {
   const { state, sendAction } = useSpyDE()
@@ -132,7 +136,7 @@ export function DaskMonitor() {
             <span style={S.wname} />
             <div style={{ flex: 1 }}>cpu</div>
             <span style={S.wnum} />
-            <span style={S.wmem}>mem (GB)</span>
+            <span style={S.wmem}>mem</span>
             <span style={S.wtasks}>tasks</span>
           </div>
           {stats.workers.map((w) => (
@@ -144,7 +148,7 @@ export function DaskMonitor() {
               </div>
               <span style={S.wnum}>{w.cpu.toFixed(0)}%</span>
               <span style={S.wmem}>
-                {fmtGB(w.mem)}{w.mem_limit > 0 ? `/${fmtGB(w.mem_limit)}` : ''}
+                {usage(w.mem, w.mem_limit)}
               </span>
               <span style={S.wtasks}
                 title={`${w.executing} running${w.ready ? `, ${w.ready} queued` : ''}`}>
@@ -163,7 +167,7 @@ export function DaskMonitor() {
               </div>
               <span style={S.wnum}>{gpu.util.toFixed(0)}%</span>
               <span style={S.wmem}>
-                {(gpu.vram_used / 1024).toFixed(1)}/{(gpu.vram_total / 1024).toFixed(1)}
+                {usage(gpu.vram_used * MEBIBYTE, gpu.vram_total * MEBIBYTE)}
               </span>
               <span style={S.wtasks} />
             </div>
@@ -267,7 +271,7 @@ const S: Record<string, React.CSSProperties> = {
   track: { flex: 1, height: 5, borderRadius: 3, background: '#313244', overflow: 'hidden' },
   fill: { height: '100%', borderRadius: 3, transition: 'width 300ms linear' },
   wnum: { width: 32, textAlign: 'right', flexShrink: 0 },
-  wmem: { width: 66, textAlign: 'right', color: '#a6adc8', flexShrink: 0 },
+  wmem: { width: 86, textAlign: 'right', color: '#a6adc8', flexShrink: 0 },
   wtasks: { width: 40, textAlign: 'right', color: '#89b4fa', flexShrink: 0 },
   cfgTitle: {
     fontSize: 9.5, color: '#6c7086', textTransform: 'uppercase', letterSpacing: 0.5,

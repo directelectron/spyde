@@ -1,0 +1,1 @@
+Sizes were given one format across the app, with the unit on every value (download progress, and the compute monitor's memory and GPU columns), and a phase's atomic percentage was made to save as it is typed and to stay between 0 and 100.

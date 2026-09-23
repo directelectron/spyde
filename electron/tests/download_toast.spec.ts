@@ -56,12 +56,12 @@ test('progress message shows a toast with a moving bar; done removes it', async 
   const toast = page.getByTestId('download-toast-zrnb_precipitate')
   await expect(toast).toBeVisible()
   await expect(toast).toContainText('Downloading zrnb_precipitate')
-  await expect(toast).toContainText('0.00 / 668 MB (0%)')
+  await expect(toast).toContainText('0 B / 668 MB (0%)')
 
   // Progress advances the bar + readout.
   await inject({ type: 'download_progress', token: TOKEN,
     label: 'zrnb_precipitate', done: 334_000_000, total: 668_000_000 })
-  await expect(toast).toContainText('334 / 668 MB (50%)')
+  await expect(toast).toContainText('334 MB / 668 MB (50%)')
   // The fill animates via a 200ms width transition — poll until it has moved.
   await expect.poll(() => page.getByTestId('download-bar-zrnb_precipitate')
     .locator('div').evaluate((el) => (el as HTMLElement).getBoundingClientRect().width),
