@@ -27,6 +27,7 @@ import logging
 
 import numpy as np
 
+from spyde.actions.figure_window import register_figure
 from spyde.actions.strain_mapping import StrainField
 from spyde.actions._common import (
     STRAIN_DISPLAY_SCALE, STRAIN_TITLES as _COMPONENTS, robust_map_limits,
@@ -94,8 +95,6 @@ def build_strain_figure(field: StrainField, *, component: str = "exx",
     and a scale bar; without it the axes are scan pixels. The colorbar is
     always on, labelled with the component's display unit."""
     import anyplotlib as apl
-    import anyplotlib._electron as _electron
-    from spyde.drawing.plots.plot import finalize_figure_html
 
     data = display_component(field, component)
     lo, hi = clim if clim is not None else _auto_clim(data)
@@ -133,8 +132,7 @@ def build_strain_figure(field: StrainField, *, component: str = "exx",
         p.add_lines([[[cx - lx, cy], [cx + lx, cy]], [[cx, cy - ly], [cx, cy + ly]]],
                     name="strain_ref", edgecolors="#00e5ff", linewidths=2.0)
 
-    fig_id = _electron.register(fig)
-    html = finalize_figure_html(fig, fig_id)
+    fig_id, html = register_figure(fig)
     return fig, fig_id, html, p
 
 
