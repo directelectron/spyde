@@ -302,8 +302,12 @@ def _axes(ds: SparseCSB, bounds, bin_factor: int):
     recognise this as a movie rather than a scan."""
     dt = ds.frame_duration
     times = np.array([f0 * dt for f0, _ in bounds], float)
-    # Plane spacing, not frame spacing: consecutive planes are `step` apart.
-    scale = float(times[1] - times[0]) if len(times) > 1 else float(dt)
+    # Plane spacing, not frame spacing, and the MEAN of it: when the exposure
+    # is not a whole number of frames, planes alternate in width (3.5 frames ->
+    # 4, 3, 4, ...), so the first gap alone would drift a uniform axis past the
+    # end of the movie. The mean keeps every plane within one frame of its start.
+    scale = (float(times[-1] - times[0]) / (len(times) - 1)
+             if len(times) > 1 else float(dt))
     ang = float(getattr(ds.csb, "ang_per_pix", 0.0) or 0.0) * bin_factor
     px = {"scale": ang, "units": "Å"} if ang > 0 else {"scale": 1.0, "units": "px"}
     h = ds.csb.frame_height // bin_factor
