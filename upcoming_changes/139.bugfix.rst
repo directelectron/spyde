@@ -1,0 +1,1 @@
+Choosing a signal type while the navigator window had focus now changes the dataset's type, as it does from the data window.
