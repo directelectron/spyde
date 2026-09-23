@@ -25,7 +25,7 @@ import logging
 import numpy as np
 
 from de_shell import ipc
-from de_shell.actions.figure_registry import keep_alive
+from spyde.actions.figure_window import emit_figure
 from spyde.actions.report.figure_builder import (
     ReportFigureController, build_cell_figure,
 )
@@ -641,7 +641,6 @@ class ReportManager:
         if interactive:
             self._wire_selection_handlers(cell.id, fig)
         wid = self.session.next_window_id()
-        keep_alive(int(wid), fig)
         ctrl = ReportFigureController(self.session, self, cell.id, wid, fig=fig)
         reg = getattr(self.session, "register_window_controller", None)
         if reg is not None:
@@ -649,12 +648,8 @@ class ReportManager:
         self._controllers[int(wid)] = ctrl
         self._window_by_cell[cell.id] = int(wid)
         self._offline.discard(cell.id)
-        ipc.emit({
-            "type": "figure", "fig_id": fig_id, "window_id": int(wid),
-            "html": html, "title": cell.caption or "Figure",
-            "is_navigator": False,
-            "host": "report", "cell_id": cell.id,
-        })
+        emit_figure(wid, fig, cell.caption or "Figure", registered=(fig_id, html),
+                    host="report", cell_id=cell.id)
 
     def _emit_vectors_explorer(self, cell: Cell, explorer: "tuple[str, str]") -> None:
         """Emit a VIEWER-vectors cell's self-contained explorer as its figure

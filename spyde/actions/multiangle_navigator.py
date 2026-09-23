@@ -43,7 +43,7 @@ import logging
 
 import numpy as np
 
-from de_shell.actions.figure_registry import keep_alive
+from spyde.actions.figure_window import emit_figure
 from spyde.drawing.selectors.base_selector import event_handler_fn
 
 logger = logging.getLogger(__name__)
@@ -303,10 +303,6 @@ class MultiAngleNavigatorController:
     def build(self) -> bool:
         """Draw the rings and emit the window. False if the figure failed."""
         import anyplotlib as apl
-        import anyplotlib._electron as _electron
-
-        from spyde.drawing.plots.plot import finalize_figure_html
-        from de_shell.ipc import emit
 
         try:
             figure, axes = apl.subplots(1, 1)
@@ -335,15 +331,7 @@ class MultiAngleNavigatorController:
             # state it belongs in rather than correcting itself a moment later.
             self.refresh()
 
-            figure_id = _electron.register(figure)
-            keep_alive(self.window_id, figure)
-            emit({"type": "figure", "fig_id": figure_id,
-                  "window_id": self.window_id,
-                  "html": finalize_figure_html(figure, figure_id),
-                  "title": self.title, "is_navigator": False})
-            # A figure message does not rename a window, so say the name too.
-            emit({"type": "window_title", "window_ids": [self.window_id],
-                  "title": self.title})
+            emit_figure(self.window_id, figure, self.title, rename=True)
         except Exception as e:
             logger.exception("building the multi-angle ring failed: %s", e)
             return False

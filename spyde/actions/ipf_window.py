@@ -52,7 +52,7 @@ import logging
 
 import numpy as np
 
-from de_shell.actions.figure_registry import keep_alive
+from spyde.actions.figure_window import emit_figure, register_figure
 from spyde.actions.ipf_view import _as_orientation_map
 
 logger = logging.getLogger(__name__)
@@ -142,11 +142,9 @@ def build_ipf_points_2d_figure(result, direction: str = "z", *,
     handler can move the highlight without rebuilding the figure.
     """
     import anyplotlib as apl
-    import anyplotlib._electron as _electron
     from orix.quaternion import Rotation
 
     from spyde.actions.ipf_density import _sector_limits
-    from spyde.drawing.plots.plot import finalize_figure_html
     from spyde.signals.orientation_map import ipf_triangle_xy, ipf_xy_for_rotations
 
     om = _as_orientation_map(result)
@@ -188,8 +186,7 @@ def build_ipf_points_2d_figure(result, direction: str = "z", *,
             except Exception as e:
                 logger.debug("set_title on IPF points panel failed: %s", e)
 
-    fig_id = _electron.register(fig)
-    html = finalize_figure_html(fig, fig_id)
+    fig_id, html = register_figure(fig)
     return fig, fig_id, html, panels
 
 
@@ -304,10 +301,8 @@ def build_ipf_density_3d_figure(result, direction: str = "z", *,
     line up by construction with no ``uv`` needed.
     """
     import anyplotlib as apl
-    import anyplotlib._electron as _electron
 
     from spyde.actions.ipf_view import IPF3D_BOUNDS, IPF3D_ZOOM
-    from spyde.drawing.plots.plot import finalize_figure_html
 
     om = _as_orientation_map(result)
     pidxs = _present_phases(om)
@@ -354,8 +349,7 @@ def build_ipf_density_3d_figure(result, direction: str = "z", *,
             except Exception as e:
                 logger.debug("set_title on IPF density-3D panel failed: %s", e)
 
-    fig_id = _electron.register(fig)
-    html = finalize_figure_html(fig, fig_id)
+    fig_id, html = register_figure(fig)
     return fig, fig_id, html, plots
 
 
@@ -388,12 +382,8 @@ class IpfWindowController:
 
     # ── emit ────────────────────────────────────────────────────────────────
     def _emit(self, fig, fig_id: str, html: str, view: str, title: str) -> None:
-        from de_shell.ipc import emit
-        keep_alive(self.window_id, fig)
-        emit({
-            "type": "figure", "fig_id": fig_id, "window_id": self.window_id,
-            "html": html, "title": title, "is_navigator": False, "view": view,
-        })
+        emit_figure(self.window_id, fig, title, registered=(fig_id, html),
+                    view=view)
 
     def emit_all(self) -> bool:
         """(Re)build and emit all four toggle figures. Returns True if the 3-D

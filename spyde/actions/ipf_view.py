@@ -17,7 +17,7 @@ import logging
 
 import numpy as np
 
-from de_shell.actions.figure_registry import keep_alive
+from spyde.actions.figure_window import emit_figure, register_figure
 
 log = logging.getLogger(__name__)
 
@@ -113,8 +113,6 @@ def build_ipf_3d_figure(xyz: np.ndarray, rgb: np.ndarray, highlight=None):
     ``highlight`` is a 3-vector, draw a large black-ringed white marker there (the
     orientation of the pixel picked by the map's point selector)."""
     import anyplotlib as apl
-    import anyplotlib._electron as _electron
-    from spyde.drawing.plots.plot import finalize_figure_html
 
     from spyde.actions.ipf_window import _aim_at
 
@@ -129,8 +127,7 @@ def build_ipf_3d_figure(xyz: np.ndarray, rgb: np.ndarray, highlight=None):
         except Exception as e:
             log.debug("setting IPF highlight failed: %s", e)
 
-    fig_id = _electron.register(fig)
-    html = finalize_figure_html(fig, fig_id)
+    fig_id, html = register_figure(fig)
     return fig, fig_id, html, p3d
 
 
@@ -141,8 +138,6 @@ def emit_ipf_3d(window_id: int, result, direction: str = "z",
     ``tree`` is given the live ``Plot3D`` is cached on ``tree._ipf_p3d`` so a later
     point-pick updates the highlight IN PLACE (camera preserved) instead of
     re-emitting. Returns True if a figure was emitted."""
-    from de_shell.ipc import emit
-
     scene = ipf_scene_data(result, direction)
     if scene is None:
         return False
@@ -157,14 +152,11 @@ def emit_ipf_3d(window_id: int, result, direction: str = "z",
         except Exception:
             highlight = None
 
-    _fig, fig_id, html, p3d = build_ipf_3d_figure(xyz, rgb, highlight=highlight)
-    keep_alive(int(window_id), _fig)
+    fig, fig_id, html, p3d = build_ipf_3d_figure(xyz, rgb, highlight=highlight)
     if tree is not None:
         tree._ipf_p3d = p3d
-    emit({
-        "type": "figure", "fig_id": fig_id, "window_id": window_id,
-        "html": html, "title": "IPF (3D)", "is_navigator": False, "view": "3d",
-    })
+    emit_figure(window_id, fig, "IPF (3D)", registered=(fig_id, html),
+                view="3d")
     return True
 
 

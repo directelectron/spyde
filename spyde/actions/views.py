@@ -19,7 +19,7 @@ import logging
 
 import numpy as np
 
-from de_shell.actions.figure_registry import keep_alive
+from spyde.actions.figure_window import emit_figure, register_figure
 
 logger = logging.getLogger(__name__)
 
@@ -203,9 +203,6 @@ def emit_view_figure(window_id: int, image, label: str, *, kind: str = "2d",
     window."""
     try:
         import anyplotlib as apl
-        import anyplotlib._electron as _electron
-        from spyde.drawing.plots.plot import finalize_figure_html
-        from de_shell.ipc import emit
 
         fig, figure_axes = apl.subplots(1, 1)
         ax = figure_axes[0][0] if isinstance(figure_axes, list) else figure_axes
@@ -224,15 +221,8 @@ def emit_view_figure(window_id: int, image, label: str, *, kind: str = "2d",
             except Exception as e:
                 logger.debug("add_key on view %s failed: %s", label, e)
 
-        fig_id = _electron.register(fig)
-        html = finalize_figure_html(fig, fig_id)
-        keep_alive(window_id, fig)
-        emit({
-            "type": "figure", "fig_id": fig_id, "window_id": window_id,
-            "html": html, "title": label, "is_navigator": False,
-            "view_label": label, "view_kind": kind,
-        })
-        return fig_id
+        return emit_figure(window_id, fig, label,
+                           view_label=label, view_kind=kind)
     except Exception as e:
         logger.debug("emit_view_figure(%s) failed: %s", label, e)
         return None
@@ -292,8 +282,6 @@ def build_tiled_figure(window_id: int, labels):
         return None
 
     import anyplotlib as apl
-    import anyplotlib._electron as _electron
-    from spyde.drawing.plots.plot import finalize_figure_html
 
     cmap, levels = data.get("cmap", "gray"), data.get("levels")
     pick_hook = data.get("pick_hook")
@@ -320,9 +308,7 @@ def build_tiled_figure(window_id: int, labels):
         # onto the others, so wiring every widget would fire N times per pick.
         _wire_pick_widget(widgets[0], pairs[0][1], pick_hook)
 
-    fig_id = _electron.register(fig)
-    html = finalize_figure_html(fig, fig_id)
-    keep_alive(int(window_id), fig)
+    fig_id, html = register_figure(fig)
     return fig, fig_id, html, sel
 
 
@@ -333,19 +319,14 @@ def emit_tiled_figure(window_id: int, labels) -> str | None:
     built = build_tiled_figure(window_id, labels)
     if built is None:
         return None
-    _fig, fig_id, html, sel = built
+    fig, fig_id, html, sel = built
     try:
-        from de_shell.ipc import emit
-        emit({
-            "type": "figure", "fig_id": fig_id, "window_id": window_id,
-            "html": html, "title": " / ".join(sel), "is_navigator": False,
-            "view_label": TILED_LABEL, "view_kind": "tiled",
-        })
+        return emit_figure(window_id, fig, " / ".join(sel),
+                           registered=(fig_id, html),
+                           view_label=TILED_LABEL, view_kind="tiled")
     except Exception as e:
-        import logging
-        logging.getLogger(__name__).debug("emit_tiled_figure failed: %s", e)
+        logger.debug("emit_tiled_figure failed: %s", e)
         return None
-    return fig_id
 
 
 def tile_views(session, plot, payload) -> None:

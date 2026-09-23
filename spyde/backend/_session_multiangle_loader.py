@@ -1461,7 +1461,7 @@ class AlignedSumWindow:
         self.window_id = int(window_id)
         self.state = state
         self.closed = False
-        self._panels: dict = {}
+        self._grid = None
 
     @property
     def source_plot(self):
@@ -1471,35 +1471,13 @@ class AlignedSumWindow:
 
     def build(self, evidence: dict) -> bool:
         """Draw the pair and emit the window. False if the figure failed."""
-        import anyplotlib as apl
-        import anyplotlib._electron as _electron
-
-        from de_shell.actions.figure_registry import keep_alive
-        from spyde.actions.drift_action import _figure_geometry
-        from spyde.drawing.plots.plot import finalize_figure_html
+        from spyde.actions.figure_window import ImageGrid
 
         try:
-            figsize, aspect = _figure_geometry()
-            figure, axes = apl.subplots(1, 2, figsize=figsize)
-            panel = np.array(axes, dtype=object).ravel()
-            self._panels = {
-                "unaligned": panel[0].imshow(
-                    evidence["unaligned"].astype(np.float32), cmap="gray"),
-                "aligned": panel[1].imshow(
-                    evidence["aligned"].astype(np.float32), cmap="gray"),
-            }
+            self._grid = ImageGrid(1, 2, {"unaligned": evidence["unaligned"],
+                                          "aligned": evidence["aligned"]})
             self._set_titles(evidence)
-
-            figure_id = _electron.register(figure)
-            keep_alive(self.window_id, figure)
-            ipc.emit({"type": "figure", "fig_id": figure_id,
-                      "window_id": self.window_id,
-                      "html": finalize_figure_html(figure, figure_id),
-                      "title": ALIGNED_WINDOW_TITLE, "is_navigator": False,
-                      "aspect": float(aspect)})
-            # A figure message does not rename a window, so say the name too.
-            ipc.emit({"type": "window_title", "window_ids": [self.window_id],
-                      "title": ALIGNED_WINDOW_TITLE})
+            self._grid.show(self.window_id, ALIGNED_WINDOW_TITLE, rename=True)
         except Exception as e:
             log.exception("building the aligned-sum window failed: %s", e)
             return False
@@ -1508,32 +1486,23 @@ class AlignedSumWindow:
     def update(self, evidence: dict) -> None:
         """Repaint both panels — a re-run moves the window, not the window
         count."""
-        if self.closed or not self._panels:
+        if self.closed or self._grid is None:
             return
-        try:
-            self._panels["unaligned"].set_data(
-                evidence["unaligned"].astype(np.float32))
-            self._panels["aligned"].set_data(
-                evidence["aligned"].astype(np.float32))
-            self._set_titles(evidence)
-        except Exception as e:
-            log.debug("repainting the aligned-sum window failed: %s", e)
+        self._grid.set_data("unaligned", evidence["unaligned"])
+        self._grid.set_data("aligned", evidence["aligned"])
+        self._set_titles(evidence)
 
     def _set_titles(self, evidence: dict) -> None:
         gain = float(evidence.get("gain", float("nan")))
-        titles = {"unaligned": "Unaligned",
-                  "aligned": ("Aligned" if not np.isfinite(gain)
-                              else f"Aligned · sharpness ×{gain:.2f}")}
-        for key, title in titles.items():
-            try:
-                self._panels[key].set_title(title)
-            except Exception as e:
-                log.debug("titling the %s panel failed: %s", key, e)
+        self._grid.set_titles({
+            "unaligned": "Unaligned",
+            "aligned": ("Aligned" if not np.isfinite(gain)
+                        else f"Aligned · sharpness ×{gain:.2f}")})
 
     def close(self) -> None:
         """Drop the panels and let go of the loader's handle on this window."""
         self.closed = True
-        self._panels = {}
+        self._grid = None
         if getattr(self.state, "aligned_window", None) is self:
             self.state.aligned_window = None
 

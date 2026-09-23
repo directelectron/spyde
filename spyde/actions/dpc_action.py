@@ -144,12 +144,6 @@ _BEAM_COLOR = "#94e2d5"        # the beam region (circle / ring) on the DP
 #: heavier edge than the other furniture to stay findable against it.
 _CORNER_LINEWIDTH = 3.0
 
-#: Bare-figure window geometry. A bare figure never receives ``resize_figure``,
-#: so its initial px size is the one it keeps and anything drawn outside is
-#: CLIPPED by the subwindow — see the same note in ``drift_action``.
-_FIG_WIDTH, _FIG_HEIGHT = 340, 300
-
-
 class DpcWizard(WizardController):
     """Owns one live DPC analysis: the cached beam shifts, the current
     parameters, the result window, and the overlays on the source windows."""
@@ -801,8 +795,8 @@ class DpcWizard(WizardController):
     # ── the result window ────────────────────────────────────────────────────
 
     def _open_window(self, result: _dpc.DpcResult) -> None:
-        from de_shell.actions.figure_registry import keep_alive
         from spyde.actions.commit import navigation_extent
+        from spyde.actions.figure_window import emit_figure, figure_geometry
         try:
             scan_axes = navigation_extent(self.signal, self._nav_shape())
             fig, fig_id, html, plot, wheel = _display.build_dpc_figure(
@@ -818,11 +812,9 @@ class DpcWizard(WizardController):
             if self._closed:
                 return
             wid = int(self.session.next_window_id())
-            keep_alive(wid, fig)
             self.window_id, self.plot, self.wheel = wid, plot, wheel
-            emit({"type": "figure", "fig_id": fig_id, "window_id": wid,
-                  "html": html, "title": self._title(), "is_navigator": False,
-                  "aspect": _FIG_WIDTH / float(_FIG_HEIGHT)})
+            emit_figure(wid, fig, self._title(), registered=(fig_id, html),
+                        aspect=figure_geometry()[1])
         self.own_window(wid)
 
     #: The live window's title. Deliberately does NOT name the field type.
