@@ -97,7 +97,7 @@ export function Field({ label, children }: {
 
 export function NumInput({
   value, onChange, onClear, step = 'any', width = 64, testid,
-  min, placeholder, accept, label, suffix, style,
+  min, max, placeholder, accept, label, suffix, style,
 }: {
   /** null is "no number yet" — the box shows `placeholder` instead. */
   value: number | null
@@ -110,6 +110,7 @@ export function NumInput({
   width?: number | string
   testid?: string
   min?: number
+  max?: number
   placeholder?: string
   /** A further condition a typed number must meet before it is sent upward
    *  (e.g. a positive integer). Finiteness is always required. */
@@ -129,7 +130,7 @@ export function NumInput({
   const [draft, setDraft] = React.useState<string | null>(null)
   const box = (
     <input
-      data-testid={testid} type="number" step={step} min={min}
+      data-testid={testid} type="number" step={step} min={min} max={max}
       placeholder={placeholder}
       value={draft ?? (value == null ? '' : String(value))}
       style={{ ...S.num, width, ...style }}
