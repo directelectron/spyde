@@ -13,6 +13,7 @@
  * can attach to an email.
  */
 import React, { useEffect, useState } from 'react'
+import { ModalDialog, S } from './WizardShell'
 
 type Phase = 'writing' | 'sending' | 'done'
 
@@ -53,85 +54,86 @@ export function ReportProblemDialog({ onClose }: { onClose: () => void }) {
   }
 
   const problems = countProblems(diagnostics)
+  const finished = phase === 'done' && result
 
   return (
-    <div style={styles.overlay} data-testid="report-problem-dialog">
-      <div style={styles.dialog} onClick={(e) => e.stopPropagation()}>
-        <h3 style={styles.title}>Report a Problem</h3>
+    <ModalDialog testid="report-problem-dialog" title="Report a Problem" width={520}
+      onClose={onClose}
+      footer={finished ? (
+        <button style={S.dialogConfirm} data-testid="report-close" onClick={onClose}>
+          Close
+        </button>
+      ) : <>
+        <button style={S.dialogCancel} data-testid="report-cancel" onClick={onClose}>
+          Cancel
+        </button>
+        <button
+          style={{
+            ...S.dialogConfirm,
+            ...(message.trim() && phase === 'writing' ? {} : styles.confirmDisabled),
+          }}
+          data-testid="report-send"
+          disabled={!message.trim() || phase !== 'writing'}
+          onClick={submit}
+        >
+          {phase === 'sending' ? 'Sending…' : canSend ? 'Send Report' : 'Save Report'}
+        </button>
+      </>}>
+      {finished ? (
+        <Outcome result={result} canSend={canSend} />
+      ) : (
+        <>
+          <p style={styles.sub}>
+            {canSend
+              ? 'This goes straight to the SpyDE maintainers, with the details below attached.'
+              : 'This build has no reporting service configured, so the report will be saved '
+                + 'to your computer for you to send on.'}
+          </p>
 
-        {phase === 'done' && result ? (
-          <Outcome result={result} canSend={canSend} onClose={onClose} />
-        ) : (
-          <>
-            <p style={styles.sub}>
-              {canSend
-                ? 'This goes straight to the SpyDE maintainers, with the details below attached.'
-                : 'This build has no reporting service configured, so the report will be saved '
-                  + 'to your computer for you to send on.'}
-            </p>
+          <label style={styles.label} htmlFor="report-message">
+            What happened?
+          </label>
+          <textarea
+            id="report-message"
+            data-testid="report-message"
+            style={styles.textarea}
+            rows={6}
+            autoFocus
+            placeholder={'What were you doing, and what did SpyDE do instead?\n\n'
+              + 'If a file was involved, its format and rough size helps a lot.'}
+            value={message}
+            onChange={(e) => setMessage(e.target.value)}
+          />
 
-            <label style={styles.label} htmlFor="report-message">
-              What happened?
-            </label>
-            <textarea
-              id="report-message"
-              data-testid="report-message"
-              style={styles.textarea}
-              rows={6}
-              autoFocus
-              placeholder={'What were you doing, and what did SpyDE do instead?\n\n'
-                + 'If a file was involved, its format and rough size helps a lot.'}
-              value={message}
-              onChange={(e) => setMessage(e.target.value)}
-            />
+          <label style={styles.label} htmlFor="report-contact">
+            Email (optional, so we can ask a follow-up question)
+          </label>
+          <input
+            id="report-contact"
+            data-testid="report-contact"
+            style={styles.input}
+            type="email"
+            placeholder="you@example.org"
+            value={contact}
+            onChange={(e) => setContact(e.target.value)}
+          />
 
-            <label style={styles.label} htmlFor="report-contact">
-              Email (optional, so we can ask a follow-up question)
-            </label>
-            <input
-              id="report-contact"
-              data-testid="report-contact"
-              style={styles.input}
-              type="email"
-              placeholder="you@example.org"
-              value={contact}
-              onChange={(e) => setContact(e.target.value)}
-            />
-
-            <button
-              style={styles.disclosure}
-              data-testid="report-toggle-details"
-              onClick={() => setShowDetails((v) => !v)}
-            >
-              {showDetails ? '▾' : '▸'} Details included with this report
-              {problems > 0 && ` (${problems} recent error${problems === 1 ? '' : 's'})`}
-            </button>
-            {showDetails && (
-              <pre style={styles.details} data-testid="report-details">
-                {diagnostics ? JSON.stringify(diagnostics, null, 2) : 'Collecting…'}
-              </pre>
-            )}
-
-            <div style={styles.footer}>
-              <button style={styles.cancel} data-testid="report-cancel" onClick={onClose}>
-                Cancel
-              </button>
-              <button
-                style={{
-                  ...styles.primary,
-                  ...(message.trim() && phase === 'writing' ? {} : styles.primaryDisabled),
-                }}
-                data-testid="report-send"
-                disabled={!message.trim() || phase !== 'writing'}
-                onClick={submit}
-              >
-                {phase === 'sending' ? 'Sending…' : canSend ? 'Send Report' : 'Save Report'}
-              </button>
-            </div>
-          </>
-        )}
-      </div>
-    </div>
+          <button
+            style={styles.disclosure}
+            data-testid="report-toggle-details"
+            onClick={() => setShowDetails((v) => !v)}
+          >
+            {showDetails ? '▾' : '▸'} Details included with this report
+            {problems > 0 && ` (${problems} recent error${problems === 1 ? '' : 's'})`}
+          </button>
+          {showDetails && (
+            <pre style={styles.details} data-testid="report-details">
+              {diagnostics ? JSON.stringify(diagnostics, null, 2) : 'Collecting…'}
+            </pre>
+          )}
+        </>
+      )}
+    </ModalDialog>
   )
 }
 
@@ -143,11 +145,7 @@ export function ReportProblemDialog({ onClose }: { onClose: () => void }) {
  * sent" there reads as a failure the user should chase. A build that CAN send
  * and did not has a real reason worth showing.
  */
-function Outcome({ result, canSend, onClose }: {
-  result: SubmitResult
-  canSend: boolean
-  onClose: () => void
-}) {
+function Outcome({ result, canSend }: { result: SubmitResult; canSend: boolean }) {
   return (
     <div data-testid="report-outcome">
       <p style={{ ...styles.sub, color: result.sent ? '#a6e3a1' : '#f9e2af' }}>
@@ -178,11 +176,6 @@ function Outcome({ result, canSend, onClose }: {
           <pre style={styles.details} data-testid="report-event-id">{result.eventId}</pre>
         </>
       )}
-      <div style={styles.footer}>
-        <button style={styles.primary} data-testid="report-close" onClick={onClose}>
-          Close
-        </button>
-      </div>
     </div>
   )
 }
@@ -195,20 +188,7 @@ function countProblems(diagnostics: Record<string, unknown> | null): number {
 }
 
 const styles: Record<string, React.CSSProperties> = {
-  overlay: {
-    position: 'fixed', inset: 0, zIndex: 9500,
-    background: 'rgba(17,17,27,0.6)',
-    display: 'flex', alignItems: 'center', justifyContent: 'center',
-  },
-  dialog: {
-    width: 520, maxHeight: '80vh', overflowY: 'auto',
-    display: 'flex', flexDirection: 'column',
-    background: '#1e1e2e', border: '1px solid #313244', borderRadius: 10,
-    padding: 18, color: '#cdd6f4', boxShadow: '0 16px 40px rgba(0,0,0,0.55)',
-    fontSize: 13,
-  },
-  title: { margin: '0 0 12px', fontSize: 16, fontWeight: 600 },
-  sub: { margin: '0 0 14px', fontSize: 12, color: '#a6adc8', lineHeight: 1.5 },
+  sub: { margin: '8px 0 14px', fontSize: 12, color: '#a6adc8', lineHeight: 1.5 },
   label: { display: 'block', margin: '0 0 6px', fontSize: 12, color: '#a6adc8' },
   textarea: {
     width: '100%', boxSizing: 'border-box', marginBottom: 14, resize: 'vertical',
@@ -231,18 +211,5 @@ const styles: Record<string, React.CSSProperties> = {
     padding: '10px 12px', fontSize: 11, lineHeight: 1.45,
     whiteSpace: 'pre-wrap', wordBreak: 'break-all',
   },
-  footer: { display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 'auto' },
-  cancel: {
-    background: 'transparent', border: '1px solid #313244', color: '#cdd6f4',
-    borderRadius: 6, padding: '6px 14px', cursor: 'pointer', fontSize: 12,
-  },
-  primary: {
-    background: '#89b4fa', border: '1px solid #89b4fa', color: '#11111b',
-    borderRadius: 6, padding: '6px 14px', cursor: 'pointer', fontSize: 12,
-    fontWeight: 600,
-  },
-  primaryDisabled: {
-    background: '#313244', border: '1px solid #313244', color: '#6c7086',
-    cursor: 'default',
-  },
+  confirmDisabled: { background: '#313244', color: '#6c7086', cursor: 'default' },
 }

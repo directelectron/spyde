@@ -31,7 +31,7 @@
  * whether the acquisition can be opened.
  */
 import React, { useEffect, useMemo, useRef, useState } from 'react'
-import { TabRow, Field, NumInput, Info, PrimaryButton } from './WizardShell'
+import { TabRow, Field, NumInput, Info, PrimaryButton, ModalDialog, S } from './WizardShell'
 import { formatBytes } from '../kernel/format'
 import { Dropdown } from './Dropdown'
 import {
@@ -873,13 +873,27 @@ export function MultiAngleLoader({ sendAction, onClose }: {
   )
 
   return (
-    <div style={styles.overlay} data-testid="multiangle-loader"
-      onDragOver={(e) => e.preventDefault()} onDrop={(e) => e.preventDefault()}>
-      <div style={styles.dialog} onClick={(e) => e.stopPropagation()}>
-        <div style={styles.head}>
-          <h3 style={styles.title}>Multi-Angle 4D STEM</h3>
-          <button data-testid="maped-close" style={styles.close} onClick={onClose}>✕</button>
-        </div>
+    <div onDragOver={(e) => e.preventDefault()} onDrop={(e) => e.preventDefault()}>
+      <ModalDialog testid="multiangle-loader" title="Multi-Angle 4D STEM" width={760}
+        maxHeight="88vh" onClose={onClose} closeTestid="maped-close"
+        footer={<>
+          <button data-testid="maped-cancel" style={S.dialogCancel} onClick={onClose}>
+            Cancel
+          </button>
+          <button
+            data-testid="maped-open"
+            style={{ ...S.dialogConfirm, opacity: state.can_commit ? 1 : 0.5 }}
+            disabled={!state.can_commit}
+            title={state.can_commit ? '' : 'Align first'}
+            onClick={() => {
+              committed.current = true
+              sendAction('maped_commit', {})
+              onClose()
+            }}
+          >
+            Open
+          </button>
+        </>}>
         <div style={styles.summary}>
           <span data-testid="maped-summary">{summarise(state)}</span>
           {/* A failed member is one small tile among ten, so its state has to
@@ -1046,26 +1060,7 @@ export function MultiAngleLoader({ sendAction, onClose }: {
         <div data-testid="maped-status" style={styles.status}>
           {state.busy ? (state.message || 'Working…') : state.message}
         </div>
-
-        <div style={styles.footer}>
-          <button data-testid="maped-cancel" style={styles.cancel} onClick={onClose}>
-            Cancel
-          </button>
-          <button
-            data-testid="maped-open"
-            style={{ ...styles.confirm, opacity: state.can_commit ? 1 : 0.5 }}
-            disabled={!state.can_commit}
-            title={state.can_commit ? '' : 'Align first'}
-            onClick={() => {
-              committed.current = true
-              sendAction('maped_commit', {})
-              onClose()
-            }}
-          >
-            Open
-          </button>
-        </div>
-      </div>
+      </ModalDialog>
 
       {zoomed}
       {state.real.pair && (
@@ -2224,25 +2219,7 @@ function SolveReport({ solve, members, testid }: {
 }
 
 const styles: Record<string, React.CSSProperties> = {
-  overlay: {
-    position: 'fixed', inset: 0, zIndex: 9500,
-    background: 'rgba(17,17,27,0.6)',
-    display: 'flex', alignItems: 'center', justifyContent: 'center',
-  },
-  dialog: {
-    width: 760, maxHeight: '88vh',
-    display: 'flex', flexDirection: 'column',
-    background: '#1e1e2e', border: '1px solid #313244', borderRadius: 10,
-    padding: 18, color: '#cdd6f4',
-    boxShadow: '0 16px 40px rgba(0,0,0,0.55)', fontSize: 13,
-  },
-  head: { display: 'flex', alignItems: 'center', justifyContent: 'space-between' },
-  title: { margin: 0, fontSize: 16, fontWeight: 600 },
-  close: {
-    background: 'none', border: 'none', color: '#6c7086',
-    cursor: 'pointer', fontSize: 14,
-  },
-  summary: { margin: '4px 0 12px', fontSize: 12.5, color: '#a6adc8' },
+  summary: { margin: '0 0 12px', fontSize: 12.5, color: '#a6adc8' },
   summaryError: { color: ERROR, fontWeight: 600 },
   body: {
     display: 'flex', flexDirection: 'column', gap: 10, alignItems: 'stretch',
@@ -2606,14 +2583,5 @@ const styles: Record<string, React.CSSProperties> = {
   status: {
     fontSize: 11, color: '#a6adc8',
     borderTop: '1px solid #313244', padding: '8px 0', minHeight: 16,
-  },
-  footer: { display: 'flex', justifyContent: 'flex-end', gap: 8 },
-  cancel: {
-    background: 'transparent', border: '1px solid #313244', color: '#cdd6f4',
-    borderRadius: 6, padding: '6px 14px', cursor: 'pointer', fontSize: 12,
-  },
-  confirm: {
-    background: ACCENT, border: 'none', color: '#11111b', fontWeight: 600,
-    borderRadius: 6, padding: '6px 18px', cursor: 'pointer', fontSize: 12,
   },
 }

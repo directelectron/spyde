@@ -5,6 +5,7 @@
  * Every wizard is the same box: a header (title + ✕), an optional tab row, the
  * step content, and a status footer — only the steps differ. This module owns
  * that chrome and the common form controls so each wizard is just its content.
+ * It also owns the centred modal (`ModalDialog`) the app's dialogs share.
  */
 import React from 'react'
 import { Dropdown } from './Dropdown'
@@ -51,6 +52,47 @@ export function WizardShell({
       )}
       {children}
       <div data-testid={statusTestid} style={S.status}>{status}</div>
+    </div>
+  )
+}
+
+/**
+ * A centred dialog over a dimmed backdrop: a title (with a ✕ when
+ * `closeTestid` is given), a body that scrolls once it outgrows `maxHeight`,
+ * and a right-aligned footer that stays in view. Footer buttons use
+ * `S.dialogCancel` / `S.dialogConfirm`.
+ *
+ * A backdrop click closes only with `dismissOnBackdrop`: a dialog holding
+ * something the user typed or picked must not vanish on a stray click.
+ */
+export function ModalDialog({
+  testid, title, onClose, closeTestid, dismissOnBackdrop = false,
+  width, maxHeight = '80vh', footer, children,
+}: {
+  testid: string
+  title: React.ReactNode
+  onClose: () => void
+  closeTestid?: string
+  dismissOnBackdrop?: boolean
+  width: number
+  maxHeight?: string
+  footer: React.ReactNode
+  children: React.ReactNode
+}) {
+  return (
+    <div data-testid={testid} style={S.modalBackdrop}
+      onClick={dismissOnBackdrop ? onClose : undefined}>
+      <div style={{ ...S.modal, width, maxHeight }} onClick={(e) => e.stopPropagation()}>
+        <div style={S.modalHead}>
+          <h3 style={S.modalTitle}>{title}</h3>
+          {closeTestid && (
+            <button data-testid={closeTestid} style={S.modalClose} title="Close"
+              aria-label="Close" onClick={onClose}>✕</button>
+          )}
+        </div>
+        <div style={S.modalBody}>{children}</div>
+        <div style={S.modalFooter}>{footer}</div>
+      </div>
     </div>
   )
 }
@@ -229,6 +271,33 @@ export const S: Record<string, React.CSSProperties> = {
   cifList: { display: 'flex', flexDirection: 'column', gap: 2 },
   cifRow: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 6, background: '#11111b', borderRadius: 4, padding: '2px 6px' },
   cifName: { fontSize: 10, color: '#cdd6f4', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+  modalBackdrop: {
+    position: 'fixed', inset: 0, zIndex: 9500, padding: 24,
+    background: 'rgba(17,17,27,0.6)',
+    display: 'flex', alignItems: 'center', justifyContent: 'center',
+  },
+  modal: {
+    maxWidth: '100%', display: 'flex', flexDirection: 'column',
+    background: POP_BG, border: '1px solid #313244', borderRadius: 10,
+    padding: 18, color: '#cdd6f4', boxShadow: '0 16px 40px rgba(0,0,0,0.55)',
+    fontSize: 13,
+  },
+  modalHead: {
+    display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start',
+    gap: 12, marginBottom: 4, flexShrink: 0,
+  },
+  modalTitle: { margin: 0, fontSize: 16, fontWeight: 600 },
+  modalClose: { background: 'none', border: 'none', color: '#6c7086', cursor: 'pointer', fontSize: 14, padding: 2 },
+  modalBody: { flex: '1 1 auto', minHeight: 0, overflowY: 'auto', display: 'flex', flexDirection: 'column' },
+  modalFooter: { display: 'flex', justifyContent: 'flex-end', gap: 8, flexShrink: 0 },
+  dialogCancel: {
+    background: 'transparent', border: '1px solid #313244', color: '#cdd6f4',
+    borderRadius: 6, padding: '6px 14px', cursor: 'pointer', fontSize: 12,
+  },
+  dialogConfirm: {
+    background: '#89b4fa', border: 'none', color: '#11111b', fontWeight: 600,
+    borderRadius: 6, padding: '6px 18px', cursor: 'pointer', fontSize: 12,
+  },
 }
 
 /** The primary action with a busy state: disabled and saying so while the
