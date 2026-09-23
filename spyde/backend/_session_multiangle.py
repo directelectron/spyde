@@ -36,7 +36,6 @@ record.
 from __future__ import annotations
 
 import logging
-import math
 import os
 import threading
 
@@ -48,7 +47,7 @@ from de_shell.ipc import emit_status, emit_error
 from spyde.signals.multiangle import MULTIANGLE_METADATA
 
 from spyde.backend._session_files import (
-    SUPPORTED_EXTS, _is_supported_dataset_path, _path_ext,
+    SUPPORTED_EXTS, _is_supported_dataset_path, _path_ext, nav_chunk_edge,
 )
 
 log = logging.getLogger(__name__)
@@ -168,8 +167,7 @@ def composed_nav_chunk(members, target_bytes: int = NAV_CHUNK_BYTES) -> int:
                    * np.dtype(sum_dtype(dtypes[0], len(dtypes))).itemsize)
     if frame_bytes <= 0:
         return NAV_CHUNK
-    # Per AXIS, so the chunk is nav_chunk**2 frames.
-    return max(1, int(math.isqrt(max(1, int(target_bytes // frame_bytes)))))
+    return nav_chunk_edge(frame_bytes, target_bytes, n_nav_dims=2)
 
 
 def _aligned_arrays(members, model):

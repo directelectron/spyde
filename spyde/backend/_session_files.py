@@ -34,6 +34,33 @@ SUPPORTED_EXTS = (".hspy", ".zspy", ".mrc", ".tif", ".tiff", ".de5", ".csb")
 _DIR_DATASET_EXTS = (".zspy", ".zarr")
 
 
+def nav_chunk_edge(frame_bytes: int, target_bytes: int, n_nav_dims: int) -> int:
+    """Positions per navigation axis so that a chunk of whole frames,
+    ``edge ** n_nav_dims`` of them, holds at most ``target_bytes`` (or one
+    frame, when a frame alone is bigger). The root is exact integer arithmetic.
+
+    Used by ``composed_nav_chunk``. Two other rules answer the same question
+    differently and deliberately do not call this yet:
+
+    * ``FileLoaderMixin._signal_spanning_chunks`` (the load path) gives EVERY
+      nav axis the whole frame count, capped at ``_NAV_CHUNK_MAX``, so a 2-D
+      scan of large frames gets up to ``32 ** 2`` of them per chunk (the reason
+      ``_cap_block_bytes`` halves oversized blocks afterwards), and a movie time
+      axis gets one frame per chunk. Both are measured on real scans; changing
+      them needs a benchmark (CLAUDE.md, Live-Display 1).
+    * ``external/rosettasciio/de5.py`` takes a FLOAT root, which can land one
+      below the exact one (``64 ** (1/3)`` is 3.99...), then rounds down to a
+      power of two, caps at 32 and aligns to the HDF5 chunk edge.
+    """
+    frames = max(1, int(target_bytes) // max(1, int(frame_bytes)))
+    edge = int(round(frames ** (1.0 / n_nav_dims)))
+    while edge > 1 and edge ** n_nav_dims > frames:
+        edge -= 1
+    while (edge + 1) ** n_nav_dims <= frames:
+        edge += 1
+    return max(1, edge)
+
+
 def _uniform_save_chunks(signal):
     """``chunks=`` for writing a lazy *signal*: each axis's largest dask block,
     or None when that is what the writer would pick anyway.
