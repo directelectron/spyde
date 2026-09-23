@@ -39,12 +39,10 @@ import logging
 
 import numpy as np
 
+from spyde.actions.figure_window import emit_figure, register_figure
 from spyde.actions.ipf_refine import interp_grid
 
 log = logging.getLogger(__name__)
-
-# Keep figures alive past the emit (the _electron registry holds a weak ref).
-_ALIVE: list = []
 
 # "fire" (black→red→white) is anyplotlib's correlation-friendly map, same as the
 # IPF density heatmap. (anyplotlib's "inferno" is a wrong black→blue ramp.)
@@ -120,8 +118,6 @@ def build_refine_figure(infos: list[dict], *, cmap: str = _CMAP):
     """Build the multi-phase refine figure. Returns ``(fig, fig_id, html,
     panels)`` where each panel carries the live marker groups to update."""
     import anyplotlib as apl
-    import anyplotlib._electron as _electron
-    from spyde.drawing.plots.plot import finalize_figure_html
 
     lut = _lut(cmap)
     n = max(1, len(infos))
@@ -169,8 +165,7 @@ def build_refine_figure(infos: list[dict], *, cmap: str = _CMAP):
                        "circle_grp": circ, "best": best, "points": points,
                        "points_shown": False, "lut": lut})
 
-    fig_id = _electron.register(fig)
-    html = finalize_figure_html(fig, fig_id)
+    fig_id, html = register_figure(fig)
     return fig, fig_id, html, panels
 
 
@@ -225,13 +220,9 @@ def best_xy_for(infos, best_lib_idx: int):
 
 def emit_refine_window(session, fig, fig_id: str, html: str, *, title: str = "IPF Refine"):
     """Emit the refine-heatmap figure to a fresh window. Returns the window id."""
-    from de_shell.ipc import emit
-    from de_shell.actions.figure_registry import keep_alive
-    wid = session.next_window_id()
-    keep_alive(int(wid), fig)
-    emit({"type": "figure", "fig_id": fig_id, "window_id": int(wid),
-          "html": html, "title": title, "is_navigator": False})
-    return int(wid)
+    wid = int(session.next_window_id())
+    emit_figure(wid, fig, title, registered=(fig_id, html))
+    return wid
 
 
 def refine_correlations(frame, *, sim, cache, gamma, normalize, rot_mask):

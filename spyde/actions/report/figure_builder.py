@@ -26,6 +26,8 @@ import logging
 
 import numpy as np
 
+from spyde.actions.figure_window import register_figure
+
 log = logging.getLogger(__name__)
 
 
@@ -775,8 +777,6 @@ def build_cell_figure(spec, snapshots, *, standalone: bool = False,
     stashed on ``fig._report_panel_map`` so the caller can push ``selected_panel``
     from a spec-panel id."""
     import anyplotlib as apl
-    import anyplotlib._electron as _electron
-    from spyde.drawing.plots.plot import finalize_figure_html
 
     snap_map = _as_snapshot_map(spec, snapshots)
     rows, cols, wr, hr = _grid_shape(spec)
@@ -893,8 +893,7 @@ def build_cell_figure(spec, snapshots, *, standalone: bool = False,
     fig._report_callout_wiring = callout_wiring
     fig._report_zoom_wiring = zoom_wiring
 
-    fig_id = _electron.register(fig)
-    html = finalize_figure_html(fig, fig_id, standalone=standalone)
+    fig_id, html = register_figure(fig, standalone=standalone)
     return fig, fig_id, html
 
 

@@ -175,11 +175,8 @@ def _tile_navigators(session, plot, tree, names) -> None:
     crosshair only forwards a drag to it, and every panel mirrors it back (see
     ``_LinkedNavCursor``), so all copies of one selector agree on one position."""
     import anyplotlib as apl
-    import anyplotlib._electron as _electron
-    from spyde.drawing.plots.plot import finalize_figure_html
-    from de_shell.actions.figure_registry import keep_alive
+    from spyde.actions.figure_window import emit_figure
     from spyde.actions.views import TILED_LABEL
-    from de_shell.ipc import emit
 
     wid = getattr(plot, "window_id", None)
     if wid is None:
@@ -219,15 +216,9 @@ def _tile_navigators(session, plot, tree, names) -> None:
             for sel in selectors
         ]
 
-        fig_id = _electron.register(fig)
-        html = finalize_figure_html(fig, fig_id)
-        keep_alive(int(wid), fig)
-        emit({
-            "type": "figure", "fig_id": fig_id, "window_id": wid,
-            "html": html, "title": " / ".join(n for n, _ in pairs),
-            "is_navigator": True,
-            "view_label": TILED_LABEL, "view_kind": "tiled",
-        })
+        emit_figure(wid, fig, " / ".join(n for n, _ in pairs),
+                    is_navigator=True,
+                    view_label=TILED_LABEL, view_kind="tiled")
         _tiled_navigators(session)[int(wid)] = list(names)
     except Exception as e:
         # Forget the view so a selector added later does not retry the build.
@@ -437,10 +428,7 @@ def _stack_navigators(session, plot, tree, names) -> None:
     vertical line on every row, all linked into ONE logical time cursor wired to
     the tree's real 1-D navigation selector (see module docstring)."""
     import anyplotlib as apl
-    import anyplotlib._electron as _electron
-    from spyde.drawing.plots.plot import finalize_figure_html
-    from de_shell.actions.figure_registry import keep_alive
-    from de_shell.ipc import emit
+    from spyde.actions.figure_window import emit_figure
 
     wid = getattr(plot, "window_id", None)
     if wid is None:
@@ -486,15 +474,9 @@ def _stack_navigators(session, plot, tree, names) -> None:
             _view_cursors(session)[int(wid)] = [
                 _LinkedNavCursor(session, sel, widgets, ("x",))]
 
-        fig_id = _electron.register(fig)
-        html = finalize_figure_html(fig, fig_id)
-        keep_alive(int(wid), fig)
-        emit({
-            "type": "figure", "fig_id": fig_id, "window_id": wid,
-            "html": html, "title": " / ".join(n for n, _ in pairs),
-            "is_navigator": True,
-            "view_label": STACKED_LABEL, "view_kind": "stacked",
-        })
+        emit_figure(wid, fig, " / ".join(n for n, _ in pairs),
+                    is_navigator=True,
+                    view_label=STACKED_LABEL, view_kind="stacked")
     except Exception as e:
         log.exception("stacking navigators failed: %s", e)
 

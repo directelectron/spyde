@@ -666,7 +666,7 @@ def strain_open(session, plot, payload) -> None:
     The initial full-field fit (compute_strain_field) is a per-pixel scipy loop
     — run it on a worker thread and build/emit the window back on the main
     thread, so opening the action doesn't freeze the UI."""
-    from de_shell.ipc import emit, emit_error, emit_status
+    from de_shell.ipc import emit_error, emit_status
     from spyde.actions.lifecycle import resolve_vectors, wait_for_vectors
     from spyde.actions.strain_mapping import compute_strain_field
     from spyde.actions.strain_display import build_strain_figure
@@ -719,14 +719,12 @@ def strain_open(session, plot, payload) -> None:
         scan_axes = navigation_extent(getattr(tree, "root", None), field.nav_shape)
         # The window shows the SCAN frame from its first paint.
         shown = rotate_strain_basis(field, rotation, flip=flip)
-        _fig, fig_id, html, p = build_strain_figure(shown, component="exx",
-                                                    axes=scan_axes)
+        fig, fig_id, html, p = build_strain_figure(shown, component="exx",
+                                                   axes=scan_axes)
         wid = session.next_window_id()
-        from de_shell.actions.figure_registry import keep_alive
-        keep_alive(int(wid), _fig)
-        emit({"type": "figure", "fig_id": fig_id, "window_id": int(wid),
-              "html": html, "title": "Strain (εxx)", "is_navigator": False,
-              "strain_components": list(_COMPONENTS)})
+        from spyde.actions.figure_window import emit_figure
+        emit_figure(wid, fig, "Strain (εxx)", registered=(fig_id, html),
+                    strain_components=list(_COMPONENTS))
         src_dp = next(iter(getattr(tree, "signal_plots", [])), None)
         ctrl = StrainController(vecs, p, window_id=wid, component="exx",
                                 ref_yx=ref_yx, session=session,
