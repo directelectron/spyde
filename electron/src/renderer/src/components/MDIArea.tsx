@@ -75,27 +75,18 @@ function overlaps(a: Rect, b: Rect, gap = 10): boolean {
 // w×h window doesn't collide with anything already placed. Falls back to a tight
 // cascade only when the area is genuinely full. This is what stops result
 // windows (IPF / strain / refine / vectors) from burying each other.
-//
-// A full area has to stack the new window over another WINDOW, which the user
-// can drag aside, but it still keeps off an open caret: the window's figure
-// iframe would swallow every click meant for the panel beneath it.
-function findFreeSlot(w: number, h: number, windows: Rect[], carets: Rect[],
-                      areaW: number, areaH: number, n: number): { x: number; y: number } {
+function findFreeSlot(w: number, h: number, taken: Rect[], areaW: number, areaH: number,
+                      n: number): { x: number; y: number } {
   const M = 14, step = 26
   const maxX = Math.max(M, areaW - w - M)
   const maxY = Math.max(M, areaH - h - M)
-  const firstFit = (obstacles: Rect[]) => {
-    for (let y = M; y <= maxY; y += step) {
-      for (let x = M; x <= maxX; x += step) {
-        const r = { x, y, w, h }
-        if (!obstacles.some(t => overlaps(r, t))) return { x, y }
-      }
+  for (let y = M; y <= maxY; y += step) {
+    for (let x = M; x <= maxX; x += step) {
+      const r = { x, y, w, h }
+      if (!taken.some(t => overlaps(r, t))) return { x, y }
     }
-    return null
   }
-  return firstFit([...windows, ...carets])
-    ?? (carets.length ? firstFit(carets) : null)
-    ?? { x: M + (n % 6) * 30, y: M + (n % 6) * 30 }
+  return { x: M + (n % 6) * 30, y: M + (n % 6) * 30 }
 }
 
 // Vertical space reserved below each window row when tiling so the floating
@@ -425,7 +416,7 @@ export function MDIArea() {
   // Open carets are obstacles too. Without this a fit/DPC/strain run drops its
   // own result window straight onto the caret that started it, and the window's
   // figure iframe then swallows every click meant for the panel.
-  const carets = Array.from(caretRectsRef.current.values())
+  for (const caret of caretRectsRef.current.values()) taken.push(caret)
   // Read the LIVE area size (the `areaSize` state can still be the default when
   // the first windows arrive); `areaSize` just forces a re-render on resize.
   const areaW = areaRef.current?.clientWidth || areaSize.w
@@ -434,8 +425,7 @@ export function MDIArea() {
     const id = String(win.windowId)
     if (placedRef.current.has(id)) continue
     const { w, h } = windowSize(win.aspect)
-    const slot = findFreeSlot(w, h, taken, carets, areaW, areaH,
-                              taken.length + carets.length)
+    const slot = findFreeSlot(w, h, taken, areaW, areaH, taken.length)
     placedRef.current.set(id, slot)
     placements.set(id, slot)
     taken.push({ ...slot, w, h })
