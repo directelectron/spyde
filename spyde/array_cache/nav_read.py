@@ -27,6 +27,20 @@ from .resolve import resolve_reader
 log = logging.getLogger(__name__)
 
 
+def _drop_blocks(block_cache, reader) -> None:
+    """Evict every block decoded by *reader* AND by the readers it reads through.
+
+    A composed reader's inner readers own their blocks under their OWN ids, not
+    the composed reader's. Dropping only the outer id leaves those blocks behind
+    after the inner readers are gone, and ids are recycled: a later inner reader
+    allocated at the same address is then served another member's pixels, a
+    plausible frame from the wrong file.
+    """
+    block_cache.drop_owner(id(reader))
+    for inner in getattr(reader, "inner_readers", ()):
+        _drop_blocks(block_cache, inner)
+
+
 def _reader_for(plot, signal, data):
     """Resolve (and cache on the plot, keyed by id(signal)) the best
     FrameReader for this signal's data — reusing it across calls is what
@@ -54,7 +68,7 @@ def _reader_for(plot, signal, data):
         plot._array_cache.drop_key(key)
         block_cache = getattr(plot, "_block_cache", None)
         if block_cache is not None and reader is not None:
-            block_cache.drop_owner(id(reader))
+            _drop_blocks(block_cache, reader)
         # The region running sum was built from those stale frames. Its token
         # includes id(reader), which normally catches this on its own — but ids
         # are recycled, so drop it explicitly at the one place we KNOW the data
@@ -370,7 +384,7 @@ def retain_readers(plot, signals) -> None:
             continue
         reader = readers.pop(key)
         if block_cache is not None:
-            block_cache.drop_owner(id(reader))
+            _drop_blocks(block_cache, reader)
         close = getattr(reader, "close", None)
         if close is not None:
             try:
@@ -498,7 +512,7 @@ def drop_reader(plot, signal) -> None:
     plot._array_cache.drop_key(key)
     reader = plot._local_transform_readers.pop(key, None)
     if reader is not None:
-        plot._block_cache.drop_owner(id(reader))
+        _drop_blocks(plot._block_cache, reader)
 
 
 def close_all_readers(plot) -> None:

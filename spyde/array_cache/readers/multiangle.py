@@ -83,6 +83,15 @@ class MultiAngleReader:
             recipe.dtype if recipe.dtype is not None else data.dtype)
 
     @property
+    def inner_readers(self) -> tuple:
+        """The readers this one reads through, whose decoded blocks must be
+        dropped with it (see ``nav_read._drop_blocks``)."""
+        inner = [reader for reader in self._member_readers if reader is not None]
+        if self._stack_reader is not None:
+            inner.append(self._stack_reader)
+        return tuple(inner)
+
+    @property
     def frame_bytes(self) -> int:
         return int(np.prod(self._frame_shape)) * self._dtype.itemsize
 

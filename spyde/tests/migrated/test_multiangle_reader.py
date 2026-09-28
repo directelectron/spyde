@@ -305,3 +305,35 @@ class TestReadAhead:
         reader = build_multiangle_reader(signal, stacked)
         span = reader.chunk_span((2, 5, 9))
         assert span is not None and span[0] == (2, 3)
+
+
+class TestLeavingTheNode:
+    """Switching away from a composed node must take its members' blocks with it.
+
+    Each member reader owns its blocks under its OWN id. Left behind, those
+    blocks outlive the readers, and a new member reader allocated at a recycled
+    address is served another member's pixels — the sum of the wrong frames,
+    which only showed as the summed frame "not coming back" after a round trip.
+    """
+
+    def test_leaving_the_node_drops_every_member_block(self, acquisition):
+        from types import SimpleNamespace
+
+        from spyde.array_cache.block_cache import BlockCache
+        from spyde.array_cache.nav_read import retain_readers
+
+        members, model = acquisition
+        composed = compose_sum(members, model)
+        signal = _composed_signal(composed, members, model,
+                                  has_angle_axis=False, dtype=composed.dtype)
+        block_cache = BlockCache(1 << 28)
+        reader = build_multiangle_reader(signal, composed,
+                                         block_cache=block_cache)
+        reader.read_frame((5, 9))
+        assert len(block_cache) >= N_MEMBERS
+
+        plot = SimpleNamespace(_local_transform_readers={id(signal): reader},
+                               _block_cache=block_cache)
+        retain_readers(plot, ())
+
+        assert len(block_cache) == 0
