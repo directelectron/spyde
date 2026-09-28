@@ -239,11 +239,9 @@ def _start_batch(session, plot, src_tree, p: dict, *, overlay_visible: bool = Tr
         kernel_radius_px=float(p.get("kernel_radius", 5)),
     )
     # LOCK the result tree for the duration of the batch: no actions, no new
-    # nodes. That constraint is what makes the preview's install-once snapshot
-    # valid by construction — the set of navigator→signal links it just captured
-    # cannot change while the tree is locked, so the interactive fill needs no
-    # re-check on the nav read path. Released in _finalize (where the vectors
-    # attach) and again in the teardown below.
+    # nodes, since its root is a placeholder the batch is about to replace.
+    # Released in _finalize (where the vectors attach) and again in the
+    # teardown below.
     from spyde.actions.lifecycle import lock_tree, unlock_tree
     lock_tree(new_tree, "Find Diffraction Vectors")
     preview = attach_signal_preview(
