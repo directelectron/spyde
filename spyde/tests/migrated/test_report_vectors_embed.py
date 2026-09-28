@@ -526,7 +526,7 @@ class TestExportHonorsMode:
         # Keep the fallback figure path inert — this test is only about
         # whether the vectors explorer is chosen.
         monkeypatch.setattr(ex, "_build_interactive_figure_html",
-                            lambda mgr, c: None)
+                            lambda mgr, c: (None, (0, 0)))
         return ex._render_body(_Mgr(), {}, interactive=True, session=object())
 
     def test_image_mode_skips_viewer(self, monkeypatch):
