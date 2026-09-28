@@ -18,6 +18,6 @@
     "shell:link": "node electron/scripts/shell-link.mjs",
     "postinstall": "node electron/scripts/shell-link.mjs --soft",
     "_comment:test:unit": "The shell's unit tests, run against the linked tree so a shell update is exercised from here too. A missing link makes this fail loudly rather than run nothing — see shell:link.",
-    "test:unit": "node --test \"electron/shell/**/*.test.ts\" \"electron/shell/**/*.test.cjs\""
+    "test:unit": "node --test \"electron/shell/**/*.test.ts\" \"electron/shell/**/*.test.cjs\" \"electron/src/**/*.test.ts\""
   }
 }
