@@ -732,13 +732,20 @@ class TestCommit:
         _with_angles(session, acquisition)
         _solve_both(session, window["messages"])
 
+        # The failure is held until the dialog is gone. Unheld, the worker can
+        # fail and report before the close is even called, and the report then
+        # sits in the messages this test counts as "before the close".
+        dialog_closed = threading.Event()
+
         def _refuse(*args, **kwargs):
+            assert dialog_closed.wait(30.0), "the dialog never closed"
             raise RuntimeError("composition refused")
 
         with patch.object(loader, "compose_multiangle_tree", _refuse):
             maped_commit(session, None, {})
             maped_close_loader(session, None, {})
             after_close = len(window["messages"])
+            dialog_closed.set()
             assert quiesce(session), why_busy(session)
             drain_loop(session)
 
