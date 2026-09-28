@@ -1120,6 +1120,10 @@ def _format_overlay_value(ov: dict, frame: int, scale_s: float,
                           n_frames: int = 0) -> str:
     """Format a 1-D-signal-as-text overlay's value at *frame* as label text (e.g.
     ``"T = 812.3 °C"``); a dash when no trace is resolved."""
+    if ov.get("builtin") == "label":
+        # A static label has no value; its string is the content, exactly as
+        # the burnt-in frame draws it.
+        return str(ov.get("text", "") or "")
     label = str(ov.get("label", "") or "")
     units = str(ov.get("units", "") or "")
     fmt = str(ov.get("fmt", "") or "")
