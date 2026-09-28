@@ -19,19 +19,18 @@ That covers the parts most likely to break silently rather than loudly:
 """
 from __future__ import annotations
 
-import struct
 
 import numpy as np
 import pytest
 
 from spyde.external.rosettasciio import csb_format
 from spyde.external.rsciio_csb._core import CSBFile, CSB_MAGIC
+from spyde.tests.migrated._csb_synthetic import csb_bytes
 
 
 # ── synthesising a CSB ────────────────────────────────────────────────────────
 
-def _csb_bytes(*, width=64, height=48, frames=3, block_w=16, block_h=16,
-               magic=CSB_MAGIC, us_per_frame=400.0, kv=200, order=0):
+def _csb_bytes(**kw):
     """A structurally valid CSB carrying zero events.
 
     data_offset == lengths_offset, so the payload region is empty and the
@@ -39,32 +38,7 @@ def _csb_bytes(*, width=64, height=48, frames=3, block_w=16, block_h=16,
     the reader's own "table sums to N events, payload holds M words" check
     demands. Everything up to and including the table is therefore real.
     """
-    hdr = bytearray(108)
-    struct.pack_into("<H", hdr, 0, magic)
-    struct.pack_into("<H", hdr, 2, 1)             # file_version
-    struct.pack_into("<H", hdr, 4, width)
-    struct.pack_into("<H", hdr, 6, height)
-    struct.pack_into("<I", hdr, 8, frames)
-    struct.pack_into("<f", hdr, 12, 0.025)        # ang_per_pix
-    struct.pack_into("<f", hdr, 16, us_per_frame)
-    struct.pack_into("<H", hdr, 20, block_w)
-    struct.pack_into("<H", hdr, 22, block_h)
-    struct.pack_into("<Q", hdr, 24, 108)          # csb_data_offset
-    struct.pack_into("<Q", hdr, 32, 108)          # csb_lengths_offset
-    struct.pack_into("<H", hdr, 40, order)
-    struct.pack_into("<H", hdr, 42, 4242)         # camera_sn
-    struct.pack_into("<H", hdr, 62, kv)           # microscope_kv
-
-    import math
-    n_table = 0 if min(width, height, frames, block_w, block_h) < 1 else (
-        frames * (math.ceil(width / block_w) * math.ceil(height / block_h)))
-    tail = b"\x00" * (n_table * 2)
-    # A degenerate dimension leaves an empty table and a 108-byte file, which
-    # trips the length guard BEFORE the dimension validation we want to reach.
-    # Pad past it so those cases fail for the reason under test.
-    if len(hdr) + len(tail) < 110:
-        tail += b"\x00" * (110 - len(hdr) - len(tail))
-    return bytes(hdr) + tail
+    return csb_bytes(**{"frames": 3, "us_per_frame": 400.0, **kw})
 
 
 @pytest.fixture
