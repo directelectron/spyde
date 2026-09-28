@@ -32,6 +32,10 @@ let ctx: any
 test.setTimeout(1_200_000)
 
 test.beforeAll(async () => {
+  // The file-scope timeout above covers the TEST, not this hook, which keeps
+  // the 120 s config default — less than the 300 s the scan load below is
+  // allowed, so a runner that had to fetch sped_ag timed out here.
+  test.setTimeout(600_000)
   ctx = await launchApp({ dask: true, env: { SPYDE_LOG_LEVEL: 'INFO' } })
   const { page, app } = ctx
   await app.evaluate(({ ipcMain }: any, cif: string) => {
@@ -91,6 +95,13 @@ test('the matched pattern lands on the measured peaks and follows the crosshair'
   await expect(page.getByTestId('phase-0-structure')).toContainText('Silver__0011135')
   await page.getByTestId('ptable-done').click()
 
+  // Picking the phase opens the IPF window. On a full MDI area it cascades
+  // from the top-left and can land on this caret, and its figure iframe then
+  // takes the click. The caret paints within its window's stacking context,
+  // so raising the window brings the caret back to the front.
+  await expect(page.getByTestId('subwindow')
+    .filter({ hasText: 'IPF Refine' })).toHaveCount(1, { timeout: 60_000 })
+  await vsig.getByTestId('subwindow-titlebar').click()
   await page.getByTestId('vom-tab-Library').click()
   await page.getByTestId('vom-generate').click()
   // Generate stops at the library and the live previews — the whole-field fit
@@ -102,7 +113,11 @@ test('the matched pattern lands on the measured peaks and follows the crosshair'
   await expect.poll(green, {
     timeout: 120_000, message: 'the matched pattern (green) was never drawn',
   }).toBeGreaterThan(0)
-  expect(await red(), 'measured vectors should be drawn').toBeGreaterThan(0)
+  // Polled like the green: a single read can land while the canvas is being
+  // redrawn with the fit, and count nothing although the vectors are up.
+  await expect.poll(red, {
+    timeout: 30_000, message: 'the measured vectors (red) were never drawn',
+  }).toBeGreaterThan(0)
   await raise()
   await page.screenshot({ path: join(SHOTS, '02-overlay-at-rest.png') })
 

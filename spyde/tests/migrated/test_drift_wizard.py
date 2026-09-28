@@ -534,7 +534,10 @@ class TestSolve:
         wiz._frame_shape = (96, 112)
         wiz._roi_widget = _Box(x=16, y=12, w=64, h=64)
         dr.drift_run(session, plot, {"use_roi": True})
-        assert _wait(lambda: wiz.model is not None)
+        # Waited on the message, not the model: the loop sets the model a few
+        # statements BEFORE it emits the result, so a test thread woken by the
+        # model can read the message list in between.
+        assert _wait(lambda: _of_type(msgs, "drift_result"))
         assert wiz.model.params["roi"] == [12, 16, 64, 64]
         assert _of_type(msgs, "drift_result")[-1]["roi"] == [12, 16, 64, 64]
 

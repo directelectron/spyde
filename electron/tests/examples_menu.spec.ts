@@ -151,9 +151,10 @@ test('each dataset shows its size, shape and download state', async () => {
   const items = page.getByTestId('examples-tech-4d-stem-items')
   await expect(items).toBeVisible({ timeout: 15_000 })
 
-  // SPEDAg is the scan the 4D-STEM work is benchmarked on; it must be listed
+  // SPEDAg is the scan the 4D-STEM work is benchmarked on, listed as its
+  // calibrated copy (spyde/external/emdatabase/sped_ag.py); it must be listed
   // with its size, and its shape once it has been downloaded and measured.
-  const sped = page.getByTestId('example-SPEDAg')
+  const sped = page.getByTestId('example-SPEDAgCalibrated')
   await expect(sped).toBeVisible()
   await expect(sped).toContainText(/\d+(\.\d+)?\s*[kMG]B/)
 
@@ -178,7 +179,7 @@ test('hovering a dataset shows a themed info card', async () => {
   await page.getByTestId('examples-tech-4d-stem').hover()
   await expect(page.getByTestId('examples-tech-4d-stem-items')).toBeVisible()
 
-  await page.getByTestId('example-SPEDAg').hover()
+  await page.getByTestId('example-SPEDAgCalibrated').hover()
   const card = page.getByTestId('menu-hover-card')
   await expect(card).toBeVisible({ timeout: 10_000 })
   await expect(card).toContainText('SPEDAg')
@@ -192,7 +193,7 @@ test('hovering a dataset shows a themed info card', async () => {
 
   // It is OUR panel, not the OS bubble — so the row must not also carry a
   // native title attribute racing it.
-  await expect(page.getByTestId('example-SPEDAg')).not.toHaveAttribute('title', /./)
+  await expect(page.getByTestId('example-SPEDAgCalibrated')).not.toHaveAttribute('title', /./)
 
   // An undownloaded set reads differently.
   await page.getByTestId('example-FeAlStripes').hover()
