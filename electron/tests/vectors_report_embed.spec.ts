@@ -165,3 +165,36 @@ test('pointer + integrate render the DP from embedded points', async () => {
   const after = await page.evaluate(() => ({ ...(window as any).__vx.cross }))
   expect(after.ix !== before.ix || after.iy !== before.iy).toBe(true)
 })
+
+// The explorer posts its own height (controls included), and inside an exported
+// report its figure box must grow to it: a 3:2 aspect box with overflow hidden
+// at phone width is far shorter than the explorer, and cut off the controls
+// with nothing left to scroll.
+test('in an exported report at phone width, the figure box grows to the explorer', async () => {
+  const root = join(__dirname, '..', '..')
+  const { existsSync } = require('fs')
+  const py = [join(root, '.venv', 'Scripts', 'python.exe'), join(root, '.venv', 'bin', 'python')]
+    .find((p) => existsSync(p)) ?? (process.platform === 'win32' ? 'python' : 'python3')
+  const reportPath = join(tmpdir(), 'spyde-vectors-embed-report-test.html')
+  execFileSync(py, ['-m', 'spyde.tests.gen_vectors_embed', reportPath, '--in-report'],
+    { cwd: root })
+  const phone = await browser.newPage({ viewport: { width: 375, height: 812 } })
+  try {
+    await phone.goto('file:///' + reportPath.replace(/\\/g, '/'))
+    const frame = phone.locator('figure.report-figure iframe')
+    await expect(frame).toHaveAttribute('data-self-sized', '1', { timeout: 30_000 })
+    const sizes = await phone.evaluate(() => {
+      const box = document.querySelector('figure.report-figure .fig-box')!
+      const iframe = box.querySelector('iframe')!
+      return { box: box.getBoundingClientRect().height,
+               frame: iframe.getBoundingClientRect().height,
+               width: box.getBoundingClientRect().width }
+    })
+    // Taller than the 3:2 box it started in, so this is the case that clipped.
+    expect(sizes.frame).toBeGreaterThan(sizes.width / 1.5)
+    expect(sizes.box).toBeGreaterThanOrEqual(sizes.frame)
+    await phone.screenshot({ path: 'vectors_embed_shots/06-report-phone.png', fullPage: true })
+  } finally {
+    await phone.close()
+  }
+})

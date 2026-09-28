@@ -218,16 +218,27 @@ _IFRAME_AUTOSIZE_JS = """<script>
     return document.querySelectorAll('figure.report-figure iframe');
   };
 
-  // An embed that measures itself wins over the box.
+  // An embed that measures itself (the vectors explorer) wins over the box.
+  // The box gives up its shape too: an aspect-ratio box with overflow hidden
+  // does not grow with its content, so a tall embed in a narrow column would be
+  // cut off below the box with nothing left to scroll.
   window.addEventListener('message', function (event) {
     var message = event.data || {};
-    var height = message.spydeEmbedHeight || message.vxHeight;
+    var height = message.vxHeight;
     if (!height || !isFinite(height)) return;
     var candidates = frames();
     for (var i = 0; i < candidates.length; i++) {
-      if (candidates[i].contentWindow === event.source) {
-        candidates[i].dataset.selfSized = '1';
-        candidates[i].style.height = Math.max(120, Math.round(height)) + 'px';
+      var frame = candidates[i];
+      if (frame.contentWindow === event.source) {
+        frame.dataset.selfSized = '1';
+        frame.style.transform = '';
+        frame.style.margin = '';
+        frame.style.height = Math.max(120, Math.round(height)) + 'px';
+        var box = frame.closest('.fig-box');
+        if (box) {
+          box.style.aspectRatio = 'auto';
+          box.style.maxHeight = 'none';
+        }
         return;
       }
     }
