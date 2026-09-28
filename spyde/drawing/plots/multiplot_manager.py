@@ -103,6 +103,7 @@ class MultiplotManager:
         selector from lingering in the manager's bookkeeping
         (``all_navigation_selectors``, the ``_run_update`` downstream-chaining
         lookup, etc.). Returns True if the selector was found and removed."""
+        from spyde.actions.navigator_views import refresh_tiled_navigators
         removed = False
         for nav_window, sel_list in self.navigation_selectors.items():
             if selector in sel_list:
@@ -110,6 +111,7 @@ class MultiplotManager:
                 removed = True
                 if getattr(nav_window, "last_used_selector", None) is selector:
                     nav_window.last_used_selector = sel_list[-1] if sel_list else None
+                refresh_tiled_navigators(self.session, nav_window)
         return removed
 
     def add_plot_states_for_navigation_signals(self, signals: List[BaseSignal]) -> None:
@@ -302,6 +304,8 @@ class MultiplotManager:
         if not is_navigator:
             self.signal_tree.signal_plots.append(child)
         child.needs_auto_level = True
+        from spyde.actions.navigator_views import refresh_tiled_navigators
+        refresh_tiled_navigators(self.session, plot_window)
         return window
 
     @property

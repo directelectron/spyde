@@ -292,7 +292,7 @@ test('in-situ movie: Play/FF gate, real-time playback, fast-forward badge, ' +
       .toBeGreaterThan(0)
 
     // ── 6. Linked cursor: while playback loops, the line should move ─────────
-    // The cursor sync (_StackedNavCursor._on_selector_index) hangs off the
+    // The cursor sync (_LinkedNavCursor._on_selector_index) hangs off the
     // SAME selector index_hooks that drove the 22 backend SIG repaints proven
     // above (step 2), so the backend-side wiring is already demonstrated.
     // This section additionally checks the CANVAS — which hits the identical
@@ -331,9 +331,9 @@ test('in-situ movie: Play/FF gate, real-time playback, fast-forward badge, ' +
     console.log(`linked cursor: restX=${restX.toFixed(1)} ` +
       `samples=[${seen.map((x) => x.toFixed(0)).join(',')}] maxShift=${maxShift.toFixed(1)}`)
     // INFORMATIONAL (not a hard assertion): the backend cursor-sync wiring is
-    // proven — `_StackedNavCursor._on_selector_index` fires on every playback
-    // index (verified: it computes x=idx*scale and `w.set(x)` updates the widget,
-    // and the iframe applies the targeted `event_json` update, counters confirm).
+    // proven — `_LinkedNavCursor._on_selector_index` fires on every playback
+    // index (verified: it copies the real selector line's x onto every row,
+    // and pushes each row's panel to the iframe, counters confirm).
     // But the stacked figure's vline canvas intermittently reverts to the resting
     // column during 20 fps playback: a SEPARATE, pre-existing defect in how rapid
     // per-widget `event_json` position updates race a competing panel redraw in

@@ -807,7 +807,8 @@ class TestHarnessMixin:
 
     def _test_add_second_navigator(self) -> None:
         """Test-only: register a second NAMED 1-D navigator trace on the
-        in-situ MOVIE tree (root ``_signal_type == "insitu"``), so Playwright
+        in-situ MOVIE tree (root ``_signal_type == "insitu"``) — or, with no
+        movie loaded, a second 2-D navigator image on the last tree — so Playwright
         can exercise the stacked-navigator chip strip
         (``navigator_views._stack_navigators``) without needing a real second
         navigator source. ``load_test_data_movie``'s synthetic movie only
@@ -831,8 +832,20 @@ class TestHarnessMixin:
         try:
             tree = next((t for t in reversed(self.signal_trees)
                          if getattr(t.root, "_signal_type", None) == "insitu"), None)
+            if tree is None and self.signal_trees:
+                # No movie: give the last tree's 2-D navigator a ramp-weighted
+                # copy of itself, for the tiled-navigator chip strip.
+                tree = self.signal_trees[-1]
+                base = next(iter(tree.navigator_signals.values()))
+                base = base[0] if isinstance(base, (list, tuple)) else base
+                ramp = base.deepcopy()
+                data = np.asarray(ramp.data, dtype=np.float32)
+                ramp.data = data * np.linspace(0.2, 1.0, data.shape[-1], dtype=np.float32)
+                tree.add_navigator_signal("ramp", ramp)
+                log.info("test_add_second_navigator: added 'ramp' navigator %s", data.shape)
+                return
             if tree is None:
-                emit_error("test_add_second_navigator: no in-situ movie tree loaded")
+                emit_error("test_add_second_navigator: no tree loaded")
                 return
             n = int(tree.root.axes_manager.navigation_shape[0])
             trace = 0.5 * np.sin(np.linspace(0, 4 * np.pi, n)) + 1.0

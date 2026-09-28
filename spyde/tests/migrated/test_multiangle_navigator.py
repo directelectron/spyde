@@ -30,7 +30,7 @@ import pytest
 
 from spyde.actions import multiangle_navigator as ring
 from spyde.actions import registry
-from spyde.drawing.selectors.base_selector import _nav_dispatcher
+from spyde.drawing.selectors.base_selector import _nav_dispatcher, index_hook_targets
 from spyde.multiangle import make_multiangle
 from spyde.multiangle.model import MultiAngleModel, assign_shells
 from spyde.multiangle.recipe import recipe_for
@@ -141,7 +141,7 @@ def _ring_hooks(selector, controller) -> list[int]:
     matters is one per half, never two on the same one.
     """
     return [sum(hook is controller._index_hook for hook in target.index_hooks)
-            for target in ring._index_hook_targets(selector)]
+            for target in index_hook_targets(selector)]
 
 
 def _click(controller, x: float, y: float) -> None:

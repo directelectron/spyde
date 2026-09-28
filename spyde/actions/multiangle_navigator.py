@@ -44,7 +44,7 @@ import logging
 import numpy as np
 
 from de_shell.actions.figure_registry import keep_alive
-from spyde.drawing.selectors.base_selector import event_handler_fn
+from spyde.drawing.selectors.base_selector import event_handler_fn, index_hook_targets
 
 logger = logging.getLogger(__name__)
 
@@ -237,23 +237,6 @@ def _selector_axis_size(selector) -> int | None:
     except Exception:
         return None
     return int(axes[0].size) if len(axes) == 1 else None
-
-
-def _index_hook_targets(selector) -> list:
-    """Every sub-selector of *selector* whose updates should move the ring.
-
-    A 1-D navigation selector is a composite that swaps between a crosshair and
-    an integrating span, and each half keeps its own hook list. Hooking only the
-    active one means the ring silently stops following the moment the user turns
-    Integrate on.
-    """
-    candidates = [getattr(selector, name, None)
-                  for name in ("_inf_line_selector", "_linear_region_selector")]
-    targets = [target for target in candidates
-               if getattr(target, "index_hooks", None) is not None]
-    if targets:
-        return targets
-    return [selector] if getattr(selector, "index_hooks", None) is not None else []
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -556,7 +539,7 @@ class MultiAngleNavigatorController:
         indices, so playback, a keyboard step and a node switch's forced
         re-slice all arrive here exactly as a drag does.
         """
-        for target in _index_hook_targets(self.selector):
+        for target in index_hook_targets(self.selector):
             try:
                 target.index_hooks.append(self._index_hook)
                 self._hooked.append(target)
