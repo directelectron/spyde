@@ -315,15 +315,17 @@ async function waitForSubwindowCount(page, n, timeout = 60_000) {
 
 /**
  * Wait for the vector actions to unlock — the REAL "diffraction_vectors
- * attached" signal: the vector toolbar buttons are requires_vectors-gated, so
- * they exist in the DOM only after find-vectors finalizes and re-sends the
- * toolbar. (Do NOT wait on the "Found N diffraction vectors" status — it
- * travels the PLOTAPP stdout protocol, invisible to the harness log buffer.)
+ * attached" signal. While find-vectors is still filling its result window the
+ * tree is locked and the vector buttons are shown DISABLED; they become
+ * clickable only when it finalizes, attaches the vectors and re-sends the
+ * toolbar. So wait for an ENABLED button, never mere presence. (Do NOT wait on
+ * the "Found N diffraction vectors" status — it travels the PLOTAPP stdout
+ * protocol, invisible to the harness log buffer.)
  */
 async function waitForVectorActions(page, timeout = 60_000) {
   await page.waitForFunction(
     () => document.querySelectorAll(
-      '[data-testid="action-btn-Strain Mapping"]').length > 0,
+      '[data-testid="action-btn-Strain Mapping"]:not([disabled])').length > 0,
     undefined, { timeout },
   )
 }

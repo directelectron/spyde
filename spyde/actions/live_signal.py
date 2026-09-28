@@ -270,7 +270,9 @@ class ProgressiveSignalPreview:
         tree = self.tree
 
         def _apply():
-            if not self._closed:
+            # Re-checked here: the grab can land between the sampler's check on
+            # the compute thread and this paint reaching the main thread.
+            if not self._closed and not self._user_owns:
                 if paint_signal_plots(tree, frame) > 0:
                     self.frames_landed += 1
 
