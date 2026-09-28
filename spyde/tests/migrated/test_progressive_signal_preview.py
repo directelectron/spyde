@@ -415,9 +415,18 @@ class TestFindVectorsWiring:
                 return None
             # Park the navigator OUTSIDE the block below, so this exercises the
             # SAMPLE paint rather than the parked-selector re-fire (each has its
-            # own unit test above).
+            # own unit test above). The result window's own first navigator
+            # update can run at any point in here, so pin what the widget
+            # reports too, or that update commits the widget's position.
+            outside = np.array([[0, 0]])
             for sel in result_tree.navigator_plot_manager.all_navigation_selectors:
-                sel.current_indices = np.array([[0, 0]])
+                sel.get_selected_indices = lambda: outside
+                sel.current_indices = outside
+            # That same first update reads through the preview, which counts
+            # as the user driving the navigator and holds the sample paint
+            # back. Whether it lands before the block is scheduling, so take
+            # the hold out of this test rather than lose the race.
+            preview.user_hold = 0.0
             blk = np.full((nav[0] - 1, nav[1], 4, 3), np.nan, dtype=np.float32)
             blk[..., 0, :] = (2.0, 3.0, 5.0)         # ky=2, kx=3, intensity=5
             on_block((slice(1, nav[0]), slice(0, nav[1])), blk)

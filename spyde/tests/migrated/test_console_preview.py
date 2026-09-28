@@ -338,11 +338,19 @@ class TestNavPositionResolution:
 
     def _settle_cursor(self, session, tree, value, expect, timeout=30.0):
         """Keep applying *value* to all selectors until the console's own
-        resolver reports *expect* (late selector attaches re-introduce state)."""
+        resolver reports *expect* (late selector attaches re-introduce state).
+
+        An update already running when *value* is pinned read the widget
+        before the pin and commits that position after it, so the resolver
+        can report *expect* for a moment and then lose it to the widget's own
+        position. Waiting for the session to go idle before asking lets that
+        update land first."""
         from spyde.backend.console_preview import _nav_indices_for
+        from spyde.tests.migrated._async import quiesce
         deadline = time.time() + timeout
         while time.time() < deadline:
             self._move_all(session, tree, value)
+            quiesce(session, timeout=min(5.0, max(0.0, deadline - time.time())))
             idx, _shape = _nav_indices_for(session.console, ["s1"])
             got = None if idx is None else tuple(int(v) for v in np.ravel(idx))
             if got == expect:

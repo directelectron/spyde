@@ -1286,18 +1286,20 @@ class BaseSignalTree:
         """Take an overlay node off every plot and out of the tree."""
         from spyde.array_cache import drop_reader
 
+        # Detach first: the painter skips a detached node, so a value staged
+        # after the groups are dropped cannot draw them back.
+        if node.attached:
+            del node.parent.children[node.name]
         for plot in list(self.signal_plots):
             try:
-                # Cancel first: a value already being evaluated must not land
-                # on a node that is going away.
+                # Cancel before dropping: a value already being evaluated
+                # must not land on a node that is going away.
                 plot.cancel_overlay_future(node)
                 plot.drop_overlay_groups(node)
                 drop_reader(plot, node.signal)
             except Exception as e:
                 logger.debug("removing overlay %r from a plot failed: %s",
                              node.name, e)
-        if node.attached:
-            del node.parent.children[node.name]
 
     def overlay_children(self, signal) -> List[SignalNode]:
         """The overlay nodes drawn on a window showing ``signal``."""

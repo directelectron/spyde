@@ -350,6 +350,10 @@ class Plot:
         # (id(node), group) -> node, for the transform groups registered here.
         self._transform_groups_expected: Dict = {}
         self._transform_image: "np.ndarray | None" = None
+        # The painter draws a value for a node it found attached, and a removal
+        # can land between that check and the draw; without one lock around
+        # both, the draw re-creates the groups the removal just dropped.
+        self._overlay_lock = _threading.RLock()
 
         # anyplotlib figure + plot objects
         self._fig: apl.Figure | None = None
@@ -598,6 +602,10 @@ class Plot:
         passed to the constructor. A ``layer`` needs its first image before it
         can be built, and a ``transform`` and a ``mask`` draw through the base
         image, so all three register the group with no handle yet."""
+        with self._overlay_lock:
+            self._ensure_overlay_group(node, name, kind, style)
+
+    def _ensure_overlay_group(self, node, name: str, kind: str, style) -> None:
         key = (id(node), name)
         if kind == "transform":
             self._transform_groups_expected[key] = node
@@ -638,6 +646,10 @@ class Plot:
         A transform group suppresses the navigator's own paint, so dropping one
         that is live stages a repaint of the raw frame: the pattern comes back
         as the node goes, without waiting for a navigator move."""
+        with self._overlay_lock:
+            self._drop_overlay_groups(node)
+
+    def _drop_overlay_groups(self, node) -> None:
         was_live = {k for k in self._live_transform_groups if k[0] == id(node)}
         self._live_transform_groups -= was_live
         self._transform_groups_answered -= {
@@ -749,25 +761,26 @@ class Plot:
         """Push staged overlay values to their groups. Runs on the painter
         thread, images before markers so a marker is never drawn over the image
         of the previous position."""
-        drawing = [(node, value) for node, value in pending.values()
-                   if node.attached]
-        for images in (True, False):
-            for node, value in drawing:
-                values = _values_to_draw(node, value)
-                for name, (kind, style) in node.groups.items():
-                    if (kind in _IMAGE_KINDS) is not images:
-                        continue
-                    try:
-                        # First value on this plot: the plot may have opened
-                        # after the node was added, and a group is an
-                        # anyplotlib push, so it is created here rather than
-                        # wherever that happened.
-                        self.ensure_overlay_group(node, name, kind, style)
-                        self._push_overlay_group(node, name, kind,
-                                                 values.get(name), base_painted)
-                    except Exception as e:
-                        logger.debug("[plot] drawing overlay group %s failed: %s",
-                                     name, e)
+        with self._overlay_lock:
+            drawing = [(node, value) for node, value in pending.values()
+                       if node.attached]
+            for images in (True, False):
+                for node, value in drawing:
+                    values = _values_to_draw(node, value)
+                    for name, (kind, style) in node.groups.items():
+                        if (kind in _IMAGE_KINDS) is not images:
+                            continue
+                        try:
+                            # First value on this plot: the plot may have opened
+                            # after the node was added, and a group is an
+                            # anyplotlib push, so it is created here rather than
+                            # wherever that happened.
+                            self.ensure_overlay_group(node, name, kind, style)
+                            self._push_overlay_group(node, name, kind,
+                                                     values.get(name), base_painted)
+                        except Exception as e:
+                            logger.debug("[plot] drawing overlay group %s failed: %s",
+                                         name, e)
         for node, value in drawing:
             self._overlay_values[id(node)] = value if node.visible else None
             if node.on_value is not None and node.visible:

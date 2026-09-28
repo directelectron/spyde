@@ -1111,6 +1111,26 @@ class TestPrivateView:
         dpc.measure_beam_shifts(dpc.private_view(s))
         assert s.__class__ is before
 
+    def test_taking_the_view_never_touches_the_original(self):
+        """The view exists so nothing else mutates the live signal; taking it
+        must not be the exception. A copy that parks a placeholder on the
+        original shows every concurrent reader a length-1 array, and raises
+        when another copy of it is under way."""
+        from unittest.mock import patch
+        s = self._signal()
+        data = type(s).data
+        assigned_to_original = []
+
+        def record(self, value):
+            if self is s:
+                assigned_to_original.append(value)
+            data.fset(self, value)
+
+        with patch.object(type(s), "data", property(data.fget, record)):
+            view = dpc.private_view(s)
+        assert view is not s
+        assert assigned_to_original == [],             "taking the view reassigned the original signal's data"
+
     def test_a_deepcopy_transiently_publishes_a_placeholder(self):
         """WHY the view exists, pinned so the reasoning cannot rot.
 

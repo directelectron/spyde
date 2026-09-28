@@ -28,6 +28,7 @@ from spyde.external.hyperspy.map_recipe import (
     FrameRecipe, apply as apply_map_recipe, recipe_for,
 )
 from spyde.tests.migrated.conftest import _settle
+from spyde.tests.migrated._async import quiesce, why_busy
 from spyde.tests.migrated.test_array_cache_binary_reader import _write_synthetic_mrc
 from spyde.tests.migrated.test_center_zero_beam import _signal_plot, _wait
 
@@ -96,11 +97,17 @@ def _centre(session, src):
 
 
 def _open_session(signal):
-    """A settled session showing ``signal``, with its signal plot."""
+    """A settled session showing ``signal``, with its signal plot.
+
+    Idle, not just settled: ``_settle`` gives up after three seconds, and a
+    navigator update still running after that evaluates every overlay the test
+    goes on to add. Most tests here stage values by hand, and that evaluation
+    lands on top of them."""
     from spyde.backend.session import Session
     session = Session(n_workers=1, threads_per_worker=1)
     session._add_signal(signal)
     _settle(session)
+    assert quiesce(session), why_busy(session)
     return session, _signal_plot(session)
 
 
@@ -405,6 +412,46 @@ class TestOverlayNodeLifecycle:
             tree.remove_overlay(node)
             assert _group_keys(plot, node) == []
             assert tree.overlay_children(tree.root) == []
+        finally:
+            session.shutdown()
+
+    def test_a_value_being_drawn_during_removal_does_not_bring_the_group_back(self):
+        """The painter checks a node is attached and then draws it; a removal
+        landing between the two used to drop the groups, only for the draw to
+        create them again. The painter is held at that exact point here."""
+        session, plot = _open_session(_off_centre_lazy())
+        try:
+            tree = plot.signal_tree
+            node = tree.add_overlay(tree.root, lambda frame: {}, name="markers",
+                                    groups={"found": ("circles", {"radius": 3.0})})
+            drawing, resume, drawn = (threading.Event(), threading.Event(),
+                                      threading.Event())
+            ensure = plot.ensure_overlay_group
+            apply_pending = plot._apply_pending_overlays
+
+            def held_ensure(*args, **kwargs):
+                if threading.current_thread().name == "nav-paint":
+                    drawing.set()
+                    resume.wait(10)
+                return ensure(*args, **kwargs)
+
+            def recorded_apply(*args, **kwargs):
+                apply_pending(*args, **kwargs)
+                drawn.set()
+
+            plot.ensure_overlay_group = held_ensure
+            plot._apply_pending_overlays = recorded_apply
+            plot.enqueue_overlay(node, {"found": np.array([[4.0, 5.0]])})
+            assert drawing.wait(10), "the painter never drew the value"
+
+            remover = threading.Thread(target=tree.remove_overlay, args=(node,))
+            remover.start()
+            assert _wait(lambda: not node.attached, 10), "the node was never detached"
+            resume.set()
+            assert drawn.wait(10), "the painter never finished its pass"
+            remover.join(10)
+            assert not remover.is_alive(), "the removal never finished"
+            assert _group_keys(plot, node) == []
         finally:
             session.shutdown()
 

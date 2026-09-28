@@ -580,11 +580,19 @@ class TestComputeCancellation:
         plot = _signal_plot(session)
         tree = plot.signal_tree
         # Only tokens this OPEN adds count — the tree already carries the
-        # navigator fill's own.
-        before = {id(t) for t in _cancel_tokens(tree)}
+        # navigator fill's own. Recorded as they are registered rather than
+        # read back afterwards: a pass over a small fixture can finish, and
+        # retire its token, before the open returns.
+        added = []
+        register = tree.register_cancel
+
+        def recording_register(**kwargs):
+            added.append(kwargs)
+            return register(**kwargs)
+
+        monkeypatch.setattr(tree, "register_cancel", recording_register)
         registry.resolve_staged(f"{key}_open")(session, plot,
                                                dict(spec["payload"]))
-        added = [t for t in _cancel_tokens(tree) if id(t) not in before]
         assert added, (
             f"{key}: opening started a compute but registered nothing on the "
             f"tree, so closing the tree cannot stop it. Call "
