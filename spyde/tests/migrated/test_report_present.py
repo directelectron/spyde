@@ -351,7 +351,7 @@ class TestSlidesExport:
         # needs the same shaped box and fit script the article page has or a big
         # figure runs off the slide.
         assert "fig-box" in html
-        assert "spydeEmbedHeight" in html
+        assert "vxHeight" in html
 
     def test_slides_export_no_open_report_errors(self, window):
         session, messages = window["window"], window["messages"]
