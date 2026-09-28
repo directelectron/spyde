@@ -28,6 +28,7 @@ from spyde.external.hyperspy.map_recipe import (
     FrameRecipe, apply as apply_map_recipe, recipe_for,
 )
 from spyde.tests.migrated.conftest import _settle
+from spyde.tests.migrated._async import quiesce, why_busy
 from spyde.tests.migrated.test_array_cache_binary_reader import _write_synthetic_mrc
 from spyde.tests.migrated.test_center_zero_beam import _signal_plot, _wait
 
@@ -96,11 +97,17 @@ def _centre(session, src):
 
 
 def _open_session(signal):
-    """A settled session showing ``signal``, with its signal plot."""
+    """A settled session showing ``signal``, with its signal plot.
+
+    Idle, not just settled: ``_settle`` gives up after three seconds, and a
+    navigator update still running after that evaluates every overlay the test
+    goes on to add. Most tests here stage values by hand, and that evaluation
+    lands on top of them."""
     from spyde.backend.session import Session
     session = Session(n_workers=1, threads_per_worker=1)
     session._add_signal(signal)
     _settle(session)
+    assert quiesce(session), why_busy(session)
     return session, _signal_plot(session)
 
 
