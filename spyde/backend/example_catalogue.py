@@ -66,6 +66,22 @@ def data_dir() -> str:
         return os.path.join(os.path.expanduser("~"), "em_database")
 
 
+def _em_database_data():
+    """``em_database.data`` with SpyDE's own additions in it.
+
+    The additions are otherwise applied with the heavy imports, which land
+    well after the backend reports ready — and the menu's catalogue is
+    fetched AT ready. Without applying them here the first catalogue listed
+    the superseded SPEDAg and a later one swapped it for its replacement,
+    under the user's cursor.
+    """
+    import em_database.data as data
+    from spyde.external.emdatabase.sped_ag import apply as add_calibrated_sped_ag
+
+    add_calibrated_sped_ag()
+    return data
+
+
 def datasets() -> list[tuple[str, object]]:
     """``(key, dataset)`` for every dataset em-database exposes.
 
@@ -75,7 +91,7 @@ def datasets() -> list[tuple[str, object]]:
     """
     try:
         import em_database
-        import em_database.data as data
+        data = _em_database_data()
     except Exception as e:
         log.debug("listing em-database datasets failed: %s", e)
         return []
@@ -109,7 +125,7 @@ SUPERSEDED = {"SPEDAg": "SPEDAgCalibrated"}
 def resolve(key: str):
     """The dataset object for a catalogue key, or None."""
     try:
-        import em_database.data as data
+        data = _em_database_data()
         key = str(key)
         replacement = SUPERSEDED.get(key)
         if replacement is not None and getattr(data, replacement, None) is not None:

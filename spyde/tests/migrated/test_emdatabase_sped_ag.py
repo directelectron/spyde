@@ -79,6 +79,20 @@ class TestTheCatalogueOffersIt:
         assert sped_ag.NAME in names
         assert "SPEDAg" not in names, "the stale copy must not be offered"
 
+    def test_the_first_catalogue_already_offers_it(self, monkeypatch):
+        """The menu's catalogue is fetched when the backend reports ready,
+        before the startup patches have run. Listing depended on them, so the
+        first menu showed the stale SPEDAg and a later one swapped it out."""
+        import em_database.data as data
+        from spyde.backend import example_catalogue
+
+        monkeypatch.delattr(data, sped_ag.NAME)
+        monkeypatch.setattr(sped_ag, "_applied", False)
+
+        names = [key for key, _ in example_catalogue.datasets()]
+        assert sped_ag.NAME in names
+        assert "SPEDAg" not in names
+
     def test_it_resolves_to_the_calibrated_record(self):
         from spyde.backend import example_catalogue
 
