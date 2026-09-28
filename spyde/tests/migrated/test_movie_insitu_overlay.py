@@ -454,6 +454,13 @@ class TestTimestampIsAnOrdinaryOverlay:
         ov = {"builtin": "time", "label": "t", "units": "s"}
         assert _format_overlay_value(ov, 100, 0.03276, 200) == "t = 3.28 s"
 
+    def test_a_static_label_shows_its_text_in_the_editor(self):
+        """It has no trace either, and used to render as a lone dash."""
+        from spyde.actions.movie_export import pipeline
+        from spyde.actions.report.movie import _format_overlay_value
+        ov = pipeline.label_overlay(512, text="OVERLAY-A")
+        assert _format_overlay_value(ov, 3, 0.05, 6) == "OVERLAY-A"
+
     def test_the_burnt_in_frame_draws_it_from_the_overlay_path(self):
         from spyde.actions.movie_export import pipeline
 
