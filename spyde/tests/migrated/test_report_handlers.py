@@ -935,6 +935,7 @@ class TestReportOpenRebind:
         h.report_add_figure(session, None, {"source_window_id": wid, "caption": "DP"})
         path = str(tmp_path / "off.spyde-report")
         h.report_save(session, None, {"path": path})
+        answer_harvest(session, messages)
 
         # Rewrite the zip WITHOUT its data/ members — a pre-data report.
         stripped = str(tmp_path / "off_nodata.spyde-report")
