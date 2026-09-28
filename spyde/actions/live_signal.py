@@ -105,15 +105,16 @@ def _block_sample_index(nav_slices: Sequence[slice]) -> tuple[int, ...]:
 def _hook_targets(selector) -> list:
     """Every object whose pointer events count as "the user touched *selector*".
 
-    Normally just the selector. A ``CompositeSelector`` (the 5-D navigator's
-    crosshair + rectangle pair) is the exception: it owns no widget of its own
+    Normally just the selector. A composite (the 2-D crosshair + rectangle
+    pair, or the 1-D line + span pair) is the exception: it owns no widget of its own
     and delegates unknown attributes to whichever sub-selector is ACTIVE, so a
     hook registered through it would reach exactly one of the two — and would
     silently stop being reachable the moment the user toggled Integrate. Each
     sub-selector has its own widget and its own hook list, so register on both.
     """
     subs = [getattr(selector, name, None)
-            for name in ("_crosshair_selector", "_rect_selector")]
+            for name in ("_crosshair_selector", "_rect_selector",
+                         "_inf_line_selector", "_linear_region_selector")]
     subs = [s for s in subs if s is not None]
     return subs or [selector]
 

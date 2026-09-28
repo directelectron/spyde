@@ -486,7 +486,6 @@ class TestProgressiveSignalPreview:
         assert preview._user_owns is True
 
         # the settle re-fire's forced read at the resting position
-        child = tree.signal_plots[0]
         assert preview.read_frame((3, 4)) is None
         assert preview.reads_declined >= 1
 
