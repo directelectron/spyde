@@ -375,9 +375,13 @@ class Session(
     def _set_signal_type(self, plot, signal_type: str) -> None:
         """Apply a new HyperSpy ``signal_type`` to the active plot's current
         signal (re-casts the signal class), then re-emit metadata/axes/type so
-        the sidebar + downstream actions reflect the change."""
+        the sidebar + downstream actions reflect the change.
+
+        With a navigator focused, the dataset is re-typed, not the navigator
+        image."""
         if plot is None or getattr(plot, "signal_tree", None) is None:
             return
+        plot = self._data_plot_for(plot)
         tree = plot.signal_tree
         try:
             sig = plot.plot_state.current_signal if plot.plot_state else tree.root
