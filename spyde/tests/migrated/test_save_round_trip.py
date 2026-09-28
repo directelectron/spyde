@@ -17,36 +17,44 @@ catches them is comparing what comes back with what went in.
 """
 from __future__ import annotations
 
-import os
+import threading
 import time
+from unittest.mock import patch
 
 import hyperspy.api as hs
 import numpy as np
 import pytest
+from de_shell import ipc
 
 from spyde.tests.migrated.conftest import close_session, make_session, open_saved
 
 
 def _saved(session, path, plot=None, timeout=120.0):
-    """Run Save and wait for the file to appear and settle."""
-    session._save_signal(str(path), plot)
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if os.path.exists(path):
-            size = -1
-            # A directory store appears before it is finished; wait for it to
-            # stop growing rather than racing the writer.
-            while time.time() < deadline:
-                current = sum(
-                    os.path.getsize(os.path.join(root, name))
-                    for root, _dirs, names in os.walk(path) for name in names
-                ) if os.path.isdir(path) else os.path.getsize(path)
-                if current == size and current > 0:
-                    return hs.load(str(path), lazy=True)
-                size = current
-                time.sleep(0.3)
-        time.sleep(0.2)
-    raise AssertionError(f"Save never produced {path}")
+    """Run Save, wait for the writer to report it finished, and load the file.
+
+    Waited on the writer's own "saved" message. A directory store that has
+    stopped growing is not a finished one: the writer pauses between the
+    array and the metadata groups, and a read in that pause finds a store
+    with no ``original_metadata``, or a ``.partial`` file mid-rename.
+    """
+    outcome = {}
+    finished = threading.Event()
+    forward = ipc.emit
+
+    def _watch(message):
+        if isinstance(message, dict):
+            if message.get("type") == "saved" and message.get("path") == str(path):
+                finished.set()
+            elif message.get("type") == "error":
+                outcome["error"] = message.get("text")
+                finished.set()
+        forward(message)
+
+    with patch.object(ipc, "emit", _watch):
+        session._save_signal(str(path), plot)
+        assert finished.wait(timeout), f"Save never finished writing {path}"
+    assert "error" not in outcome, outcome["error"]
+    return hs.load(str(path), lazy=True)
 
 
 def _plots_of(session):
