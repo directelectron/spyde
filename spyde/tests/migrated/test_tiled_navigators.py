@@ -217,3 +217,109 @@ class TestSelectorsWhileTiled:
         _manager(session).add_navigation_selector_and_signal_plot(plot.plot_window)
         _settle(session)
         assert not [m for m in messages if m.get("view_kind") == "tiled"]
+
+
+# ── (e) integrate mode: the tiles follow the integrating rectangle ───────────
+
+def _rectangle(selector):
+    return selector._rect_selector._widget
+
+
+def _rectangle_centre(selector):
+    rectangle = _rectangle(selector)
+    return (float(rectangle.get("x")) + float(rectangle.get("w")) / 2,
+            float(rectangle.get("y")) + float(rectangle.get("h")) / 2)
+
+
+def _hook_counts(selector, hook):
+    """How many copies of *hook* sit on each half of the composite selector."""
+    return [sum(h is hook for h in half.index_hooks)
+            for half in (selector._crosshair_selector, selector._rect_selector)]
+
+
+class TestTiledIntegrate:
+    def _assert_tiles_on_rectangle(self, figure, selector):
+        centre = _rectangle_centre(selector)
+        for _panel_id, (crosshair,) in _panels(figure):
+            assert _wait_for(lambda: _position(crosshair) == centre), \
+                f"tiled crosshair at {_position(crosshair)}, rectangle centre {centre}"
+
+    def test_built_while_integrating_tiles_follow_the_rectangle(
+            self, stem_4d_dataset):
+        session = stem_4d_dataset["window"]
+        (selector,) = _selectors(session)
+        selector.set_integrating(True)
+        _settle(session)
+        _fig_id, figure = _tile(session, stem_4d_dataset["messages"])
+        self._assert_tiles_on_rectangle(figure, selector)
+
+        _rectangle(selector).set(x=1.0, y=2.0)   # a drag on the live navigator
+        _settle(session)
+        self._assert_tiles_on_rectangle(figure, selector)
+
+    def test_toggling_integrate_after_tiling_keeps_tiles_following(
+            self, stem_4d_dataset):
+        session = stem_4d_dataset["window"]
+        (selector,) = _selectors(session)
+        _fig_id, figure = _tile(session, stem_4d_dataset["messages"])
+
+        selector.set_integrating(True)
+        _settle(session)
+        _rectangle(selector).set(x=2.0, y=1.0)
+        _settle(session)
+        self._assert_tiles_on_rectangle(figure, selector)
+
+    def test_dragging_a_tile_centres_the_rectangle_there(self, stem_4d_dataset):
+        session = stem_4d_dataset["window"]
+        (selector,) = _selectors(session)
+        selector.set_integrating(True)
+        _settle(session)
+        fig_id, figure = _tile(session, stem_4d_dataset["messages"])
+        size = (float(_rectangle(selector).get("w")), float(_rectangle(selector).get("h")))
+        (first_id, (first,)), (second_id, (second,)) = _panels(figure)
+
+        _drag(fig_id, second_id, second, 3.5, 3.0)
+        _settle(session)
+
+        assert _rectangle_centre(selector) == (3.5, 3.0)
+        assert (float(_rectangle(selector).get("w")),
+                float(_rectangle(selector).get("h"))) == size
+        assert _position(first) == (3.5, 3.0)
+
+    def test_hooks_both_halves_and_close_removes_them_after_a_toggle(
+            self, stem_4d_dataset):
+        session = stem_4d_dataset["window"]
+        (selector,) = _selectors(session)
+        _tile(session, stem_4d_dataset["messages"])
+        plot = _navigator_plot(session)
+        (cursor,) = session._nav_view_cursors[plot.window_id]
+        hook = cursor._index_hook
+        assert _hook_counts(selector, hook) == [1, 1]
+
+        selector.set_integrating(True)      # the composite now forwards to the rectangle
+        _settle(session)
+        tree = session.signal_trees[0]
+        navigator_views.select_navigator(
+            session, plot, {"names": [next(iter(tree.navigator_signals))],
+                            "window_id": plot.window_id})
+
+        assert _hook_counts(selector, hook) == [0, 0]
+
+    def test_dragging_a_tile_to_the_edge_keeps_the_rectangle_inside(
+            self, stem_4d_dataset):
+        session = stem_4d_dataset["window"]
+        (selector,) = _selectors(session)
+        selector.set_integrating(True)
+        _settle(session)
+        fig_id, figure = _tile(session, stem_4d_dataset["messages"])
+        (panel_id, (crosshair,)), _second = _panels(figure)
+
+        _drag(fig_id, panel_id, crosshair, 100.0, -100.0)
+        _settle(session)
+
+        rectangle = _rectangle(selector)
+        state = rectangle._plot._state
+        assert float(rectangle.get("x")) + float(rectangle.get("w")) <= state["image_width"]
+        assert float(rectangle.get("y")) == 0.0
+        # The copies settle on where the region actually is.
+        assert _wait_for(lambda: _position(crosshair) == _rectangle_centre(selector))

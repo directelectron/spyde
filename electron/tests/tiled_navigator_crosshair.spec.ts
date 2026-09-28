@@ -10,7 +10,9 @@
  *   2. dragging the crosshair in one panel moves the one in the other panel to
  *      the same place, and neither snaps back once the drag is released;
  *   3. adding a selector while tiled puts its crosshair (in its own colour) on
- *      every panel.
+ *      every panel;
+ *   4. with Integrate on, dragging a panel's copy moves the selector's
+ *      rectangle — the integrated indices change — and both copies agree.
  *
  * Screenshots go to tiled_crosshair_shots/ — read them; they are the test.
  */
@@ -84,7 +86,7 @@ function describe(list: Crosshair[]) {
 test('tiled navigators: one master crosshair per selector, copies follow it', async () => {
   test.setTimeout(240_000)
   const { app, page, backend, assertNoJsErrors } = await launchApp({
-    dask: true, env: { SPYDE_LOG_LEVEL: 'WARNING' },
+    dask: true, env: { SPYDE_LOG_LEVEL: 'INFO', SPYDE_NAV_PROFILE: '1' },
   })
   const shot = (name: string) => page.screenshot({ path: `${SHOTS}/${name}.png` })
   try {
@@ -159,6 +161,47 @@ test('tiled navigators: one master crosshair per selector, copies follow it', as
     expect(green.length).toBe(2)
     expect(Math.abs(green[0].u - green[1].u)).toBeLessThan(0.02)
     expect(Math.abs(blue[0].u - blue[1].u)).toBeLessThan(0.02)
+
+    // 4. Integrate the blue selector while tiled: its copies now stand for the
+    //    rectangle's centre, so dragging one must MOVE THE RECTANGLE — the
+    //    integrated indices the backend reads change — and both copies agree.
+    await raiseWindow(nav)
+    await page.getByTestId('selector-integrate').nth(1).click()
+    await page.waitForTimeout(2500)
+    await shot('06-integrate')
+    const regionReads = (from: number) => backend.logBuffer.slice(from)
+      .map((l: string) => l.match(/\[NAV-PROFILE\].*idx=\[([^\]]*)\]/))
+      .filter((m: any) => m && m[1].split(',').length > 2)
+      .map((m: any) => m[1].replace(/\s/g, ''))
+    const beforeDrag = regionReads(0)
+    expect(beforeDrag.length, 'no integrated read after clicking Integrate').toBeGreaterThan(0)
+    const marker = backend.logBuffer.length
+
+    const integrating = await crosshairs(nav, BLUE)
+    console.log('integrating:', describe(integrating))
+    expect(integrating.length).toBe(2)
+    const handle = integrating[0]
+    await page.mouse.move(handle.x, handle.y)
+    await page.mouse.down()
+    for (let i = 1; i <= 6; i++) {
+      await page.mouse.move(handle.x + 10 * i, handle.y - 8 * i, { steps: 3 })
+      await page.waitForTimeout(120)
+    }
+    await page.mouse.up()
+    await page.waitForTimeout(2500)
+    await shot('07-integrate-dragged')
+    const moved = await crosshairs(nav, BLUE)
+    console.log('integrate dragged:', describe(moved))
+    expect(moved.length).toBe(2)
+    expect(Math.abs(moved[0].u - handle.u), 'the dragged copy moved').toBeGreaterThan(0.05)
+    expect(Math.abs(moved[0].u - moved[1].u), 'panels disagree').toBeLessThan(0.02)
+    expect(Math.abs(moved[0].v - moved[1].v), 'panels disagree').toBeLessThan(0.02)
+    const afterDrag = regionReads(marker)
+    console.log(`region read before: [${beforeDrag[beforeDrag.length - 1]}]`)
+    console.log(`region read after:  [${afterDrag[afterDrag.length - 1]}]`)
+    expect(afterDrag.length, 'the drag never read an integrated region').toBeGreaterThan(0)
+    expect(afterDrag[afterDrag.length - 1], 'the rectangle did not move')
+      .not.toBe(beforeDrag[beforeDrag.length - 1])
 
     assertNoJsErrors()
     const errors = backendErrorLines(backend)

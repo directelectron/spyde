@@ -549,6 +549,28 @@ class BaseSelector:
             logger.debug("re-pushing panel on selector close failed: %s", e)
 
 
+# The halves of the point/region composites (IntegratingSelector1D,
+# IntegratingSSelector2D), each of which keeps its own ``index_hooks``.
+_COMPOSITE_HALVES = ("_inf_line_selector", "_linear_region_selector",
+                     "_crosshair_selector", "_rect_selector")
+
+
+def index_hook_targets(selector) -> list:
+    """Every selector whose ``index_hooks`` fire when *selector* moves.
+
+    A navigation selector is usually a composite that swaps between a point
+    and an integrating region, and each half keeps its own hook list. The
+    composite forwards ``index_hooks`` to whichever half is active when it is
+    read, so a hook added through it stops firing the moment the user toggles
+    Integrate. Hook every half instead.
+    """
+    targets = [half for half in (getattr(selector, name, None) for name in _COMPOSITE_HALVES)
+               if getattr(half, "index_hooks", None) is not None]
+    if targets:
+        return targets
+    return [selector] if getattr(selector, "index_hooks", None) is not None else []
+
+
 class IntegratingSelectorMixin:
     """Mixin that provides integrate-over-region behaviour."""
     is_integrating: bool = False

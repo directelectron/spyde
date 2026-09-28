@@ -33,6 +33,8 @@ import logging
 
 import numpy as np
 
+from spyde.drawing.selectors.base_selector import index_hook_targets
+
 log = logging.getLogger(__name__)
 
 
@@ -191,7 +193,6 @@ def _tile_navigators(session, plot, tree, names) -> None:
         pairs.append((name, np.nan_to_num(np.asarray(sig.data, np.float32))))
     if len(pairs) < 2:
         return
-    _tiled_navigators(session)[int(wid)] = list(names)
     _teardown_view_cursors(session, plot)
     mgr = tree.navigator_plot_manager
     selectors = [
@@ -210,13 +211,11 @@ def _tile_navigators(session, plot, tree, names) -> None:
             except Exception as e:
                 log.debug("set_title on tiled navigator failed: %s", e)
             for sel in selectors:
-                master = _crosshair_widget(sel)
+                position = _cursor_position(_active_widget(sel), ("cx", "cy"))
                 copies[id(sel)].append(p.add_crosshair_widget(
-                    cx=float(master.cx), cy=float(master.cy),
-                    color=getattr(sel, "color", None) or "green"))
+                    **position, color=getattr(sel, "color", None) or "green"))
         _view_cursors(session)[int(wid)] = [
-            _LinkedNavCursor(session, sel, _crosshair_widget(sel),
-                             copies[id(sel)], ("cx", "cy"))
+            _LinkedNavCursor(session, sel, copies[id(sel)], ("cx", "cy"))
             for sel in selectors
         ]
 
@@ -229,7 +228,10 @@ def _tile_navigators(session, plot, tree, names) -> None:
             "is_navigator": True,
             "view_label": TILED_LABEL, "view_kind": "tiled",
         })
+        _tiled_navigators(session)[int(wid)] = list(names)
     except Exception as e:
+        # Forget the view so a selector added later does not retry the build.
+        _tiled_navigators(session).pop(int(wid), None)
         log.exception("tiling navigators failed: %s", e)
 
 
@@ -249,18 +251,43 @@ def _real_nav_selector(session, window_id: int):
     return getattr(session, "_nav_selectors", {}).get(window_id)
 
 
-def _selector_vline_widget(sel):
-    """The draggable VLine widget backing the real 1-D navigation selector.
+def _active_widget(selector):
+    """The widget of the half of a navigation selector that is live now: its
+    point, or its integrating region while Integrate is on. A bare selector is
+    its own active half."""
+    return getattr(getattr(selector, "selector", selector), "_widget", None)
 
-    A movie navigator's selector is an ``IntegratingSelector1D`` composite; its
-    crosshair (point) sub-selector holds the VLine. Fall back to ``sel._widget``
-    (which the composite's ``__getattr__`` delegates to the active sub-selector)
-    so this also works if a bare ``InfiniteLineSelector`` is ever wired."""
-    inner = getattr(sel, "_inf_line_selector", None)
-    w = getattr(inner, "_widget", None) if inner is not None else None
-    if w is None:
-        w = getattr(sel, "_widget", None)
-    return w
+
+def _cursor_position(widget, fields) -> dict:
+    """Where the point copies of a selector's widget belong: the widget's own
+    position, or the centre of an integrating region (a span or rectangle)."""
+    kind = getattr(widget, "_type", None)
+    if kind == "range":
+        return {"x": (float(widget.get("x0")) + float(widget.get("x1"))) / 2}
+    if kind == "rectangle":
+        return {"cx": float(widget.get("x")) + float(widget.get("w")) / 2,
+                "cy": float(widget.get("y")) + float(widget.get("h")) / 2}
+    return {field: float(widget.get(field)) for field in fields}
+
+
+def _move_to(widget, position: dict) -> None:
+    """Move a selector's widget to a copy's position. A region keeps its size
+    and is centred there, the inverse of ``_cursor_position``."""
+    kind = getattr(widget, "_type", None)
+    if kind == "range":
+        half_width = (float(widget.get("x1")) - float(widget.get("x0"))) / 2
+        widget.set(x0=position["x"] - half_width, x1=position["x"] + half_width)
+    elif kind == "rectangle":
+        width, height = float(widget.get("w")), float(widget.get("h"))
+        x, y = position["cx"] - width / 2, position["cy"] - height / 2
+        # A rectangle hanging past the image edge reads the edge frames twice.
+        state = getattr(getattr(widget, "_plot", None), "_state", None) or {}
+        if "image_width" in state and "image_height" in state:
+            x = min(max(x, 0.0), float(state["image_width"]) - width)
+            y = min(max(y, 0.0), float(state["image_height"]) - height)
+        widget.set(x=x, y=y)
+    else:
+        widget.set(**position)
 
 
 def _selector_axis(sel):
@@ -278,8 +305,9 @@ class _LinkedNavCursor:
     """Display copies of ONE navigation selector's widget, linked to it.
 
     The selector's own widget on the live navigator is the MASTER and the only
-    holder of the position. Each copy (a stacked row's line, a tiled panel's
-    crosshair):
+    holder of the position: the point, or the integrating region's centre while
+    Integrate is on. It is looked up on every read, so toggling Integrate needs
+    no rebuild. Each copy (a stacked row's line, a tiled panel's crosshair):
 
       • forwards a drag to the master — the master's normal update path then
         drives the signal plot — and mirrors it onto the other copies;
@@ -294,10 +322,9 @@ class _LinkedNavCursor:
     position at that moment rather than the committed index: the dispatcher
     lags a drag, and an older index would pull the dragged copy backwards."""
 
-    def __init__(self, session, sel, master, widgets, fields):
+    def __init__(self, session, sel, widgets, fields):
         self.session = session
         self.sel = sel
-        self.master = master
         self.widgets = list(widgets)
         self.fields = tuple(fields)
         self._handlers: list = []  # widget callbacks are held weakly
@@ -311,24 +338,24 @@ class _LinkedNavCursor:
                 except Exception as e:
                     log.debug("wiring linked cursor %s handler failed: %s", event_type, e)
         self._index_hook = self._on_selector_index
-        try:
-            self.sel.index_hooks.append(self._index_hook)
-        except Exception as e:
-            log.debug("installing linked cursor index hook failed: %s", e)
-
-    def _position(self, widget) -> dict:
-        return {field: float(widget.get(field)) for field in self.fields}
+        self._hooked: list = []
+        for target in index_hook_targets(self.sel):
+            try:
+                target.index_hooks.append(self._index_hook)
+                self._hooked.append(target)
+            except Exception as e:
+                log.debug("installing linked cursor index hook failed: %s", e)
 
     def _make_drag_handler(self, source):
         def handler(_ev=None):
             if self._closed:
                 return
-            position = self._position(source)
+            position = _cursor_position(source, self.fields)
             for widget in self.widgets:
                 if widget is not source:
                     self._set_quietly(widget, position)
             try:
-                self.master.set(**position)
+                _move_to(_active_widget(self.sel), position)
                 self.sel.delayed_update_data(force=True)
             except Exception as e:
                 log.debug("driving the navigation selector from a copy failed: %s", e)
@@ -341,7 +368,10 @@ class _LinkedNavCursor:
     def _follow_master(self) -> None:
         if self._closed:
             return
-        position = self._position(self.master)
+        master = _active_widget(self.sel)
+        if master is None:
+            return
+        position = _cursor_position(master, self.fields)
         for widget in self.widgets:
             self._set_quietly(widget, position)
 
@@ -367,11 +397,14 @@ class _LinkedNavCursor:
     def close(self) -> None:
         """Detach from the selector so a torn-down view stops following it."""
         self._closed = True
-        try:
-            if self._index_hook in self.sel.index_hooks:
-                self.sel.index_hooks.remove(self._index_hook)
-        except Exception as e:
-            log.debug("removing linked cursor index hook failed: %s", e)
+        for target in self._hooked:
+            try:
+                target.index_hooks.remove(self._index_hook)
+            except ValueError:
+                pass
+            except Exception as e:
+                log.debug("removing linked cursor index hook failed: %s", e)
+        self._hooked = []
         self.widgets = []
 
 
@@ -424,10 +457,10 @@ def _stack_navigators(session, plot, tree, names) -> None:
         return
 
     sel = _real_nav_selector(session, int(wid))
-    master = _selector_vline_widget(sel) if sel is not None else None
+    master = _active_widget(sel) if sel is not None else None
     scale, offset = _selector_axis(sel) if sel is not None else (1.0, 0.0)
     # The rows start on the live selector position.
-    cur_x = float(master.get("x")) if master is not None else offset
+    cur_x = _cursor_position(master, ("x",))["x"] if master is not None else offset
 
     _tiled_navigators(session).pop(int(wid), None)
     _teardown_view_cursors(session, plot)
@@ -451,7 +484,7 @@ def _stack_navigators(session, plot, tree, names) -> None:
 
         if len(widgets) >= 2 and master is not None:
             _view_cursors(session)[int(wid)] = [
-                _LinkedNavCursor(session, sel, master, widgets, ("x",))]
+                _LinkedNavCursor(session, sel, widgets, ("x",))]
 
         fig_id = _electron.register(fig)
         html = finalize_figure_html(fig, fig_id)

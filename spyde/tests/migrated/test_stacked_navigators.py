@@ -158,7 +158,7 @@ class TestStackedDrag:
         assert int(np.asarray(sel.current_indices).ravel()[0]) == 5
 
         # And the real selector's own VLine widget followed the drag.
-        real_w = nv._selector_vline_widget(sel)
+        real_w = sel._inf_line_selector._widget
         assert abs(float(real_w.x) - 5 * 0.1) < 1e-6
 
     def test_drag_mirrors_to_the_other_row(self, movie_dataset):
@@ -283,3 +283,93 @@ class TestStackedTeardown:
                          if h in (first_hook, second._index_hook)]
         assert stacked_hooks == [second._index_hook]
         assert len(second.widgets) == 3
+
+
+# ── (e) integrate mode: the rows follow the integrating span ─────────────────
+
+def _span_centre(sel):
+    span = sel._linear_region_selector._widget
+    return (float(span.get("x0")) + float(span.get("x1"))) / 2
+
+
+def _hook_counts(sel, hook):
+    """How many copies of *hook* sit on each half of the composite selector."""
+    return [sum(h is hook for h in half.index_hooks)
+            for half in (sel._inf_line_selector, sel._linear_region_selector)]
+
+
+class TestStackedIntegrate:
+    def _stack(self, session):
+        _add_second_navigator(session, "peak")
+        wid = _nav_window_id(session)
+        plot = session._plot_by_window_id(wid)
+        nv.select_navigator(session, plot, {"names": ["base", "peak"], "window_id": wid})
+        return session._nav_view_cursors[wid][0]
+
+    def _assert_rows_on_span(self, cursor, sel):
+        for w in cursor.widgets:
+            assert abs(float(w.get("x")) - _span_centre(sel)) < 1e-6, \
+                f"row line at {w.get('x')}, span centre at {_span_centre(sel)}"
+
+    def test_built_while_integrating_rows_follow_playback(self, movie_dataset):
+        session = movie_dataset["window"]
+        sel = _real_selector(session)
+        sel.set_integrating(True)
+        _settle(session, sel)
+        cursor = self._stack(session)
+        self._assert_rows_on_span(cursor, sel)
+
+        before = _span_centre(sel)
+        sel.translate_pixels(2)             # what the playback clock does
+        sel.delayed_update_data(force=True)
+        _settle(session, sel)
+
+        assert abs(_span_centre(sel) - (before + 2 * 0.1)) < 1e-6
+        self._assert_rows_on_span(cursor, sel)
+
+    def test_toggling_integrate_after_stacking_keeps_rows_following(
+            self, movie_dataset):
+        session = movie_dataset["window"]
+        sel = _real_selector(session)
+        cursor = self._stack(session)
+
+        sel.set_integrating(True)
+        _settle(session, sel)
+        self._assert_rows_on_span(cursor, sel)
+
+        sel.translate_pixels(1)
+        sel.delayed_update_data(force=True)
+        _settle(session, sel)
+        self._assert_rows_on_span(cursor, sel)
+
+    def test_dragging_a_row_moves_the_span_and_keeps_its_width(self, movie_dataset):
+        session = movie_dataset["window"]
+        sel = _real_selector(session)
+        sel.set_integrating(True)
+        _settle(session, sel)
+        cursor = self._stack(session)
+        span = sel._linear_region_selector._widget
+        width = float(span.get("x1")) - float(span.get("x0"))
+
+        cursor.widgets[1].set(x=6 * 0.1)   # a drag on row 2
+        _settle(session, sel)
+
+        assert abs(_span_centre(sel) - 6 * 0.1) < 1e-6
+        assert abs(float(span.get("x1")) - float(span.get("x0")) - width) < 1e-6
+        assert abs(float(cursor.widgets[0].get("x")) - 6 * 0.1) < 1e-6
+
+    def test_hooks_both_halves_and_close_removes_them_after_a_toggle(
+            self, movie_dataset):
+        session = movie_dataset["window"]
+        sel = _real_selector(session)
+        cursor = self._stack(session)
+        hook = cursor._index_hook
+        assert _hook_counts(sel, hook) == [1, 1]
+
+        sel.set_integrating(True)           # the composite now forwards to the span
+        _settle(session, sel)
+        wid = _nav_window_id(session)
+        plot = session._plot_by_window_id(wid)
+        nv.select_navigator(session, plot, {"names": ["base"], "window_id": wid})
+
+        assert _hook_counts(sel, hook) == [0, 0]
