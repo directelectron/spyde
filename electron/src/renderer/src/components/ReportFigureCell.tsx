@@ -42,7 +42,7 @@ import React, { useState } from 'react'
 import { useSpyDE } from '../kernel/SpyDEContext'
 import { reportClipboard, type SerializedFigureCell } from '../kernel/reportClipboard'
 import type { ReportCell, RepfigPanel, RepfigLayer, RepfigSpec } from '../kernel/protocol'
-import { FIGURE_DRAG_MIME, WINDOW_DRAG_MIME, peekWindowDrag } from '../kernel/dnd'
+import { FIGURE_DRAG_MIME, WINDOW_DRAG_MIME, figurePayloadFromDrop } from '../kernel/dnd'
 import { dlog, dlogOnce } from '../kernel/dragDiag'
 import { COLORMAPS } from '../kernel/colormaps'
 import { useKeyedDebounce } from './wizardHooks'
@@ -130,34 +130,6 @@ function panelAnnAnchor(
     fx: (col + AX_INSET_X + fxData * AX_SPAN_X) / cols,
     fy: (row + AX_INSET_Y + fyData * AX_SPAN_Y) / rows,
   }
-}
-
-// The figure payload of a pill drop: the source window id plus — when the
-// FIGURE_DRAG_MIME payload carries them — the dragged window's shown-figure id
-// and view tag (view:'3d' while its 3-D IPF explorer was up; the placeholder
-// fill forwards these so report_add_figure can snapshot the 3-D scene).
-interface DropFigurePayload { windowId: number; figId?: string; view?: string }
-
-export function figurePayloadFromDrop(dt: DataTransfer): DropFigurePayload | null {
-  const fig = dt.getData(FIGURE_DRAG_MIME)
-  if (fig) {
-    try {
-      const { windowId, figId, view } = JSON.parse(fig) as {
-        windowId?: number; figId?: string; view?: string
-      }
-      if (typeof windowId === 'number') return { windowId, figId, view }
-    } catch { /* malformed */ }
-  }
-  const win = dt.getData(WINDOW_DRAG_MIME)
-  if (win) {
-    const n = parseInt(win, 10)
-    if (Number.isFinite(n)) return { windowId: n }
-  }
-  // getData() came back empty even though the MIME was advertised in `types`
-  // (which is what let the drop zones light up). Fall back to the in-process
-  // payload the drag source stashed — see dnd.ts. Without this the compose
-  // handlers return null here and the drop is a silent no-op.
-  return peekWindowDrag()
 }
 
 // Resolve just the source window id from a drop (compose paths — a compose

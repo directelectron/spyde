@@ -507,3 +507,168 @@ class TestExportToken:
         ex.report_export_markdown(session, None, {"path": out})
         exp = _exported(messages, session)
         assert exp and "token" not in exp[0]
+
+
+# ── a figure with no pixels ───────────────────────────────────────────────────
+
+
+class TestAFigureWithoutPixels:
+    """A figure cell with no pixels still exports its caption."""
+
+    def test_figure_without_pixels_keeps_its_caption(self):
+        # A scene3d cell nobody harvested, or an offline figure that never baked.
+        # Dropping the whole <figure> deleted the caption with it, so the reader
+        # saw no trace that anything was meant to be there.
+        frag = ex._figure_img_html("Orientation, IPF-Z", None)
+        assert "Orientation, IPF-Z" in frag
+        assert "report-figure--missing" in frag
+
+    def test_no_caption_and_no_pixels_still_renders_nothing(self):
+        assert ex._figure_img_html("", None) == ""
+
+
+
+def _figure_cell_tsx() -> str:
+    """The renderer's ReportFigureCell.tsx source, for the aspect-ratio guard."""
+    from pathlib import Path
+
+    return (Path(__file__).resolve().parents[3] / "electron" / "src" / "renderer"
+            / "src" / "components" / "ReportFigureCell.tsx").read_text(
+                encoding="utf-8")
+
+
+def _ratio_in(source: str, pattern: str) -> float:
+    """The ``a / b`` ratio the first match of *pattern* captures."""
+    import re
+
+    match = re.search(pattern, source)
+    assert match, f"could not find {pattern!r} in ReportFigureCell.tsx"
+    return int(match.group(1)) / int(match.group(2))
+
+
+# Each pattern is anchored on the CODE around its ratio, not on where that code
+# happens to sit, so reflowing the component does not fail the guard and only a
+# changed number does.
+_TSX_RATIOS = {
+    r"PANEL_ASPECT\s*=\s*(\d+)\s*/\s*(\d+)": ex._PANEL_ASPECT,
+    r"vectors_mode\)\s*!==\s*'image'\)\s*\{\s*return\s+(\d+)\s*/\s*(\d+)":
+        ex._VECTORS_ASPECT,
+    r"layout\.kind\s*!==\s*'grid'\)\s*return\s+(\d+)\s*/\s*(\d+)":
+        ex._DEFAULT_ASPECT,
+}
+
+
+def _fig_box_iframe_rule(css: str) -> str:
+    """The ``.fig-box iframe`` declaration block of a page stylesheet."""
+    import re
+
+    match = re.search(r"\.fig-box iframe \{([^}]*)\}", css)
+    assert match, "no .fig-box iframe rule in the stylesheet"
+    return match.group(1)
+
+
+class TestAnEmbedWithNoHeightOfItsOwnFillsItsBox:
+    """The bespoke explorer pages carry no height, so the BOX must give them one.
+
+    The orientation explorer and the overlay blender are emitted with only
+    ``width:100%``: nothing posts a measured height and the fit script skips
+    them. Inside an ``overflow:hidden`` box with no height rule they collapse to
+    the browser's default 150 px and the reader sees a sliver of the page.
+    """
+
+    def test_the_stylesheet_gives_such_an_iframe_the_full_box(self):
+        for css in (ex._ARTICLE_CSS, ex._SLIDES_CSS):
+            assert "height: 100%" in _fig_box_iframe_rule(css)
+
+    def test_a_blender_cell_carries_no_pixel_height_of_its_own(
+            self, tem_2d_dataset, tmp_path, monkeypatch):
+        session = tem_2d_dataset["window"]
+        messages = tem_2d_dataset["messages"]
+        _prime_plot_data(session)
+        monkeypatch.setattr(
+            "spyde.actions.report.overlay_embed.overlay_blender_html",
+            lambda mgr, cell, caption="": "<html><body>blended</body></html>")
+
+        h.report_new(session, None, {})
+        h.report_add_figure(session, None,
+                            {"source_window_id": _signal_window_id(session)})
+        path = str(tmp_path / "blender.html")
+        messages.clear()
+        ex.report_export_html(session, None, {"mode": "interactive", "path": path})
+        assert _exported(messages, session)
+        html = open(path, encoding="utf-8").read()
+
+        assert 'srcdoc="&lt;html&gt;' in html, "the blender page was not embedded"
+        # No inline height, so the stylesheet above is the only thing sizing it.
+        assert 'style="width:100%;"' in html
+
+class TestFigureBoxMatchesTheSidebar:
+    """The exported figure box is sized the way the sidebar cell is.
+
+    A fixed pixel height gave every exported figure the same tall box whatever
+    its shape: a wide 1x3 row was letterboxed and a square pattern stretched.
+    Reading a report and reading its export should not be two experiences.
+    """
+
+    def test_a_single_panel_uses_the_default_ratio(self):
+        from spyde.actions.report.model import FigureSpec
+
+        assert ex._figure_aspect(FigureSpec()) == ex._DEFAULT_ASPECT
+
+    def test_a_grid_scales_by_cols_over_rows(self):
+        from spyde.actions.report.model import FigureSpec
+
+        wide = FigureSpec(layout={"kind": "grid", "rows": 1, "cols": 3})
+        tall = FigureSpec(layout={"kind": "grid", "rows": 3, "cols": 1})
+        assert ex._figure_aspect(wide) == ex._PANEL_ASPECT * 3
+        assert ex._figure_aspect(tall) == ex._PANEL_ASPECT / 3
+
+    def test_a_vectors_explorer_gets_room_for_its_chrome(self):
+        from spyde.actions.report.model import FigureSpec
+
+        spec = FigureSpec()
+        spec.vectors_mode = "viewer"
+        assert ex._figure_aspect(spec) == ex._VECTORS_ASPECT
+
+    def test_the_export_sizes_by_aspect_not_a_fixed_height(self, tem_2d_dataset,
+                                                           tmp_path):
+        session = tem_2d_dataset["window"]
+        messages = tem_2d_dataset["messages"]
+        _prime_plot_data(session)
+        h.report_new(session, None, {})
+        h.report_add_figure(session, None,
+                            {"source_window_id": _signal_window_id(session)})
+
+        path = str(tmp_path / "aspect.html")
+        messages.clear()
+        ex.report_export_html(session, None, {"mode": "interactive", "path": path})
+        assert _exported(messages, session)
+        html = open(path, encoding="utf-8").read()
+        import re
+
+        box = re.search(r'<div class="fig-box" style="aspect-ratio:([\d.]+);', html)
+        assert box, "the figure has no aspect-shaped box"
+        # The box is shaped BY THIS FIGURE, not by a page-wide constant: its
+        # ratio is the figure's own laid-out width over its height.
+        iframe = re.search(r'<iframe [^>]*style="width:(\d+)px;height:(\d+)px;',
+                           html)
+        assert iframe, "the iframe does not carry the figure's natural size"
+        natural = int(iframe.group(1)) / int(iframe.group(2))
+        assert abs(float(box.group(1)) - natural) < 0.001
+
+    def test_the_ratios_match_the_sidebar_component(self):
+        # The renderer has its own copy (ReportFigureCell.tsx) and the two must
+        # agree, or the export silently disagrees with the thing it is a copy of.
+        # PARSE the TSX rather than trust a comment: the caret-defaults trap was
+        # exactly a TSX value drifting from its Python twin and winning silently.
+        source = _figure_cell_tsx()
+        for pattern, expected in _TSX_RATIOS.items():
+            assert _ratio_in(source, pattern) == expected
+
+    def test_the_guard_would_catch_a_drift(self):
+        # The check above is only worth having if it fails on a changed value, so
+        # run the REAL patterns over a TSX with one ratio edited.
+        source = _figure_cell_tsx().replace("const PANEL_ASPECT = 4 / 3",
+                                            "const PANEL_ASPECT = 5 / 3")
+        drifted = {pattern: _ratio_in(source, pattern) for pattern in _TSX_RATIOS}
+        assert drifted != _TSX_RATIOS
