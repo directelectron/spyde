@@ -1003,6 +1003,28 @@ class TestMeasureIsolation:
             "the pass lane must be serial — private_view cannot overlap itself"
 
 
+    def test_the_region_check_after_a_pass_reads_its_own_view(self, window):
+        """A finished pass checks the region is on the beam by slicing one
+        frame, and a slice copies the signal it is taken from. On the live
+        signal that races the next pass's copy on the pass lane."""
+        _session, _plot, _tree, wiz = _opened(window)
+        handed = []
+        real = dpca._dpc.region_brightness
+
+        def spy(signal, region, **kw):
+            handed.append(signal)
+            return real(signal, region, **kw)
+
+        dpca._dpc.region_brightness = spy
+        try:
+            region = wiz.region()
+            assert region.active, "the fixture's default region is not usable"
+            wiz._warn_if_region_missed(np.zeros((2, 2, 2)), region, (32, 32))
+        finally:
+            dpca._dpc.region_brightness = real
+        assert handed, "the region check never read a frame"
+        assert all(signal is not wiz.signal for signal in handed),             "the region check sliced the tree's live signal"
+
 @pytest.mark.usefixtures("_capture_module_emit")
 class TestDoubleFire:
     def test_open_close_open_leaves_exactly_one_wizard(self, window):

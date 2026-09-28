@@ -708,7 +708,10 @@ class DpcWizard(WizardController):
             emit_error("DPC: the beam region captured no intensity anywhere — "
                        "drag it onto the direct beam.")
             return
-        brightness = _dpc.region_brightness(self.signal, region)
+        # Its own view: `region_brightness` slices with `inav`, which copies
+        # the signal it slices, and the pass lane may be copying this one.
+        brightness = _dpc.region_brightness(_dpc.private_view(self.signal),
+                                            region)
         if np.isfinite(brightness) and brightness < _dpc.BEAM_DIM_THRESHOLD:
             emit_status(
                 f"DPC: warning — the beam region is dimmer than the detector "

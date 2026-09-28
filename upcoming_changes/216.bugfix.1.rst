@@ -1,0 +1,1 @@
+DPC: a beam-shift pass could be handed the dataset's live signal, instead of a copy of its own, when a new pass started just as the previous one was checking its beam region. The two copies of that signal could then fail, or show other readers an empty placeholder in place of the data. Each pass now reads its own copy, and taking that copy no longer touches the original.
