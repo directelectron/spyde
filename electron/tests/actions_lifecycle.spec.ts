@@ -2,10 +2,10 @@
  * actions_lifecycle.spec.ts — the formalized action lifecycle end-to-end:
  *
  *  1. requires_vectors gating — the vector actions (Strain Mapping, Vector
- *     Orientation Mapping, Vector Virtual Imaging) must NOT be on the vectors
- *     window's toolbar while the find-vectors batch is still computing, and
- *     must appear once it finalizes ("Found N diffraction vectors" re-sends
- *     the toolbar config).
+ *     Orientation Mapping, Vector Virtual Imaging) are on the vectors window's
+ *     toolbar but DISABLED while the find-vectors batch is still filling it
+ *     (the result tree is locked), and become clickable once it finalizes
+ *     (the unlock re-sends the toolbar config).
  *  2. The Commit affordance — the Strain caret's Commit button
  *     (strain_commit → commit_result_tree) freezes the live field as a NEW
  *     SignalTree window.
@@ -73,34 +73,35 @@ test('requires_vectors gate + Commit-to-new-tree + caret teardown', async () => 
     timeout: 120_000, message: 'vectors result window never opened',
   }).toBeGreaterThan(before)
 
-  // ── 2) requires_vectors: while the batch is STILL computing, NO window's
-  // toolbar may offer the vector actions (page-wide — the buttons simply
-  // don't exist until diffraction_vectors attach re-sends the toolbar).
-  // Timing-tolerant: on a fast box the batch may already be done — then the
-  // "absent" half is skipped and we still verify "present after".
+  // ── 2) requires_vectors: while the batch is STILL computing, the vector
+  // actions sit on the vectors window's toolbar GREYED (the result tree is
+  // locked until diffraction_vectors attach), and no window offers them
+  // enabled. Timing-tolerant: on a fast box the batch may already be done —
+  // then the "disabled" half is skipped and we still verify "enabled after".
+  const enabledCount = (name: string) =>
+    page.locator(`[data-testid="action-btn-${name}"]:not([disabled])`).count()
   if (!found()) {
     for (const name of ['Strain Mapping', 'Vector Orientation Mapping',
                         'Vector Virtual Imaging']) {
-      expect(await page.getByTestId(`action-btn-${name}`).count(),
-        `${name} must be hidden until diffraction_vectors attach`).toBe(0)
+      expect(await enabledCount(name),
+        `${name} must not be clickable until diffraction_vectors attach`).toBe(0)
     }
     await page.screenshot({ path: join(SHOTS, '02-gated.png') })
-    console.log('[gate] vector actions hidden during the batch — OK')
+    console.log('[gate] vector actions disabled during the batch — OK')
   } else {
-    console.log('[gate] batch finished before the check — absence half skipped')
+    console.log('[gate] batch finished before the check — disabled half skipped')
   }
 
-  // The button APPEARING is the real completion signal (the "Found …" status
-  // travels the PLOTAPP protocol, not the harness log — see CLAUDE.md). The
-  // distributed batch on this box takes minutes (per-worker process spawn),
-  // so give it a real budget.
-  await expect.poll(
-    () => page.getByTestId('action-btn-Strain Mapping').count(), {
-      timeout: 360_000,
-      message: 'vector actions never appeared (diffraction_vectors attach)',
-    }).toBeGreaterThan(0)
+  // The button turning CLICKABLE is the real completion signal (the "Found …"
+  // status travels the PLOTAPP protocol, not the harness log — see
+  // CLAUDE.md). The distributed batch on this box takes minutes (per-worker
+  // process spawn), so give it a real budget.
+  await expect.poll(() => enabledCount('Strain Mapping'), {
+    timeout: 360_000,
+    message: 'vector actions never became clickable (diffraction_vectors attach)',
+  }).toBeGreaterThan(0)
   await page.screenshot({ path: join(SHOTS, '03-ungated.png') })
-  console.log('[gate] vector actions appeared after the attach — OK')
+  console.log('[gate] vector actions enabled after the attach — OK')
 
   // Close the FV caret so it doesn't cover the strain caret.
   if (await page.getByTestId('fv-close').count()) {
