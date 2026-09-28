@@ -1,0 +1,1 @@
+Stopping **Find Vectors** while its live preview was drawing no longer leaves the preview's circles on the diffraction pattern. A removal that landed mid-draw used to be undone by that draw.
