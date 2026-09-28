@@ -95,6 +95,13 @@ test('the matched pattern lands on the measured peaks and follows the crosshair'
   await expect(page.getByTestId('phase-0-structure')).toContainText('Silver__0011135')
   await page.getByTestId('ptable-done').click()
 
+  // Picking the phase opens the IPF window. On a full MDI area it cascades
+  // from the top-left and can land on this caret, and its figure iframe then
+  // takes the click. The caret paints within its window's stacking context,
+  // so raising the window brings the caret back to the front.
+  await expect(page.getByTestId('subwindow')
+    .filter({ hasText: 'IPF Refine' })).toHaveCount(1, { timeout: 60_000 })
+  await vsig.getByTestId('subwindow-titlebar').click()
   await page.getByTestId('vom-tab-Library').click()
   await page.getByTestId('vom-generate').click()
   // Generate stops at the library and the live previews — the whole-field fit
