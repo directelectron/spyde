@@ -256,8 +256,10 @@ teardown (`_forget_window`), and when a dispatched action raises.
 - **Bare-figure windows**: a window emitted as a raw `figure` message is NOT
   a registered Plot — `_plot_by_window_id` returns None and generic dispatch
   silently no-ops. Register a controller (`own_window`) and resolve via
-  `session.controller_by_window_id`; keep figures alive with
-  `figure_registry.keep_alive(window_id, fig)`.
+  `session.controller_by_window_id`; open the window with
+  `figure_window.emit_figure` (registers the figure, keeps it alive for the
+  window's lifetime, emits the message) or `figure_window.ImageGrid` for a
+  grid of grey image panels.
 - **Thread marshal**: plots/figures/IPC state may only be touched on the
   asyncio main thread. Workers hand results to `on_done` (marshalled);
   `emit_status`/`emit_error` are safe from any thread.

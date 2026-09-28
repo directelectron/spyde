@@ -45,9 +45,8 @@ the whole-movie raw/corrected sums on top, the discovery pair (ROI raw vs ROI
 aligned) beneath. The *Drift dy/dx* window is the curve, opened when the solve
 starts and filled progressively from ``on_shift`` — it is a normal figure
 window, not caret furniture. Both are bare ``figure`` windows (NOT registered
-``Plot``s), so each registers a controller via ``own_window`` and keeps its
-figure referenced through ``figure_registry.keep_alive``, per
-``actions/README.md`` §6.
+``Plot``s), so each registers a controller via ``own_window`` and is opened
+through ``actions/figure_window.py``, per ``actions/README.md`` §6.
 
 **Nothing here materialises the movie.** ``solve_translation`` streams one
 frame at a time; the check sums stream over a bounded subset
@@ -69,6 +68,7 @@ import numpy as np
 
 from spyde.actions.context import current_signal as _current_signal
 from spyde.actions.context import src_plot_tree as _src_plot_tree
+from spyde.actions.figure_window import ImageGrid, emit_figure, figure_geometry
 from spyde.actions.lifecycle import (
     bump_generation, is_current, run_on_worker, show_tree_node,
 )
@@ -108,33 +108,6 @@ _TRACE_BATCH = 16
 # computed". Flush on whichever comes first, so the trace is live at any movie
 # length and still capped at ~7 messages/s on a fast one.
 _TRACE_MAX_INTERVAL = 0.15
-
-#: Figure geometry for the two bare-figure windows.
-#:
-#: A bare figure never receives ``resize_figure`` (that path resolves a
-#: registered ``Plot``), so its INITIAL px size is the one it keeps and anything
-#: outside it is CLIPPED by the subwindow — which is what cut the check
-#: window's bottom row in half. The renderer sizes a new window from the
-#: ``aspect`` field as ``inner_h = clamp(460 / aspect, 130, 300)`` then
-#: ``inner_w = inner_h * aspect`` (``MDIArea.windowSize``). At the height cap
-#: the first clamp is active for any aspect below 460/300, so a figure exactly
-#: :data:`_FIG_HEIGHT` tall lands pixel-for-pixel in its window at any width up
-#: to 460 — pick the width, derive the aspect.
-#:
-#: The width is deliberately the renderer's OWN default (340). Widening the
-#: check window to 460 made it no longer fit beside the movie, so the free-slot
-#: packer wrapped it to the next row — straight on top of the caret, which is an
-#: overlay the packer cannot see. Keeping the default width keeps the placement
-#: the packer already gets right.
-_FIG_WIDTH = 340
-_FIG_HEIGHT = 300
-
-
-def _figure_geometry(width: int = _FIG_WIDTH) -> tuple[tuple[int, int], float]:
-    """``(figsize, aspect)`` that opens a bare-figure window with no clipping."""
-    w = int(min(460, max(190, width)))
-    return (w, _FIG_HEIGHT), w / float(_FIG_HEIGHT)
-
 
 #: Frames the discovery preview aligns. ~20 is the brief's number and it is a
 #: DEFAULT, not a law — ``preview_frames`` in Advanced moves it.
@@ -261,7 +234,7 @@ class DriftWizard(WizardController):
         self.model = None
         #: The Drift Check window (a bare figure) and its four panels.
         self.window_id: int | None = None
-        self._panels: dict[str, Any] = {}
+        self._grid: ImageGrid | None = None
         self._sum_indices: np.ndarray | None = None
         self._before_sum: np.ndarray | None = None
         #: The dy/dx window — opened by the solve, filled from ``on_shift``.
@@ -476,61 +449,28 @@ class DriftWizard(WizardController):
         toggle is off). Side by side, because "is this landmark good" is
         answered by comparing two sums, not by staring at one.
         """
-        import anyplotlib as apl
-        import anyplotlib._electron as _electron
-        from de_shell.actions.figure_registry import keep_alive
-        from spyde.drawing.plots.plot import finalize_figure_html
-
-        figsize, aspect = _figure_geometry()
-        fig, axes = apl.subplots(2, 2, figsize=figsize)
-        ax = np.array(axes, dtype=object).ravel()
         before = np.asarray(before, np.float32)
         zeros = np.zeros_like(before)
+        grid = ImageGrid(2, 2, {"before": before, "after": zeros,
+                                "roi_raw": zeros, "roi_aligned": zeros})
+        grid.set_titles({"before": "Raw sum", "after": "Corrected sum",
+                         "roi_raw": "ROI raw", "roi_aligned": "ROI aligned"})
+        self._grid = grid
 
-        panels = {
-            "before": ax[0].imshow(before, cmap="gray"),
-            "after": ax[1].imshow(zeros, cmap="gray"),
-            "roi_raw": ax[2].imshow(zeros, cmap="gray"),
-            "roi_aligned": ax[3].imshow(zeros, cmap="gray"),
-        }
-        titles = {"before": "Raw sum", "after": "Corrected sum",
-                  "roi_raw": "ROI raw", "roi_aligned": "ROI aligned"}
-        self._panels = panels
-        for key, title in titles.items():
-            self._set_panel_title(key, title)
-
-        wid = self.session.next_window_id()
-        fig_id = _electron.register(fig)
-        html = finalize_figure_html(fig, fig_id)
-        keep_alive(int(wid), fig)
-        emit({"type": "figure", "fig_id": fig_id, "window_id": int(wid),
-              "html": html, "title": "Drift Check", "is_navigator": False,
-              "aspect": float(aspect)})
-        self.window_id = int(wid)
+        wid = int(self.session.next_window_id())
+        grid.show(wid, "Drift Check")
+        self.window_id = wid
         self._before_sum = before
         self.own_window(wid)
 
-    def _set_panel_title(self, key: str, title: str) -> None:
-        panel = self._panels.get(key)
-        if panel is None:
-            return
-        try:
-            panel.set_title(title)
-        except Exception as exc:
-            log.debug("[drift] set_title(%s) failed: %s", key, exc)
-
     def update_check(self, *, after=None) -> None:
         """Paint the whole-movie corrected sum (main thread only)."""
-        if after is None or not self._panels:
-            return
-        try:
-            self._panels["after"].set_data(np.asarray(after, np.float32))
-        except Exception as exc:
-            log.debug("[drift] painting the corrected sum failed: %s", exc)
+        if after is not None and self._grid is not None:
+            self._grid.set_data("after", after)
 
     def show_preview(self, result: dict) -> None:
         """Paint the discovery pair + its titles (main thread only)."""
-        if not self._panels:
+        if self._grid is None:
             return
         what = "ROI" if result.get("roi") is not None else "Whole frame"
         n = int(result.get("frames", 0))
@@ -543,11 +483,8 @@ class DriftWizard(WizardController):
         ):
             if arr is None:
                 continue
-            try:
-                self._panels[key].set_data(np.asarray(arr, np.float32))
-            except Exception as exc:
-                log.debug("[drift] painting the %s panel failed: %s", key, exc)
-            self._set_panel_title(key, title)
+            self._grid.set_data(key, arr)
+            self._grid.set_titles({key: title})
 
     # ── the dy/dx window ─────────────────────────────────────────────────────
 
@@ -565,11 +502,8 @@ class DriftWizard(WizardController):
             self.reset_trace(n)
             return
         import anyplotlib as apl
-        import anyplotlib._electron as _electron
-        from de_shell.actions.figure_registry import keep_alive
-        from spyde.drawing.plots.plot import finalize_figure_html
 
-        figsize, aspect = _figure_geometry()
+        figsize, aspect = figure_geometry()
         fig, axes = apl.subplots(1, 1, figsize=figsize)
         ax = np.array(axes, dtype=object).ravel()[0]
         x0 = np.zeros(1, dtype=np.float64)
@@ -585,14 +519,9 @@ class DriftWizard(WizardController):
             except Exception as exc:
                 log.debug("[drift] trace %s failed: %s", setter, exc)
 
-        wid = self.session.next_window_id()
-        fig_id = _electron.register(fig)
-        html = finalize_figure_html(fig, fig_id)
-        keep_alive(int(wid), fig)
-        emit({"type": "figure", "fig_id": fig_id, "window_id": int(wid),
-              "html": html, "title": "Drift dy/dx", "is_navigator": False,
-              "aspect": float(aspect)})
-        self.trace_window_id = int(wid)
+        wid = int(self.session.next_window_id())
+        emit_figure(wid, fig, "Drift dy/dx", aspect=float(aspect))
+        self.trace_window_id = wid
         self._trace = {"panel": panel, "dx": dx_line}
         self.reset_trace(n)
         self.own_window(wid)
@@ -685,7 +614,7 @@ class DriftWizard(WizardController):
         self._stop[0] = True             # stop a solve in flight
         self.cancel_preview()
         self.remove_roi_widget()
-        self._panels = {}
+        self._grid = None
         self._trace = {}
         wid, self.window_id = self.window_id, None
         twid, self.trace_window_id = self.trace_window_id, None
@@ -1217,11 +1146,8 @@ def drift_discard(session, plot, payload=None) -> None:
     if getattr(wiz.tree, "drift", None) is not None:
         wiz.tree.drift = None
     wiz.close_trace_window()
-    if wiz._panels and wiz._before_sum is not None:
-        try:
-            wiz._panels["after"].set_data(np.zeros_like(wiz._before_sum))
-        except Exception as exc:
-            log.debug("[drift] clearing the corrected sum failed: %s", exc)
+    if wiz._grid is not None and wiz._before_sum is not None:
+        wiz._grid.set_data("after", np.zeros_like(wiz._before_sum))
     _emit_state(wiz)
     emit_status("Drift result discarded.")
 

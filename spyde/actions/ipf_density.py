@@ -22,11 +22,11 @@ import logging
 
 import numpy as np
 
+from spyde.actions.figure_window import emit_figure, register_figure
 from spyde.actions.ipf_view import _as_orientation_map
 
 # NB: named `logger` (not `log`) — build_ipf_density_figure has a `log: bool`
 # param for log-scale density that would otherwise shadow a module-level `log`.
-from de_shell.actions.figure_registry import keep_alive
 
 logger = logging.getLogger(__name__)
 
@@ -136,11 +136,9 @@ def build_ipf_density_figure(result, direction: str = "z", *,
     path (still correct, just slower to draw).
     """
     import anyplotlib as apl
-    import anyplotlib._electron as _electron
     from orix.measure import pole_density_function
     from orix.quaternion import Rotation
 
-    from spyde.drawing.plots.plot import finalize_figure_html
     from spyde.signals.orientation_map import _direction_vector, ipf_triangle_xy
 
     om = _as_orientation_map(result)
@@ -185,24 +183,18 @@ def build_ipf_density_figure(result, direction: str = "z", *,
             except Exception as e:
                 logger.debug("set_title on IPF density panel failed: %s", e)
 
-    fig_id = _electron.register(fig)
-    html = finalize_figure_html(fig, fig_id)
+    fig_id, html = register_figure(fig)
     return fig, fig_id, html
 
 
 def emit_ipf_density(window_id: int, result, direction: str = "z", **kw) -> bool:
     """Build + emit the IPDF heatmap as a ``view="density"`` figure for
     *window_id*. Returns True if a figure was emitted."""
-    from de_shell.ipc import emit
     try:
-        _fig, fig_id, html = build_ipf_density_figure(result, direction, **kw)
+        fig, fig_id, html = build_ipf_density_figure(result, direction, **kw)
     except Exception as e:
         logger.debug("ipf density build failed: %s", e)
         return False
-    keep_alive(int(window_id), _fig)
-    emit({
-        "type": "figure", "fig_id": fig_id, "window_id": int(window_id),
-        "html": html, "title": "IPF density", "is_navigator": False,
-        "view": "density",
-    })
+    emit_figure(window_id, fig, "IPF density", registered=(fig_id, html),
+                view="density")
     return True

@@ -28,6 +28,7 @@ import numpy as np
 
 from spyde.actions import dpc as _dpc
 from spyde.actions._common import robust_map_limits
+from spyde.actions.figure_window import register_figure
 
 logger = logging.getLogger(__name__)
 
@@ -153,8 +154,6 @@ def build_dpc_figure(result: "_dpc.DpcResult", *, view: str = RGB_VIEW,
     view has the colour wheel instead.
     """
     import anyplotlib as apl
-    import anyplotlib._electron as _electron
-    from spyde.drawing.plots.plot import finalize_figure_html
 
     data, clim, cmap = view_array(result, view)
     fig, figure_axes = apl.subplots(1, 1)
@@ -175,8 +174,7 @@ def build_dpc_figure(result: "_dpc.DpcResult", *, view: str = RGB_VIEW,
     wheel_key = attach_wheel_key(p, visible=(view == RGB_VIEW),
                                  scale=wheel_scale_label(result))
 
-    fig_id = _electron.register(fig)
-    html = finalize_figure_html(fig, fig_id)
+    fig_id, html = register_figure(fig)
     return fig, fig_id, html, p, wheel_key
 
 
