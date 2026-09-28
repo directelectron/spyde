@@ -38,7 +38,9 @@ async function settledSlideCount(page: any): Promise<number> {
   let last = -1, stable = 0
   for (let i = 0; i < 60 && stable < 3; i++) {
     const n = await page.getByTestId(/^report-slide-\d+$/).count()
-    stable = n === last ? stable + 1 : 0
+    // Zero is "not arrived yet", never "settled": opening the deck rebuilds its
+    // figures from their saved pixels first, which outlasts three polls.
+    stable = n > 0 && n === last ? stable + 1 : 0
     last = n
     await page.waitForTimeout(400)
   }
