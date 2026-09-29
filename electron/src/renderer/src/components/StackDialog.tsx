@@ -10,6 +10,7 @@
  * a common shape if they differ.
  */
 import React, { useState } from 'react'
+import { ModalDialog, S } from './WizardShell'
 
 const ACCENT = '#89b4fa'
 
@@ -73,141 +74,114 @@ export function StackDialog({
   const canStack = paths.length >= 2
 
   return (
-    <div style={styles.overlay} data-testid="stack-dialog">
-      <div style={styles.dialog} onClick={(e) => e.stopPropagation()}>
-        <h3 style={styles.title}>Load Stack</h3>
-        <p style={styles.sub}>
-          Combine several datasets into one — they stack along a new index axis
-          (top = 0). Drag to reorder. Mismatched shapes are cropped to the common
-          size.
-        </p>
+    <ModalDialog testid="stack-dialog" title="Load Stack" width={420} onClose={onCancel}
+      footer={<>
+        <button data-testid="stack-cancel" style={S.dialogCancel} onClick={onCancel}>
+          Cancel
+        </button>
+        <button
+          data-testid="stack-confirm"
+          style={{ ...S.dialogConfirm, opacity: canStack ? 1 : 0.5 }}
+          disabled={!canStack}
+          onClick={() => onConfirm(paths)}
+          title={canStack ? '' : 'Add at least two datasets'}
+        >
+          Stack {paths.length > 0 ? `(${paths.length})` : ''}
+        </button>
+      </>}>
+      <p style={styles.sub}>
+        Combine several datasets into one — they stack along a new index axis
+        (top = 0). Drag to reorder. Mismatched shapes are cropped to the common
+        size.
+      </p>
 
-        <div style={styles.stack}>
-          {paths.map((p, i) => (
-            <div
-              key={`${p}#${i}`}
-              data-testid={`stack-chip-${i}`}
-              draggable
-              onDragStart={() => setDragIdx(i)}
-              onDragEnd={() => {
-                setDragIdx(null)
-                setOverIdx(null)
-              }}
-              onDragOver={(e) => {
-                e.preventDefault()
-                if (overIdx !== i) setOverIdx(i)
-              }}
-              onDrop={(e) => {
-                e.preventDefault()
-                if (dragIdx !== null) reorder(dragIdx, i)
-                setDragIdx(null)
-                setOverIdx(null)
-              }}
-              style={{
-                ...styles.chip,
-                ...(dragIdx === i ? styles.chipDragging : null),
-                ...(overIdx === i && dragIdx !== null && dragIdx !== i
-                  ? styles.chipDropTarget
-                  : null),
-              }}
-              title={p}
+      <div style={styles.stack}>
+        {paths.map((p, i) => (
+          <div
+            key={`${p}#${i}`}
+            data-testid={`stack-chip-${i}`}
+            draggable
+            onDragStart={() => setDragIdx(i)}
+            onDragEnd={() => {
+              setDragIdx(null)
+              setOverIdx(null)
+            }}
+            onDragOver={(e) => {
+              e.preventDefault()
+              if (overIdx !== i) setOverIdx(i)
+            }}
+            onDrop={(e) => {
+              e.preventDefault()
+              if (dragIdx !== null) reorder(dragIdx, i)
+              setDragIdx(null)
+              setOverIdx(null)
+            }}
+            style={{
+              ...styles.chip,
+              ...(dragIdx === i ? styles.chipDragging : null),
+              ...(overIdx === i && dragIdx !== null && dragIdx !== i
+                ? styles.chipDropTarget
+                : null),
+            }}
+            title={p}
+          >
+            <span style={styles.grip} aria-hidden>
+              ⠿
+            </span>
+            <span style={styles.badge}>{i}</span>
+            <span style={styles.chipName}>{basename(p)}</span>
+            <button
+              data-testid={`stack-remove-${i}`}
+              style={styles.remove}
+              onClick={() => removeAt(i)}
+              title="Remove from stack"
             >
-              <span style={styles.grip} aria-hidden>
-                ⠿
-              </span>
-              <span style={styles.badge}>{i}</span>
-              <span style={styles.chipName}>{basename(p)}</span>
-              <button
-                data-testid={`stack-remove-${i}`}
-                style={styles.remove}
-                onClick={() => removeAt(i)}
-                title="Remove from stack"
-              >
-                ×
-              </button>
-            </div>
-          ))}
+              ×
+            </button>
+          </div>
+        ))}
 
-          {/* Drop zone at the very end (reorder to last). */}
-          {dragIdx !== null && (
-            <div
-              data-testid="stack-drop-end"
-              onDragOver={(e) => {
-                e.preventDefault()
-                setOverIdx(paths.length)
-              }}
-              onDrop={(e) => {
-                e.preventDefault()
-                if (dragIdx !== null) reorder(dragIdx, paths.length)
-                setDragIdx(null)
-                setOverIdx(null)
-              }}
-              style={{
-                ...styles.dropEnd,
-                ...(overIdx === paths.length ? styles.chipDropTarget : null),
-              }}
-            />
-          )}
+        {/* Drop zone at the very end (reorder to last). */}
+        {dragIdx !== null && (
+          <div
+            data-testid="stack-drop-end"
+            onDragOver={(e) => {
+              e.preventDefault()
+              setOverIdx(paths.length)
+            }}
+            onDrop={(e) => {
+              e.preventDefault()
+              if (dragIdx !== null) reorder(dragIdx, paths.length)
+              setDragIdx(null)
+              setOverIdx(null)
+            }}
+            style={{
+              ...styles.dropEnd,
+              ...(overIdx === paths.length ? styles.chipDropTarget : null),
+            }}
+          />
+        )}
 
-          <button
-            data-testid="stack-add"
-            style={styles.addTile}
-            onClick={addDatasets}
-          >
-            + Add datasets…
-          </button>
-          <button
-            data-testid="stack-add-folders"
-            style={styles.addTile}
-            onClick={addFolders}
-          >
-            + Add .zspy/.zarr folders…
-          </button>
-        </div>
-
-        <div style={styles.footer}>
-          <button data-testid="stack-cancel" style={styles.cancel} onClick={onCancel}>
-            Cancel
-          </button>
-          <button
-            data-testid="stack-confirm"
-            style={{ ...styles.confirm, opacity: canStack ? 1 : 0.5 }}
-            disabled={!canStack}
-            onClick={() => onConfirm(paths)}
-            title={canStack ? '' : 'Add at least two datasets'}
-          >
-            Stack {paths.length > 0 ? `(${paths.length})` : ''}
-          </button>
-        </div>
+        <button
+          data-testid="stack-add"
+          style={styles.addTile}
+          onClick={addDatasets}
+        >
+          + Add datasets…
+        </button>
+        <button
+          data-testid="stack-add-folders"
+          style={styles.addTile}
+          onClick={addFolders}
+        >
+          + Add .zspy/.zarr folders…
+        </button>
       </div>
-    </div>
+    </ModalDialog>
   )
 }
 
 const styles: Record<string, React.CSSProperties> = {
-  overlay: {
-    position: 'fixed',
-    inset: 0,
-    zIndex: 9500,
-    background: 'rgba(17,17,27,0.6)',
-    display: 'flex',
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  dialog: {
-    width: 420,
-    maxHeight: '80vh',
-    display: 'flex',
-    flexDirection: 'column',
-    background: '#1e1e2e',
-    border: '1px solid #313244',
-    borderRadius: 10,
-    padding: 18,
-    color: '#cdd6f4',
-    boxShadow: '0 16px 40px rgba(0,0,0,0.55)',
-    fontSize: 13,
-  },
-  title: { margin: '0 0 4px', fontSize: 16, fontWeight: 600 },
   sub: { margin: '0 0 14px', fontSize: 12, color: '#a6adc8', lineHeight: 1.4 },
   stack: {
     display: 'flex',
@@ -276,25 +250,5 @@ const styles: Record<string, React.CSSProperties> = {
     color: '#a6adc8',
     cursor: 'pointer',
     fontSize: 13,
-  },
-  footer: { display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 'auto' },
-  cancel: {
-    background: 'transparent',
-    border: '1px solid #313244',
-    color: '#cdd6f4',
-    borderRadius: 6,
-    padding: '6px 14px',
-    cursor: 'pointer',
-    fontSize: 12,
-  },
-  confirm: {
-    background: ACCENT,
-    border: 'none',
-    color: '#11111b',
-    fontWeight: 600,
-    borderRadius: 6,
-    padding: '6px 18px',
-    cursor: 'pointer',
-    fontSize: 12,
   },
 }
