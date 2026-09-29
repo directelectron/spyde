@@ -360,7 +360,10 @@ def _ipf_title(src, title: str) -> str:
 def _open_ipf_window(session, src, nav_shape, title="Orientation (IPF-Z)"):
     """Open the IPF-Z window before the fit, every position in the unfit
     grey, so the map has somewhere to fill in. :func:`_build_ipf_heatmap`
-    finishes it once the result exists."""
+    finishes it once the result exists.
+
+    The window is LOCKED while it fills; the caller releases it with
+    ``lifecycle.unlock_tree`` on every exit of the fit."""
     from spyde.actions.commit import commit_result_tree
     ny, nx = nav_shape
     blank = np.empty((ny, nx, 3), np.uint8)
@@ -371,6 +374,7 @@ def _open_ipf_window(session, src, nav_shape, title="Orientation (IPF-Z)"):
                     "source_title": src.metadata.get_item(
                         "General.title", "Signal")},
         source_signal=src,
+        filling="Vector Orientation Mapping",
     )
 
 
@@ -568,7 +572,12 @@ def vom_run(session, plot, payload) -> None:
     # a time as the match lands — the same early window every other long
     # compute here opens, instead of a status line and then everything at once.
     ipf_tree = _open_ipf_window(session, tree.root, vecs.nav_shape)
-    painter = _BandPainter(session, ipf_tree, vecs.nav_shape, wiz.phases)
+    try:
+        painter = _BandPainter(session, ipf_tree, vecs.nav_shape, wiz.phases)
+    except Exception:
+        from spyde.actions.lifecycle import unlock_tree
+        unlock_tree(ipf_tree)
+        raise
 
     def _work():
         try:
@@ -590,9 +599,17 @@ def vom_run(session, plot, payload) -> None:
         except Exception as e:
             emit_error(f"Compute Maps failed: {e}")
             log.exception("Compute Maps failed")
+        finally:
+            # Released on every exit of the fit, a cancel or failure included.
+            from spyde.actions.lifecycle import unlock_tree
+            unlock_tree(ipf_tree)
 
-    from spyde.actions.lifecycle import run_on_worker
-    run_on_worker(session, _work, name="vom-run")
+    from spyde.actions.lifecycle import run_on_worker, unlock_tree
+    try:
+        run_on_worker(session, _work, name="vom-run")
+    except Exception:
+        unlock_tree(ipf_tree)    # the fit never started, so nothing will
+        raise
 
 
 def _fit_field(vecs, wiz, params, *, tree=None, on_band=None):
