@@ -117,10 +117,14 @@ click ──► toolbar gate (plot_control_toolbar filters)
 `progress_emitter`, `live_fill_poller`, `lock_tree`/`unlock_tree`/
 `refuse_if_locked`.
 
-**A progressively-filled result tree is LOCKED while its batch runs**
-(`lock_tree(tree, "<action>")` where the window opens; `unlock_tree` where the
-result attaches AND in the run's teardown, so a cancelled run cannot strand
-it). No actions and no new nodes on that tree until it finishes — the toolbar
+**A progressively-filled result tree is LOCKED while its batch runs.** Open
+the window with `open_result_tree(..., filling="<action>")` — or, for a blank
+committed early, `commit_result_tree(..., filling="<action>")` — and the tree
+is locked from the moment it exists. The action releases it with
+`unlock_tree` in the `finally` of its fill, so a failed or cancelled run
+cannot strand it, and BEFORE any finalize step that adds nodes
+(`test_fill_lock.py` fails a module that opens a locked window and never
+unlocks). No actions and no new nodes on that tree until it finishes — the toolbar
 invoker, the staged dispatch and `BaseSignalTree.add_node` /
 `add_transformation` all call `refuse_if_locked`, which errors at the user
 rather than no-op'ing silently. Any NEW path that adds a node or runs an
