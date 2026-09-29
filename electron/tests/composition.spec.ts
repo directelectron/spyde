@@ -106,7 +106,7 @@ test('with no phases, the first element click builds Phase 1', async () => {
   await page.screenshot({ path: join(__dirname, '..', 'periodic_table.png') })
 })
 
-test('a percentage is saved when the field is left, as typed', async () => {
+test('a percentage is saved as typed', async () => {
   await trackActions()
   await aSignalWindow()
   await phasesEcho([{ id: 'steel', elements: ['Fe', 'Ni'] }])

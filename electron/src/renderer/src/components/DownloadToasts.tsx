@@ -16,6 +16,7 @@
  */
 import React from 'react'
 import { useSpyDE } from '../kernel/SpyDEContext'
+import { formatBytes } from '../kernel/format'
 
 interface Download {
   label: string
@@ -23,10 +24,7 @@ interface Download {
   total: number
 }
 
-const fmtMB = (bytes: number) => {
-  const mb = bytes / 1e6
-  return mb >= 100 ? mb.toFixed(0) : mb >= 10 ? mb.toFixed(1) : mb.toFixed(2)
-}
+const size = (bytes: number) => formatBytes(bytes, '0 B')
 
 export function DownloadToasts() {
   const { sendAction } = useSpyDE()
@@ -106,8 +104,8 @@ export function DownloadToasts() {
             </div>
             <div style={S.bytes}>
               {pct == null
-                ? `${fmtMB(d.done)} MB`
-                : `${fmtMB(d.done)} / ${fmtMB(d.total)} MB (${pct.toFixed(0)}%)`}
+                ? size(d.done)
+                : `${size(d.done)} / ${size(d.total)} (${pct.toFixed(0)}%)`}
             </div>
           </div>
         )
