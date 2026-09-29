@@ -183,6 +183,10 @@ def _start_batch(session, plot, src_tree, p: dict, *, overlay_visible: bool = Tr
         provenance={"action": "Find Diffraction Vectors",
                     "source_title": base_title,
                     "source_node": _node_name(src_tree, src), "params": dict(p)},
+        # LOCKED until the vectors attach: released in _finalize and again in
+        # the batch teardown below, which is the one a cancelled or failed run
+        # reaches.
+        filling="Find Diffraction Vectors",
     )
 
     emit_status("Finding diffraction vectors…")
@@ -238,12 +242,7 @@ def _start_batch(session, plot, src_tree, p: dict, *, overlay_visible: bool = Tr
         sig_hw=(int(am.signal_axes[1].size), int(am.signal_axes[0].size)),
         kernel_radius_px=float(p.get("kernel_radius", 5)),
     )
-    # LOCK the result tree for the duration of the batch: no actions, no new
-    # nodes, since its root is a placeholder the batch is about to replace.
-    # Released in _finalize (where the vectors attach) and again in the
-    # teardown below.
-    from spyde.actions.lifecycle import lock_tree, unlock_tree
-    lock_tree(new_tree, "Find Diffraction Vectors")
+    from spyde.actions.lifecycle import unlock_tree
     preview = attach_signal_preview(
         session, new_tree, render=live_frames.render,
         nav_shape=nav_shape_full, name="fv-signal",
