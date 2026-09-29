@@ -66,6 +66,10 @@ contextBridge.exposeInMainWorld('electron', {
   /** Open a native save dialog. */
   saveDialog: (): Promise<void> => ipcRenderer.invoke('spyde:save-dialog'),
 
+  /** Export the active window's maps to a .npz / .npy (path chosen natively,
+   *  the export itself runs in Python). */
+  exportNumpyDialog: (): Promise<void> => ipcRenderer.invoke('spyde:export-numpy-dialog'),
+
   /** Pick a file and return its path (for action params, e.g. a .cif). */
   pickFile: (opts: { name?: string; extensions?: string[] }): Promise<string | null> =>
     ipcRenderer.invoke('spyde:pick-file', opts),
