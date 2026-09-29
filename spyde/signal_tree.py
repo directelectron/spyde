@@ -1140,6 +1140,12 @@ class BaseSignalTree:
         *,
         local: bool | None = None,
     ) -> None:
+        # A tree being progressively filled is LOCKED: its root is a placeholder
+        # the batch is about to replace, so a node hung off it now would describe
+        # data that does not exist yet. See lifecycle.refuse_if_locked.
+        from spyde.actions.lifecycle import refuse_if_locked
+        if refuse_if_locked(self, f"Adding '{transformation}'"):
+            return
         parent_node = self.get_node(parent_signal)
         if parent_node is None:
             raise ValueError("Parent node not found in the tree.")
@@ -1168,6 +1174,13 @@ class BaseSignalTree:
         **kwargs,
     ) -> BaseSignal | None:
         from de_shell.ipc import emit_error
+        from spyde.actions.lifecycle import refuse_if_locked
+
+        # Same lock as add_node — refuse BEFORE running the transformation, so a
+        # locked tree never pays for compute whose node it will not keep.
+        if refuse_if_locked(
+                self, f"'{method or getattr(function, '__name__', 'Transform')}'"):
+            return None
 
         if method is not None:
             try:

@@ -58,6 +58,12 @@ export interface ToolbarAction {
    *  but its results or controls may still change. Drawn as a badge on the
    *  button and a ribbon across its caret. */
   beta?: boolean
+  /** Set while this window's tree is locked by a progressive compute (a
+   *  find-vectors batch filling it). The button renders unavailable instead of
+   *  looking clickable and erroring; `disabled_reason` is its tooltip. The
+   *  backend refuses the action anyway — this is the visible half of that. */
+  disabled?: boolean
+  disabled_reason?: string
 }
 
 export interface SpyDEWindow {

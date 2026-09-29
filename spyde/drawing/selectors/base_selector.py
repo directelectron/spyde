@@ -224,6 +224,23 @@ class BaseSelector:
         # break navigation.
         self.index_hooks: list = []
 
+        # Hooks fired when the USER touches this selector — one per pointer
+        # event, on the event thread, BEFORE anything is read. Each is called
+        # ``hook(selector)``; exceptions are swallowed.
+        #
+        # Deliberately NOT index_hooks: those fire after a read, from EVERY
+        # update including the internal forced re-fires (the settle timer, a
+        # contrast repaint, a progressive preview refreshing the parked
+        # position), so they cannot answer "did a human do this?". Anything that
+        # must hand control to the user on first touch needs that question
+        # answered exactly, and answering it by inference — "the nav index
+        # changed, so someone must have dragged" — has holes: `_run_update`
+        # short-circuits a repeat position, so a grab that ends where it began
+        # produces no changed index at all, and a read that never reaches the
+        # listener (declined, coalesced away) produces nothing either.
+        # See ProgressiveSignalPreview._user_owns.
+        self.interaction_hooks: list = []
+
         # anyplotlib widget (set by subclasses)
         self.roi = None   # Alias for the anyplotlib Widget
         self._widget = None  # type: anyplotlib Widget
@@ -332,8 +349,16 @@ class BaseSelector:
 
     # ── Update dispatch ───────────────────────────────────────────────────────
 
-    def update_data(self, ev=None) -> None:
+    def update_data(self, ev=None, *, user: bool = False) -> None:
         """Trigger a navigator update on the single serial dispatcher.
+
+        ``user=True`` means "a pointer event caused this" and is passed ONLY by
+        the widget event handlers in selector1d/selector2d. It fires
+        :attr:`interaction_hooks` and changes nothing else about the update —
+        the dispatcher, the coalescing and the settle re-fire below are all
+        untouched. Default False so a programmatic caller (multiplot_manager
+        wiring a new plot, the CSB width change, the strain reference selector)
+        can never be mistaken for a human.
 
         Every selector move just queues the LATEST position on the dispatcher
         (coalescing: a newer submit replaces any still-queued one for this
@@ -359,6 +384,16 @@ class BaseSelector:
         newer move follows, that future is not cancelled and paints. This timer has
         NO in-flight gate (unlike the removed self-pacing), so it cannot wedge.
         """
+        if user:
+            # Fired FIRST, before the read is even queued: a listener whose job
+            # is "the panel is the user's now" must be right at the moment of
+            # the touch, not once a frame comes back (which for a
+            # progressively-filled window may be never).
+            for hook in list(self.interaction_hooks):
+                try:
+                    hook(self)
+                except Exception as e:
+                    logger.debug("interaction hook failed: %s", e)
         _nav_dispatcher.submit(self)
         self._arm_settle()
 
@@ -420,11 +455,16 @@ class BaseSelector:
             return
         self.current_indices = indices
 
-        # Per-frame index trace — gated (fires on every move).
+        # Per-frame index trace — gated (fires on every move). The per-child
+        # update-function names answer "which function does this link dispatch
+        # to?", the first question when a display does not follow the drag.
         if _NAV_TIMING:
-            logger.debug("[NAV-IDX] %s indices=%s force=%s nchildren=%d multi=%s",
-                         type(self).__name__, np.asarray(indices).tolist(), force,
-                         len(self.children), self.multi_selector)
+            logger.debug("[NAV-IDX] %s id=%d indices=%s force=%s multi=%s "
+                         "children=%s",
+                         type(self).__name__, id(self),
+                         np.asarray(indices).tolist(), force, self.multi_selector,
+                         [(id(c), getattr(f, "__qualname__", repr(f)))
+                          for c, f in self.children.items()])
 
         for child, fn in self.children.items():
             try:

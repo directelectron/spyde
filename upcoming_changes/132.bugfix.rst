@@ -1,0 +1,6 @@
+While Find Diffraction Vectors is still running, dragging the result window's
+navigator over positions the batch has already computed now shows their
+diffraction patterns, and once you touch the navigator the window stops
+replacing your pattern with automatic previews. The window's toolbar buttons,
+including the vector actions that were previously hidden until the run
+finished, are shown greyed out with a tooltip until the vectors are ready.

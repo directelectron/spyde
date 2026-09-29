@@ -56,7 +56,7 @@ class CrosshairSelector(BaseSelector):
         return getattr(plot, "_plot2d", None) if plot is not None else None
 
     def _on_pointer_up(self, event):
-        self.update_data()
+        self.update_data(event, user=True)
 
     def _get_selected_indices(self) -> np.ndarray:
         if self._widget is None:
@@ -125,7 +125,7 @@ class RectangleSelector(BaseSelector):
         self._clamp_extent()
         after = self._spans()
         self._trace_geometry(before, after)
-        self.update_data()
+        self.update_data(event, user=True)
 
     def _spans(self):
         """Geometry as ``[(x0, x1), (y0, y1)]`` for RoiTrace — the rectangle is
@@ -238,7 +238,7 @@ class CircleSelector(BaseSelector):
         return getattr(plot, "_plot2d", None) if plot is not None else None
 
     def _on_pointer_up(self, event):
-        self.update_data()
+        self.update_data(event, user=True)
 
     def _get_selected_indices(self) -> np.ndarray:
         if self._widget is None:
@@ -275,7 +275,7 @@ class AnnularSelector(BaseSelector):
         return getattr(plot, "_plot2d", None) if plot is not None else None
 
     def _on_pointer_up(self, event):
-        self.update_data()
+        self.update_data(event, user=True)
 
     def _get_selected_indices(self) -> np.ndarray:
         if self._widget is None:
@@ -387,7 +387,7 @@ class LineProfileSelector(BaseSelector):
         finally:
             self._syncing = False
         self._redraw()
-        self.update_data()
+        self.update_data(event, user=True)
 
     def _on_width_moved(self, event=None):
         # Width = 2 × the control point's projection onto the perpendicular;
@@ -408,7 +408,7 @@ class LineProfileSelector(BaseSelector):
         finally:
             self._syncing = False
         self._redraw()
-        self.update_data()
+        self.update_data(event, user=True)
 
     # ── Drawing ─────────────────────────────────────────────────────────────────
 

@@ -58,8 +58,10 @@ test.beforeAll(async () => {
   await backendAction(page, 'load_test_vectors')
   await waitForSubwindowCount(page, 4, 60_000)
   // The vectors attach at batch FINALIZE (not when the result window opens) — the
-  // requires_vectors-gated toolbar button appearing is the attach signal.
-  await expect(page.getByTestId('action-btn-Vector Virtual Imaging').first())
+  // requires_vectors-gated toolbar button turning ENABLED is the attach signal
+  // (it is shown disabled while the batch fills the locked result tree).
+  await expect(page.locator(
+    '[data-testid="action-btn-Vector Virtual Imaging"]:not([disabled])').first())
     .toBeAttached({ timeout: 60_000 })
   await page.waitForTimeout(500)
 })

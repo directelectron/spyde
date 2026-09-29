@@ -144,11 +144,19 @@ def _stamp_display(signal, *, colormap: str | None, symmetric: bool) -> None:
 
 def open_result_tree(session, *, title: str, signal=None, data=None,
                      signal_type: str | None = None, navigator_override=None,
-                     selector_type=None, provenance: dict | None = None):
+                     selector_type=None, provenance: dict | None = None,
+                     filling: str | None = None):
     """Open a NEW SignalTree up front for progressive fill-in.
 
     Pass either a prepared hyperspy *signal* (e.g. the lazy zero placeholder a
     Find-Vectors batch builds) or a raw *data* array (wrapped in a Signal2D).
+
+    *filling* names the compute about to fill the window. The tree is then
+    LOCKED (``lifecycle.lock_tree``): its toolbar shows greyed out and it
+    refuses actions and new nodes, because until the fill finishes it holds a
+    placeholder. The caller owns the release — ``lifecycle.unlock_tree`` on
+    EVERY exit of the fill (success, failure and cancel), since a toolbar left
+    grey is worse than none.
     Returns the tree.
     """
     import hyperspy.api as hs
@@ -167,6 +175,9 @@ def open_result_tree(session, *, title: str, signal=None, data=None,
         kwargs["selector_type"] = selector_type
     tree = session._add_signal(signal, **kwargs)
     _stamp_provenance(tree, signal, provenance)
+    if filling:
+        from spyde.actions.lifecycle import lock_tree
+        lock_tree(tree, filling)
     return tree
 
 
@@ -176,7 +187,8 @@ def commit_result_tree(session, *, title: str, primary, primary_label: str | Non
                        cmap: str = "gray", attrs: dict[str, Any] | None = None,
                        provenance: dict | None = None,
                        on_tree: Callable[[Any], None] | None = None,
-                       source_signal=None, value_units=None, signed=None):
+                       source_signal=None, value_units=None, signed=None,
+                       filling: str | None = None):
     """Commit a finished result as a NEW SignalTree — the Commit action.
 
     *primary* is the map shown as the tree's signal plot: a 2-D scalar array,
@@ -200,6 +212,11 @@ def commit_result_tree(session, *, title: str, primary, primary_label: str | Non
     *attrs* are set on the tree (e.g. ``{"vector_orientation": result}`` so
     signal-type gates and downstream actions find the result object).
     *on_tree* runs after the tree is built (attach IPF explorers etc.).
+
+    *filling* is for a window committed EARLY, as a blank the compute then
+    fills in (Vector Orientation's IPF map): the tree is locked exactly as
+    :func:`open_result_tree` locks it, and the caller must release it the same
+    way on every exit of the fill.
 
     *source_signal* is the scan the maps were computed over: every node takes
     its spatial navigation calibration (``copy_navigation_calibration``), so
@@ -315,4 +332,7 @@ def commit_result_tree(session, *, title: str, primary, primary_label: str | Non
             on_tree(tree)
         except Exception as e:
             log.debug("commit on_tree hook failed: %s", e)
+    if filling:
+        from spyde.actions.lifecycle import lock_tree
+        lock_tree(tree, filling)
     return tree
