@@ -1,0 +1,4 @@
+While Orientation Mapping, EBSD Indexing or Vector Orientation Mapping is still
+filling its orientation map, that window's toolbar buttons are shown greyed out
+with a tooltip saying why, and come back when the map is finished, fails or is
+cancelled, as Find Diffraction Vectors' window already does.

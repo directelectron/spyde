@@ -915,13 +915,8 @@ class TestFindVectorsWiring:
 
 class TestResultTreeIsLockedWhileFilling:
     """The result tree is LOCKED for the duration of the batch — no actions, no
-    new nodes — and released when the vectors attach.
-
-    The lock is not housekeeping: it is what makes the preview's install-ONCE
-    snapshot of the navigator→signal links correct by construction, so the
-    interactive-fill read path needs no per-read re-check (which would put a
-    branch on the Live-Display nav read, CLAUDE.md §3).
-    """
+    new nodes — and released when the vectors attach: its root is a
+    placeholder the batch is about to replace."""
 
     @staticmethod
     def _run_batch(session, tree, monkeypatch, compute):
