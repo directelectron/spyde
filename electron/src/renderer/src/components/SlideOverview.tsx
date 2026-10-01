@@ -220,9 +220,9 @@ const styles: Record<string, React.CSSProperties> = {
     background: '#14141f', cursor: 'pointer',
     transition: 'border-color 0.12s, transform 0.12s',
   },
-  thumbCurrent: { borderColor: '#89b4fa', boxShadow: '0 0 0 2px rgba(137,180,250,0.35)' },
+  thumbCurrent: { border: '2px solid #89b4fa', boxShadow: '0 0 0 2px rgba(137,180,250,0.35)' },
   thumbDragging: { opacity: 0.4 },
-  thumbDropTarget: { borderColor: '#a6e3a1' },
+  thumbDropTarget: { border: '2px solid #a6e3a1' },
   dropBar: {
     position: 'absolute', top: 0, bottom: 0, left: 0, width: 4,
     background: '#a6e3a1', zIndex: 2, borderRadius: '2px 0 0 2px',

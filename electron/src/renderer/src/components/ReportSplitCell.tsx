@@ -41,6 +41,10 @@ import { AddFigureMenu } from './AddFigureMenu'
 import { SeamlessFigureFrame, FigureEditOverlay } from './ReportFigureCell'
 import { ComposeZones, ZONE_TILE, hoverZoneAt, type HoverZone } from './composeDrop'
 import { dlog, dlogOnce } from '../kernel/dragDiag'
+import {
+  hasImageFiles, imageExtOf, imageFilesFrom, readFileAsDataURL,
+} from './imageDrop'
+import { useReplaceDrop } from './useReplaceDrop'
 
 const DROP_MIMES = [FIGURE_DRAG_MIME, WINDOW_DRAG_MIME]
 const isComposeDrag = (dt: DataTransfer) => DROP_MIMES.some(m => dt.types.includes(m))
@@ -104,6 +108,8 @@ export function ReportSplitCell({ cell, onRemove, index, dragProps, reorderActiv
   // window on its EDGE must tile into a subplot grid exactly as it does on a
   // plain figure cell — before this it only ever replaced the figure.
   const [hoverZone, setHoverZone] = useState<HoverZone | null>(null)
+  // Swap a FILLED photo side for another file / a live figure, in place.
+  const replace = useReplaceDrop(cell.id)
   // The ＋ chrome button's window picker (the click path to a subplot grid).
   const [addMenu, setAddMenu] = useState(false)
   const taRef = useRef<HTMLTextAreaElement>(null)
@@ -129,6 +135,11 @@ export function ReportSplitCell({ cell, onRemove, index, dragProps, reorderActiv
   const fig = state.reportFigures.get(cell.id)
   const hasImage = !empty && !cell.figure && !!cell.image
   const isLive = !empty && !!cell.figure && !!fig
+  // The saved still, shown when the figure side has a spec but no live window
+  // and no photo — i.e. the data is offline and no pixels were saved with the
+  // report. `isLive` is checked first, so a DETACHED figure (rebuilt from the
+  // report's own data) renders as the real interactive figure, not this.
+  const hasBakedPng = !empty && !isLive && !hasImage && !!cell.png
 
   // Keep the text draft in sync when the backing source changes and we're not
   // actively editing (a live report_state update from elsewhere).
@@ -206,14 +217,39 @@ export function ReportSplitCell({ cell, onRemove, index, dragProps, reorderActiv
   ]
 
   // ── Figure-side drop (fill the empty figure side in place) ─────────────────
+  //
+  // TWO transports land here, and the handler has to test for both: a figure /
+  // window PILL (`application/x-spyde-*` data) and an image FILE dragged in from
+  // the OS (`Files`). Gating on the pill alone made a dropped PNG fail the test,
+  // bubble to the sidebar body, and get APPENDED as a new image cell below —
+  // the slot the user aimed at stayed empty.
   const onFigDragOver = (e: React.DragEvent) => {
-    if (!isComposeDrag(e.dataTransfer)) return
+    if (!isComposeDrag(e.dataTransfer) && !hasImageFiles(e.dataTransfer)) return
     e.preventDefault()
     e.stopPropagation()   // don't also trigger the sidebar-body insertion logic
     e.dataTransfer.dropEffect = 'copy'
     setDropHover(true)
   }
   const onFigDrop = (e: React.DragEvent) => {
+    // A dropped PHOTO fills this cell's slot in place. Checked FIRST so it can
+    // never collide with the pill path below.
+    if (hasImageFiles(e.dataTransfer)) {
+      e.preventDefault()
+      e.stopPropagation()
+      setDropHover(false)
+      const file = imageFilesFrom(e.dataTransfer)[0]
+      if (!file) return
+      void (async () => {
+        try {
+          const dataUrl = await readFileAsDataURL(file)
+          if (!dataUrl) return
+          sendAction('report_set_cell_image', {
+            cell_id: cell.id, image_b64: dataUrl, image_ext: imageExtOf(file),
+          })
+        } catch { /* unreadable file — leave the slot empty */ }
+      })()
+      return
+    }
     if (!isComposeDrag(e.dataTransfer)) return
     e.preventDefault()
     e.stopPropagation()
@@ -396,11 +432,22 @@ export function ReportSplitCell({ cell, onRemove, index, dragProps, reorderActiv
         </div>
       ) : hasImage ? (
         <div
-          style={styles.figBox}
+          style={{ ...styles.figBox,
+                   ...(replace.active ? styles.figBoxDropOn : {}) }}
           onMouseEnter={() => setFigHover(true)}
           onMouseLeave={() => setFigHover(false)}
+          // A FILLED photo side had no drop target at all — the dropzone below
+          // only ever rendered while the side was empty — so swapping the
+          // picture meant removing the figure side and re-adding it.
+          {...replace.handlers}
         >
           <img src={cell.image} alt={cell.caption ?? ''} style={styles.img} />
+          {replace.active && (
+            <div style={styles.dropHint}
+                 data-testid={`report-split-drophint-${cell.id}`}>
+              Replace this image
+            </div>
+          )}
           {figHover && (
             <button
               data-testid={`report-split-remove-figure-${cell.id}`}
@@ -419,6 +466,20 @@ export function ReportSplitCell({ cell, onRemove, index, dragProps, reorderActiv
               }}
             >✕</button>
           )}
+        </div>
+      ) : hasBakedPng ? (
+        // OFFLINE: the source signal is unavailable AND the report carries no
+        // saved pixels for this cell, so all that is left is the baked still.
+        // Without this branch the pane fell through to "rendering…" and sat
+        // there forever — Present mode has always shown the PNG here, the
+        // editor just never looked at it.
+        <div style={styles.figBox}>
+          <img src={cell.png} alt={cell.caption ?? ''} style={styles.img} />
+          <div style={styles.offlineBadge}
+               data-testid={`report-split-offline-${cell.id}`}
+               title="The data behind this figure isn't loaded — showing the saved image.">
+            data offline
+          </div>
         </div>
       ) : (
         <div style={styles.figBox}>
@@ -637,6 +698,19 @@ const styles: Record<string, React.CSSProperties> = {
   pending: {
     display: 'flex', alignItems: 'center', justifyContent: 'center',
     width: '100%', height: '100%', color: '#6c7086', fontSize: 11,
+  },
+  figBoxDropOn: { outline: '2px dashed #89b4fa', outlineOffset: 2 },
+  dropHint: {
+    position: 'absolute', inset: 0, display: 'flex',
+    alignItems: 'center', justifyContent: 'center',
+    background: 'rgba(17,17,27,0.66)', color: '#89b4fa',
+    fontSize: 11, fontWeight: 700, pointerEvents: 'none',
+  },
+  offlineBadge: {
+    position: 'absolute', left: 6, bottom: 6,
+    background: 'rgba(24,24,37,0.9)', border: '1px solid #45475a',
+    borderRadius: 5, padding: '2px 7px', fontSize: 10, color: '#a6adc8',
+    pointerEvents: 'none',
   },
   shield: {
     position: 'absolute', inset: 0, zIndex: 3, background: 'transparent',

@@ -145,7 +145,7 @@ const S: Record<string, React.CSSProperties> = {
     textAlign: 'left',
   },
   triggerCompact: { padding: '0 5px', fontSize: 10, borderRadius: 3 },
-  triggerOpen: { borderColor: '#45475a', background: '#181825' },
+  triggerOpen: { border: '1px solid #45475a', background: '#181825' },
   triggerBare: {
     background: 'transparent', border: 'none', padding: '0 5px 0 2px',
     width: 'auto',

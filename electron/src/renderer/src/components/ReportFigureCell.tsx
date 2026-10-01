@@ -52,6 +52,10 @@ import {
   ComposeZones, ZONE_TILE, hoverZoneAt, panelLabel, PANEL_LETTERS,
   type ComposeMode, type HoverZone,
 } from './composeDrop'
+import {
+  hasImageFiles, imageExtOf, imageFilesFrom, readFileAsDataURL,
+} from './imageDrop'
+import { useFileDragActive, useReplaceDrop } from './useReplaceDrop'
 
 // The compose-zone primitives (types, the tile map, hit-testing and the overlay
 // component) live in ./composeDrop so the SPLIT block mounts the IDENTICAL
@@ -236,6 +240,10 @@ export function ReportFigureCell({ cell, onRemove, index, dragProps, reorderActi
   const [captionEditing, setCaptionEditing] = useState(false)
   const [captionDraft, setCaptionDraft] = useState(cell.caption ?? '')
   const [hover, setHover] = useState(false)
+  // A dropped image REPLACES this figure (the cell converts to a photo cell).
+  // fileDragActive is what mounts the shield over the iframe for an OS drag.
+  const fileDragActive = useFileDragActive()
+  const replace = useReplaceDrop(cell.id)
   const [dropHover, setDropHover] = useState(false)     // placeholder fill hover
   const [editOpen, setEditOpen] = useState(false)
   // The SELECTED spec panel id (null = figure-level), mirrored from the backend's
@@ -432,15 +440,40 @@ export function ReportFigureCell({ cell, onRemove, index, dragProps, reorderActi
     }
   }
 
-  // ── Placeholder fill drop (unchanged Phase-1 behaviour) ───────────────────
+  // ── Placeholder fill drop ─────────────────────────────────────────────────
+  //
+  // Accepts BOTH transports, like the split cell's figure side: a figure/window
+  // PILL and an image FILE from the OS. Gating on the pill alone let a dropped
+  // PNG bubble to the sidebar body, which appended a new image cell BELOW and
+  // left this placeholder empty.
   const onPlaceholderDragOver = (e: React.DragEvent) => {
-    if (!isComposeDrag(e.dataTransfer)) return
+    if (!isComposeDrag(e.dataTransfer) && !hasImageFiles(e.dataTransfer)) return
     e.preventDefault()
     e.stopPropagation()   // don't also trigger the sidebar-body insertion logic
     e.dataTransfer.dropEffect = 'copy'
     setDropHover(true)
   }
   const onPlaceholderDrop = (e: React.DragEvent) => {
+    // A dropped PHOTO converts this placeholder into an image cell IN PLACE —
+    // same cell id, so the slide attributes riding on it (break, kind, style,
+    // speaker notes) survive. Checked first so it can't collide with the pill.
+    if (hasImageFiles(e.dataTransfer)) {
+      e.preventDefault()
+      e.stopPropagation()
+      setDropHover(false)
+      const file = imageFilesFrom(e.dataTransfer)[0]
+      if (!file) return
+      void (async () => {
+        try {
+          const dataUrl = await readFileAsDataURL(file)
+          if (!dataUrl) return
+          sendAction('report_set_cell_image', {
+            cell_id: cell.id, image_b64: dataUrl, image_ext: imageExtOf(file),
+          })
+        } catch { /* unreadable file — leave the placeholder empty */ }
+      })()
+      return
+    }
     if (!isComposeDrag(e.dataTransfer)) return
     e.preventDefault()
     e.stopPropagation()
@@ -630,17 +663,27 @@ export function ReportFigureCell({ cell, onRemove, index, dragProps, reorderActi
    * accepted it, and the release produced `dragend` with no `drop`. Identical
    * symptom to a hit-testing failure, entirely different cause.
    */
-  const composeShieldNode = dragKind === 'window' ? (
+  const composeShieldNode = (dragKind === 'window' || fileDragActive) ? (
     <div
       ref={() => dlogOnce('3.shield/mounted', { cell: cell.id })}
       data-testid={`figcell-compose-shield-${cell.id}`}
-      style={styles.composeShield}
-      onDragEnter={onComposeDragOver}
-      onDragOver={onComposeDragOver}
-      onDragLeave={onComposeDragLeave}
-      onDrop={onComposeDrop}
+      style={{ ...styles.composeShield,
+               ...(replace.active ? styles.composeShieldFileOn : {}) }}
+      // A FILE drag gets the shield too. It is gated on `dragKind` for pills,
+      // which an OS file drag never sets — so nothing covered the iframe, the
+      // iframe swallowed the dragover, and the drop fell through to the sidebar
+      // body and appended a new image cell BELOW the figure.
+      onDragEnter={fileDragActive ? replace.handlers.onDragOver : onComposeDragOver}
+      onDragOver={fileDragActive ? replace.handlers.onDragOver : onComposeDragOver}
+      onDragLeave={fileDragActive ? replace.handlers.onDragLeave : onComposeDragLeave}
+      onDrop={fileDragActive ? replace.handlers.onDrop : onComposeDrop}
     >
-      {hoverZone != null && (
+      {fileDragActive ? (
+        <div style={styles.fileDropHint}
+             data-testid={`figcell-filedrop-hint-${cell.id}`}>
+          Drop to replace with this image
+        </div>
+      ) : hoverZone != null && (
         <ComposeZones active={hoverZone.zone} cellId={cell.id}
           panelRect={hoverZone.panelRect} panelLabel={hoverZone.panelLabel} />
       )}
@@ -703,12 +746,24 @@ export function ReportFigureCell({ cell, onRemove, index, dragProps, reorderActi
             </>
           }
           trailing={
-            <button
-              data-testid={`report-figcell-refresh-${cell.id}`}
-              style={styles.chromeBtn}
-              title="Refresh all panels from live plots"
-              onClick={() => sendAction('report_refresh_figure', { cell_id: cell.id })}
-            >⟳</button>
+            // A DETACHED figure was rebuilt from the report's own saved pixels,
+            // so there is no live plot to refresh FROM. Everything else about it
+            // works; offering a button that can only fail is worse than not
+            // offering one.
+            cell.data_detached ? (
+              <span
+                data-testid={`report-figcell-detached-${cell.id}`}
+                style={{ ...styles.chromeBtn, cursor: 'default', opacity: 0.75 }}
+                title="Interactive, but detached — this figure was restored from the report's own saved data, so there is no source to refresh from."
+              >⛓︎</span>
+            ) : (
+              <button
+                data-testid={`report-figcell-refresh-${cell.id}`}
+                style={styles.chromeBtn}
+                title="Refresh all panels from live plots"
+                onClick={() => sendAction('report_refresh_figure', { cell_id: cell.id })}
+              >⟳</button>
+            )
           }
         />
       )}
@@ -2145,13 +2200,23 @@ const styles: Record<string, React.CSSProperties> = {
     transition: 'border-color 90ms, background 90ms',
   },
   placeholderHot: {
-    borderColor: '#89b4fa', background: 'rgba(137,180,250,0.08)', color: '#89b4fa',
+    border: '2px dashed #89b4fa', background: 'rgba(137,180,250,0.08)', color: '#89b4fa',
   },
   placeholderIcon: { fontSize: 26, opacity: 0.6 },
   placeholderText: { fontSize: 12, textAlign: 'center', padding: '0 12px' },
   // ── Compose zones ──────────────────────────────────────────────────────────
   composeShield: {
     position: 'absolute', inset: 0, zIndex: 3,
+  },
+  composeShieldFileOn: {
+    outline: '2px dashed #89b4fa', outlineOffset: -2,
+    background: 'rgba(17,17,27,0.55)',
+  },
+  fileDropHint: {
+    position: 'absolute', inset: 0, display: 'flex',
+    alignItems: 'center', justifyContent: 'center',
+    color: '#89b4fa', fontSize: 12, fontWeight: 700,
+    pointerEvents: 'none',
   },
   // (The zone overlay's own styles moved to ./composeDrop with the component.)
   // ── Compose prompt popover ───────────────────────────────────────────────

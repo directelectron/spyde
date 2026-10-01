@@ -32,6 +32,9 @@ import { GUIDES } from '@guides/index'
 import type { ReportCell as ReportCellType } from '../kernel/protocol'
 import { dlog, dlogOnce } from '../kernel/dragDiag'
 import { ThemePanel, resolveTheme } from './ThemePanel'
+import {
+  IMAGE_EXTS, hasImageFiles, imageExtOf, imageFilesFrom, readFileAsDataURL,
+} from './imageDrop'
 
 const MIN_W = 300
 const MAX_W = 800
@@ -63,47 +66,9 @@ function figurePayloadFromDrop(dt: DataTransfer): DropFigurePayload | null {
   return null
 }
 
-// The image file extensions a PHOTO cell may carry (must mirror the backend's
-// IMAGE_EXTS). Anything else the browser hands us is normalised to png (the
-// backend defaults unknown exts to png too).
-const IMAGE_EXTS = ['png', 'jpg', 'jpeg', 'gif', 'webp'] as const
-
-/** Map an image file's MIME / name to one of IMAGE_EXTS. */
-function imageExtOf(file: File): string {
-  const fromType = (file.type.split('/')[1] || '').toLowerCase()
-  if ((IMAGE_EXTS as readonly string[]).includes(fromType)) return fromType
-  const fromName = (file.name.split('.').pop() || '').toLowerCase()
-  if ((IMAGE_EXTS as readonly string[]).includes(fromName)) return fromName
-  return 'png'
-}
-
-/** Read a File/Blob as a data URL. Rejects on read error. */
-function readFileAsDataURL(file: Blob): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const fr = new FileReader()
-    fr.onload = () => resolve(String(fr.result || ''))
-    fr.onerror = () => reject(fr.error)
-    fr.readAsDataURL(file)
-  })
-}
-
-/** True when a DataTransfer carries at least one image FILE (drop-a-photo path,
- *  distinct from a figure/window pill drop). */
-function hasImageFiles(dt: DataTransfer): boolean {
-  if (dt.files && dt.files.length) {
-    for (const f of Array.from(dt.files)) {
-      if (f.type.startsWith('image/')) return true
-    }
-  }
-  // During dragover the file list isn't readable yet — fall back to the items
-  // kind/type (Files with an image type).
-  if (dt.items && dt.items.length) {
-    for (const it of Array.from(dt.items)) {
-      if (it.kind === 'file' && it.type.startsWith('image/')) return true
-    }
-  }
-  return false
-}
+// The image-file drop helpers now live in ./imageDrop so the split cell's
+// figure side and the empty figure placeholder can accept a dropped PNG too —
+// while they were private here, only the sidebar BODY recognised one.
 
 /** One slide's worth of cells, carrying each cell's ORIGINAL flat index (so the
  *  slide-native list still drives the index-keyed drop/reorder machinery
@@ -692,9 +657,9 @@ export function ReportSidebar() {
       e.preventDefault()
       const idx = computeDropIndex(e.clientY)
       setDropIndex(null)
-      const files = Array.from(e.dataTransfer.files).filter(f => f.type.startsWith('image/'))
       // Insert each dropped image in order at the drop point.
-      files.forEach((f, k) => { void addImageFile(f, imageExtOf(f), idx + k) })
+      imageFilesFrom(e.dataTransfer)
+        .forEach((f, k) => { void addImageFile(f, imageExtOf(f), idx + k) })
       return
     }
     if (!DROP_MIMES.some(m => e.dataTransfer.types.includes(m))) {
@@ -1584,7 +1549,7 @@ const styles: Record<string, React.CSSProperties> = {
     transition: 'border-color 120ms ease, background 120ms ease, transform 120ms ease',
   },
   docCardHover: {
-    background: '#1e1e2e', borderColor: '#89b4fa', transform: 'translateY(-1px)',
+    background: '#1e1e2e', border: '1px solid #89b4fa', transform: 'translateY(-1px)',
   },
   docCardIcon: {
     display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
@@ -1637,7 +1602,7 @@ const styles: Record<string, React.CSSProperties> = {
     marginBottom: 12,
   },
   slideGroupDragging: { opacity: 0.4 },
-  slideGroupDropOn: { borderColor: '#89b4fa', boxShadow: '0 0 0 1px #89b4fa inset' },
+  slideGroupDropOn: { border: '1px solid #89b4fa', boxShadow: '0 0 0 1px #89b4fa inset' },
   slideHeader: {
     display: 'flex', alignItems: 'center', gap: 6,
     padding: '5px 2px 6px', borderBottom: '1px solid #313244',

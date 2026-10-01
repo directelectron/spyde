@@ -1,0 +1,1 @@
+In a report or presentation, dropping an image or a live figure on an existing picture now replaces it in place, dropping one on a text slide turns it into a split slide, all four split layouts render in Present mode, and a saved figure reopens as an interactive figure instead of a flat picture.

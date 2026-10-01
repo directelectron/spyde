@@ -2418,7 +2418,7 @@ const styles: Record<string, React.CSSProperties> = {
     background: '#181825', border: '1px solid #313244', borderRadius: 6,
     overflow: 'hidden', cursor: 'zoom-in',
   },
-  cornerPanelEmpty: { borderStyle: 'dashed', borderColor: '#45475a' },
+  cornerPanelEmpty: { border: '1px dashed #45475a' },
   evidenceBox: {
     display: 'flex', flexDirection: 'column', gap: 6,
     background: '#181825', border: '1px solid #313244',
@@ -2439,7 +2439,7 @@ const styles: Record<string, React.CSSProperties> = {
     border: '1px solid #313244', borderRadius: 6, padding: '5px 7px',
     outline: '1px solid transparent',
   },
-  nudgePadLive: { outline: '1px solid #89b4fa', borderColor: '#45475a' },
+  nudgePadLive: { outline: '1px solid #89b4fa', border: '1px solid #45475a' },
   nudgeRow: {
     display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap',
     fontSize: 11.5,

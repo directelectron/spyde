@@ -154,6 +154,16 @@ class ReportManager:
         self._selected: dict[str, "str | None"] = {}
         # cell_id -> True while a figure's rebuild is pending
         self._offline: set[str] = set()
+        # DETACHED cells: rebuilt from the report's OWN saved pixels
+        # (data/<id>.npz) because the source signal wasn't available. The figure
+        # is fully live and interactive — pan, zoom, widgets — it just has
+        # nothing to refresh FROM, so the UI hides "refresh from data".
+        # Deliberately NOT _offline: offline means "show the flat PNG".
+        self._detached: set[str] = set()
+        # cell_id -> {(panel_id, layer_id): ndarray} loaded from data/<id>.npz on
+        # open. Kept separately from _snapshots so a re-save can round-trip the
+        # pixels of a cell that was never rebuilt this session.
+        self._loaded_snapshots: dict[str, dict] = {}
         # pending save handshake: token -> {cells, path, remaining}
         self._pending_save: dict[str, dict] = {}
         # UNDO stack of {"label": str, "restore": callable}. Bounded, because an
@@ -249,6 +259,8 @@ class ReportManager:
         self._baked.clear()
         self._images.clear()
         self._offline.clear()
+        self._detached.clear()
+        self._loaded_snapshots.clear()
         self._editing.clear()
         self._edit_wiring.clear()
         self._ann_widgets.clear()
@@ -306,6 +318,8 @@ class ReportManager:
         self._baked.clear()
         self._images.clear()
         self._offline.clear()
+        self._detached.clear()
+        self._loaded_snapshots.clear()
         self._pending_save.clear()
         self._editing.clear()
         self._edit_wiring.clear()
@@ -369,6 +383,12 @@ class ReportManager:
                 "fig_id": (c.id if c.cell_type in ("figure", "split") else None),
                 "data_offline": bool(
                     c.cell_type in ("figure", "split") and c.id in self._offline),
+                # Rebuilt from the report's OWN saved pixels: a real, interactive
+                # figure with no signal behind it. Distinct from data_offline
+                # (which means "there are no pixels, show the PNG") — the UI
+                # keeps every interaction and hides only refresh-from-data.
+                "data_detached": bool(
+                    c.cell_type in ("figure", "split") and c.id in self._detached),
                 # Present-mode fields (Phase 6): slide grouping + go-live handle
                 # + per-slide kind/style (title/section slide + background preset —
                 # carried on the slide's first cell).
@@ -878,6 +898,44 @@ class ReportManager:
             log.debug("push_ann_widget failed (cell %s panel %s idx %s): %s",
                       cell_id, panel_id, ann_index, e)
             return False
+
+    #: Per-cell cap on saved figure pixels. A report is a file people email; a
+    #: multi-panel figure of 4096² float64 layers would otherwise quietly add
+    #: hundreds of MB. Over the cap the cell simply saves without its data and
+    #: reloads as the baked PNG — the pre-existing behaviour, not a failure.
+    SNAPSHOT_MAX_BYTES = 32 * 1024 * 1024
+
+    def assemble_snapshots(self) -> dict:
+        """``{cell_id -> npz bytes}`` of the per-layer pixels behind every figure
+        cell, for ``data/<id>.npz`` in the zip.
+
+        This is what makes a reopened figure INTERACTIVE rather than a flat PNG:
+        ``figure_builder.build_figure`` wants a spec AND a snapshot map, the spec
+        already round-trips through ``figures/<id>.yaml``, and this is the other
+        half. Prefers the LIVE snapshots; falls back to the ones loaded from the
+        opened report so re-saving a report whose sources were never available
+        doesn't silently drop the pixels it came with."""
+        out: dict[str, bytes] = {}
+        for c in self.doc.cells:
+            if c.cell_type not in ("figure", "split") or c.spec is None:
+                continue
+            snap = self._snapshots.get(c.id) or self._loaded_snapshots.get(c.id)
+            if not snap:
+                continue
+            try:
+                blob = model.snapshots_to_npz(snap)
+            except Exception as e:                     # pragma: no cover
+                log.debug("snapshot pack failed for cell %s: %s", c.id, e)
+                continue
+            if blob and len(blob) <= self.SNAPSHOT_MAX_BYTES:
+                out[c.id] = blob
+            elif blob:
+                log.info(
+                    "figure %s: %.1f MB of pixels exceeds the %.0f MB save cap — "
+                    "it will reopen as a static image",
+                    c.id, len(blob) / (1024 * 1024),
+                    self.SNAPSHOT_MAX_BYTES / (1024 * 1024))
+        return out
 
     def assemble_assets(self, harvested: dict) -> dict:
         """Build ``{cell_id -> bytes}`` for every non-placeholder figure cell AND
@@ -2114,6 +2172,10 @@ def report_open(session, plot, payload) -> None:
             or (c.cell_type == "split" and c.spec is None and c.image_ext))
     }
     mgr._offline.clear()
+    mgr._detached.clear()
+    # The figure PIXELS this report was saved with — empty for a report written
+    # before they were persisted, which then behaves exactly as it always did.
+    mgr._loaded_snapshots = model.read_report_snapshots(path)
     # Rebind each figure cell: resolve EVERY layer of EVERY panel against open trees
     # / files. The cell rebinds live only when ALL its layers resolve; if any layer's
     # source is offline the whole cell is offline (renderer shows the baked PNG).
@@ -2148,10 +2210,26 @@ def report_open(session, plot, payload) -> None:
                     mgr.set_snapshot(c.id, panel.id, layer.id, arr)
         if all_resolved:
             mgr.build_figure_window(c)
-        else:
-            # Unresolved → offline: renderer shows the baked PNG (data URL in state).
+            continue
+        # The source is unavailable — but the report may carry its OWN pixels.
+        # Rebuild from those: spec + saved snapshots is exactly what
+        # build_figure_window consumes, so the figure comes back fully
+        # interactive (pan, zoom, widgets) and is merely DETACHED — there is no
+        # signal behind it to refresh from. That is strictly better than the flat
+        # PNG this used to fall back to.
+        saved = mgr._loaded_snapshots.get(c.id)
+        if saved:
+            mgr._snapshots[c.id] = dict(saved)
+            mgr.build_figure_window(c)
+            if mgr._window_by_cell.get(c.id) is not None:
+                mgr._detached.add(c.id)
+                continue
+            # The rebuild produced no window (an unusable spec / snapshot pair):
+            # fall through to the static path rather than leaving a dead box.
             mgr._snapshots.pop(c.id, None)
-            mgr._offline.add(c.id)
+        # No saved pixels → offline: renderer shows the baked PNG (data URL in state).
+        mgr._snapshots.pop(c.id, None)
+        mgr._offline.add(c.id)
     # A figure whose spec yaml was corrupt (read_report recorded spec_error) is shown
     # as its baked PNG but can no longer be edited/refreshed — tell the user loudly
     # rather than leaving them to discover the dead Edit button.
@@ -2265,9 +2343,12 @@ def _finish_save(session, mgr: ReportManager, path: str,
     """Assemble the asset PNGs (harvested → held-baked → offline-baked) and write
     the zip atomically, then emit ``report_saved`` + refresh state."""
     assets = mgr.assemble_assets(harvested)
+    # The figure PIXELS as well as the baked stills, so reopening this report
+    # without its source data still gives a figure you can pan, zoom and drag.
+    snapshots = mgr.assemble_snapshots()
     try:
         mgr.doc.touch()
-        write_report(mgr.doc, path, assets=assets)
+        write_report(mgr.doc, path, assets=assets, snapshots=snapshots)
     except Exception as e:
         ipc.emit_error(f"Saving report failed: {e}")
         return
@@ -2381,28 +2462,127 @@ def report_add_image_cell(session, plot, payload) -> None:
     are refused over :data:`_IMAGE_CELL_MAX_BYTES` so a giant photo can't bloat the
     report."""
     mgr = _ensure_open(session)
-    raw = payload.get("image_b64")
-    data = _decode_data_url(raw) if raw else None
-    if not data:
-        ipc.emit_error("report_add_image_cell: no / undecodable image data.")
+    decoded = _decode_image_payload(payload.get("image_b64"),
+                                    payload.get("image_ext"),
+                                    "report_add_image_cell")
+    if decoded is None:
         return
-    if len(data) > _IMAGE_CELL_MAX_BYTES:
-        mb = _IMAGE_CELL_MAX_BYTES / (1024 * 1024)
-        ipc.emit_error(
-            f"Image is too large ({len(data) / (1024 * 1024):.1f} MB) — the limit "
-            f"is {mb:.0f} MB. Resize it and try again.")
-        return
-    ext = str(payload.get("image_ext", "") or "").lower().lstrip(".")
-    if ext == "jpeg":
-        ext = "jpg"
-    if ext not in IMAGE_EXTS:
-        ext = "png"
+    data, ext = decoded
     cell = Cell(id=new_cell_id(), cell_type="image",
                 caption=str(payload.get("caption", "") or ""), image_ext=ext)
     if payload.get("slide_break") is not None:
         cell.slide_break = bool(payload.get("slide_break"))
     mgr._images[cell.id] = data
     _insert_cell(mgr.doc, cell, payload.get("index"))
+    mgr.dirty = True
+    mgr.emit_state()
+
+
+def _decode_image_payload(raw, ext_raw, verb: str):
+    """Shared decode + size-cap + extension normalisation for the two image
+    verbs. Returns ``(data, ext)`` or ``None`` after emitting the error."""
+    data = _decode_data_url(raw) if raw else None
+    if not data:
+        ipc.emit_error(f"{verb}: no / undecodable image data.")
+        return None
+    if len(data) > _IMAGE_CELL_MAX_BYTES:
+        mb = _IMAGE_CELL_MAX_BYTES / (1024 * 1024)
+        ipc.emit_error(
+            f"Image is too large ({len(data) / (1024 * 1024):.1f} MB) — the limit "
+            f"is {mb:.0f} MB. Resize it and try again.")
+        return None
+    ext = str(ext_raw or "").lower().lstrip(".")
+    if ext == "jpeg":
+        ext = "jpg"
+    if ext not in IMAGE_EXTS:
+        ext = "png"
+    return data, ext
+
+
+def report_set_cell_image(session, plot, payload) -> None:
+    """Fill an EXISTING cell's figure slot with a dropped/pasted PHOTO — the
+    image counterpart of :func:`report_set_split_figure`.
+
+    ``{cell_id, image_b64, image_ext, caption?}``.
+
+    Why this exists: dropping a PNG onto a split cell's empty figure side, or
+    onto an empty figure placeholder, used to fall through to
+    :func:`report_add_image_cell` and APPEND a new image cell BELOW — the slot
+    the user aimed at stayed empty and the picture landed somewhere else. There
+    was no verb that could fill a slot that already existed.
+
+    Four accepted targets:
+
+    * a ``markdown`` cell — the text slide BECOMES a split slide: its prose moves
+      to the text side and the photo fills the other. ``layout`` picks the side
+      (default ``text-left``).
+    * a ``split`` cell — the photo becomes its figure side; the TEXT side
+      (``source``) and ``split_layout`` are untouched. Works whether the side
+      was empty or already held a photo/figure, so this is also the REPLACE
+      path.
+    * an ``image`` cell — swap the bytes in place. Same cell, so its caption,
+      size and slide attributes all survive; only the picture changes.
+    * a ``figure`` cell, placeholder OR filled — there is no "figure cell
+      holding a photo" in the model, so it converts IN PLACE to an ``image``
+      cell, tearing down the live figure window first. Converting rather
+      than replacing is what preserves the cell's identity: its id, and with it
+      the slide attributes that ride on a slide's first cell (``slide_break``,
+      kind, style, speaker notes). Re-creating the cell would silently drop the
+      slide's notes and could merge it into the previous slide.
+
+    Any other cell type is a no-op with an error. Filling with a photo clears
+    any figure previously in the slot (spec, snapshot, baked PNG, figure
+    window), mirroring how :func:`report_set_split_figure` clears a prior photo.
+    """
+    mgr = _ensure_open(session)
+    cell = mgr.doc.cell_by_id(payload.get("cell_id"))
+    if cell is None:
+        ipc.emit_error("report_set_cell_image: unknown cell.")
+        return
+    if cell.cell_type not in ("split", "figure", "image", "markdown"):
+        ipc.emit_error(
+            f"report_set_cell_image: cell is a {cell.cell_type!r}, which has no "
+            f"figure slot to fill.")
+        return
+    decoded = _decode_image_payload(payload.get("image_b64"),
+                                    payload.get("image_ext"),
+                                    "report_set_cell_image")
+    if decoded is None:
+        return
+    data, ext = decoded
+    # Tear down whatever figure was in the slot, exactly as
+    # report_split_remove_figure does, so nothing leaks behind the photo.
+    wid = mgr._window_by_cell.get(cell.id)
+    if wid is not None:
+        mgr._forget(wid)
+    mgr._snapshots.pop(cell.id, None)
+    mgr._baked.pop(cell.id, None)
+    mgr._offline.discard(cell.id)
+    mgr._editing.discard(cell.id)
+    mgr._edit_wiring.pop(cell.id, None)
+    mgr._ann_widgets.pop(cell.id, None)
+    mgr._selected.pop(cell.id, None)
+    _clear_vectors_explorer_cache(cell.id)
+    cell.spec = None
+    if cell.cell_type == "figure":
+        # A placeholder becomes a real photo cell — same id, same slide flags.
+        cell.cell_type = "image"
+        cell.placeholder = False
+    elif cell.cell_type == "markdown":
+        # A TEXT slide becomes a SPLIT slide: the prose it already had moves to
+        # the text side and the picture fills the other. Converting in place
+        # (rather than adding an image cell after it) is what makes this a
+        # layout change instead of a new slide — the cell keeps its id, so the
+        # slide break, kind, style and speaker notes riding on it survive, and
+        # a slide that WAS one text block stays one slide.
+        cell.cell_type = "split"
+        cell.split_layout = model._normalize_split_layout(
+            payload.get("layout") or cell.split_layout)
+    cell.image_ext = ext
+    mgr._images[cell.id] = data
+    caption = str(payload.get("caption", "") or "")
+    if caption:
+        cell.caption = caption
     mgr.dirty = True
     mgr.emit_state()
 
@@ -2414,8 +2594,8 @@ def report_add_split_cell(session, plot, payload) -> None:
     ``payload``: ``{index?, slide_break?, source?, caption?, layout?}``. The figure
     side starts EMPTY (a drop zone) — Wave B wires a figure/photo drop onto it via
     :func:`report_set_split_figure` (or ``report_add_figure`` targeting the split
-    cell's slot). ``layout`` is ``"text-left"`` / ``"text-right"`` (normalised;
-    default ``text-left``). Mirrors :func:`report_add_cell` for the seed-time
+    cell's slot). ``layout`` is any of the four in ``_SPLIT_LAYOUTS``
+    (normalised; default ``text-left``). Mirrors :func:`report_add_cell` for the seed-time
     Present-mode fields so a seeded deck can create it already-marked."""
     from spyde.actions.report.model import _normalize_split_layout
     mgr = _ensure_open(session)
@@ -2450,9 +2630,10 @@ def report_add_figure_placeholder(session, plot, payload) -> None:
 
 
 def report_set_split_layout(session, plot, payload) -> None:
-    """Set a SPLIT cell's ``split_layout`` — ``"text-left"`` (text on the left,
-    figure on the right — the default) or ``"text-right"`` (mirror). Any other
-    value normalises to ``"text-left"``.
+    """Set a SPLIT cell's ``split_layout`` — one of ``"text-left"`` (the
+    default), ``"text-right"``, ``"text-top"`` or ``"text-bottom"``: the first
+    pair is side by side, the second stacks. Any other value normalises to
+    ``"text-left"``.
 
     ``{cell_id, layout}``. A non-split / unknown cell is a no-op (no crash)."""
     from spyde.actions.report.model import _normalize_split_layout
@@ -3051,6 +3232,35 @@ def report_add_figure(session, plot, payload) -> None:
         # Fill an existing SPLIT cell's FIGURE SIDE in place (Wave B's figure-drop-
         # onto-a-split path) — keeps the split cell's text side + layout, replaces
         # any prior photo side with this figure.
+        cell.spec = spec
+        cell.image_ext = ""
+        mgr._images.pop(cell.id, None)
+        if caption:
+            cell.caption = caption
+    elif cell is not None and cell.cell_type == "markdown":
+        # A TEXT slide becomes a SPLIT slide with a LIVE figure beside its prose.
+        # Same in-place conversion as the photo path in report_set_cell_image —
+        # a layout change, not a new slide, so the cell id (and the slide break /
+        # kind / style / speaker notes on it) survives.
+        cell.cell_type = "split"
+        cell.split_layout = model._normalize_split_layout(
+            payload.get("layout") or cell.split_layout)
+        cell.placeholder = False
+        cell.spec = spec
+        cell.image_ext = ""
+        mgr._images.pop(cell.id, None)
+        if caption:
+            cell.caption = caption
+    elif cell is not None and cell.cell_type == "image":
+        # Dropping a live window onto a PHOTO replaces the picture with the
+        # figure. There is no "image cell holding a figure", so it converts IN
+        # PLACE to a figure cell — same id, so the caption, the display size and
+        # the slide attributes riding on a slide's first cell (break / kind /
+        # style / speaker notes) all survive. Appending a new cell instead (what
+        # the else-branch below used to do for an image target) left the photo
+        # sitting above an unrelated new figure.
+        cell.cell_type = "figure"
+        cell.placeholder = False
         cell.spec = spec
         cell.image_ext = ""
         mgr._images.pop(cell.id, None)

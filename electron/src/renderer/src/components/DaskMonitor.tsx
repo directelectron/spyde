@@ -236,7 +236,7 @@ const S: Record<string, React.CSSProperties> = {
     color: '#a6adc8', fontSize: 11, cursor: 'pointer', padding: '2px 8px',
     fontVariantNumeric: 'tabular-nums',
   },
-  segOpen: { background: '#1e1e2e', borderColor: '#45475a' },
+  segOpen: { background: '#1e1e2e', border: '1px solid #45475a' },
   pop: {
     position: 'absolute', bottom: 26, right: 0, zIndex: 9300,
     background: '#1e1e2e', border: '1px solid #313244',

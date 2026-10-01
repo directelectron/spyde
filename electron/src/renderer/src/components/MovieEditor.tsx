@@ -645,7 +645,7 @@ const styles: Record<string, React.CSSProperties> = {
   rail: { display: 'flex', flexDirection: 'column', gap: 5, padding: 12, borderRight: '1px solid #313244', flexShrink: 0, width: 132, overflowY: 'auto' },
   railHead: { fontSize: 10, fontWeight: 700, color: '#89b4fa', textTransform: 'uppercase', letterSpacing: 0.4 },
   toolBtn: { background: '#1e1e2e', color: '#cdd6f4', border: '1px solid #313244', borderRadius: 5, padding: '5px 8px', fontSize: 11.5, cursor: 'pointer', textAlign: 'left' },
-  toolBtnActive: { background: '#89b4fa', color: '#11111b', borderColor: '#89b4fa', fontWeight: 700 },
+  toolBtnActive: { background: '#89b4fa', color: '#11111b', border: '1px solid #89b4fa', fontWeight: 700 },
   center: { flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0, padding: 14, gap: 10 },
   figRow: { flex: 1, display: 'flex', gap: 10, minHeight: 0 },
   figWrap: { flex: 1, position: 'relative', background: '#11111b', borderRadius: 8, border: '1px solid #313244', overflow: 'hidden', minWidth: 0 },

@@ -714,6 +714,151 @@ class TestReportSave:
 # ── open + rebind round-trip ───────────────────────────────────────────────────
 
 
+class TestReplaceAPhotoWithALiveFigure:
+    """Dropping a plot window onto a PICTURE replaces it with a live figure.
+
+    ``report_add_figure {at_cell}`` knew how to fill a figure cell and a split
+    cell's figure side, but an ``image`` target fell through to the append
+    branch — so the photo stayed put and an unrelated figure landed underneath
+    it."""
+
+    def test_image_cell_becomes_a_live_figure_in_place(self, tem_2d_dataset):
+        import base64
+        png = base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR4nGNgYGAAAAAE"
+            "AAH2FzhVAAAAAElFTkSuQmCC")
+        session = tem_2d_dataset["window"]
+        messages = tem_2d_dataset["messages"]
+        _prime_plot_data(session)
+        wid = _signal_window_id(session)
+        h.report_new(session, None, {})
+        h.report_add_image_cell(session, None, {
+            "image_b64": "data:image/png;base64," +
+                         base64.b64encode(png).decode("ascii"),
+            "image_ext": "png", "caption": "a photo"})
+        cell_id = session._report.doc.cells[0].id
+        messages.clear()
+
+        h.report_add_figure(session, None,
+                            {"source_window_id": wid, "at_cell": cell_id})
+
+        cells = _last_state(messages)["cells"]
+        assert len(cells) == 1, "the figure must REPLACE the photo, not follow it"
+        cell = session._report.doc.cells[0]
+        assert cell.id == cell_id                 # same cell, converted
+        assert cell.cell_type == "figure"
+        assert cell.spec is not None
+        assert cell.image_ext == ""
+        assert cell_id not in session._report._images
+        # And it really is live.
+        assert session._report._window_by_cell.get(cell_id) is not None
+
+    def test_the_photo_cell_keeps_its_slide_role(self, tem_2d_dataset):
+        import base64
+        png = base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR4nGNgYGAAAAAE"
+            "AAH2FzhVAAAAAElFTkSuQmCC")
+        session = tem_2d_dataset["window"]
+        _prime_plot_data(session)
+        wid = _signal_window_id(session)
+        h.report_new(session, None, {})
+        h.report_add_cell(session, None, {"source": "slide one"})
+        h.report_add_image_cell(session, None, {
+            "image_b64": "data:image/png;base64," +
+                         base64.b64encode(png).decode("ascii"),
+            "image_ext": "png", "slide_break": True})
+        cell = session._report.doc.cells[1]
+        cell.notes = "point at the peak"
+
+        h.report_add_figure(session, None,
+                            {"source_window_id": wid, "at_cell": cell.id})
+
+        after = session._report.doc.cells[1]
+        assert after.slide_break is True
+        assert after.notes == "point at the peak"
+        assert len(session._report.doc.slides()) == 2
+
+
+class TestPhotoReplacesALiveFigure:
+    """A dropped image onto a FILLED figure cell replaces the figure.
+
+    The renderer gap this pairs with: a report figure is an out-of-process
+    iframe that swallows drag events, and the shield that normally covers it was
+    mounted only for in-app pill drags — so an OS file drag never reached the
+    cell at all."""
+
+    def test_filled_figure_converts_to_a_photo_cell(self, tem_2d_dataset):
+        import base64
+        png = base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR4nGNgYGAAAAAE"
+            "AAH2FzhVAAAAAElFTkSuQmCC")
+        session = tem_2d_dataset["window"]
+        messages = tem_2d_dataset["messages"]
+        _prime_plot_data(session)
+        wid = _signal_window_id(session)
+        h.report_new(session, None, {})
+        h.report_add_figure(session, None,
+                            {"source_window_id": wid, "caption": "DP"})
+        cell_id = session._report.doc.cells[0].id
+        assert session._report._window_by_cell.get(cell_id) is not None
+        messages.clear()
+
+        h.report_set_cell_image(session, None, {
+            "cell_id": cell_id,
+            "image_b64": "data:image/png;base64," +
+                         base64.b64encode(png).decode("ascii"),
+            "image_ext": "png"})
+
+        cells = _last_state(messages)["cells"]
+        assert len(cells) == 1, "replacing must not append a second cell"
+        cell = session._report.doc.cells[0]
+        assert cell.id == cell_id
+        assert cell.cell_type == "image"
+        assert cell.spec is None
+        assert session._report._images[cell_id] == png
+        # The live figure is torn down, not orphaned.
+        assert session._report._window_by_cell.get(cell_id) is None
+        assert cell_id not in session._report._snapshots
+
+
+class TestTextSlideBecomesASplitWithALiveFigure:
+    def test_markdown_converts_in_place_keeping_its_prose(self, tem_2d_dataset):
+        session = tem_2d_dataset["window"]
+        messages = tem_2d_dataset["messages"]
+        _prime_plot_data(session)
+        wid = _signal_window_id(session)
+        h.report_new(session, None, {})
+        h.report_add_cell(session, None, {"source": "## Live\n\n- a point\n"})
+        cell_id = session._report.doc.cells[0].id
+        messages.clear()
+
+        h.report_add_figure(session, None,
+                            {"source_window_id": wid, "at_cell": cell_id})
+
+        cells = _last_state(messages)["cells"]
+        assert len(cells) == 1, "a layout change must not add a second cell"
+        cell = session._report.doc.cells[0]
+        assert cell.id == cell_id
+        assert cell.cell_type == "split"
+        assert cell.source == "## Live\n\n- a point\n"
+        assert cell.spec is not None
+        # The figure side really is live.
+        assert session._report._window_by_cell.get(cell_id) is not None
+
+    def test_conversion_respects_an_explicit_layout(self, tem_2d_dataset):
+        session = tem_2d_dataset["window"]
+        _prime_plot_data(session)
+        wid = _signal_window_id(session)
+        h.report_new(session, None, {})
+        h.report_add_cell(session, None, {"source": "text"})
+        cell_id = session._report.doc.cells[0].id
+
+        h.report_add_figure(session, None, {
+            "source_window_id": wid, "at_cell": cell_id, "layout": "text-right"})
+
+        assert session._report.doc.cells[0].split_layout == "text-right"
+
+
 class TestReportOpenRebind:
     def test_save_then_open_rebinds_live(self, tem_2d_dataset, tmp_path):
         session = tem_2d_dataset["window"]
@@ -743,9 +888,15 @@ class TestReportOpenRebind:
         # A live report figure was re-emitted.
         assert len(_report_figures(messages)) == 1
 
-    def test_open_offline_when_source_gone_includes_png(self, tem_2d_dataset, tmp_path):
-        """With NO matching open tree, a figure cell is offline and its baked PNG
-        rides along in the state as a data URL (renderer has no zip access)."""
+    def test_open_detached_when_source_gone_but_pixels_were_saved(
+            self, tem_2d_dataset, tmp_path):
+        """With NO matching open tree, a figure saved WITH its pixels
+        (``data/<id>.npz``) comes back DETACHED — a real, interactive figure
+        rebuilt from the report's own data — rather than the flat PNG this used
+        to fall back to. See test_report_detached_figures.py.
+
+        The offline-PNG path is still exercised by the sibling test below, which
+        strips the data from the zip first."""
         session = tem_2d_dataset["window"]
         messages = tem_2d_dataset["messages"]
         _prime_plot_data(session)
@@ -764,7 +915,44 @@ class TestReportOpenRebind:
 
         st = _last_state(messages)
         fig_cell = [c for c in st["cells"] if c["cell_type"] == "figure"][0]
+        assert fig_cell["data_detached"] is True
+        assert fig_cell["data_offline"] is False
+        # A detached cell IS live — that is the whole point.
+        assert _report_figures(messages) != []
+
+    def test_open_offline_when_no_saved_pixels_includes_png(
+            self, tem_2d_dataset, tmp_path):
+        """With no matching open tree AND no saved pixels, the cell is offline
+        and its baked PNG rides in the state as a data URL (the renderer has no
+        zip access). This is the pre-existing fallback, still reachable for any
+        report written before figure data was persisted."""
+        import zipfile
+        session = tem_2d_dataset["window"]
+        messages = tem_2d_dataset["messages"]
+        _prime_plot_data(session)
+        wid = _signal_window_id(session)
+        h.report_new(session, None, {})
+        h.report_add_figure(session, None, {"source_window_id": wid, "caption": "DP"})
+        path = str(tmp_path / "off.spyde-report")
+        h.report_save(session, None, {"path": path})
+        answer_harvest(session, messages)
+
+        # Rewrite the zip WITHOUT its data/ members — a pre-data report.
+        stripped = str(tmp_path / "off_nodata.spyde-report")
+        with zipfile.ZipFile(path) as src, zipfile.ZipFile(stripped, "w") as dst:
+            for item in src.namelist():
+                if not item.startswith("data/"):
+                    dst.writestr(item, src.read(item))
+
+        session._plots = []
+        h.report_close(session, None, {})
+        messages.clear()
+        h.report_open(session, None, {"path": stripped})
+
+        st = _last_state(messages)
+        fig_cell = [c for c in st["cells"] if c["cell_type"] == "figure"][0]
         assert fig_cell["data_offline"] is True
+        assert fig_cell["data_detached"] is False
         assert isinstance(fig_cell.get("png"), str)
         assert fig_cell["png"].startswith("data:image/png;base64,")
         # No live figure emitted for an offline cell.

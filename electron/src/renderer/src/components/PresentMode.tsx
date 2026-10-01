@@ -121,6 +121,25 @@ if (typeof document !== 'undefined' && !document.getElementById('spyde-present-m
 .present-md strong { color: var(--spyde-deck-text, #ffffff); }
 .present-md .katex-display { display: block; margin: 1rem 0; text-align: center;
   overflow-x: auto; overflow-y: hidden; }
+/* ── text-only slides FILL the stage ──────────────────────────────────────────
+   A heading and a few bullets at prose size, centred in a 60rem column, is a
+   small block adrift in a large dark rectangle on a projector. These tiers scale
+   the type up so a sparse slide uses the room it has; a dense slide gets no
+   class at all and keeps prose size, which is what stops it overflowing.
+
+   vh-based with a clamp, so it tracks the projector rather than a fixed px
+   guess, and cannot run away on a very tall or very short display. */
+.present-fill .present-md { font-size: clamp(1.25rem, 2.55vh, 2.05rem); line-height: 1.55; }
+.present-fill .present-md h1 { font-size: clamp(2.6rem, 5.6vh, 4.4rem); margin: 0 0 1.4rem; }
+.present-fill .present-md h2 { font-size: clamp(2rem, 4.3vh, 3.4rem); margin: 0 0 1rem; }
+.present-fill .present-md h3 { font-size: clamp(1.5rem, 3.2vh, 2.4rem); }
+.present-fill .present-md li { margin: 0.55em 0; }
+.present-fill .present-md ul, .present-fill .present-md ol { margin: 0.8em 0; }
+.present-fill .present-md p { margin: 0 0 0.9em; }
+/* The sparse tier goes further — this is the "title + four bullets" slide. */
+.present-fill-lg .present-md { font-size: clamp(1.45rem, 3.05vh, 2.5rem); }
+.present-fill-lg .present-md h2 { font-size: clamp(2.3rem, 5vh, 3.9rem); }
+.present-fill-lg .present-md li { margin: 0.7em 0; }
 /* ── presentation polish: TITLE / SECTION slides ──────────────────────────────
    A title slide centers a large title block — first heading huge, the rest a
    muted subtitle. Scoped to .present-title-md so a content slide is unchanged. */
@@ -170,6 +189,29 @@ interface Props {
    *  action, and shows the "Back to presentation" pill. */
   onLaunchLive: (action: LiveAction) => void
 }
+
+/**
+ * Resolve a split cell's layout into the two booleans that actually drive the
+ * grid — the renderer mirror of `model._SPLIT_LAYOUTS` and of the EDITOR's own
+ * resolution in ReportSplitCell.
+ *
+ * All FOUR layouts, not the left/right pair this used to test with a bare
+ * `!== 'text-right'`: that read `text-top` and `text-bottom` as text-left, so a
+ * stacked split round-tripped through the document perfectly and then rendered
+ * side-by-side on the slide. The editor offered a layout the deck could not
+ * show.
+ */
+function splitLayoutOf(raw: string | undefined): {
+  stacked: boolean; textFirst: boolean; layout: string
+} {
+  const layout = SPLIT_LAYOUTS.includes(raw ?? '') ? (raw as string) : 'text-left'
+  return {
+    layout,
+    stacked: layout === 'text-top' || layout === 'text-bottom',
+    textFirst: layout === 'text-left' || layout === 'text-top',
+  }
+}
+const SPLIT_LAYOUTS: string[] = ['text-left', 'text-right', 'text-top', 'text-bottom']
 
 /** Group the mirrored report cells into slides by `slide_break` — the renderer
  *  mirror of `ReportDoc.slides()`. A break STARTS a new slide; the first cell
@@ -767,11 +809,13 @@ function PreviewCell({ cell, titleSlide }: { cell: ReportCell; titleSlide: boole
              : <div style={styles.previewFigPending}>figure</div>}
       </div>
     )
-    const textLeft = (cell.split_layout ?? 'text-left') !== 'text-right'
+    const { stacked, textFirst } = splitLayoutOf(cell.split_layout)
     return (
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem',
+      <div style={{ display: 'grid',
+                    gridTemplateColumns: stacked ? '1fr' : '1fr 1fr',
+                    gap: '1rem',
                     alignItems: 'center', margin: '0.5rem 0' }}>
-        {textLeft ? [textPane, figPane] : [figPane, textPane]}
+        {textFirst ? [textPane, figPane] : [figPane, textPane]}
       </div>
     )
   }
@@ -838,6 +882,32 @@ function Slide({ cells, active, reportFigures, iframeRefs, replayState, onLaunch
   // real stage height whatever the captions and markdown around them cost.
   const figVh = visualCells <= 1 ? 58 : Math.max(16, Math.round(62 / visualCells))
 
+  // FILL THE STAGE on a text-only slide.
+  //
+  // A heading plus a few bullets used to render at prose size, vertically
+  // centred in a 60rem column, which on a 1900px projector is a small block
+  // floating in a large dark rectangle with dead space above AND below. A slide
+  // is not a paragraph — it should use the room it has.
+  //
+  // Scaled by CONTENT LENGTH rather than by measuring: a sparse slide gets the
+  // big type, a dense one keeps prose size so it can't overflow into the
+  // pager. Deterministic, no layout thrash, no reflow loop — and the tier is
+  // exported as `data-fill` so a spec can assert it without reading font sizes.
+  // SPLIT slides qualify too. Their text side is its own column, so scaling it
+  // cannot crowd the picture — and a split left at prose size was the same
+  // complaint: a heading and four bullets adrift in half a dark rectangle.
+  // A slide with a full-width figure/image/movie does NOT qualify: there the
+  // text shares the vertical budget with the visual and bigger type pushes it
+  // off the stage.
+  const splitCells = cells.filter(c => c.cell_type === 'split').length
+  const splitOnly = splitCells > 0 && visualCells === splitCells
+  const fillable = !isTitle && (visualCells === 0 || splitOnly)
+  const textLen = cells.reduce((n, c) => n + (c.source ?? '').length, 0)
+  // A split's text lives in HALF the width, so the same character count fills
+  // twice the height — the tiers step down accordingly.
+  const [lgMax, mdMax] = splitOnly ? [260, 520] : [400, 850]
+  const fill = !fillable ? '' : textLen < lgMax ? 'lg' : textLen < mdMax ? 'md' : ''
+
   const renderCell = (cell: ReportCell) => (
     <SlideCell
       key={cell.id}
@@ -856,17 +926,31 @@ function Slide({ cells, active, reportFigures, iframeRefs, replayState, onLaunch
       data-kind={isTitle ? 'title' : 'content'}
       data-style={meta.style || 'default'}
       data-fig-vh={figVh}
+      data-fill={fill || 'base'}
       style={{ ...styles.slide, ...styleBg,
         ...(isTitle ? styles.slideTitle : {}),
         ...(active ? styles.slideActive : {}),
         ['--spyde-fig-vh' as any]: `${figVh}vh` }}
     >
-      <div style={{ ...styles.slideInner,
+      <div
+        className={fill ? `present-fill present-fill-${fill}` : undefined}
+        style={{ ...styles.slideInner,
         // A slide carrying a figure gets the WIDE column: 60rem is a prose
         // measure (right for text, wrong for data), and capping a figure slide
         // at it left most of a wide screen empty while the plot rendered small.
-        // Text-only slides keep the readable measure.
         ...(visualCells > 0 ? styles.slideInnerWide : {}),
+        // A scaled-up text slide needs the column to grow WITH the type:
+        // max-width is in `rem` (root-relative), so it is a fixed pixel box —
+        // leaving it at 60rem while the body goes 18px → 27px would SHORTEN the
+        // measure to ~45 characters and undo the point.
+        ...(fill ? styles.slideInnerFill : {}),
+        // TOP-align content slides. Centring is right for a title card, but on a
+        // content slide it floats the heading at a height that depends on how
+        // much text follows it — so consecutive slides visibly jump. Anchoring
+        // the heading is what makes a deck read as one deck. A slide whose
+        // figures grow to fill has no free space to distribute, so this is a
+        // no-op there.
+        ...(isTitle ? {} : styles.slideInnerTop),
         ...(isTitle ? styles.slideInnerTitle : {}) }}>
         {cells.map(cell => (
           <React.Fragment key={cell.id}>{renderCell(cell)}</React.Fragment>
@@ -1019,12 +1103,19 @@ function SlideSplit({ cell, reportFigures, iframeRefs, replayState }: {
       )}
     </div>
   )
-  const textLeft = (cell.split_layout ?? 'text-left') !== 'text-right'
+  const { stacked, textFirst, layout } = splitLayoutOf(cell.split_layout)
   return (
     <div data-testid={`present-split-${cell.id}`}
-         data-layout={textLeft ? 'text-left' : 'text-right'}
-         style={styles.splitRow}>
-      {textLeft ? [textPane, figPane] : [figPane, textPane]}
+         data-layout={layout}
+         style={{ ...styles.splitRow,
+                  // Stacked: ONE column, and the text row sizes to its content
+                  // while the figure row takes the rest. `1fr 1fr` here would
+                  // give a two-line caption half the slide.
+                  gridTemplateColumns: stacked ? '1fr' : '1fr 1fr',
+                  ...(stacked
+                    ? { gridTemplateRows: textFirst ? 'auto 1fr' : '1fr auto' }
+                    : {}) }}>
+      {textFirst ? [textPane, figPane] : [figPane, textPane]}
     </div>
   )
 }
@@ -1044,7 +1135,12 @@ const styles: Record<string, React.CSSProperties> = {
     // Grow into the stage like a plain figure cell does.
     flex: '1 1 var(--spyde-fig-vh, 58vh)', minHeight: 0,
   },
-  splitText: { minWidth: 0, alignSelf: 'center', maxHeight: '100%', overflow: 'hidden' },
+  // START, not center: the row is stretched to the stage, so centring the text
+  // inside it floats the heading at a height that depends on how many bullets
+  // follow — the same drift the content slides had, and it puts the heading out
+  // of line with the top of the picture beside it. Long text fills the column
+  // either way, so this only changes the sparse case, which is the broken one.
+  splitText: { minWidth: 0, alignSelf: 'start', maxHeight: '100%', overflow: 'hidden' },
   splitFig: {
     minWidth: 0, minHeight: 0, display: 'flex', flexDirection: 'column',
     alignItems: 'center', justifyContent: 'center',
@@ -1081,6 +1177,11 @@ const styles: Record<string, React.CSSProperties> = {
   },
   // A slide with a figure on it: let the data have the screen.
   slideInnerWide: { maxWidth: '96rem' },
+  // A scaled-up text slide: wider column so the bigger type keeps a sane
+  // measure, and a little top padding so the heading isn't jammed to the edge.
+  slideInnerFill: { maxWidth: '78rem', paddingTop: '2vh' },
+  // Content slides anchor their heading at the top (see the call site).
+  slideInnerTop: { justifyContent: 'flex-start' },
   // A title slide: content vertically + horizontally centered, tighter column.
   slideTitle: { justifyContent: 'center', textAlign: 'center' },
   slideInnerTitle: { maxWidth: '48rem' },
@@ -1181,7 +1282,7 @@ const styles: Record<string, React.CSSProperties> = {
     padding: 0,
   },
   iconBtnActive: {
-    background: '#89b4fa', color: '#11111b', borderColor: '#89b4fa',
+    background: '#89b4fa', color: '#11111b', border: '1px solid #89b4fa',
   },
   // The whole audience slide stack is hidden (but kept MOUNTED) while the
   // presenter dashboard is up, so the live figure iframes never tear down.

@@ -19,6 +19,7 @@ import { useSpyDE } from '../kernel/SpyDEContext'
 import { reportClipboard, type SerializedImageCell } from '../kernel/reportClipboard'
 import type { ReportCell } from '../kernel/protocol'
 import { CellChrome } from './CellChrome'
+import { useReplaceDrop } from './useReplaceDrop'
 
 const WIDTH_KEY = (id: string) => `spyde-report-imgw-${id}`
 const DEFAULT_WIDTH_PCT = 100
@@ -43,6 +44,9 @@ interface Props {
 
 export function ReportImageCell({ cell, onRemove, index, dragProps }: Props) {
   const { sendAction } = useSpyDE()
+  // Drop a file OR a live figure window onto the picture to swap it, keeping
+  // this cell's caption, width and slide attributes.
+  const replace = useReplaceDrop(cell.id)
   const [hover, setHover] = useState(false)
   const [captionEditing, setCaptionEditing] = useState(false)
   const [captionDraft, setCaptionDraft] = useState(cell.caption ?? '')
@@ -147,8 +151,12 @@ export function ReportImageCell({ cell, onRemove, index, dragProps }: Props) {
       <div style={styles.imgWrap}>
         <div
           ref={boxRef}
-          style={{ ...styles.imgBox, width: `${widthPct}%` }}
+          style={{
+            ...styles.imgBox, width: `${widthPct}%`,
+            ...(replace.active ? styles.imgBoxDropOn : {}),
+          }}
           data-testid={`report-imgcell-box-${cell.id}`}
+          {...replace.handlers}
         >
           {cell.image ? (
             <img
@@ -161,6 +169,12 @@ export function ReportImageCell({ cell, onRemove, index, dragProps }: Props) {
           ) : (
             <div style={styles.missing} data-testid={`report-imgcell-missing-${cell.id}`}>
               image unavailable
+            </div>
+          )}
+          {replace.active && (
+            <div style={styles.dropHint}
+                 data-testid={`report-imgcell-drophint-${cell.id}`}>
+              Replace this image
             </div>
           )}
           {cell.image && (
@@ -235,6 +249,13 @@ const styles: Record<string, React.CSSProperties> = {
   imgBox: {
     position: 'relative', maxWidth: '100%',
     // width set per-instance (widthPct).
+  },
+  imgBoxDropOn: { outline: '2px dashed #89b4fa', outlineOffset: 3, borderRadius: 6 },
+  dropHint: {
+    position: 'absolute', inset: 0, display: 'flex',
+    alignItems: 'center', justifyContent: 'center',
+    background: 'rgba(17,17,27,0.66)', color: '#89b4fa',
+    fontSize: 12, fontWeight: 700, borderRadius: 6, pointerEvents: 'none',
   },
   img: {
     display: 'block', width: '100%', height: 'auto',
