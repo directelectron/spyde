@@ -32,9 +32,23 @@ import numpy as np
 
 log = logging.getLogger(__name__)
 
-# H.264 quality (imageio scale 0..10, higher = better). 7 is a good
-# size/quality balance for scientific movies.
-_H264_QUALITY = 7
+# H.264 quality (imageio scale 0..10, higher = better).
+#
+# 9, not 7. A fast-forward segment SUBSAMPLES the source (one output frame per
+# N source frames — see pipeline.frame_indices_with_speed), so at 16×/32× two
+# consecutive output frames can be ~80 source frames apart. Every P-frame then
+# carries a near-total rewrite of the picture, and at quality 7 x264 spends its
+# budget on the low-frequency bulk and smears the high-frequency detail —
+# visibly, the burnt-in timestamp and scale bar TEAR and ghost while the image
+# itself looks fine. The content is noisy electron-microscope data, which is
+# expensive to encode at the best of times.
+_H264_QUALITY = 9
+
+# Cap the keyframe interval. Without it x264 picks a GOP of ~250 frames and,
+# on a heavily subsampled sequence, a scene-cut-every-frame stream never gets a
+# clean reference to recover against. One keyframe per ~1 s of output bounds
+# how far any artifact can propagate.
+_H264_GOP = 24
 
 
 class Writer(Protocol):
@@ -57,11 +71,21 @@ class _ImageioWriter:
         # size is (W, H); imageio infers it from the first appended frame, but we
         # keep it for the GIF path and for validation.
         self._w, self._h = int(size[0]), int(size[1])
-        self._writer = imageio.get_writer(
-            path, fps=float(fps), codec="libx264",
+        kwargs = dict(
+            fps=float(fps), codec="libx264",
             quality=_H264_QUALITY, macro_block_size=1,
             pixelformat="yuv420p", ffmpeg_log_level="error",
         )
+        # `output_params` is imageio-ffmpeg's passthrough to the CLI. It is not
+        # in every imageio version's signature, so a TypeError falls back to
+        # the plain writer rather than failing the export — the GOP cap is a
+        # quality improvement, never a requirement.
+        try:
+            self._writer = imageio.get_writer(
+                path, output_params=["-g", str(_H264_GOP)], **kwargs)
+        except TypeError:
+            log.debug("imageio has no output_params; encoding without a GOP cap")
+            self._writer = imageio.get_writer(path, **kwargs)
 
     def append(self, rgb: np.ndarray) -> None:
         self._writer.append_data(np.ascontiguousarray(rgb, dtype=np.uint8))
