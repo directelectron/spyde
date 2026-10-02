@@ -1,0 +1,1 @@
+Find Vectors with the neural detector now reports spots at their true positions. They were scaled by up to ~0.6 % toward the top-left corner of the pattern (up to ~0.7 px at the far edge), which biased absolute (CIF-referenced) strain by the same amount.
