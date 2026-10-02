@@ -455,6 +455,25 @@ class TestSinglePatternFitter:
 
         assert residual(fit.spots) < residual(ideal) / 4
 
+    def test_peaks_beyond_the_simulation_leave_the_matched_residual_alone(
+            self, fitted):
+        """A peak finder that sees more of a pattern than the simulation holds
+        (weak reflections, ones past its reciprocal cutoff) raises ``residual``,
+        the median over every measured peak, without the fit changing at all.
+        ``matched_residual`` is the one that measures the fit, so it must not
+        move: on the real sped_ag scan the calibrated detector found 132 peaks
+        against 73, and ``residual`` went from 0.019 to 0.17 Å⁻¹ on the same
+        orientation."""
+        fitter, rows, fit = fitted
+        angles = np.linspace(0.0, 2.0 * np.pi, 3 * len(rows), endpoint=False)
+        outside = _rows(*[(1.9 * np.cos(a), 1.9 * np.sin(a), 0.01) for a in angles])
+        crowded = fitter.fit(np.vstack([rows, outside]))
+        assert crowded.residual > 10 * fit.residual
+        assert crowded.n_matched == fit.n_matched
+        assert crowded.matched_residual == pytest.approx(fit.matched_residual,
+                                                         rel=0.05)
+        assert fit.matched_residual <= fit.residual
+
     def test_spots_and_intensities_agree_in_length(self, fitted):
         _fitter, _rows, fit = fitted
         assert fit.spots.shape[0] == fit.intensities.shape[0]

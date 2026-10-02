@@ -8,8 +8,9 @@
  *     (asserted via the backend log line — PLOTAPP messages don't reach stdout),
  *   - clicking ↻ refreshes the model list (offline-safe) and reports in the
  *     status line,
- *   - Compute still opens the vectors window with the new bg_sigma param in the
- *     payload.
+ *   - Compute is held until the automatic estimates have landed, then runs
+ *     with exactly the parameters the caret shows, and opens the vectors
+ *     window.
  *
  * Real Dask + bundled si-grains, matching find_vectors_workflow.spec.ts.
  */
@@ -36,7 +37,14 @@ test.afterAll(async () => {
 test.setTimeout(180_000)
 
 test('neural wizard: bg-σ control, auto-calibration, model refresh, compute', async () => {
-  const { page, backend } = ctx
+  const { page, backend, app } = ctx
+  // Record what the renderer sends, beside the real handler that forwards it.
+  await app.evaluate(({ ipcMain }) => {
+    ;(globalThis as any).__fvSent = []
+    ipcMain.on('spyde:action', (_e, action, payload) => {
+      ;(globalThis as any).__fvSent.push({ action, payload })
+    })
+  })
 
   const sig = sigWindow(page)
   await sig.getByTestId('subwindow-title').click()
@@ -76,10 +84,25 @@ test('neural wizard: bg-σ control, auto-calibration, model refresh, compute', a
   })
   await page.screenshot({ path: 'fv_neural_shots/02-models-refreshed.png' })
 
-  // Compute (params now include spot_radius; nav blur forced off) → vectors
-  // result window opens and the batch runs to completion.
+  // Compute waits for the estimates, then sends what the caret shows (params
+  // include spot_radius; nav blur forced off) → the vectors result window
+  // opens and the batch runs to completion.
+  await expect(page.getByTestId('fv-compute')).toBeEnabled({ timeout: 60_000 })
+  // The number beside each slider, not the slider itself: a range input
+  // snaps its value to the step, and a calibrated threshold need not sit on it.
+  const label = (testid: string) => page.getByTestId(testid)
+    .locator('xpath=following-sibling::span').textContent()
+  const shown = {
+    spot: Number(await label('fv-spot-size')),
+    threshold: Number(await label('fv-threshold')),
+  }
   const before = await page.getByTestId('subwindow').count()
   await page.getByTestId('fv-compute').click()
+  const sent = await app.evaluate(() => (globalThis as any).__fvSent)
+  const run = sent.find((s: any) => s.action === 'fv_run')
+  expect(run, 'Compute sent no fv_run').toBeTruthy()
+  expect(run.payload).toMatchObject({ spot_radius: shown.spot, kernel_radius: shown.spot })
+  expect(run.payload.threshold).toBeCloseTo(shown.threshold, 2)
   await expect.poll(() => page.getByTestId('subwindow').count(), {
     timeout: 120_000, message: 'vectors result window never opened',
   }).toBeGreaterThan(before)

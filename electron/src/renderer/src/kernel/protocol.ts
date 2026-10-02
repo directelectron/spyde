@@ -1069,6 +1069,7 @@ export interface WizardEventMessage extends MsgBase {
     | 'fv_auto_params'
     | 'fv_models'
     | 'fv_calibration'
+    | 'fv_estimates_done'
     | 'cod_results'
     | 'gpu_status_result'
     | 'first_run_result'
