@@ -785,11 +785,13 @@ def fv_open(session, plot, payload) -> None:
     src, tree = _src_plot_tree(session, plot)
     if src is None or tree is None:
         emit_error("Find Vectors: no active dataset")
+        _emit_estimates_done(src or plot)
         return
     source = _current_signal(src) or tree.root
     am = source.axes_manager
     if am.signal_dimension != 2 or am.navigation_dimension < 2:
         emit_error("Find Vectors needs a 4D-STEM dataset (2-D nav + 2-D signal)")
+        _emit_estimates_done(src)
         return
     p = _coerce(payload)
     log.debug("[fv-preview] ATTACH method=%s thr=%s show_transform=%s beamstop=%s "
@@ -848,9 +850,26 @@ def fv_open(session, plot, payload) -> None:
         except Exception as e:
             import logging
             logging.getLogger(__name__).debug("fv_open attach failed: %s", e)
+        finally:
+            # A superseded open stays quiet: the open that superseded it sends
+            # its own, and an early one would enable Compute before that
+            # open's estimates land.
+            if is_current(tree, "_fv_run_gen", gen):
+                _emit_estimates_done(src)
 
     from spyde.actions.lifecycle import run_on_worker
     run_on_worker(session, _work, name="fv-preview")
+
+
+def _emit_estimates_done(plot) -> None:
+    """Tell the wizard its automatic estimates have all been sent.
+
+    The wizard holds Compute until this arrives, so a batch never runs with
+    parameters the estimates were about to replace. It is sent on every way
+    an open can end — estimates sent, skipped, cached or failed — because a
+    Compute that never enables is worse than the race it closes."""
+    emit({"type": "fv_estimates_done",
+          "window_id": getattr(plot, "window_id", None)})
 
 
 def _emit_auto_params(plot, tree) -> None:
