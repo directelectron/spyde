@@ -53,8 +53,9 @@ def torch_gpu_device():
     return _TORCH_DEV
 
 
-def _nxcorr_torch(frames: np.ndarray, kr: int, device, kernel_window_pad: int = 0):
-    """(N,H,W) window-normalised cross-correlation in [-1,1] on ``device``.
+def _nxcorr_torch(frames: np.ndarray, kr: int, device, kernel_window_pad: int = 1):
+    """(N,H,W) window-normalised cross-correlation on ``device``, >= -1 and NOT
+    clipped above 1 (see the CPU path in detectors for why).
 
     Same Lewis-1995 NXCORR as ``find_vectors._find_vectors_single_frame``
     (numerator = xcorr/n - win_mean*t_mean; denom = max(win_std*t_std, floor)),
@@ -97,7 +98,7 @@ def _nxcorr_torch(frames: np.ndarray, kr: int, device, kernel_window_pad: int = 
     denom_floor = 0.01 * gstd * t_std
     numer = xcorr / n - win_mean * t_mean
     denom = torch.maximum(win_std * t_std, denom_floor)
-    return (numer / denom).clamp_(-1.0, 1.0)
+    return (numer / denom).clamp_(min=-1.0)
 
 
 _QFIT_PINV: dict = {}     # device-keyed cache of the (6, ks*ks) LS pseudo-inverse
@@ -191,7 +192,7 @@ def find_vectors_torch_batch(
         if idx.numel() == 0:
             return [np.zeros((0, 3), np.float32) for _ in range(N)]
         nn, yy, xx = idx[:, 0], idx[:, 1], idx[:, 2]
-        vals = raw[nn, yy, xx]
+        vals = raw[nn, yy, xx].clamp(max=1.0)
         if subpixel:
             dy, dx = _fit_peaks_quadratic(raw, nn, yy, xx, dev)
             py = yy.to(torch.float32) + dy

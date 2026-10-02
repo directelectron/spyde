@@ -486,9 +486,7 @@ class TestPeakIntensityRobust:
         peaks_xy = [(64, 64)]
         frame = _blurred_frame((128, 128), peaks_xy, sigma=1.5)
         frame = frame + np.random.RandomState(2).randn(128, 128).astype(np.float32) * 0.01
-        # Kernel radius matched to the ~4 px spot: NXCORR scores a template far
-        # larger than the spot below any sensible threshold.
-        _cmap, _raw, peaks = _find_vectors_single_frame(frame, 4, 0.3, 10)
+        _cmap, _raw, peaks = _find_vectors_single_frame(frame, 12, 0.3, 10)
         assert len(peaks) >= 1
         # intensity column is finite and positive (a real brightness, not a score).
         assert np.all(np.isfinite(peaks[:, 2]))

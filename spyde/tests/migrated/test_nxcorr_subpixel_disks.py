@@ -1,10 +1,11 @@
 """NXCORR recovers the subpixel centre of a flat-topped disk on every path.
 
-A statistics window larger than the disk template makes the correlation score
-flat across the top of a disk, so the parabolic vertex snapped to an integer
-pixel (0.85 px RMS for a 6 px disk). The disks here are noise-free, rendered
-exactly at known subpixel centres; every path must recover them to a few
-hundredths of a pixel.
+The statistics window is a pixel larger than the disk template, so near a disk
+centre the score exceeds 1. Clipping it to [-1, 1] before locating the peak
+turned the top into a flat plateau and the parabolic vertex snapped to an
+integer pixel (0.85 px RMS for a 6 px disk). The disks here are noise-free,
+rendered exactly at known subpixel centres; every path must recover them to a
+few hundredths of a pixel.
 """
 import math
 
