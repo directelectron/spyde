@@ -61,7 +61,7 @@ def _nxcorr_fft_cupy(frames_d, kernel_r: int, disk_stats, numba_stream):
 
     n_disk, t_mean, t_std = disk_stats
     kr = int(kernel_r)
-    krw = kr + 1  # kernel_window_pad = 1, same as the CPU and numba paths
+    krw = kr  # window = template box, same as the CPU and numba paths (detectors.kernel_window_pad)
 
     with cp.cuda.ExternalStream(_stream_ptr(numba_stream)):
         frames = cp.asarray(frames_d)  # zero-copy view of the numba buffer
