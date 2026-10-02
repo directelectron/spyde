@@ -1254,6 +1254,12 @@ class SinglePatternFit:
     #: would penalise a good fit for being complete.
     residual: float
     n_matched: int              #: measured peaks with a drawn spot on them
+    #: The same distance over the matched peaks alone: how well the fit sits on
+    #: the reflections it explains. ``residual`` also counts every detected
+    #: peak the simulation leaves out (weak or beyond its reciprocal cutoff),
+    #: so a peak finder that sees more of a pattern raises it without the fit
+    #: getting any worse.
+    matched_residual: float = float("nan")
 
 
 class SinglePatternFitter:
@@ -1521,10 +1527,12 @@ class SinglePatternFitter:
             nearest = np.linalg.norm(
                 drawn[:, None, :] - measured[None, :, :], axis=-1).min(axis=0)
             residual = float(np.median(nearest))
-            n_matched = int((nearest < (self.pair_distance
-                                        or self._plan_pair_distance)).sum())
+            paired = nearest < (self.pair_distance or self._plan_pair_distance)
+            n_matched = int(paired.sum())
+            matched_residual = (float(np.median(nearest[paired])) if n_matched
+                                else float("nan"))
         else:
-            residual, n_matched = float("nan"), 0
+            residual, n_matched, matched_residual = float("nan"), 0, float("nan")
 
         return SinglePatternFit(
             quat=quantem_quats_to_orix(
@@ -1537,6 +1545,7 @@ class SinglePatternFitter:
             intensities=intensity.cpu().numpy().astype(np.float32),
             residual=residual,
             n_matched=n_matched,
+            matched_residual=matched_residual,
         )
 
 

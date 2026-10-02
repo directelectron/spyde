@@ -1,0 +1,1 @@
+The **Vector Orientation Mapping** Refine readout now also gives the residual over the matched peaks alone ("matched resid"). The existing "resid" counts every detected peak, so it rises when Find Vectors picks up weak reflections the simulated pattern leaves out, even though the fit itself has not got any worse.
