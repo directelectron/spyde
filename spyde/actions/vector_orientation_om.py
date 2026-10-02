@@ -476,6 +476,7 @@ def _emit_vom_fit(window_id, fit) -> None:
         "exx": _number(exx), "eyy": _number(eyy), "exy": _number(exy),
         "residual": _number(fit.residual),
         "matched": int(getattr(fit, "n_matched", 0) or 0),
+        "matched_residual": _number(getattr(fit, "matched_residual", float("nan"))),
     }
     friedel = getattr(fit, "friedel_asym", None)
     if friedel is not None:
