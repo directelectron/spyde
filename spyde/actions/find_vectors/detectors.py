@@ -257,7 +257,7 @@ def _find_vectors_single_frame(
     *,
     subpixel: bool = True,
     beamstop_mask: Optional[np.ndarray] = None,
-    kernel_window_pad: int = 1,
+    kernel_window_pad: int = 0,
     _disk_fft=None,
     _disk_stats=None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -288,11 +288,12 @@ def _find_vectors_single_frame(
         brightness.
     beamstop_mask : (ky, kx) bool — masked pixels excluded before correlation
     kernel_window_pad : extra pixels added to the window radius used for
-        computing local mean/std (not the correlation template).  A pad of 1
-        means the statistics window is (kr+1) rather than kr, sampling a ring
-        of background around the disk and making the denominator more robust
-        against spurious single-pixel intensity spikes.  Positions where the
-        padded window std is still zero are set to score=0 (not inflated).
+        computing local mean/std (not the correlation template).  Keep it 0:
+        with any pad the statistics window no longer matches the template
+        window, the score stops being a true correlation coefficient, and its
+        peak over a disk turns into a flat plateau ~2 px wide — the parabolic
+        vertex then snaps to an integer pixel (up to ~1 px off) and a small
+        ``min_distance`` reports one disk several times.
     _disk_fft : pre-computed rfft2 of the disk at the padded frame size
     _disk_stats : (n, t_mean, t_std) pre-computed disk statistics
 
@@ -338,11 +339,7 @@ def _find_vectors_single_frame(
     xcorr = irfft2(rfft2(buf) * _disk_fft.conj(), s=(pH, pW))[:H, :W].astype(np.float32)
 
     # --- Step 2: window statistics via integral images ---
-    # The statistics window uses kr_win = kr + kernel_window_pad so it samples
-    # a slightly larger region than the correlation template.  This makes the
-    # local std estimate more robust: a single bright pixel at the disk edge
-    # raises the std of the padded window without affecting the correlation
-    # numerator, preventing spurious near-1 scores.
+    # kr_win = kr + kernel_window_pad (see the parameter doc for why it is 0).
     # t_mean / t_std always come from the actual disk template (kr), not kr_win.
     disk = _make_disk(kr)
     kH, kW = disk.shape

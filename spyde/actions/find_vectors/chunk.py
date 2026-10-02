@@ -528,7 +528,7 @@ def _find_vectors_chunk_gpu_impl(
     t_mean = np.float32(t_mean)
     t_std  = np.float32(t_std)
     kr     = np.int32(kernel_r)
-    kr_win = np.int32(kernel_r + 1)
+    kr_win = np.int32(kernel_r)   # window = template box; see detectors.kernel_window_pad
     thr    = np.float32(threshold)
     min_d  = np.int32(min_dist)
     iH, iW = np.int32(KY), np.int32(KX)

@@ -53,7 +53,7 @@ def torch_gpu_device():
     return _TORCH_DEV
 
 
-def _nxcorr_torch(frames: np.ndarray, kr: int, device, kernel_window_pad: int = 1):
+def _nxcorr_torch(frames: np.ndarray, kr: int, device, kernel_window_pad: int = 0):
     """(N,H,W) window-normalised cross-correlation in [-1,1] on ``device``.
 
     Same Lewis-1995 NXCORR as ``find_vectors._find_vectors_single_frame``
