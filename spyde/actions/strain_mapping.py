@@ -196,14 +196,69 @@ def _trim_keep(r: np.ndarray, rms: float, tol: float) -> np.ndarray:
     return keep
 
 
+def _friedel_centres(points, owner, n_owners, tol, iterations=2):
+    """Centre of each pattern's g-vectors, from its Friedel pairs.
+
+    ``points`` (N, 2) belong to pattern ``owner`` (N,). A vector pairs with the
+    nearest vector of the same pattern within ``tol`` of its mirror image about
+    the current centre; the centre is the mean pair midpoint. Patterns with no
+    pair keep a zero centre. Returns (n_owners, 2).
+
+    The ±g matching below needs each pattern centred on its own beam: with an
+    offset c, a reflection's +g and −g candidates sit 2c apart and the
+    nearest-neighbour pick mixes them, which bends the fit away from any affine
+    map. Descan and a calibrated centre that is off by a fraction of a pixel are
+    enough to trigger it."""
+    centres = np.zeros((n_owners, 2))
+    if len(points) == 0:
+        return centres
+    from scipy.spatial import cKDTree
+    # A third coordinate far larger than tol keeps patterns from pairing with
+    # each other, so one tree serves the whole scan.
+    separation = float(np.ptp(points)) + 4.0 * tol + 1.0
+    lift = owner[:, None].astype(float) * separation
+    tree = cKDTree(np.hstack([points, lift]))
+    for _ in range(iterations):
+        mirrored = 2.0 * centres[owner] - points
+        distance, partner = tree.query(np.hstack([mirrored, lift]), distance_upper_bound=tol)
+        paired = np.isfinite(distance)
+        midpoints = 0.5 * (points[paired] + points[partner[paired]])
+        sums = np.zeros((n_owners, 2))
+        np.add.at(sums, owner[paired], midpoints)
+        counts = np.bincount(owner[paired], minlength=n_owners)
+        found = counts > 0
+        centres[found] = sums[found] / counts[found, None]
+    return centres
+
+
+def _friedel_paired_reference(g_ref, tol):
+    """The reference centred on its own beam, keeping only reflections whose
+    Friedel partner is also present.
+
+    An unpaired reflection makes the reference asymmetric: its centroid is no
+    longer the beam, and the centroid alignment then offers every spot two
+    candidates (see :func:`_friedel_centres`). Exact positions gave wrong
+    strain at up to half the pixels. Falls back to the centred set when fewer
+    than two pairs remain (one pair alone is collinear)."""
+    g_ref = np.asarray(g_ref, dtype=float).reshape(-1, 2)
+    if len(g_ref) < 2 or not np.isfinite(tol):
+        return g_ref
+    from scipy.spatial import cKDTree
+    centred = g_ref - _friedel_centres(g_ref, np.zeros(len(g_ref), int), 1, tol)[0]
+    distance, _ = cKDTree(centred).query(-centred, distance_upper_bound=tol)
+    paired = centred[np.isfinite(distance)]
+    return paired if len(paired) >= 4 else centred
+
+
 def _fit_pattern_strain_full(g_meas, g_ref, *, tol, min_matches=DEFAULT_MIN_MATCHES,
                              trim=True):
     """fit_pattern_strain + fit-quality extras:
     ``(exx, eyy, exy, omega, coverage, residual_rms, n_matched)`` or None."""
     g_meas = np.asarray(g_meas, dtype=float).reshape(-1, 2)
-    g_ref = np.asarray(g_ref, dtype=float).reshape(-1, 2)
+    g_ref = _friedel_paired_reference(g_ref, tol)
     if len(g_meas) < 2 or len(g_ref) < 2:
         return None
+    g_meas = g_meas - _friedel_centres(g_meas, np.zeros(len(g_meas), int), 1, tol)[0]
 
     from scipy.spatial import cKDTree
     # TWO candidate alignments; the one matching MORE spots wins (per pixel):
@@ -515,6 +570,8 @@ def _compute_strain_field_vectorized(flat_buffer, x_off, g_ref, tol, ny, nx,
     kxy = kxy[:Ntot]
     # Per-vector owning pixel id (segment id from the CSR row pointers).
     pix = np.repeat(np.arange(P), counts)
+    g_ref = _friedel_paired_reference(g_ref, tol)
+    kxy = kxy - _friedel_centres(kxy, pix, P, tol)[pix]
 
     # Per-pixel mean-centre (the −g=g centroid removal in fit_pattern_strain).
     sums = np.zeros((P, 2)); np.add.at(sums, pix, kxy)
