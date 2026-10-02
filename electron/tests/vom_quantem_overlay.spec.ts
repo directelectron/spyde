@@ -62,6 +62,10 @@ test('the matched pattern lands on the measured peaks and follows the crosshair'
   await expect(page.getByTestId('find-vectors-wizard')).toBeVisible()
   await page.screenshot({ path: join(SHOTS, '01-find-vectors-preview.png') })
 
+  // Compute is held until the spot-size estimate and the neural calibration
+  // have landed. Clicking earlier ran the batch with whichever of them had
+  // arrived, and the fit downstream changed with it.
+  await expect(page.getByTestId('fv-compute')).toBeEnabled({ timeout: 120_000 })
   const before = await page.getByTestId('subwindow').count()
   await page.getByTestId('fv-compute').click()
   await expect.poll(() => page.getByTestId('subwindow').count(), {
