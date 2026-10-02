@@ -257,7 +257,7 @@ def _find_vectors_single_frame(
     *,
     subpixel: bool = True,
     beamstop_mask: Optional[np.ndarray] = None,
-    kernel_window_pad: int = 0,
+    kernel_window_pad: int = 1,
     _disk_fft=None,
     _disk_stats=None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -288,12 +288,11 @@ def _find_vectors_single_frame(
         brightness.
     beamstop_mask : (ky, kx) bool — masked pixels excluded before correlation
     kernel_window_pad : extra pixels added to the window radius used for
-        computing local mean/std (not the correlation template).  Keep it 0:
-        with any pad the statistics window no longer matches the template
-        window, the score stops being a true correlation coefficient, and its
-        peak over a disk turns into a flat plateau ~2 px wide — the parabolic
-        vertex then snaps to an integer pixel (up to ~1 px off) and a small
-        ``min_distance`` reports one disk several times.
+        computing local mean/std (not the correlation template).  A pad of 1
+        means the statistics window is (kr+1) rather than kr, sampling a ring
+        of background around the disk and making the denominator more robust
+        against spurious single-pixel intensity spikes.  Positions where the
+        padded window std is still zero are set to score=0 (not inflated).
     _disk_fft : pre-computed rfft2 of the disk at the padded frame size
     _disk_stats : (n, t_mean, t_std) pre-computed disk statistics
 
@@ -339,7 +338,11 @@ def _find_vectors_single_frame(
     xcorr = irfft2(rfft2(buf) * _disk_fft.conj(), s=(pH, pW))[:H, :W].astype(np.float32)
 
     # --- Step 2: window statistics via integral images ---
-    # kr_win = kr + kernel_window_pad (see the parameter doc for why it is 0).
+    # The statistics window uses kr_win = kr + kernel_window_pad so it samples
+    # a slightly larger region than the correlation template.  This makes the
+    # local std estimate more robust: a single bright pixel at the disk edge
+    # raises the std of the padded window without affecting the correlation
+    # numerator, preventing spurious near-1 scores.
     # t_mean / t_std always come from the actual disk template (kr), not kr_win.
     disk = _make_disk(kr)
     kH, kW = disk.shape
@@ -397,23 +400,28 @@ def _find_vectors_single_frame(
     denom_floor = 0.01 * global_std * t_std
     numerator = xcorr / n - win_mean * t_mean
     denom = np.maximum(win_std * t_std, denom_floor)
-    raw_corr = (numerator / denom).astype(np.float32)
-    np.clip(raw_corr, -1.0, 1.0, out=raw_corr)
+    # Peaks are found on the UNCLIPPED score. The statistics window is a box a
+    # pad larger than the disk template, so near a disk centre the score exceeds
+    # 1; clipping it there turns the peak into a flat plateau and the parabola
+    # below returns the integer pixel (up to ~1 px off). Only the returned
+    # surface is clipped, so thresholds behave exactly as before.
+    score = (numerator / denom).astype(np.float32)
 
     if beamstop_mask is not None and beamstop_mask.any():
-        raw_corr[beamstop_mask] = -1.0
+        score[beamstop_mask] = -1.0
 
+    raw_corr = np.clip(score, -1.0, 1.0)
     corr_map = np.where(raw_corr >= threshold, raw_corr, 0.0).astype(np.float32)
 
     # Fast peak detection: local maximum filter enforces min_distance separation,
     # then threshold.  Using size = 2*min_distance+1 means a pixel is a local max
     # only if no neighbor within min_distance has a higher value.
-    if not (raw_corr >= threshold).any():
+    if not (score >= threshold).any():
         return corr_map, raw_corr, np.zeros((0, 3), dtype=np.float32)
 
     min_d = int(min_distance)
-    local_max = maximum_filter(raw_corr, size=2 * min_d + 1)
-    peaks_mask = (raw_corr == local_max) & (raw_corr >= threshold)
+    local_max = maximum_filter(score, size=2 * min_d + 1)
+    peaks_mask = (score == local_max) & (score >= threshold)
 
     if beamstop_mask is not None and beamstop_mask.any():
         peaks_mask &= ~beamstop_mask
@@ -422,7 +430,7 @@ def _find_vectors_single_frame(
     # Greedy NMS: sort by intensity descending and suppress any peak within
     # min_distance of a higher-intensity peak already accepted.
     if len(peaks_px) > 1:
-        intensities = raw_corr[peaks_px[:, 0], peaks_px[:, 1]]
+        intensities = score[peaks_px[:, 0], peaks_px[:, 1]]
         order = np.argsort(-intensities)
         peaks_px = peaks_px[order]
         kept = np.ones(len(peaks_px), dtype=bool)
@@ -443,7 +451,7 @@ def _find_vectors_single_frame(
     # INTENSITY from the raw experimental frame at that position (not the corr
     # score, which is ≈1 for every matched disk).
     if subpixel:
-        pos = _subpixel_parabola(raw_corr, peaks_px)
+        pos = _subpixel_parabola(score, peaks_px)
     else:
         pos = peaks_px.astype(np.float32)
     # Disk-MEAN brightness over the kernel footprint (robust), not a single

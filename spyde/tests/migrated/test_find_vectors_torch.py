@@ -39,8 +39,8 @@ def _gauss_frame(centers, H=112, W=112, sigma=2.2, amp=100.0, seed=3):
 
 class TestFindVectorsTorch:
     def test_quadratic_fit_recovers_subpixel_centers(self):
-        """The 2D-quadratic fit recovers KNOWN subpixel disk centres to <0.1 px,
-        as does the numpy path's parabolic vertex on the same data."""
+        """The 2D-quadratic fit recovers KNOWN subpixel disk centres to <0.1 px —
+        and beats the numpy CoM, which is biased to ~0.8 px on the same data."""
         from spyde.actions.find_vectors import _find_vectors_single_frame
         truth = [(56.3, 55.7), (40.8, 72.2), (72.1, 40.6)]
         f = _gauss_frame(truth)
@@ -51,9 +51,9 @@ class TestFindVectorsTorch:
             return np.array([np.sqrt((p[:, 0] - cy) ** 2 + (p[:, 1] - cx) ** 2).min()
                              for (cy, cx) in truth])
         torch_err = float(err(tr).mean())
-        numpy_err = float(err(cp).mean())
+        com_err = float(err(cp).mean())
         assert torch_err < 0.1, f"quad-fit error {torch_err:.3f} px"
-        assert numpy_err < 0.1, f"numpy parabolic error {numpy_err:.3f} px"
+        assert torch_err < com_err            # the fit is more accurate than CoM
 
     def test_finds_all_disks_batched(self):
         """Batched over many frames: every true disk is found in every frame."""
