@@ -108,7 +108,7 @@ def scale_batch(x: torch.Tensor, factor: float) -> torch.Tensor:
     """Batched, on-device ``scipy.ndimage.zoom(order=1)`` (bilinear, grid_mode=False):
     output size ``round(n*factor)`` per axis, endpoint-aligned. ``x`` is ``(N, H, W)``.
     Returns ``(N, round(H*factor), round(W*factor))``. Caller maps predicted positions
-    back with ``/factor`` exactly as with the scipy path."""
+    back with ``infer._to_frame_coordinates`` exactly as with the scipy path."""
     _, H, W = x.shape
     out_h = int(round(H * factor))
     out_w = int(round(W * factor))

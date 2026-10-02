@@ -221,6 +221,25 @@ def bg_sigma_from_peak_size(peak_diameter_px: float) -> float:
     return float(np.clip(1.2 * peak_diameter_px, 4.0, 24.0))
 
 
+def _to_frame_coordinates(peaks: np.ndarray, frame_shape, factor: float) -> np.ndarray:
+    """Map peak ``(y, x)`` from the rescaled working frame back to the frame.
+
+    The rescale (``scipy.ndimage.zoom(order=1)`` and its torch twin) aligns the
+    first and last pixel centres, so working pixel ``i`` sits at frame position
+    ``i * (n - 1) / (out - 1)`` with ``out = round(n * factor)`` -- not at
+    ``i / factor``. The two differ by the rounding of the output size: a uniform
+    scale error of up to ~0.6 %, invisible in relative strain but a bias of that
+    size in absolute strain and up to ~0.7 px at the far edge of a 128 px frame.
+    Only this inverse changes; the forward rescale stays as trained."""
+    if factor == 1.0 or len(peaks) == 0:
+        return peaks
+    peaks = peaks.copy()
+    for axis, n in enumerate(frame_shape[:2]):
+        out = int(round(n * factor))
+        peaks[:, axis] = peaks[:, axis] * ((n - 1) / (out - 1))
+    return peaks
+
+
 @torch.no_grad()
 def detect(model, frame: np.ndarray, device, thresh: float = 0.3,
            min_distance: int = 4, auto_scale: bool = True,
@@ -249,10 +268,7 @@ def detect(model, frame: np.ndarray, device, thresh: float = 0.3,
     x = torch.from_numpy(nrm[None, None]).to(device)
     hm, off = model(x)
     pred = decode(hm[0], off[0], thresh=thresh, min_distance=md)
-    if len(pred) and factor != 1.0:
-        pred = pred.copy()
-        pred[:, :2] = pred[:, :2] / factor          # map back to original coords
-    return pred
+    return _to_frame_coordinates(pred, frame.shape, factor)
 
 
 def _neural_sub_batch_size() -> int:
@@ -431,13 +447,7 @@ def detect_batch(model, frames, device, thresh: float = 0.3,
         if cur_device.type == "cuda":
             torch.cuda.empty_cache()
 
-    if factor != 1.0:
-        for i, p in enumerate(per_frame):
-            if len(p):
-                p = p.copy()
-                p[:, :2] = p[:, :2] / factor
-                per_frame[i] = p
-    return per_frame
+    return [_to_frame_coordinates(p, frames.shape[1:], factor) for p in per_frame]
 
 
 @torch.no_grad()
