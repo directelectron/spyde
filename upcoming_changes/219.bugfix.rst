@@ -1,0 +1,1 @@
+Find Vectors (NXCORR) now places each spot at its subpixel centre. Positions used to snap to whole pixels (up to ~1 px off on flat-topped disks), and a small minimum distance reported the same disk several times; strain maps built from NXCORR vectors are no longer quantised.
