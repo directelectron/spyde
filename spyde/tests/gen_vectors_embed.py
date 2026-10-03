@@ -87,17 +87,25 @@ def synthetic_vectors_5d(nt=4, nav=(16, 16)):
     )
 
 
-def main(out_path: str, stack: bool = False) -> None:
+def main(out_path: str, stack: bool = False, in_report: bool = False) -> None:
+    """Write the explorer page to ``out_path``. ``in_report`` wraps it in an
+    exported report page, figure box and fit script included, the way an
+    interactive export embeds it."""
     from spyde.actions.report.vectors_embed import vectors_explorer_html
 
     vecs = synthetic_vectors_5d() if stack else synthetic_vectors()
     html = vectors_explorer_html(
         vecs, caption="synthetic stack embed" if stack else "synthetic embed")
     assert html is not None
+    if in_report:
+        from spyde.actions.report import export_html as ex
+        html = ex._page("Vectors report", ex._figure_iframe_html(
+            "synthetic embed", html, aspect=ex._VECTORS_ASPECT))
     with open(out_path, "w", encoding="utf-8") as fh:
         fh.write(html)
     print(f"wrote {out_path} ({len(html)} bytes)")
 
 
 if __name__ == "__main__":
-    main(sys.argv[1], stack="--5d" in sys.argv[2:])
+    main(sys.argv[1], stack="--5d" in sys.argv[2:],
+         in_report="--in-report" in sys.argv[2:])
