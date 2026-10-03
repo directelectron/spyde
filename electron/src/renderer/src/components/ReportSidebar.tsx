@@ -19,7 +19,7 @@
  */
 import React, { useEffect, useRef, useState } from 'react'
 import { useSpyDE } from '../kernel/SpyDEContext'
-import { FIGURE_DRAG_MIME, WINDOW_DRAG_MIME } from '../kernel/dnd'
+import { FIGURE_DRAG_MIME, WINDOW_DRAG_MIME, figurePayloadFromDrop } from '../kernel/dnd'
 import { reportFromGuide } from '../kernel/reportFromGuide'
 import { ReportCell } from './ReportCell'
 import { ReportFigureCell } from './ReportFigureCell'
@@ -38,30 +38,6 @@ const MAX_W = 800
 const DEFAULT_W = 420
 
 const DROP_MIMES = [FIGURE_DRAG_MIME, WINDOW_DRAG_MIME]
-
-/** The figure payload of a pill drop: the source window id plus — when the
- *  FIGURE_DRAG_MIME payload carries them — the dragged window's shown figure
- *  id and its view tag (view:'3d' while the 3-D IPF explorer was up), which
- *  report_add_figure branches on to snapshot the 3-D scene. */
-interface DropFigurePayload { windowId: number; figId?: string; view?: string }
-
-function figurePayloadFromDrop(dt: DataTransfer): DropFigurePayload | null {
-  const fig = dt.getData(FIGURE_DRAG_MIME)
-  if (fig) {
-    try {
-      const { windowId, figId, view } = JSON.parse(fig) as {
-        windowId?: number; figId?: string; view?: string
-      }
-      if (typeof windowId === 'number') return { windowId, figId, view }
-    } catch { /* malformed */ }
-  }
-  const win = dt.getData(WINDOW_DRAG_MIME)
-  if (win) {
-    const n = parseInt(win, 10)
-    if (Number.isFinite(n)) return { windowId: n }
-  }
-  return null
-}
 
 // The image file extensions a PHOTO cell may carry (must mirror the backend's
 // IMAGE_EXTS). Anything else the browser hands us is normalised to png (the
