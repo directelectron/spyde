@@ -156,6 +156,7 @@ include = [
     "spyde/**/*.svg",
     "spyde/models/weights/*.pt",
     "spyde/models/weights/registry.json",
+    "spyde/models/weights/adapt_replay.npz",
 ]
 exclude = [
     ".venv/**/*",
@@ -189,6 +190,8 @@ spyde = [
     "drawing/toolbars/icons/*.svg",
     "models/weights/*.pt",
     "models/weights/registry.json",
+    # The detector-adaptation replay frames (spyde/models/adapt.py).
+    "models/weights/adapt_replay.npz",
     # The CSB plugin's rsciio spec. `"*.yaml"` above only matches spyde/*.yaml —
     # a glob does not cross directories — so without this line the file is
     # absent from a built wheel. Nothing reads it at RUNTIME (csb_format._SPEC

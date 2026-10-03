@@ -52,6 +52,8 @@ _SPYDE_STAGED_HANDLERS: dict[str, str] = {
     "fv_close":            "spyde.actions.find_vectors_action.fv_close",
     "fv_models":           "spyde.actions.find_vectors_action.fv_models",
     "fv_refresh_models":   "spyde.actions.find_vectors_action.fv_refresh_models",
+    "fv_adapt":            "spyde.actions.find_vectors_adapt.fv_adapt",
+    "fv_adapt_revert":     "spyde.actions.find_vectors_adapt.fv_adapt_revert",
     "vom_generate_library": "spyde.actions.vector_orientation_om.vom_generate_library",
     "vom_refine":          "spyde.actions.vector_orientation_om.vom_refine",
     "vom_run":             "spyde.actions.vector_orientation_om.vom_run",

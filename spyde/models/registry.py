@@ -15,6 +15,13 @@ collision and contributing a newer ``default``:
 overwrites it, but a user is free to hand-edit it; both are the "user-dir"
 manifest and sit above the bundled one.)
 
+A fourth layer holds the models a user TAUGHT — the Find Vectors adapt step
+(``spyde/models/adapt.py``) fine-tunes a copy of a model on their marks. Those
+live in their own manifest (``spyde.teach``, ``~/.spyde/models/taught.json``)
+because a remote refresh rewrites ``registry.json`` wholesale. A taught model
+is never the ``default``, carries the ``scope`` (dataset) it was taught on, and
+is listed by :func:`available_models` only for that scope.
+
 Resolution + caching:
   - ``list_models()`` / ``available_models()`` → the merged manifest for the UI.
   - ``get_model(model_id)`` → a cached ``(model, device)``; resolves weights
@@ -73,8 +80,10 @@ _MANIFEST_CACHE: Optional[dict] = None
 # ── user dir ──────────────────────────────────────────────────────────────────
 def user_models_dir() -> str:
     """``~/.spyde/models`` — where remote-downloaded weights + the user manifest
-    live (mirrors the ``~/.spyde`` settings dir used elsewhere). Created on demand."""
-    d = os.path.join(os.path.expanduser("~"), ".spyde", "models")
+    live (mirrors the ``~/.spyde`` settings dir used elsewhere). Created on demand.
+    ``SPYDE_MODELS_DIR`` moves it, as ``SPYDE_SETTINGS_DIR`` does the settings, so
+    a test run never writes a taught model into the real home directory."""
+    d = os.environ.get("SPYDE_MODELS_DIR") or os.path.join(os.path.expanduser("~"), ".spyde", "models")
     os.makedirs(d, exist_ok=True)
     return d
 
@@ -122,17 +131,34 @@ def _merge_manifests(*manifests: Optional[dict]) -> dict:
     return {"default": default, "models": models}
 
 
+def _load_taught_manifest() -> dict:
+    """The user's taught models (no ``default`` — a taught model never is one)."""
+    from spyde import teach
+    return {"default": None, "models": teach.user_models(user_models_dir(), kind=TAUGHT_KIND)}
+
+
+#: ``spyde.teach`` kind of a taught SpotUNet.
+TAUGHT_KIND = "spotunet"
+
+
 def _manifest(force: bool = False) -> dict:
     global _MANIFEST_CACHE
     if _MANIFEST_CACHE is not None and not force:
         return _MANIFEST_CACHE
-    _MANIFEST_CACHE = _merge_manifests(_load_bundled_manifest(), _load_user_manifest())
+    _MANIFEST_CACHE = _merge_manifests(_load_bundled_manifest(), _load_user_manifest(),
+                                       _load_taught_manifest())
     return _MANIFEST_CACHE
 
 
 def _invalidate_manifest():
     global _MANIFEST_CACHE
     _MANIFEST_CACHE = None
+
+
+def reload_manifest() -> None:
+    """Re-read every manifest layer on next use (after a model is taught or
+    removed)."""
+    _invalidate_manifest()
 
 
 # ── public manifest API (for the UI) ────────────────────────────────────────────
@@ -145,15 +171,18 @@ def default_model_id() -> Optional[str]:
     return _manifest().get("default")
 
 
-def available_models() -> dict:
+def available_models(scope: Optional[str] = None) -> dict:
     """Compact payload for the wizard Model dropdown: ``{default, models:[{id,label,
-    version,notes}]}`` (arch/source omitted — the UI doesn't need them)."""
+    version,notes}]}`` (arch/source omitted — the UI doesn't need them). Taught
+    models are listed only when ``scope`` is the dataset they were taught on."""
     return {
         "default": default_model_id(),
         "models": [
             {"id": m["id"], "label": m.get("label", m["id"]),
-             "version": m.get("version"), "notes": m.get("notes")}
+             "version": m.get("version"), "notes": m.get("notes"),
+             **({"taught": True, "parent": m.get("parent", {}).get("id")} if m.get("kind") else {})}
             for m in list_models()
+            if not m.get("kind") or (scope is not None and m.get("scope") == scope)
         ],
     }
 
@@ -220,6 +249,8 @@ def _resolve_weights(entry: dict) -> str:
         path = _resolve_bundled(source)
     elif stype == "hf":
         path = _resolve_hf(source)
+    elif stype == "taught":
+        path = os.path.join(user_models_dir(), source["file"])
     else:
         raise ValueError(f"unknown model source type {stype!r} for {entry.get('id')}")
     expected = entry.get("sha256") or source.get("sha256")
@@ -238,7 +269,7 @@ def is_cached(model_id: Optional[str] = None) -> bool:
     if entry is None:
         return True                      # unknown id resolves to bundled default
     source = entry.get("source", {})
-    if source.get("type") != "hf":
+    if source.get("type") not in ("hf", "taught"):
         return True
     return os.path.exists(os.path.join(user_models_dir(), source.get("file", "")))
 
@@ -353,6 +384,13 @@ def demote_cached_models_to_cpu() -> None:
                     _MODEL_CACHE[mid] = (model, _torch.device("cpu"))
             except Exception as e:      # pragma: no cover — best-effort demotion
                 log.debug("[models] demoting cached model %r to CPU failed: %s", mid, e)
+
+
+def forget_model(model_id: str) -> None:
+    """Drop a model from the in-process caches (a taught model that was removed)."""
+    with _CACHE_LOCK:
+        _MODEL_CACHE.pop(model_id, None)
+        _CPU_MODEL_CACHE.pop(model_id, None)
 
 
 def _raise_no_models():        # pragma: no cover
