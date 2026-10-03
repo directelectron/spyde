@@ -110,6 +110,27 @@ async function setThreshold(page: Page, value: string) {
   }, value)
 }
 
+/** Raise the pattern's figure through the focus message: on CI a click can be
+ * swallowed by another window's iframe otherwise (vom_quantem_overlay.spec.ts). */
+async function raise(page: Page) {
+  const id = await sigWindow(page).locator('iframe').first().getAttribute('data-testid')
+  await page.evaluate((figId: string) => window.postMessage({ type: 'spyde_focus', figId }, '*'),
+    id!.replace('figure-', ''))
+  await page.waitForTimeout(300)
+}
+
+/** Double-click, and if no mark lands, say what the backend saw. */
+async function mark(page: Page, backend: any, x: number, y: number, expected: string) {
+  await raise(page)
+  await page.mouse.dblclick(x, y)
+  try {
+    await expect(page.getByTestId('fv-teach-count')).toContainText(expected, { timeout: 20_000 })
+  } catch (error) {
+    console.log((backend.logBuffer as string[]).filter((l) => l.includes('fv-adapt')).slice(-10).join('\n'))
+    throw error
+  }
+}
+
 /** A screenshot of the pattern window and the caret only. */
 async function shot(page: Page, name: string) {
   const a = (await sigWindow(page).boundingBox())!
@@ -154,25 +175,26 @@ test('double-click marks, adapt, revert', async () => {
 
   // "A disk is here" on empty pattern draws a green ring; double-clicking the
   // ring again removes it, and with no marks left nothing is refitted.
-  let empty = { x: frameRect.left + frameRect.width / 2, y: frameRect.top + frameRect.height / 2 }
+  // Inside the circles' own extent, so the click is on the image, not its margin.
+  const xs = low.map((b) => b.x), ys = low.map((b) => b.y)
+  const span = { left: Math.min(...xs), top: Math.min(...ys),
+    width: Math.max(...xs) - Math.min(...xs), height: Math.max(...ys) - Math.min(...ys) }
+  let empty = { x: span.left + span.width / 2, y: span.top + span.height / 2 }
   let room = -1
-  for (let i = 1; i < 10; i++) {
-    for (let j = 1; j < 10; j++) {
-      const p = { x: frameRect.left + frameRect.width * (0.1 + 0.08 * i),
-        y: frameRect.top + frameRect.height * (0.1 + 0.08 * j) }
+  for (let i = 0; i <= 10; i++) {
+    for (let j = 0; j <= 10; j++) {
+      const p = { x: span.left + span.width * 0.1 * i, y: span.top + span.height * 0.1 * j }
       const d = Math.min(...low.map((b) => Math.hypot(b.x - p.x, b.y - p.y)))
       if (d > room) { room = d; empty = p }
     }
   }
-  await page.mouse.dblclick(box.x + empty.x, box.y + empty.y)
-  await expect(page.getByTestId('fv-teach-count')).toContainText('0 wrong · 1 missed', { timeout: 20_000 })
+  await mark(page, backend, box.x + empty.x, box.y + empty.y, '0 wrong · 1 missed')
   await expect.poll(async () => (await blobs(frame, 'green')).blobs, {
     timeout: 20_000, message: 'no green ring where empty pattern was double-clicked',
   }).toEqual(expect.arrayContaining([expect.anything()]))
   expect(near(empty, (await blobs(frame, 'green')).blobs, 12)).toBeTruthy()
   await shot(page, '02-disk-mark.png')
-  await page.mouse.dblclick(box.x + empty.x, box.y + empty.y)
-  await expect(page.getByTestId('fv-teach-count')).toContainText('double-click a wrong circle', { timeout: 20_000 })
+  await mark(page, backend, box.x + empty.x, box.y + empty.y, 'double-click a wrong circle')
   await expect.poll(async () => (await blobs(frame, 'green')).count, { timeout: 20_000 }).toBe(0)
 
   // Circles that only appear at the low threshold, on nothing, are what a user
@@ -191,10 +213,8 @@ test('double-click marks, adapt, revert', async () => {
     const next = now.find((b) => !near(b, disks, 10) && !near(b, marked, 10)
       && b.n >= 0.8 * ring && b.n <= 1.25 * ring && inside(b))
     if (!next) break
-    await page.mouse.dblclick(box.x + next.x, box.y + next.y)
     marked.push(next)
-    await expect(page.getByTestId('fv-teach-count')).toContainText(`${marked.length} wrong · 0 missed`,
-      { timeout: 20_000 })
+    await mark(page, backend, box.x + next.x, box.y + next.y, `${marked.length} wrong · 0 missed`)
     if (marked.length === 1) await shot(page, '02-marked.png')
     // Let the refit this mark starts land and repaint before reading the circles
     // again (a user looks before the next click; a script has to wait for it).

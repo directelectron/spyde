@@ -137,10 +137,12 @@ class FindVectorsAdapt:
 
     def on_double_click(self, event=None) -> None:
         if not self.active or event is None or self.plot is None:
+            log.info("[fv-adapt] double-click ignored: caret %s", "open" if self.active else "closed")
             return
         try:
             x, y = float(event.xdata), float(event.ydata)
         except Exception:
+            log.info("[fv-adapt] double-click ignored: no data position (%r)", event)
             return
         from spyde.actions.vector_overlay import DetectorPixels
         source = _current_signal(self.plot) or self.tree.root
@@ -148,7 +150,8 @@ class FindVectorsAdapt:
         drawn = self.plot.last_overlay_value(getattr(self.tree, "_fv_preview", None)) or {}
         index = drawn.get("index")
         if index is None:
-            return                                  # the preview has not drawn yet
+            log.info("[fv-adapt] double-click ignored: the preview has not drawn on this window yet")
+            return
         peaks = drawn.get("peaks") or {}
         self.toggle(tuple(index), float(py), float(px),
                     np.asarray(peaks.get("data", np.zeros((0, 2))), np.float64).reshape(-1, 2),
@@ -158,14 +161,17 @@ class FindVectorsAdapt:
         """One double-click at ``(y, x)`` pixels on the pattern at ``index``."""
         from spyde.models.adapt import DISK, NOT_DISK
         if self.marks.remove_near(index, y, x, MARK_HIT_PX):
-            pass
+            what = "removed a mark"
         else:
             d = np.hypot(peaks_xy[:, 1] - y, peaks_xy[:, 0] - x) if len(peaks_xy) else np.zeros(0)
             if len(d) and d.min() <= max(radius, MARK_HIT_PX):
                 hit = peaks_xy[int(np.argmin(d))]
                 self.marks.add(index, hit[1], hit[0], NOT_DISK)
+                what = "not a disk"
             else:
                 self.marks.add(index, y, x, DISK)
+                what = "disk here"
+        log.info("[fv-adapt] double-click at %s px (%.1f, %.1f): %s", index, y, x, what)
         self._refresh_overlay()
         self.emit_state()
         if len(self.marks):
