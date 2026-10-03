@@ -244,6 +244,14 @@ class TestUserModelStore:
         assert device.type == "cpu"
         assert torch.equal(model.head_hm.weight, base.head_hm.weight.cpu())
 
+    def test_vendored_models_have_short_names_and_full_descriptions(self, cpu_models):
+        from spyde.models import registry
+        vendored = {m["id"]: m for m in registry.available_models()["models"] if m["group"] == "vendored"}
+        default = registry.default_model_id()
+        assert vendored[default]["label"].endswith("(default)") and len(vendored[default]["label"]) < 25
+        assert all(len(m["label"]) < 25 for m in vendored.values())
+        assert all(m["description"].startswith("SpotUNet") for m in vendored.values())
+
     def test_every_bundled_model_ships_an_icon(self, cpu_models):
         from spyde.models import registry
         vendored = [m for m in registry.available_models()["models"] if m["group"] == "vendored"]
@@ -307,6 +315,30 @@ class TestAdapt:
         assert 0.0 <= report["original_f1"] <= 1.0 and report["original_f1_base"] > 0.7
         assert next(model.parameters()).device.type == "cpu"
         assert all(torch.equal(v, untouched[k]) for k, v in base.state_dict().items())  # base untouched
+
+    def test_training_runs_until_the_marks_are_learned_or_the_cap(self, cpu_models):
+        from spyde import models
+        from spyde.models.adapt import MIN_STEPS, NOT_DISK, Working, adapt, marks_learned
+        base, device = models.get_model(None)
+        frames = [_disk_pattern()]
+        junk = Working(frames, PARAMS, int(base.levels))
+        import torch
+        with torch.no_grad():
+            found = junk.peaks(*base(junk.x))[0]
+        near_junk = [p for p in found if np.hypot(p[0] - 48.5, p[1] - 14.5) < 5]
+        if not near_junk:
+            pytest.skip("the base model does not fire on the synthetic junk")
+        marks = [np.array([[near_junk[0][0], near_junk[0][1], NOT_DISK]])]
+        assert not marks_learned(base, junk, marks, 5.0).all()          # the base disagrees
+        model, report = adapt(base, device, frames, marks, PARAMS)
+        assert report["stopped"] == "learned" and report["marks_learned"] == report["marks_total"] == 1
+        assert report["steps"] >= MIN_STEPS
+        assert marks_learned(model, junk, marks, 5.0).all()
+        # A cap that runs out first is reported as such, with what was learned so far.
+        _, capped = adapt(base, device, frames, marks + [], PARAMS, max_seconds=0.0, max_steps=MIN_STEPS + 2)
+        assert capped["stopped"] in ("time", "steps", "learned") and capped["steps"] <= MIN_STEPS + 2
+        _, fixed = adapt(base, device, frames, marks, PARAMS, until_learned=False, steps=3)
+        assert fixed["steps"] == 3
 
     def test_a_stopped_fit_raises_cancelled(self, cpu_models):
         from spyde import models

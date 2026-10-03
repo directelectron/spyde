@@ -246,8 +246,8 @@ class FindVectorsAdapt:
                        calibration={k: snap["params"].get(k) for k in
                                     ("spot_radius", "min_distance", "bg_sigma", "threshold")},
                        hyperparameters={k: report[k] for k in
-                                        ("steps", "learning_rate", "replay_weight", "distill_weight",
-                                         "offset_weight", "peak_hold", "method")},
+                                        ("steps", "stopped", "learning_rate", "replay_weight",
+                                         "distill_weight", "offset_weight", "peak_hold", "method")},
                        report=report))
         models.registry.reload_manifest()
         return entry
@@ -260,8 +260,10 @@ class FindVectorsAdapt:
         if old and old != entry["id"]:
             models.registry.forget_model(old)
         report = entry["report"]
-        self.emit_state(f"Adapted in {report['seconds']:.1f} s — "
-                        f"{report['not_disk_marks']} wrong, {report['disk_marks']} missed")
+        learned, total = report.get("marks_learned", 0), report.get("marks_total", 0)
+        verdict = ("all marks learned" if learned == total
+                   else f"{learned} of {total} marks learned — mark again or add marks")
+        self.emit_state(f"Adapted in {report['seconds']:.1f} s ({report['steps']} steps): {verdict}")
         self.emit_models()
 
     def _failed(self, error: Exception) -> None:
@@ -395,6 +397,8 @@ class FindVectorsAdapt:
             message["name"] = self.entry.get("name") or ""
             message["default_name"] = self.entry.get("default_name") or ""
             message["original_f1"] = float(self.entry["report"]["original_f1"])
+            message["marks_learned"] = int(self.entry["report"].get("marks_learned", 0))
+            message["marks_total"] = int(self.entry["report"].get("marks_total", 0))
             message["original_f1_base"] = float(self.entry["report"]["original_f1_base"])
         if status:
             message["status"] = status

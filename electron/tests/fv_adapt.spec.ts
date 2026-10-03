@@ -143,6 +143,23 @@ async function shot(page: Page, name: string) {
     height: Math.max(a.y + a.height, b.y + b.height) - y + 12 } })
 }
 
+/** A screenshot of ``win`` (default: the pattern window) and the caret, grown to
+ * take in the open model menu and its card when they are showing. */
+async function shotAll(page: Page, name: string, win?: any) {
+  const boxes = [(await (win ?? sigWindow(page)).boundingBox())!,
+    (await page.getByTestId('find-vectors-wizard').boundingBox())!]
+  for (const id of ['fv-model-card']) {
+    const el = page.getByTestId(id)
+    if (await el.count()) boxes.push((await el.boundingBox())!)
+  }
+  const menu = page.locator('[role="listbox"][aria-label="Model"]')
+  if (await menu.count()) boxes.push((await menu.boundingBox())!)
+  const x = Math.min(...boxes.map((b) => b.x)) - 6, y = Math.min(...boxes.map((b) => b.y)) - 6
+  await page.screenshot({ path: join(SHOTS, name), clip: {
+    x, y, width: Math.max(...boxes.map((b) => b.x + b.width)) - x + 12,
+    height: Math.max(...boxes.map((b) => b.y + b.height)) - y + 12 } })
+}
+
 const near = (a: { x: number, y: number }, list: { x: number, y: number }[], r: number) =>
   list.some((b) => Math.hypot(a.x - b.x, a.y - b.y) < r)
 
@@ -212,8 +229,10 @@ test('double-click marks, adapt, revert', async () => {
     // One whole ring: not cut by the edge (smaller) and not touching another
     // ring (larger) — either way its pixel centroid is not the circle's centre.
     const ring = sizes[Math.floor(sizes.length / 2)]
-    const next = now.find((b) => !near(b, disks, 10) && !near(b, marked, 10)
-      && b.n >= 0.8 * ring && b.n <= 1.25 * ring && inside(b))
+    const free = (b: { x: number, y: number }) => !near(b, disks, 10) && !near(b, marked, 10) && inside(b)
+    // Prefer a ring of the usual size; on a pattern with none, any free one will do.
+    const next = now.find((b) => free(b) && b.n >= 0.8 * ring && b.n <= 1.25 * ring)
+      ?? (marked.length === 0 ? now.find((b) => free(b) && b.n >= 0.5 * ring && b.n <= 1.6 * ring) : undefined)
     if (!next) break
     marked.push(next)
     await mark(page, backend, box.x + next.x, box.y + next.y, `${marked.length} wrong · 0 missed`)
@@ -238,13 +257,14 @@ test('double-click marks, adapt, revert', async () => {
   await expect(page.getByTestId('fv-teach-gauge')).toBeVisible({ timeout: 120_000 })
   await expect(page.getByTestId('fv-status')).toContainText(/Adapted in/, { timeout: 30_000 })
   await expect(page.getByTestId('fv-teach-count')).not.toContainText('adapting', { timeout: 30_000 })
-  // Fewer of the marked circles are drawn. Not necessarily none: 20 steps do not
-  // always push a mark on something disk-like below the threshold, and a user can
-  // mark it again — the model's strength is reported below, the wiring is gated.
+  // Every marked circle is gone: training runs until each "not a disk" mark has
+  // no detection on it (checked with the preview's own decode), and on these
+  // patterns that is reached within the minimum 20 steps every time we measured.
+  await expect(page.getByTestId('fv-status')).toContainText('all marks learned')
   await expect.poll(async () => {
     const now = (await blobs(frame, 'red')).blobs
     return junk.filter((j) => near(j, now, 6)).length
-  }, { timeout: 30_000, message: 'adapting removed none of the marked circles' }).toBeLessThan(junk.length)
+  }, { timeout: 30_000, message: 'a marked circle is still drawn after adapting' }).toBe(0)
   const nowDrawn = (await blobs(frame, 'red')).blobs
   const stillDrawn = junk.filter((j) => near(j, nowDrawn, 6)).length
   await page.waitForTimeout(1000)
@@ -258,54 +278,77 @@ test('double-click marks, adapt, revert', async () => {
   // was marked), not the wiring this spec checks — so it is reported, not gated.
   await shot(page, '04-adapted.png')
 
-  // The fit is an unsaved draft: a dashed tile after the divider, and a name
-  // field with "<dataset> adapted" filled in. Enter keeps it as the user's model.
-  const draftTile = page.locator('[data-testid^="fv-model-tile-spotunet-taught-"]')
-  await expect(draftTile).toHaveCount(1)
-  await expect(page.getByTestId('fv-model-divider')).toBeVisible()
-  await expect(draftTile).toHaveAttribute('aria-selected', 'true')
+  // The fit is an unsaved draft: the Model dropdown shows it, a name field with
+  // "<dataset> adapted" sits under it, and in the open menu it is a dashed row
+  // after the divider. Enter in the name field keeps it as the user's model.
+  const trigger = page.getByTestId('fv-model')
+  const taught = page.locator('[data-testid^="fv-model-opt-spotunet-taught-"]')
+  await expect(trigger).toContainText('Unsaved: test_data_si_grains adapted')
   await expect(page.getByTestId('fv-model-name-input')).toHaveValue('test_data_si_grains adapted')
-  await shot(page, '05-name-the-model.png')
+  await shotAll(page, '05-draft-collapsed.png')
+  await trigger.click()
+  await expect(taught).toHaveCount(1)
+  await expect(page.getByTestId('fv-model-divider')).toBeVisible()
+  await expect(taught).toHaveAttribute('aria-selected', 'true')
+  await taught.hover()
+  await expect(page.getByTestId('fv-model-card')).toContainText('Not saved')
+  await page.waitForTimeout(300)
+  await shotAll(page, '06-draft-row-open.png')
+  await page.keyboard.press('Escape')
+  await expect(taught).toHaveCount(0)
   await page.getByTestId('fv-model-name-input').fill('Si grains, junk removed')
   await page.getByTestId('fv-model-name-input').press('Enter')
-  await expect(page.getByTestId('fv-model-rename')).toBeVisible({ timeout: 20_000 })
-  await expect(page.getByTestId('fv-model-selected')).toHaveText('Si grains, junk removed')
+  await expect(trigger).toContainText('Si grains, junk removed', { timeout: 20_000 })
+  await expect(page.getByTestId('fv-model-name-input')).toHaveCount(0)
+  const taughtId = await trigger.getAttribute('data-value')
 
   // Its card: where it came from, what it was taught on, how general it still is.
-  await draftTile.hover()
+  await trigger.click()
+  await taught.hover()
   const card = page.getByTestId('fv-model-card')
-  await expect(card).toBeVisible()
   await expect(card).toContainText('Si grains, junk removed')
   await expect(card).toContainText('taught on')
   await expect(card).toContainText('general F1')
   await expect(card).toContainText('→')
+  await expect(taught).toContainText('taught on test_data_si_grains')
   await page.waitForTimeout(300)
-  await shot(page, '06-strip-hover-card.png')
-  await page.locator('[data-testid^="fv-model-tile-"]').first().hover()
-  await expect(card).toContainText('vendored')
+  await shotAll(page, '07-open-menu-card.png')
+  await page.locator('[data-testid^="fv-model-opt-"]').first().hover()
+  await expect(card).toContainText('SpotUNet')
+  await expect(page.locator('[data-testid^="fv-model-opt-"]').first()).toContainText('built-in')
   await page.waitForTimeout(300)
-  await shot(page, '07-vendored-card.png')
-  await page.mouse.move(0, 0)
+  await shotAll(page, '08-vendored-card.png')
 
-  // Keyboard: ← from the taught model selects the vendored model before it.
-  await draftTile.focus()
-  await page.keyboard.press('ArrowLeft')
-  await expect(draftTile).toHaveAttribute('aria-selected', 'false')
-  await page.keyboard.press('End')
-  await expect(draftTile).toHaveAttribute('aria-selected', 'true')
+  // Keyboard: Esc closes; ↓ opens on the current model; ↑ moves above the
+  // divider; Enter picks it.
+  await page.keyboard.press('Escape')
+  await expect(taught).toHaveCount(0)
+  // Move the pointer off the menu first: a row that reappears under a resting
+  // pointer gets its mouseenter, and the mouse sets the active row as it should.
+  await page.mouse.move(0, 0)
+  await trigger.focus()
+  await page.keyboard.press('ArrowDown')
+  await expect(taught).toHaveCount(1)
+  await page.keyboard.press('ArrowUp')
+  await page.keyboard.press('Enter')
+  await expect(taught).toHaveCount(0)
+  await expect(trigger).not.toHaveAttribute('data-value', taughtId!)
+  await expect(trigger).toContainText('base16')          // the last built-in row, above the divider
 
   // Revert: no marks, no ✕ left, the original model and its low-threshold circles
-  // return — and the NAMED model stays in the strip, it is the user's now.
+  // return — and the NAMED model stays in the menu, it is the user's now.
   await page.getByTestId('fv-adapt-revert').click()
   await expect(page.getByTestId('fv-teach-count')).toContainText('double-click a wrong circle', { timeout: 20_000 })
   await expect(page.getByTestId('fv-teach-gauge')).toHaveCount(0)
-  await expect(draftTile).toHaveCount(1)
-  await expect(draftTile).toHaveAttribute('aria-selected', 'false')
+  await trigger.click()
+  await expect(taught).toHaveCount(1)
+  await expect(taught).toHaveAttribute('aria-selected', 'false')
+  await page.keyboard.press('Escape')
   await expect.poll(async () => (await blobs(frame, 'orange')).count, { timeout: 20_000 }).toBe(0)
   await expect.poll(async () => (await blobs(frame, 'red')).blobs.length, {
     timeout: 30_000, message: 'reverting did not restore the original detector',
   }).toBeGreaterThanOrEqual(low.length - 1)
-  await shot(page, '08-reverted.png')
+  await shot(page, '09-reverted.png')
   // The backend reaches Playwright only through its log; an adapt that failed
   // there would still leave this page looking reverted.
   const lines = backend.logBuffer as string[]
@@ -330,41 +373,42 @@ test('a named model is offered on another dataset, renamed and deleted', async (
   await expect(page.getByTestId('find-vectors-wizard')).toBeVisible()
 
   // The model taught on the Si grains is here too, after the divider.
-  const mine = page.locator('[data-testid^="fv-model-tile-spotunet-taught-"]')
+  const trigger = page.getByTestId('fv-model')
+  const mine = page.locator('[data-testid^="fv-model-opt-spotunet-taught-"]')
+  await expect(trigger).toBeVisible({ timeout: 30_000 })
+  await trigger.click()
   await expect(mine).toHaveCount(1, { timeout: 30_000 })
   await expect(page.getByTestId('fv-model-divider')).toBeVisible()
   await mine.click()
-  await expect(mine).toHaveAttribute('aria-selected', 'true')
-  await expect(page.getByTestId('fv-model-selected')).toHaveText('Si grains, junk removed')
+  await expect(trigger).toContainText('Si grains, junk removed')
+  const id = await trigger.getAttribute('data-value')
+  await trigger.click()
   await mine.hover()
   await expect(page.getByTestId('fv-model-card')).toContainText('test_data_si_grains')
-  await page.waitForTimeout(500)
-  const shotOther = async (name: string) => {
-    const a = (await other.boundingBox())!
-    const b = (await page.getByTestId('find-vectors-wizard').boundingBox())!
-    const x = Math.min(a.x, b.x) - 6, y = Math.min(a.y, b.y) - 6
-    await page.screenshot({ path: join(SHOTS, name), clip: {
-      x, y, width: Math.max(a.x + a.width, b.x + b.width) - x + 12,
-      height: Math.max(a.y + a.height, b.y + b.height) - y + 12 } })
-  }
-  await shotOther('09-used-on-another-dataset.png')
-  await page.mouse.move(0, 0)
+  await page.waitForTimeout(300)
+  await shotAll(page, '10-used-on-another-dataset.png', other)
 
-  // Rename.
+  // Rename and Delete live on the row, behind its ⋯.
+  await page.getByTestId(`fv-model-more-${id}`).click()
   await page.getByTestId('fv-model-rename').click()
-  await page.getByTestId('fv-model-name-input').fill('Si grains v2')
-  await shotOther('10-rename.png')
-  await page.getByTestId('fv-model-name-input').press('Enter')
-  await expect(page.getByTestId('fv-model-selected')).toHaveText('Si grains v2', { timeout: 20_000 })
+  await page.getByTestId('fv-model-rename-input').fill('Si grains v2')
+  await shotAll(page, '11-rename.png', other)
+  await page.getByTestId('fv-model-rename-input').press('Enter')
+  await expect(mine).toContainText('Si grains v2', { timeout: 20_000 })
+  await page.keyboard.press('Escape')
+  await expect(trigger).toContainText('Si grains v2', { timeout: 20_000 })
 
-  // Delete asks once, then the tile, the divider and the selection go.
+  // Delete asks once; then the row, the divider and the selection go.
+  await trigger.click()
+  await page.getByTestId(`fv-model-more-${id}`).click()
   await page.getByTestId('fv-model-delete').click()
   await expect(page.getByTestId('fv-model-delete')).toHaveText('Delete?')
-  await shotOther('11-delete-confirm.png')
+  await shotAll(page, '12-delete-confirm.png', other)
   await page.getByTestId('fv-model-delete').click()
   await expect(mine).toHaveCount(0, { timeout: 20_000 })
   await expect(page.getByTestId('fv-model-divider')).toHaveCount(0)
-  await expect(page.locator('[data-testid^="fv-model-tile-"][aria-selected="true"]')).toHaveCount(1)
-  await shotOther('12-deleted.png')
+  await page.keyboard.press('Escape')
+  await expect(trigger).not.toHaveAttribute('data-value', id!)
+  await shotAll(page, '13-deleted.png', other)
   ctx.assertNoJsErrors()
 })

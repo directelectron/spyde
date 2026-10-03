@@ -24,14 +24,14 @@
  * pattern → "a disk is here", a mark → removed. It refits a copy of the model
  * about a second after the last mark and reports `fv_adapt_state`; the caret
  * adopts the taught model as its Model so the preview and Compute both use it.
- * A fit is an unsaved draft until it is named (the name field under the strip,
- * Enter saves); named models are offered on every dataset, can be renamed or
- * deleted, and can be adapted again.
+ * A fit is an unsaved draft until it is named (the name field under the Model
+ * dropdown, Enter saves); named models are offered on every dataset, can be
+ * renamed or deleted from the dropdown's rows, and can be adapted again.
  */
 import React from 'react'
 import { WizardShell, Field, Slider, Select, Check, S } from './WizardShell'
 import { useWizardLifecycle, useDebouncedAction, useWizardEvent } from './wizardHooks'
-import { ModelStrip, ModelInfo } from './ModelStrip'
+import { ModelMenu, ModelInfo } from './ModelMenu'
 
 interface Props {
   caretPos: React.CSSProperties
@@ -42,7 +42,7 @@ interface Props {
 
 type Method = 'neural' | 'nxcorr' | 'dog'
 const METHODS: readonly { value: Method; label: string }[] = [
-  { value: 'neural', label: 'Neural (SpotUNet)' },
+  { value: 'neural', label: 'Neural network' },
   { value: 'nxcorr', label: 'NXCORR (disk)' },
   { value: 'dog', label: 'DoG (small spots)' },
 ]
@@ -194,6 +194,8 @@ export function FindVectorsWizard({ caretPos, windowId, sendAction, onClose }: P
     setTeach({
       marks: Number(d.marks ?? 0), disk: Number(d.disk ?? 0), notDisk: Number(d.not_disk ?? 0),
       busy: Boolean(d.busy), taught, unsaved: Boolean(d.unsaved),
+      learned: typeof d.marks_learned === 'number' ? d.marks_learned : null,
+      learnable: typeof d.marks_total === 'number' ? d.marks_total : null,
       defaultName: typeof d.default_name === 'string' ? d.default_name : '',
       originalF1: typeof d.original_f1 === 'number' ? d.original_f1 : null,
       originalF1Base: typeof d.original_f1_base === 'number' ? d.original_f1_base : null,
@@ -255,8 +257,10 @@ export function FindVectorsWizard({ caretPos, windowId, sendAction, onClose }: P
             <button data-testid="fv-refresh-models" style={refreshBtnStyle}
               title="Check Hugging Face for new models" onClick={refreshModels}>↻</button>
           </div>
-          <ModelStrip testid="fv-model" models={models} value={modelId} onChange={live(setModelId)} />
-          <ModelActions model={models.find((m) => m.id === modelId)} teach={teach}
+          <ModelMenu testid="fv-model" models={models} value={modelId} onChange={live(setModelId)}
+            onRename={(id, name) => sendRef.current('fv_model_name', { model_id: id, name }, windowId)}
+            onDelete={(id) => sendRef.current('fv_model_delete', { model_id: id }, windowId)} />
+          <NameDraft model={models.find((m) => m.id === modelId)} teach={teach}
             send={(action, payload) => sendRef.current(action, payload, windowId)} />
         </div>
       )}
@@ -348,6 +352,9 @@ export function FindVectorsWizard({ caretPos, windowId, sendAction, onClose }: P
             <div data-testid="fv-teach-gauge"
               style={{ color: teach.originalF1 < 0.7 ? '#ff9a3c' : '#a6adc8' }}
               title="F1 on the synthetic patterns the model was trained on: how far teaching pulled it toward this dataset">
+              {teach.learned !== null && teach.learnable !== null && teach.learned < teach.learnable
+                ? `${teach.learned} of ${teach.learnable} marks learned · `
+                : ''}
               {teach.originalF1 < 0.7 ? 'Now specific to this dataset' : 'Using the taught model'}
               {` · general F1 ${teach.originalF1.toFixed(2)}`}
               {teach.originalF1Base !== null ? ` (was ${teach.originalF1Base.toFixed(2)})` : ''}
@@ -362,59 +369,37 @@ export function FindVectorsWizard({ caretPos, windowId, sendAction, onClose }: P
 
 interface TeachState {
   marks: number; disk: number; notDisk: number; busy: boolean; taught: string | null
-  unsaved: boolean; defaultName: string
+  unsaved: boolean; defaultName: string; learned: number | null; learnable: number | null
   originalF1: number | null; originalF1Base: number | null
 }
 const TEACH_EMPTY: TeachState = {
   marks: 0, disk: 0, notDisk: 0, busy: false, taught: null, unsaved: false, defaultName: '',
-  originalF1: null, originalF1Base: null,
+  learned: null, learnable: null, originalF1: null, originalF1Base: null,
 }
 
-/** Under the strip: name the fit that was just made (Enter saves), or rename /
- * delete the selected taught model. Vendored models have no actions. */
-function ModelActions({ model, teach, send }: {
+/** Under the Model dropdown: name the fit that was just made (Enter saves). A
+ * named model's Rename / Delete live on its row in the dropdown. */
+function NameDraft({ model, teach, send }: {
   model: ModelInfo | undefined
   teach: TeachState
   send: (action: string, payload: Record<string, unknown>) => void
 }) {
   const naming = Boolean(model?.unsaved && model.id === teach.taught)
-  const [editing, setEditing] = React.useState(false)
   const [text, setText] = React.useState('')
-  const [confirm, setConfirm] = React.useState(false)
   React.useEffect(() => {
-    setEditing(false); setConfirm(false)
-    setText(naming ? (teach.defaultName || model?.label || '') : (model?.name ?? model?.label ?? ''))
+    setText(teach.defaultName || model?.label || '')
   }, [model?.id, naming, teach.defaultName])  // eslint-disable-line react-hooks/exhaustive-deps
-  if (!model?.taught) return null
+  if (!naming || !model) return null
   const save = () => {
     const name = text.trim()
-    if (!name) return
-    send('fv_model_name', { model_id: model.id, name })
-    setEditing(false)
-  }
-  if (naming || editing) {
-    return (
-      <div style={actionRowStyle}>
-        <input data-testid="fv-model-name-input" style={{ ...S.num, flex: 1, minWidth: 0 }} value={text}
-          autoFocus={editing} placeholder="Name this model"
-          onChange={(e) => setText(e.target.value)}
-          onKeyDown={(e) => { if (e.key === 'Enter') save(); if (e.key === 'Escape') setEditing(false) }} />
-        <button data-testid="fv-model-save" style={smallBtnStyle} disabled={!text.trim()} onClick={save}>
-          {naming ? 'Save' : 'Rename'}
-        </button>
-      </div>
-    )
+    if (name) send('fv_model_name', { model_id: model.id, name })
   }
   return (
     <div style={actionRowStyle}>
-      <span style={{ flex: 1, fontSize: 10, color: '#6c7086' }}>your model</span>
-      <button data-testid="fv-model-rename" style={smallBtnStyle} onClick={() => setEditing(true)}>Rename</button>
-      <button data-testid="fv-model-delete" style={{ ...smallBtnStyle, ...(confirm ? { color: '#f38ba8', borderColor: '#f38ba8' } : null) }}
-        onClick={() => {
-          if (!confirm) { setConfirm(true); return }
-          send('fv_model_delete', { model_id: model.id })
-          setConfirm(false)
-        }}>{confirm ? 'Delete?' : 'Delete'}</button>
+      <input data-testid="fv-model-name-input" style={{ ...S.num, flex: 1, minWidth: 0 }} value={text}
+        placeholder="Name this model" onChange={(e) => setText(e.target.value)}
+        onKeyDown={(e) => { if (e.key === 'Enter') save() }} />
+      <button data-testid="fv-model-save" style={smallBtnStyle} disabled={!text.trim()} onClick={save}>Save</button>
     </div>
   )
 }
