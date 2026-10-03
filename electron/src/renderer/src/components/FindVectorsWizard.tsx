@@ -18,6 +18,12 @@
  *     (Disk Radius slider; threshold is a [-1,1] correlation score).
  *   • DoG — Difference-of-Gaussians band-pass, best for small (2-3 px) spots
  *     and beam-stopped patterns (σ₁/σ₂ sliders; threshold is a band-pass SNR).
+ *
+ * Teach (neural only): double-clicks on the pattern are handled by the backend
+ * (spyde/actions/find_vectors_adapt.py) — a circle → "not a disk", empty
+ * pattern → "a disk is here", a mark → removed. It refits a copy of the model
+ * about a second after the last mark and reports `fv_adapt_state`; the caret
+ * adopts the taught model as its Model so the preview and Compute both use it.
  */
 import React from 'react'
 import { WizardShell, Field, Slider, Select, Check, S } from './WizardShell'
@@ -73,6 +79,7 @@ export function FindVectorsWizard({ caretPos, windowId, sendAction, onClose }: P
   const [showTransform, setShowTransform] = React.useState(saved?.showTransform ?? false)
   const [persistence, setPersistence] = React.useState(saved?.persistence ?? false)
   const [status, setStatus] = React.useState('Tune the parameters — peaks preview under the crosshair.')
+  const [teach, setTeach] = React.useState<TeachState>(TEACH_EMPTY)
 
   React.useEffect(() => {
     _fvStore.set(windowId, {
@@ -162,6 +169,29 @@ export function FindVectorsWizard({ caretPos, windowId, sendAction, onClose }: P
     if (adopted) {
       const conf = typeof d.confidence === 'number' ? ` (conf ${d.confidence.toFixed(2)})` : ''
       setStatus(`Auto-calibrated background removal${conf}.`)
+      tune()
+    }
+  })
+
+  // Teach: the backend owns the marks and the taught model; the caret follows
+  // its Model choice so the preview and Compute both use the taught model, and
+  // goes back to the original one on Revert.
+  const teachRef = React.useRef<string | null>(null)
+  useWizardEvent('spyde:fv_adapt_state', windowId, (d) => {
+    const taught = typeof d.model_id === 'string' ? d.model_id : null
+    const base = typeof d.base_model_id === 'string' ? d.base_model_id : ''
+    setTeach({
+      marks: Number(d.marks ?? 0), disk: Number(d.disk ?? 0), notDisk: Number(d.not_disk ?? 0),
+      busy: Boolean(d.busy), taught,
+      originalF1: typeof d.original_f1 === 'number' ? d.original_f1 : null,
+      originalF1Base: typeof d.original_f1_base === 'number' ? d.original_f1_base : null,
+    })
+    if (typeof d.status === 'string') setStatus(d.status)
+    const want = taught ?? (teachRef.current ? base : vals.current.modelId)
+    teachRef.current = taught
+    if (want !== vals.current.modelId) {
+      setModelId(want)
+      vals.current = { ...vals.current, modelId: want }
       tune()
     }
   })
@@ -284,9 +314,53 @@ export function FindVectorsWizard({ caretPos, windowId, sendAction, onClose }: P
             label="Neighbor refine" />
         )}
       </div>
+      {isNeural && (
+        <div data-testid="fv-teach" style={teachStyle}
+          title={'Double-click a circle that is not a disk, or a disk it missed; double-click a mark to remove it. '
+            + 'The model is refitted on your marks about a second after the last one.'}>
+          <div style={teachRowStyle}>
+            <span data-testid="fv-teach-count" style={{ flex: 1 }}>
+              {teach.marks === 0
+                ? 'Teach: double-click a wrong circle or a missed disk'
+                : `Teach: ${teach.notDisk} wrong · ${teach.disk} missed${teach.busy ? ' — adapting…' : ''}`}
+            </span>
+            <button data-testid="fv-adapt" style={smallBtnStyle} disabled={teach.marks === 0 || teach.busy}
+              onClick={() => sendRef.current('fv_adapt', {}, windowId)}>Adapt</button>
+            <button data-testid="fv-adapt-revert" style={smallBtnStyle}
+              disabled={teach.marks === 0 && !teach.taught}
+              onClick={() => sendRef.current('fv_adapt_revert', {}, windowId)}>Revert</button>
+          </div>
+          {teach.taught && teach.originalF1 !== null && (
+            <div data-testid="fv-teach-gauge"
+              style={{ color: teach.originalF1 < 0.7 ? '#ff9a3c' : '#a6adc8' }}
+              title="F1 on the synthetic patterns the model was trained on: how far teaching pulled it toward this dataset">
+              {teach.originalF1 < 0.7 ? 'Now specific to this dataset' : 'Using the taught model'}
+              {` · general F1 ${teach.originalF1.toFixed(2)}`}
+              {teach.originalF1Base !== null ? ` (was ${teach.originalF1Base.toFixed(2)})` : ''}
+            </div>
+          )}
+        </div>
+      )}
       <button data-testid="fv-compute" style={S.primary} onClick={compute}>Compute</button>
     </WizardShell>
   )
+}
+
+interface TeachState {
+  marks: number; disk: number; notDisk: number; busy: boolean; taught: string | null
+  originalF1: number | null; originalF1Base: number | null
+}
+const TEACH_EMPTY: TeachState = {
+  marks: 0, disk: 0, notDisk: 0, busy: false, taught: null, originalF1: null, originalF1Base: null,
+}
+const teachStyle: React.CSSProperties = {
+  display: 'flex', flexDirection: 'column', gap: 3, fontSize: 11,
+  borderTop: '1px solid #333', paddingTop: 6,
+}
+const teachRowStyle: React.CSSProperties = { display: 'flex', alignItems: 'center', gap: 4 }
+const smallBtnStyle: React.CSSProperties = {
+  flex: '0 0 auto', padding: '1px 6px', fontSize: 11, background: 'transparent', color: 'inherit',
+  border: '1px solid #555', borderRadius: 4, cursor: 'pointer',
 }
 
 const gridStyle: React.CSSProperties = {
