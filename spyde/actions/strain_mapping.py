@@ -196,12 +196,39 @@ def _trim_keep(r: np.ndarray, rms: float, tol: float) -> np.ndarray:
     return keep
 
 
+def _centred_reference(g_ref, tol, iterations=2):
+    """The reference shifted so its Friedel pairs are symmetric about the origin.
+
+    Every spot is matched against the reference at +g OR -g. If the reference
+    sits a little off its own beam (a region reference pools frames whose beam
+    drifts; a calibrated centre is a fraction of a pixel off), the +g and -g
+    candidates of one reflection lie twice that offset apart and the per-spot
+    nearest pick mixes them: a correspondence no affine map fits, which gave
+    wrong strain at up to half the pixels with exact positions. The centre is
+    the mean midpoint of the reflections whose mirror image is within ``tol``.
+    Reflections without a partner are kept -- on tilted patterns most of them
+    have none, and dropping them made those fits fail."""
+    g_ref = np.asarray(g_ref, dtype=float).reshape(-1, 2)
+    if len(g_ref) < 2 or not np.isfinite(tol):
+        return g_ref
+    from scipy.spatial import cKDTree
+    tree = cKDTree(g_ref)
+    centre = np.zeros(2)
+    for _ in range(iterations):
+        distance, partner = tree.query(2.0 * centre - g_ref, distance_upper_bound=tol)
+        paired = np.isfinite(distance)
+        if not paired.any():
+            break
+        centre = 0.5 * (g_ref[paired] + g_ref[partner[paired]]).mean(axis=0)
+    return g_ref - centre
+
+
 def _fit_pattern_strain_full(g_meas, g_ref, *, tol, min_matches=DEFAULT_MIN_MATCHES,
                              trim=True):
     """fit_pattern_strain + fit-quality extras:
     ``(exx, eyy, exy, omega, coverage, residual_rms, n_matched)`` or None."""
     g_meas = np.asarray(g_meas, dtype=float).reshape(-1, 2)
-    g_ref = np.asarray(g_ref, dtype=float).reshape(-1, 2)
+    g_ref = _centred_reference(g_ref, tol)
     if len(g_meas) < 2 or len(g_ref) < 2:
         return None
 
@@ -515,6 +542,7 @@ def _compute_strain_field_vectorized(flat_buffer, x_off, g_ref, tol, ny, nx,
     kxy = kxy[:Ntot]
     # Per-vector owning pixel id (segment id from the CSR row pointers).
     pix = np.repeat(np.arange(P), counts)
+    g_ref = _centred_reference(g_ref, tol)
 
     # Per-pixel mean-centre (the −g=g centroid removal in fit_pattern_strain).
     sums = np.zeros((P, 2)); np.add.at(sums, pix, kxy)
