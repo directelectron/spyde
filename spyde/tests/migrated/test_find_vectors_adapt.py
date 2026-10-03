@@ -102,12 +102,15 @@ class TestDebouncedFit:
         return fitter, done, started
 
     def test_requests_in_quick_succession_fit_once(self):
+        # A debounce much longer than the gaps between requests, so a slow CI
+        # runner cannot open a gap wide enough to let a second fit start.
         fitter, done, started = self._fitter()
+        fitter.delay = 1.0
         for _ in range(5):
             fitter.request()
             time.sleep(0.02)
-        assert wait_until(lambda: done, 5)
-        time.sleep(0.4)
+        assert wait_until(lambda: done, 10)
+        time.sleep(1.5)
         assert done == [10] and len(started) == 1
 
     def test_cancel_drops_the_result(self):
