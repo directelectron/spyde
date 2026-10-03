@@ -19,8 +19,13 @@ A fourth layer holds the models a user TAUGHT — the Find Vectors adapt step
 (``spyde/models/adapt.py``) fine-tunes a copy of a model on their marks. Those
 live in their own manifest (``spyde.teach``, ``~/.spyde/models/taught.json``)
 because a remote refresh rewrites ``registry.json`` wholesale. A taught model
-is never the ``default``, carries the ``scope`` (dataset) it was taught on, and
-is listed by :func:`available_models` only for that scope.
+is never the ``default``. Once the user names it, it is offered for every
+dataset (it can be adapted again, its parents recorded as a chain); until then
+it is an unsaved draft offered only on the dataset it was fitted on.
+
+Every model has an icon — its preferred input, the disk it would most like to
+see (``adapt.write_icon``): bundled models ship theirs in ``weights/icons/``,
+a taught model's is written beside its weights.
 
 Resolution + caching:
   - ``list_models()`` / ``available_models()`` → the merged manifest for the UI.
@@ -172,19 +177,58 @@ def default_model_id() -> Optional[str]:
 
 
 def available_models(scope: Optional[str] = None) -> dict:
-    """Compact payload for the wizard Model dropdown: ``{default, models:[{id,label,
-    version,notes}]}`` (arch/source omitted — the UI doesn't need them). Taught
-    models are listed only when ``scope`` is the dataset they were taught on."""
-    return {
-        "default": default_model_id(),
-        "models": [
-            {"id": m["id"], "label": m.get("label", m["id"]),
-             "version": m.get("version"), "notes": m.get("notes"),
-             **({"taught": True, "parent": m.get("parent", {}).get("id")} if m.get("kind") else {})}
-            for m in list_models()
-            if not m.get("kind") or (scope is not None and m.get("scope") == scope)
-        ],
-    }
+    """Payload for the wizard's model picker: ``{default, models:[…]}``, vendored
+    models (bundled + remote) first, then the user's taught ones. Each carries
+    ``group`` (``vendored`` | ``local``), an ``icon`` data URL when there is one,
+    and the details its card shows. An unsaved draft is listed only for the
+    dataset (``scope``) it was fitted on."""
+    out = []
+    for m in list_models():
+        taught = bool(m.get("kind"))
+        if taught and m.get("unsaved") and m.get("scope") != scope:
+            continue
+        item = {"id": m["id"], "label": m.get("label", m["id"]),
+                "version": m.get("version"), "notes": m.get("notes"),
+                "group": "local" if taught else "vendored", "icon": _icon_data_url(m)}
+        if taught:
+            report = m.get("report") or {}
+            item.update(taught=True, unsaved=bool(m.get("unsaved")), name=m.get("name"),
+                        default_name=m.get("default_name"), created=m.get("created"),
+                        trained_on=(m.get("trained_on") or {}).get("title"),
+                        chain=[c.get("label") or c.get("id") for c in m.get("chain", [])],
+                        marks=report.get("disk_marks", 0) + report.get("not_disk_marks", 0),
+                        original_f1=report.get("original_f1"),
+                        original_f1_base=report.get("original_f1_base"))
+        out.append(item)
+    out.sort(key=lambda item: item["group"] == "local")
+    return {"default": default_model_id(), "models": out}
+
+
+_ICON_CACHE: dict = {}
+
+
+def _icon_data_url(entry: dict) -> Optional[str]:
+    """The model's icon as a ``data:image/png`` URL, or None (the picker then
+    draws its initials)."""
+    import base64
+    source = entry.get("source", {})
+    try:
+        if entry.get("kind"):
+            if not entry.get("icon"):
+                return None
+            path = os.path.join(user_models_dir(), entry["icon"])
+        elif source.get("type") == "bundled":
+            ref = resources.files("spyde.models.weights") / "icons" / (source["file"][:-3] + ".png")
+            path = str(ref)
+        else:
+            return None
+        if path not in _ICON_CACHE:
+            with open(path, "rb") as handle:
+                _ICON_CACHE[path] = "data:image/png;base64," + base64.b64encode(handle.read()).decode()
+        return _ICON_CACHE[path]
+    except Exception as error:      # noqa: BLE001 - no icon is a glyph, not an error
+        log.debug("[models] no icon for %s: %s", entry.get("id"), error)
+        return None
 
 
 def _entry(model_id: Optional[str]) -> Optional[dict]:
