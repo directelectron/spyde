@@ -243,7 +243,7 @@ functions:
         max: 20
         tab: Run
   Find Diffraction Vectors:
-    description: Find diffraction vectors via the neural (SpotUNet) disk detector, window-normalized cross-correlation (flat disk) or a Difference-of-Gaussians band-pass (small spots / beam-stopped data).
+    description: Find diffraction vectors via the neural network disk detector, window-normalized cross-correlation (flat disk) or a Difference-of-Gaussians band-pass (small spots / beam-stopped data).
     icon: drawing/toolbars/icons/peak_finding.svg
     function: spyde.actions.find_vectors_action.find_diffraction_vectors
     signal_class: pyxem.signals.Diffraction2D

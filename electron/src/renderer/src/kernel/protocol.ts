@@ -1069,6 +1069,8 @@ export interface WizardEventMessage extends MsgBase {
     | 'fv_auto_params'
     | 'fv_models'
     | 'fv_calibration'
+    // Find Vectors adapt: marks, the taught model, how far it moved (find_vectors_adapt.py).
+    | 'fv_adapt_state'
     | 'cod_results'
     | 'gpu_status_result'
     | 'first_run_result'

@@ -15,6 +15,18 @@ collision and contributing a newer ``default``:
 overwrites it, but a user is free to hand-edit it; both are the "user-dir"
 manifest and sit above the bundled one.)
 
+A fourth layer holds the models a user TAUGHT — the Find Vectors adapt step
+(``spyde/models/adapt.py``) fine-tunes a copy of a model on their marks. Those
+live in their own manifest (``spyde.teach``, ``~/.spyde/models/taught.json``)
+because a remote refresh rewrites ``registry.json`` wholesale. A taught model
+is never the ``default``. Once the user names it, it is offered for every
+dataset (it can be adapted again, its parents recorded as a chain); until then
+it is an unsaved draft offered only on the dataset it was fitted on.
+
+Every model has an icon — its preferred input, the disk it would most like to
+see (``adapt.write_icon``): bundled models ship theirs in ``weights/icons/``,
+a taught model's is written beside its weights.
+
 Resolution + caching:
   - ``list_models()`` / ``available_models()`` → the merged manifest for the UI.
   - ``get_model(model_id)`` → a cached ``(model, device)``; resolves weights
@@ -73,8 +85,10 @@ _MANIFEST_CACHE: Optional[dict] = None
 # ── user dir ──────────────────────────────────────────────────────────────────
 def user_models_dir() -> str:
     """``~/.spyde/models`` — where remote-downloaded weights + the user manifest
-    live (mirrors the ``~/.spyde`` settings dir used elsewhere). Created on demand."""
-    d = os.path.join(os.path.expanduser("~"), ".spyde", "models")
+    live (mirrors the ``~/.spyde`` settings dir used elsewhere). Created on demand.
+    ``SPYDE_MODELS_DIR`` moves it, as ``SPYDE_SETTINGS_DIR`` does the settings, so
+    a test run never writes a taught model into the real home directory."""
+    d = os.environ.get("SPYDE_MODELS_DIR") or os.path.join(os.path.expanduser("~"), ".spyde", "models")
     os.makedirs(d, exist_ok=True)
     return d
 
@@ -122,17 +136,34 @@ def _merge_manifests(*manifests: Optional[dict]) -> dict:
     return {"default": default, "models": models}
 
 
+def _load_taught_manifest() -> dict:
+    """The user's taught models (no ``default`` — a taught model never is one)."""
+    from spyde import teach
+    return {"default": None, "models": teach.user_models(user_models_dir(), kind=TAUGHT_KIND)}
+
+
+#: ``spyde.teach`` kind of a taught SpotUNet.
+TAUGHT_KIND = "spotunet"
+
+
 def _manifest(force: bool = False) -> dict:
     global _MANIFEST_CACHE
     if _MANIFEST_CACHE is not None and not force:
         return _MANIFEST_CACHE
-    _MANIFEST_CACHE = _merge_manifests(_load_bundled_manifest(), _load_user_manifest())
+    _MANIFEST_CACHE = _merge_manifests(_load_bundled_manifest(), _load_user_manifest(),
+                                       _load_taught_manifest())
     return _MANIFEST_CACHE
 
 
 def _invalidate_manifest():
     global _MANIFEST_CACHE
     _MANIFEST_CACHE = None
+
+
+def reload_manifest() -> None:
+    """Re-read every manifest layer on next use (after a model is taught or
+    removed)."""
+    _invalidate_manifest()
 
 
 # ── public manifest API (for the UI) ────────────────────────────────────────────
@@ -145,17 +176,64 @@ def default_model_id() -> Optional[str]:
     return _manifest().get("default")
 
 
-def available_models() -> dict:
-    """Compact payload for the wizard Model dropdown: ``{default, models:[{id,label,
-    version,notes}]}`` (arch/source omitted — the UI doesn't need them)."""
-    return {
-        "default": default_model_id(),
-        "models": [
-            {"id": m["id"], "label": m.get("label", m["id"]),
-             "version": m.get("version"), "notes": m.get("notes")}
-            for m in list_models()
-        ],
-    }
+def available_models(scope: Optional[str] = None) -> dict:
+    """Payload for the wizard's model menu: ``{default, models:[…]}``, vendored
+    models (bundled + remote) first, then the user's taught ones. Each carries
+    ``group`` (``vendored`` | ``local``), an ``icon`` data URL when there is one,
+    and the details its card shows. An unsaved draft is listed only for the
+    dataset (``scope``) it was fitted on."""
+    out = []
+    for m in list_models():
+        taught = bool(m.get("kind"))
+        if taught and m.get("unsaved") and m.get("scope") != scope:
+            continue
+        # ``name`` is the short display name; ``label`` the full description,
+        # which the picker shows on a model's card.
+        name = m.get("name") or m.get("label", m["id"])
+        if not taught and m["id"] == default_model_id():
+            name = f"{name} (default)"
+        item = {"id": m["id"], "label": name, "description": m.get("label", m["id"]),
+                "version": m.get("version"), "notes": m.get("notes"),
+                "group": "local" if taught else "vendored", "icon": _icon_data_url(m)}
+        if taught:
+            report = m.get("report") or {}
+            item.update(taught=True, unsaved=bool(m.get("unsaved")), name=m.get("name"),
+                        default_name=m.get("default_name"), created=m.get("created"),
+                        trained_on=(m.get("trained_on") or {}).get("title"),
+                        chain=[c.get("label") or c.get("id") for c in m.get("chain", [])],
+                        marks=report.get("disk_marks", 0) + report.get("not_disk_marks", 0),
+                        original_f1=report.get("original_f1"),
+                        original_f1_base=report.get("original_f1_base"))
+        out.append(item)
+    out.sort(key=lambda item: item["group"] == "local")
+    return {"default": default_model_id(), "models": out}
+
+
+_ICON_CACHE: dict = {}
+
+
+def _icon_data_url(entry: dict) -> Optional[str]:
+    """The model's icon as a ``data:image/png`` URL, or None (the picker then
+    draws its initials)."""
+    import base64
+    source = entry.get("source", {})
+    try:
+        if entry.get("kind"):
+            if not entry.get("icon"):
+                return None
+            path = os.path.join(user_models_dir(), entry["icon"])
+        elif source.get("type") == "bundled":
+            ref = resources.files("spyde.models.weights") / "icons" / (source["file"][:-3] + ".png")
+            path = str(ref)
+        else:
+            return None
+        if path not in _ICON_CACHE:
+            with open(path, "rb") as handle:
+                _ICON_CACHE[path] = "data:image/png;base64," + base64.b64encode(handle.read()).decode()
+        return _ICON_CACHE[path]
+    except Exception as error:      # noqa: BLE001 - no icon is a glyph, not an error
+        log.debug("[models] no icon for %s: %s", entry.get("id"), error)
+        return None
 
 
 def _entry(model_id: Optional[str]) -> Optional[dict]:
@@ -220,6 +298,8 @@ def _resolve_weights(entry: dict) -> str:
         path = _resolve_bundled(source)
     elif stype == "hf":
         path = _resolve_hf(source)
+    elif stype == "taught":
+        path = os.path.join(user_models_dir(), source["file"])
     else:
         raise ValueError(f"unknown model source type {stype!r} for {entry.get('id')}")
     expected = entry.get("sha256") or source.get("sha256")
@@ -238,7 +318,7 @@ def is_cached(model_id: Optional[str] = None) -> bool:
     if entry is None:
         return True                      # unknown id resolves to bundled default
     source = entry.get("source", {})
-    if source.get("type") != "hf":
+    if source.get("type") not in ("hf", "taught"):
         return True
     return os.path.exists(os.path.join(user_models_dir(), source.get("file", "")))
 
@@ -353,6 +433,13 @@ def demote_cached_models_to_cpu() -> None:
                     _MODEL_CACHE[mid] = (model, _torch.device("cpu"))
             except Exception as e:      # pragma: no cover — best-effort demotion
                 log.debug("[models] demoting cached model %r to CPU failed: %s", mid, e)
+
+
+def forget_model(model_id: str) -> None:
+    """Drop a model from the in-process caches (a taught model that was removed)."""
+    with _CACHE_LOCK:
+        _MODEL_CACHE.pop(model_id, None)
+        _CPU_MODEL_CACHE.pop(model_id, None)
 
 
 def _raise_no_models():        # pragma: no cover
