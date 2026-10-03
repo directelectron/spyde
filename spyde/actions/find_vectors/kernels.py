@@ -51,7 +51,8 @@ def _nxcorr_fft_cupy(frames_d, kernel_r: int, disk_stats, numba_stream):
     O(N·H·W·(disk² + win²)), which dominates at large patterns and radii.
 
     frames_d : numba device array (N, H, W) float32, blurred + beamstop-filled
-    Returns a CuPy (N, H, W) float32 raw_corr in [-1, 1].  All work is bound
+    Returns a CuPy (N, H, W) float32 raw_corr >= -1, NOT clipped above 1
+    (see the CPU path in detectors for why).  All work is bound
     to `numba_stream` via ExternalStream, so the numba local-max / subpixel
     kernels that consume the result on the same stream stay correctly ordered
     (CuPy arrays pass to numba kernels zero-copy via the CUDA array interface).
@@ -127,7 +128,7 @@ def _nxcorr_fft_cupy(frames_d, kernel_r: int, disk_stats, numba_stream):
             denom = cp.maximum(win_std * np.float32(t_std), denom_floor)
             raw = (xcorr / np.float32(n_disk)
                    - win_mean * np.float32(t_mean)) / denom
-            raw_out[s0:s1] = cp.clip(raw, -1.0, 1.0)
+            raw_out[s0:s1] = cp.maximum(raw, -1.0)
 
         return raw_out
 
@@ -526,10 +527,9 @@ try:
         num = xcorr / n_disk - win_mean * t_mean
 
         if denom >= 1e-8:
+            # Unclipped above: see the CPU path (detectors) for why.
             score = num / denom
-            if score > 1.0:
-                score = 1.0
-            elif score < -1.0:
+            if score < -1.0:
                 score = -1.0
         else:
             score = 0.0
@@ -652,10 +652,9 @@ try:
         num = xcorr / n_disk - win_mean * t_mean
 
         if denom >= 1e-8:
+            # Unclipped above: see the CPU path (detectors) for why.
             score = num / denom
-            if score > 1.0:
-                score = 1.0
-            elif score < -1.0:
+            if score < -1.0:
                 score = -1.0
         else:
             score = 0.0

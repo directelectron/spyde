@@ -400,23 +400,28 @@ def _find_vectors_single_frame(
     denom_floor = 0.01 * global_std * t_std
     numerator = xcorr / n - win_mean * t_mean
     denom = np.maximum(win_std * t_std, denom_floor)
-    raw_corr = (numerator / denom).astype(np.float32)
-    np.clip(raw_corr, -1.0, 1.0, out=raw_corr)
+    # Peaks are found on the UNCLIPPED score. The statistics window is a box a
+    # pad larger than the disk template, so near a disk centre the score exceeds
+    # 1; clipping it there turns the peak into a flat plateau and the parabola
+    # below returns the integer pixel (up to ~1 px off). Only the returned
+    # surface is clipped, so thresholds behave exactly as before.
+    score = (numerator / denom).astype(np.float32)
 
     if beamstop_mask is not None and beamstop_mask.any():
-        raw_corr[beamstop_mask] = -1.0
+        score[beamstop_mask] = -1.0
 
+    raw_corr = np.clip(score, -1.0, 1.0)
     corr_map = np.where(raw_corr >= threshold, raw_corr, 0.0).astype(np.float32)
 
     # Fast peak detection: local maximum filter enforces min_distance separation,
     # then threshold.  Using size = 2*min_distance+1 means a pixel is a local max
     # only if no neighbor within min_distance has a higher value.
-    if not (raw_corr >= threshold).any():
+    if not (score >= threshold).any():
         return corr_map, raw_corr, np.zeros((0, 3), dtype=np.float32)
 
     min_d = int(min_distance)
-    local_max = maximum_filter(raw_corr, size=2 * min_d + 1)
-    peaks_mask = (raw_corr == local_max) & (raw_corr >= threshold)
+    local_max = maximum_filter(score, size=2 * min_d + 1)
+    peaks_mask = (score == local_max) & (score >= threshold)
 
     if beamstop_mask is not None and beamstop_mask.any():
         peaks_mask &= ~beamstop_mask
@@ -425,7 +430,7 @@ def _find_vectors_single_frame(
     # Greedy NMS: sort by intensity descending and suppress any peak within
     # min_distance of a higher-intensity peak already accepted.
     if len(peaks_px) > 1:
-        intensities = raw_corr[peaks_px[:, 0], peaks_px[:, 1]]
+        intensities = score[peaks_px[:, 0], peaks_px[:, 1]]
         order = np.argsort(-intensities)
         peaks_px = peaks_px[order]
         kept = np.ones(len(peaks_px), dtype=bool)
@@ -446,7 +451,7 @@ def _find_vectors_single_frame(
     # INTENSITY from the raw experimental frame at that position (not the corr
     # score, which is ≈1 for every matched disk).
     if subpixel:
-        pos = _subpixel_parabola(raw_corr, peaks_px)
+        pos = _subpixel_parabola(score, peaks_px)
     else:
         pos = peaks_px.astype(np.float32)
     # Disk-MEAN brightness over the kernel footprint (robust), not a single
