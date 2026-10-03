@@ -7,8 +7,11 @@ is fine-tuned on those marks for a few steps; the original is never touched.
 What was measured to work, in a research spike on synthetic data with a
 deliberate domain shift (5 datasets, 2 click draws each):
 
-* All weights, 20 Adam steps at 1e-3, about a second on a GPU and two to three
-  on a CPU. Training only the last 1x1 heatmap head made detection WORSE: eight
+* All weights, Adam at 1e-3, about a second on a GPU and two to three on a CPU.
+  Training runs until every mark is learned — each "not a disk" mark has no
+  detection on it and each "disk here" mark has one, checked with the same
+  decode the preview uses — or until a few seconds pass; the report says which,
+  and how many marks were learned. Training only the last 1x1 heatmap head made detection WORSE: eight
   feature channels cannot separate a faint disk from a hot pixel linearly.
 * Almost all of the gain is fewer false positives (20 → 1-2 per pattern, F1
   0.75 → 0.83). "Not a disk" marks carry it; "disk here" marks barely move recall,
@@ -45,7 +48,11 @@ log = logging.getLogger(__name__)
 #: Marks: 1 = "a disk is here", 0 = "this detection is wrong".
 DISK, NOT_DISK = 1, 0
 
-STEPS = 20
+STEPS = 20                 # a fixed run's length (``until_learned=False``)
+MIN_STEPS = 20             # never stop before this: stopping as soon as the marks pass
+                           # (often ~8 steps) generalises less to unmarked patterns
+MAX_STEPS = 300
+MAX_SECONDS = 3.0
 LEARNING_RATE = 1e-3
 REPLAY_WEIGHT = 0.2
 DISTILL_WEIGHT = 1.0
@@ -60,7 +67,7 @@ class Cancelled(Exception):
     """The fit was stopped (its tree closed, or a newer fit replaced it)."""
 
 
-HYPERPARAMETERS = dict(steps=STEPS, learning_rate=LEARNING_RATE, replay_weight=REPLAY_WEIGHT,
+HYPERPARAMETERS = dict(learning_rate=LEARNING_RATE, replay_weight=REPLAY_WEIGHT,
                        distill_weight=DISTILL_WEIGHT, offset_weight=OFFSET_WEIGHT,
                        peak_hold=PEAK_HOLD, method="all weights, Adam, D4 augmentation")
 
@@ -280,13 +287,34 @@ def _greedy_matches(a, b, tolerance) -> int:
 
 # ── the fine-tune ────────────────────────────────────────────────────────────
 
+@torch.no_grad()
+def marks_learned(model, working: Working, marks: list[np.ndarray], disk_radius_px: float) -> np.ndarray:
+    """Per mark, whether ``model`` now agrees with it on its pattern: no detection
+    within ~0.4 disk radii of a "not a disk" mark, a detection within ~0.5 radii
+    of a "disk here" mark. The decode is the preview's (``Working.peaks``)."""
+    logit, off = model(working.x.to(next(model.parameters()).device))
+    found = working.peaks(logit, off)
+    out = []
+    for frame_marks, peaks in zip(marks, found):
+        for my, mx, label in np.asarray(frame_marks, np.float64).reshape(-1, 3):
+            d = np.hypot(peaks[:, 0] - my, peaks[:, 1] - mx).min() if len(peaks) else np.inf
+            out.append(d > max(2.0, 0.4 * disk_radius_px) if int(label) == NOT_DISK
+                       else d <= max(2.5, 0.5 * disk_radius_px))
+    return np.asarray(out, bool)
+
+
 def adapt(base, device, frames, marks: list[np.ndarray], params: dict, *,
-          steps: int = STEPS, learning_rate: float = LEARNING_RATE,
+          until_learned: bool = True, steps: int = STEPS, max_steps: int = MAX_STEPS,
+          max_seconds: float = MAX_SECONDS, learning_rate: float = LEARNING_RATE,
           replay_weight: float = REPLAY_WEIGHT, seed: int = 0, stop: list | None = None):
     """Fine-tune a copy of ``base`` on ``marks`` (one ``[y, x, label]`` array per
     pattern in ``frames``, original pixels). ``params`` are the detector
     parameters the user tuned (``spot_radius``, ``min_distance``, ``bg_sigma``,
     ``threshold``), so the copy is trained on exactly the input it will see.
+
+    With ``until_learned`` (the default) it steps until :func:`marks_learned`
+    holds for every mark (checked every other step, never before ``MIN_STEPS``),
+    or ``max_seconds`` / ``max_steps`` run out; otherwise exactly ``steps``.
 
     Runs on the calling thread. Every device step holds the process-wide
     accelerator lock (a no-op off Apple-MPS) and releases it between steps, so a
@@ -315,11 +343,24 @@ def adapt(base, device, frames, marks: list[np.ndarray], params: dict, *,
         torch.autograd.set_multithreading_enabled(False)
     except Exception as error:                      # pragma: no cover - older torch
         log.debug("set_multithreading_enabled unavailable: %s", error)
+    limit = int(max_steps) if until_learned else int(steps)
+    stopped, taken, learned = "steps", 0, None
     try:
         with torch.enable_grad():
-            for _ in range(int(steps)):
+            for step in range(limit):
                 if stop is not None and stop[0]:
                     raise Cancelled()
+                if until_learned and step >= MIN_STEPS and step % 2 == 0:
+                    with accelerator_lock(device):
+                        model.eval()
+                        learned = marks_learned(model, working, marks, disk_radius)
+                    if learned.all():
+                        stopped = "learned"
+                        break
+                    if time.perf_counter() - started > max_seconds:
+                        stopped = "time"
+                        break
+                taken = step + 1
                 with accelerator_lock(device):
                     k = int(rng.integers(0, 8))
                     logit, off = model(_dihedral(labels["x"], k))
@@ -343,14 +384,22 @@ def adapt(base, device, frames, marks: list[np.ndarray], params: dict, *,
         p.requires_grad_(False)
     with accelerator_lock(device):
         model.eval()
+        if stopped != "learned":
+            learned = marks_learned(model, working, marks, disk_radius)
+            stopped = "learned" if learned.all() else stopped
         after = original_f1(model, device)
         model = model.to("cpu")
     marks_all = np.concatenate([np.asarray(m).reshape(-1, 3) for m in marks]) if marks else np.zeros((0, 3))
+    labels_all = marks_all[:, 2].astype(int)
     report = dict(device=str(device), seconds=time.perf_counter() - started,
                   patterns=len(frames), disk_marks=int((marks_all[:, 2] == DISK).sum()),
                   not_disk_marks=int((marks_all[:, 2] == NOT_DISK).sum()),
                   original_f1_base=before, original_f1=after, scale_factor=float(working.factor),
-                  **{**HYPERPARAMETERS, "steps": int(steps), "learning_rate": float(learning_rate),
+                  marks_learned=int(learned.sum()), marks_total=int(len(learned)),
+                  not_disk_learned=int(learned[labels_all == NOT_DISK].sum()),
+                  disk_learned=int(learned[labels_all == DISK].sum()),
+                  stopped=stopped,
+                  **{**HYPERPARAMETERS, "steps": int(taken), "learning_rate": float(learning_rate),
                      "replay_weight": float(replay_weight)})
     return model, report
 

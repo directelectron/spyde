@@ -177,7 +177,7 @@ def default_model_id() -> Optional[str]:
 
 
 def available_models(scope: Optional[str] = None) -> dict:
-    """Payload for the wizard's model picker: ``{default, models:[…]}``, vendored
+    """Payload for the wizard's model menu: ``{default, models:[…]}``, vendored
     models (bundled + remote) first, then the user's taught ones. Each carries
     ``group`` (``vendored`` | ``local``), an ``icon`` data URL when there is one,
     and the details its card shows. An unsaved draft is listed only for the
@@ -187,7 +187,12 @@ def available_models(scope: Optional[str] = None) -> dict:
         taught = bool(m.get("kind"))
         if taught and m.get("unsaved") and m.get("scope") != scope:
             continue
-        item = {"id": m["id"], "label": m.get("label", m["id"]),
+        # ``name`` is the short display name; ``label`` the full description,
+        # which the picker shows on a model's card.
+        name = m.get("name") or m.get("label", m["id"])
+        if not taught and m["id"] == default_model_id():
+            name = f"{name} (default)"
+        item = {"id": m["id"], "label": name, "description": m.get("label", m["id"]),
                 "version": m.get("version"), "notes": m.get("notes"),
                 "group": "local" if taught else "vendored", "icon": _icon_data_url(m)}
         if taught:
