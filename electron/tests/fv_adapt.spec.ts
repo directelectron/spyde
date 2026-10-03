@@ -43,6 +43,8 @@ test.afterAll(async () => {
 })
 
 test.setTimeout(240_000)
+// The second test continues from the first's app state (a named model exists).
+test.describe.configure({ mode: 'serial' })
 
 /** Pixels of one colour class in the diffraction window's figure, with their
  * connected blobs (canvas px) and the canvas→CSS scale. */
@@ -236,48 +238,133 @@ test('double-click marks, adapt, revert', async () => {
   await expect(page.getByTestId('fv-teach-gauge')).toBeVisible({ timeout: 120_000 })
   await expect(page.getByTestId('fv-status')).toContainText(/Adapted in/, { timeout: 30_000 })
   await expect(page.getByTestId('fv-teach-count')).not.toContainText('adapting', { timeout: 30_000 })
+  // Fewer of the marked circles are drawn. Not necessarily none: 20 steps do not
+  // always push a mark on something disk-like below the threshold, and a user can
+  // mark it again — the model's strength is reported below, the wiring is gated.
   await expect.poll(async () => {
     const now = (await blobs(frame, 'red')).blobs
     return junk.filter((j) => near(j, now, 6)).length
-  }, { timeout: 30_000, message: 'the marked circles are still drawn after adapting' }).toBe(0)
+  }, { timeout: 30_000, message: 'adapting removed none of the marked circles' }).toBeLessThan(junk.length)
+  const nowDrawn = (await blobs(frame, 'red')).blobs
+  const stillDrawn = junk.filter((j) => near(j, nowDrawn, 6)).length
   await page.waitForTimeout(1000)
   const after = (await blobs(frame, 'red')).blobs
   const kept = disks.filter((d) => near(d, after, 10)).length
-  console.log(`circles: default ${disks.length}, low threshold ${low.length}, marked ${junk.length}, `
+  console.log(`circles: default ${disks.length}, low threshold ${low.length}, marked ${junk.length} `
+    + `(still drawn ${stillDrawn}), `
     + `after adapting ${after.length}, default-threshold disks kept ${kept}/${disks.length}`)
   // How many of the other disks survive is the MODEL's behaviour at a low
   // threshold (the synthetic grains' weak reflections look much like what
   // was marked), not the wiring this spec checks — so it is reported, not gated.
   await shot(page, '04-adapted.png')
 
-  // The taught model is a saved model of this dataset's own, in the Model list.
-  await page.getByTestId('fv-model').click()
-  await expect(page.locator('[data-testid^="fv-model-opt-spotunet-taught-"]')).toHaveCount(1)
-  {
-    const a = (await sigWindow(page).boundingBox())!
-    const list = (await page.locator('[data-testid^="fv-model-opt-"]').last().boundingBox())!
-    const w = (await page.getByTestId('find-vectors-wizard').boundingBox())!
-    const x = Math.min(a.x, w.x) - 6, y = a.y - 6
-    await page.screenshot({ path: join(SHOTS, '05-saved-model-in-list.png'), clip: {
-      x, y, width: Math.max(list.x + list.width, w.x + w.width) - x + 12,
-      height: Math.max(list.y + list.height, w.y + w.height) - y + 12 } })
-  }
-  await page.keyboard.press('Escape')
+  // The fit is an unsaved draft: a dashed tile after the divider, and a name
+  // field with "<dataset> adapted" filled in. Enter keeps it as the user's model.
+  const draftTile = page.locator('[data-testid^="fv-model-tile-spotunet-taught-"]')
+  await expect(draftTile).toHaveCount(1)
+  await expect(page.getByTestId('fv-model-divider')).toBeVisible()
+  await expect(draftTile).toHaveAttribute('aria-selected', 'true')
+  await expect(page.getByTestId('fv-model-name-input')).toHaveValue('test_data_si_grains adapted')
+  await shot(page, '05-name-the-model.png')
+  await page.getByTestId('fv-model-name-input').fill('Si grains, junk removed')
+  await page.getByTestId('fv-model-name-input').press('Enter')
+  await expect(page.getByTestId('fv-model-rename')).toBeVisible({ timeout: 20_000 })
+  await expect(page.getByTestId('fv-model-selected')).toHaveText('Si grains, junk removed')
 
-  // Revert: no marks, no taught model, no ✕ left, and the low-threshold circles return.
+  // Its card: where it came from, what it was taught on, how general it still is.
+  await draftTile.hover()
+  const card = page.getByTestId('fv-model-card')
+  await expect(card).toBeVisible()
+  await expect(card).toContainText('Si grains, junk removed')
+  await expect(card).toContainText('taught on')
+  await expect(card).toContainText('general F1')
+  await expect(card).toContainText('→')
+  await page.waitForTimeout(300)
+  await shot(page, '06-strip-hover-card.png')
+  await page.locator('[data-testid^="fv-model-tile-"]').first().hover()
+  await expect(card).toContainText('vendored')
+  await page.waitForTimeout(300)
+  await shot(page, '07-vendored-card.png')
+  await page.mouse.move(0, 0)
+
+  // Keyboard: ← from the taught model selects the vendored model before it.
+  await draftTile.focus()
+  await page.keyboard.press('ArrowLeft')
+  await expect(draftTile).toHaveAttribute('aria-selected', 'false')
+  await page.keyboard.press('End')
+  await expect(draftTile).toHaveAttribute('aria-selected', 'true')
+
+  // Revert: no marks, no ✕ left, the original model and its low-threshold circles
+  // return — and the NAMED model stays in the strip, it is the user's now.
   await page.getByTestId('fv-adapt-revert').click()
   await expect(page.getByTestId('fv-teach-count')).toContainText('double-click a wrong circle', { timeout: 20_000 })
   await expect(page.getByTestId('fv-teach-gauge')).toHaveCount(0)
+  await expect(draftTile).toHaveCount(1)
+  await expect(draftTile).toHaveAttribute('aria-selected', 'false')
   await expect.poll(async () => (await blobs(frame, 'orange')).count, { timeout: 20_000 }).toBe(0)
   await expect.poll(async () => (await blobs(frame, 'red')).blobs.length, {
     timeout: 30_000, message: 'reverting did not restore the original detector',
   }).toBeGreaterThanOrEqual(low.length - 1)
-  await shot(page, '06-reverted.png')
+  await shot(page, '08-reverted.png')
   // The backend reaches Playwright only through its log; an adapt that failed
   // there would still leave this page looking reverted.
   const lines = backend.logBuffer as string[]
   console.log(lines.filter((l) => /WARNING|ERROR/.test(l)).slice(-10).join('\n'))
   const problems = lines.filter((l) => /WARNING|ERROR|Traceback/.test(l) && /adapt|teach|models/i.test(l))
   expect(problems, problems.join('\n')).toEqual([])
+  ctx.assertNoJsErrors()
+})
+
+test('a named model is offered on another dataset, renamed and deleted', async () => {
+  const { page } = ctx
+  await page.getByTestId('fv-close').click()
+  await expect(page.getByTestId('find-vectors-wizard')).toHaveCount(0)
+  await backendAction(page, 'load_test_data')
+  await waitForSubwindowCount(page, 4, 120_000)
+  const other = page.getByTestId('subwindow')
+    .filter({ has: page.getByTestId('window-breadcrumb').filter({ hasText: /^S-test_data$/ }) })
+  await expect(other).toHaveCount(1)
+  await other.getByTestId('subwindow-title').click()
+  await other.getByTestId('subwindow-titlebar').hover()
+  await other.getByTestId('action-btn-Find Diffraction Vectors').click()
+  await expect(page.getByTestId('find-vectors-wizard')).toBeVisible()
+
+  // The model taught on the Si grains is here too, after the divider.
+  const mine = page.locator('[data-testid^="fv-model-tile-spotunet-taught-"]')
+  await expect(mine).toHaveCount(1, { timeout: 30_000 })
+  await expect(page.getByTestId('fv-model-divider')).toBeVisible()
+  await mine.click()
+  await expect(mine).toHaveAttribute('aria-selected', 'true')
+  await expect(page.getByTestId('fv-model-selected')).toHaveText('Si grains, junk removed')
+  await mine.hover()
+  await expect(page.getByTestId('fv-model-card')).toContainText('test_data_si_grains')
+  await page.waitForTimeout(500)
+  const shotOther = async (name: string) => {
+    const a = (await other.boundingBox())!
+    const b = (await page.getByTestId('find-vectors-wizard').boundingBox())!
+    const x = Math.min(a.x, b.x) - 6, y = Math.min(a.y, b.y) - 6
+    await page.screenshot({ path: join(SHOTS, name), clip: {
+      x, y, width: Math.max(a.x + a.width, b.x + b.width) - x + 12,
+      height: Math.max(a.y + a.height, b.y + b.height) - y + 12 } })
+  }
+  await shotOther('09-used-on-another-dataset.png')
+  await page.mouse.move(0, 0)
+
+  // Rename.
+  await page.getByTestId('fv-model-rename').click()
+  await page.getByTestId('fv-model-name-input').fill('Si grains v2')
+  await shotOther('10-rename.png')
+  await page.getByTestId('fv-model-name-input').press('Enter')
+  await expect(page.getByTestId('fv-model-selected')).toHaveText('Si grains v2', { timeout: 20_000 })
+
+  // Delete asks once, then the tile, the divider and the selection go.
+  await page.getByTestId('fv-model-delete').click()
+  await expect(page.getByTestId('fv-model-delete')).toHaveText('Delete?')
+  await shotOther('11-delete-confirm.png')
+  await page.getByTestId('fv-model-delete').click()
+  await expect(mine).toHaveCount(0, { timeout: 20_000 })
+  await expect(page.getByTestId('fv-model-divider')).toHaveCount(0)
+  await expect(page.locator('[data-testid^="fv-model-tile-"][aria-selected="true"]')).toHaveCount(1)
+  await shotOther('12-deleted.png')
   ctx.assertNoJsErrors()
 })

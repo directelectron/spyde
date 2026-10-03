@@ -10,9 +10,10 @@ diffraction or about any particular model:
 * :class:`PointMarks` — the marks, kept per field (a navigation position).
 * :class:`DebouncedFit` — fit a snapshot of the marks once the user pauses,
   one fit at a time, the newest request winning.
-* :func:`save_user_model` / :func:`user_models` / :func:`remove_user_model` —
-  a fitted model kept on disk beside the downloaded ones, in a manifest of its
-  own (the downloaded models' manifest is overwritten by every refresh).
+* :func:`save_user_model` / :func:`name_user_model` / :func:`user_models` /
+  :func:`remove_user_model` — a fitted model kept on disk beside the downloaded
+  ones, in a manifest of its own (the downloaded models' manifest is overwritten
+  by every refresh). A fit is an unsaved draft until the user names it.
 * :func:`provenance` — the record a result made with a taught model carries.
 
 torch is never imported here.
@@ -255,16 +256,21 @@ def _write_manifest(directory: str, entries: Iterable[dict]) -> None:
 
 
 def save_user_model(directory: str, *, kind: str, scope: str,
-                    write_weights: Callable[[str], None], entry: dict) -> dict:
-    """Write a taught model's weights and record it, replacing the previous model
-    taught for the same ``(kind, scope)``.
+                    write_weights: Callable[[str], None], entry: dict,
+                    write_icon: Callable[[str], None] | None = None) -> dict:
+    """Write a fitted model's weights (and icon) and record it as an UNSAVED draft
+    of ``scope``, replacing that scope's previous draft. A draft becomes a model
+    of the user's own when it is named (:func:`name_user_model`); a draft nobody
+    names is discarded by the caller, and drafts left by a crash are pruned here
+    after a day.
 
     ``write_weights(path)`` writes the weight file. The id is derived from the
     file's sha256, so a model is immutable once recorded and a new fit is a new
     id — a process that cached the old one by id can never be handed new weights
-    under it. ``entry`` holds whatever the kind needs to load and describe it;
-    ``id``, ``kind``, ``scope``, ``sha256``, ``source`` and ``created`` are added.
-    Returns the recorded entry."""
+    under it. ``write_icon(path)`` writes a small PNG; a failure leaves the model
+    without one. ``entry`` holds whatever the kind needs to load and describe it;
+    ``id``, ``kind``, ``scope``, ``sha256``, ``source``, ``icon``, ``unsaved``
+    and ``created`` are added. Returns the recorded entry."""
     weights_dir = os.path.join(directory, USER_WEIGHTS_DIR)
     os.makedirs(weights_dir, exist_ok=True)
     temporary = os.path.join(weights_dir, f".{kind}-{os.getpid()}-{threading.get_ident()}.part")
@@ -277,28 +283,63 @@ def save_user_model(directory: str, *, kind: str, scope: str,
     model_id = f"{kind}-taught-{sha256[:12]}"
     filename = f"{model_id}.pt"
     os.replace(temporary, os.path.join(weights_dir, filename))
+    icon = None
+    if write_icon is not None:
+        try:
+            write_icon(os.path.join(weights_dir, f"{model_id}.png"))
+            icon = f"{USER_WEIGHTS_DIR}/{model_id}.png"
+        except Exception as error:      # noqa: BLE001 - an icon is decoration
+            log.info("[teach] no icon for %s: %s", model_id, error)
     recorded = {**entry, "id": model_id, "kind": kind, "scope": scope, "sha256": sha256,
                 "source": {"type": "taught", "file": f"{USER_WEIGHTS_DIR}/{filename}"},
-                "created": time.strftime("%Y-%m-%dT%H:%M:%S")}
+                "icon": icon, "unsaved": True, "created": time.strftime("%Y-%m-%dT%H:%M:%S")}
     entries = user_models(directory)
-    replaced = [e for e in entries if e.get("kind") == kind and e.get("scope") == scope
-                and e.get("id") != model_id]
+    now = time.time()
+    replaced = [e for e in entries if e.get("unsaved") and e.get("id") != model_id
+                and e.get("kind") == kind
+                and (e.get("scope") == scope or now - _created(e) > STALE_DRAFT_SECONDS)]
     kept = [e for e in entries if e not in replaced and e.get("id") != model_id]
     _write_manifest(directory, kept + [recorded])
     for old in replaced:
-        _remove_weights(directory, old)
+        _remove_files(directory, old)
     return recorded
 
 
+#: An unsaved draft older than this belongs to a session that is gone.
+STALE_DRAFT_SECONDS = 24 * 3600
+
+
+def _created(entry: dict) -> float:
+    try:
+        return time.mktime(time.strptime(entry.get("created", ""), "%Y-%m-%dT%H:%M:%S"))
+    except ValueError:
+        return 0.0
+
+
+def name_user_model(directory: str, model_id: str, name: str) -> dict:
+    """Name (or rename) a model: a named model is the user's own, kept, and
+    offered for every dataset. Returns the updated entry."""
+    name = " ".join(str(name).split())
+    if not name:
+        raise ValueError("a model needs a name")
+    entries = user_models(directory)
+    for entry in entries:
+        if entry.get("id") == model_id:
+            entry.update(name=name, label=name, unsaved=False)
+            _write_manifest(directory, entries)
+            return entry
+    raise KeyError(model_id)
+
+
 def remove_user_model(directory: str, model_id: str) -> bool:
-    """Forget a taught model and delete its weights. Returns True when found."""
+    """Forget a taught model and delete its files. Returns True when found."""
     entries = user_models(directory)
     gone = [e for e in entries if e.get("id") == model_id]
     if not gone:
         return False
     _write_manifest(directory, [e for e in entries if e.get("id") != model_id])
     for entry in gone:
-        _remove_weights(directory, entry)
+        _remove_files(directory, entry)
     return True
 
 
@@ -306,11 +347,14 @@ def user_model_path(directory: str, entry: dict) -> str:
     return os.path.join(directory, entry["source"]["file"])
 
 
-def _remove_weights(directory: str, entry: dict) -> None:
-    try:
-        os.remove(user_model_path(directory, entry))
-    except OSError as error:
-        log.debug("[teach] removing %s failed: %s", entry.get("id"), error)
+def _remove_files(directory: str, entry: dict) -> None:
+    for relative in (entry["source"]["file"], entry.get("icon")):
+        if not relative:
+            continue
+        try:
+            os.remove(os.path.join(directory, relative))
+        except OSError as error:
+            log.debug("[teach] removing %s failed: %s", relative, error)
 
 
 # ── provenance ────────────────────────────────────────────────────────────────

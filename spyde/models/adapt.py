@@ -353,3 +353,42 @@ def adapt(base, device, frames, marks: list[np.ndarray], params: dict, *,
                   **{**HYPERPARAMETERS, "steps": int(steps), "learning_rate": float(learning_rate),
                      "replay_weight": float(replay_weight)})
     return model, report
+
+
+# ── the model's icon ─────────────────────────────────────────────────────────
+
+ICON_SIZE = 48
+
+
+def preferred_input(model, device, *, size: int = ICON_SIZE, steps: int = 200, seed: int = 0) -> np.ndarray:
+    """What the model treats as an ideal disk: the input that maximises its centre
+    heatmap logit, found by gradient ascent from near-zero, with an L2 and a
+    total-variation penalty so the answer is a smooth picture rather than noise.
+    At the model's working resolution, where every disk is ~9 px across."""
+    from spyde.device_lock import accelerator_lock
+    model = model.to(device).eval()
+    generator = torch.Generator().manual_seed(seed)
+    with accelerator_lock(device), torch.enable_grad():
+        x = (0.01 * torch.randn(1, 1, size, size, generator=generator)).to(device).requires_grad_(True)
+        optimiser = torch.optim.Adam([x], lr=0.05)
+        for _ in range(int(steps)):
+            logit, _ = model(x)
+            tv = (x[..., 1:, :] - x[..., :-1, :]).abs().mean() + (x[..., :, 1:] - x[..., :, :-1]).abs().mean()
+            loss = -logit[0, 0, size // 2, size // 2] + 0.02 * (x ** 2).mean() + 0.3 * tv
+            optimiser.zero_grad(set_to_none=True)
+            loss.backward()
+            optimiser.step()
+        return x.detach().cpu().numpy()[0, 0]
+
+
+def write_icon(model, device, path: str) -> None:
+    """The model's icon: its preferred input (:func:`preferred_input`), the centre
+    cropped, on a diverging scale centred at zero, as a PNG."""
+    from matplotlib import colormaps
+    from PIL import Image
+    image = preferred_input(model, device)
+    margin = ICON_SIZE // 8
+    image = image[margin:-margin, margin:-margin]
+    scale = float(np.percentile(np.abs(image), 99.5)) or 1.0
+    rgba = colormaps["RdBu_r"](np.clip(0.5 + 0.5 * image / scale, 0, 1))
+    Image.fromarray((rgba[..., :3] * 255).astype(np.uint8)).resize((64, 64), Image.BICUBIC).save(path)

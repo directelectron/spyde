@@ -57,11 +57,12 @@ test('neural wizard: bg-σ control, auto-calibration, model refresh, compute', a
   await expect(page.getByTestId('fv-refresh-models')).toBeVisible()
   await page.screenshot({ path: 'fv_neural_shots/01-wizard-open.png' })
 
-  // The themed Model dropdown opens with the menubar look (screenshot check).
-  await page.getByTestId('fv-model').click()
-  await expect(page.getByTestId('fv-model-opt-spotunet-production-v2')).toBeVisible()
-  await page.screenshot({ path: 'fv_neural_shots/01b-model-dropdown.png' })
-  await page.keyboard.press('Escape')
+  // The model strip lists every bundled model as an icon tile.
+  await expect(page.getByTestId('fv-model-tile-spotunet-production-v2')).toBeVisible()
+  await page.getByTestId('fv-model-tile-spotunet-production-v2').hover()
+  await expect(page.getByTestId('fv-model-card')).toBeVisible()
+  await page.screenshot({ path: 'fv_neural_shots/01b-model-strip.png' })
+  await page.mouse.move(0, 0)
 
   // Auto-calibration ran on wizard-open (backend log; the emitted fv_calibration
   // is only adopted in the UI when it differs from the defaults, so the log is
