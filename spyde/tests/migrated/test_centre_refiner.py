@@ -443,6 +443,59 @@ class TestNetworkRefinerInference:
         assert abs(mean[0][0, 1] - unbiased[0][0, 1]) < 0.2 * (single[0][0, 1] - unbiased[0][0, 1])
         assert mean[1][0] == pytest.approx(single[1][0], rel=1e-4)
 
+    def test_sampling_the_crop_equals_sampling_the_whole_frame(self):
+        """The refiner resamples each disk's small native crop, never the frame.
+        That must give exactly what bilinear sampling of the whole frame gives
+        (zeros outside it), which is how the network's training crops are cut —
+        including disks whose grid runs off the frame edge."""
+        import torch
+        import torch.nn.functional as F
+
+        rng = np.random.default_rng(21)
+        refiner = _network(_ThresholdNet())
+        radius = 6.0
+        step = radius / refiner.crop_radius
+        frame = rng.normal(50, 20, (90, 70)).astype(np.float32)
+        centres = np.column_stack([rng.uniform(-2, 92, 64), rng.uniform(-2, 72, 64)])
+        crops, local = extract_crops(frame, centres, refiner.crop_half_width(radius))
+        from_crops = refiner._resample(torch.as_tensor(crops),
+                                       torch.as_tensor(local, dtype=torch.float32), step)
+
+        offsets = np.arange(-refiner.crop_half, refiner.crop_half + 1) * step
+        rows = centres[:, 0, None] + offsets[None]
+        columns = centres[:, 1, None] + offsets[None]
+        grid = np.stack([np.broadcast_to(columns[:, None, :], (64, len(offsets), len(offsets))) / 69 * 2 - 1,
+                         np.broadcast_to(rows[:, :, None], (64, len(offsets), len(offsets))) / 89 * 2 - 1], -1)
+        from_frame = F.grid_sample(torch.as_tensor(frame)[None, None].expand(64, 1, -1, -1),
+                                   torch.as_tensor(grid, dtype=torch.float32), mode="bilinear",
+                                   padding_mode="zeros", align_corners=True)
+        # float32 grid coordinates: ~1e-5 of the signal (measured 8e-6)
+        assert float((from_crops - from_frame).abs().max()) < 3e-5 * float(from_frame.abs().max())
+
+    def test_no_tensor_is_ever_the_size_of_a_frame_per_disk(self, monkeypatch):
+        """Memory guard: with 512 x 512 frames, everything the refiner samples
+        or runs through the network is crop-sized."""
+        import torch.nn.functional as F
+
+        from spyde.models import centre_network
+
+        seen = []
+        original = F.grid_sample
+
+        def spy(source, grid, *args, **kwargs):
+            seen.append(tuple(source.shape))
+            return original(source, grid, *args, **kwargs)
+
+        monkeypatch.setattr(centre_network.F, "grid_sample", spy)
+        rng = np.random.default_rng(22)
+        truth = disk_lattice(512, 6.0, rng, spacing=40.0)
+        frames = [uneven_disks((512, 512), truth, 6.0, rng)] * 2
+        refiner = _network(_ThresholdNet())
+        refine_centres(frames, [truth, truth], 6.0, refiner)
+        crop = 2 * refiner.crop_half_width(6.0) + 1
+        assert seen and all(shape[-2:] == (crop, crop) for shape in seen)
+        assert all(shape[0] <= 2 * len(truth) for shape in seen)
+
     def test_a_re_crop_pass_corrects_a_network_that_leans_to_the_crop_centre(self):
         errors = {}
         for passes in (1, 2, 3):
