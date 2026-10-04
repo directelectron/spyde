@@ -283,7 +283,37 @@ class TestRefinerRegistry:
         crops, local = extract_crops(np.ones((64, 64), np.float32), np.array([[30.0, 30.0]]),
                                      refiner.crop_half_width(6.0))
         centres, sigma = refiner.refine(crops, local, 6.0)
-        assert centres.shape == (1, 2) and sigma is None
+        assert centres.shape == (1, 2) and sigma.shape == (1,)
+
+    @pytest.mark.parametrize("crop_half, annulus", [(16, [0.78125, 1.0]), (20, [0.78, 1.0])])
+    def test_each_checkpoint_gets_its_own_crop(self, tmp_path, crop_half, annulus):
+        """R1 crops 33 px with the annulus at 12.5-16 px; R3 on crops 41 px with
+        the annulus at 15.6-20 px. Both come from the registry's input contract."""
+        import torch
+
+        from spyde.models import centre_network
+
+        path = tmp_path / f"half{crop_half}.pt"
+        _write_stub_refiner(path)
+        refiner = centre_network.load_refiner(
+            path, "cpu", contract={"crop_half": crop_half, "annulus": annulus})
+        assert refiner.crop_half == crop_half and refiner.annulus == tuple(annulus)
+        assert refiner.crop_half_width(6.0) == int(np.ceil(crop_half / 10 * 6.0 + 0.5 * 6.0 + 0.5)) + 1
+
+        shapes = []
+        refiner.net.register_forward_pre_hook(lambda module, inputs: shapes.append(inputs[0].shape))
+        crops, local = extract_crops(np.ones((96, 96), np.float32), np.array([[48.0, 48.0]]),
+                                     refiner.crop_half_width(6.0))
+        refiner.refine(crops, local, 6.0)
+        assert {tuple(shape[-2:]) for shape in shapes} == {(2 * crop_half + 1,) * 2}
+
+        # the background is the median of the contract's annulus, and only of it
+        offsets = np.arange(-crop_half, crop_half + 1)
+        distance = np.hypot(offsets[:, None], offsets[None, :])
+        ring = (distance > annulus[0] * crop_half) & (distance <= annulus[1] * crop_half)
+        sampled = np.where(ring, 7.0, 0.0) + np.where(distance <= 10, 20.0, 0.0)
+        normalised = refiner._normalise(torch.as_tensor(sampled[None, None], dtype=torch.float32))
+        assert float(normalised[0, 0][torch.as_tensor(ring)].abs().max()) == 0.0
 
     def test_a_detector_is_not_a_refiner(self, stub_registry):
         with pytest.raises(ValueError):
@@ -296,6 +326,133 @@ class TestRefinerRegistry:
         _write_stub_refiner(path)
         with pytest.raises(ValueError, match="normalisation"):
             centre_network.load_refiner(path, "cpu", contract={"normalisation": "zscore"})
+
+
+# ── the network refiner's inference: mirrors, sigma, re-crop ───────────────────
+
+class _ThresholdNet:
+    """A stand-in segmenter: covered where the normalised crop is above 0.3.
+    Mirror-equivariant, as a well-trained network should be."""
+
+    def __call__(self, x):
+        return 40.0 * (x - 0.3)
+
+
+class _BiasedNet(_ThresholdNet):
+    """Adds coverage toward +x in whatever crop it is shown, so its mirrored
+    answers disagree by a known amount."""
+
+    def __init__(self, bias):
+        self.bias = bias
+
+    def __call__(self, x):
+        import torch
+
+        columns = torch.linspace(-1, 1, x.shape[-1])
+        return super().__call__(x) + self.bias * columns
+
+
+class _CentreSeekingNet(_ThresholdNet):
+    """Coverage fades away from the crop centre: a network that leans toward the
+    middle of its crop, which is what a re-crop pass corrects."""
+
+    def __call__(self, x):
+        import torch
+
+        offsets = torch.linspace(-1, 1, x.shape[-1])
+        distance = torch.sqrt(offsets[:, None] ** 2 + offsets[None, :] ** 2)
+        return super().__call__(x) - 100.0 * distance ** 2
+
+
+def _one_disk(offset, radius=6.0, seed=0, uneven=True):
+    """A disk at a sub-pixel position, unevenly filled unless asked otherwise,
+    and a detection ``offset`` px away from it."""
+    rng = np.random.default_rng(seed)
+    truth = np.array([[48.37, 47.81]])
+    frame = uneven_disks((96, 96), truth, radius, rng, gradient=0.4 if uneven else 0.0,
+                         lobe=0.8 if uneven else 0.0, amplitude=400.0)
+    return frame, truth, truth + np.asarray(offset)
+
+
+def _network(net, **options):
+    from spyde.models.centre_network import NetworkRefiner
+
+    return NetworkRefiner(net, "cpu", crop_half=20, **options)
+
+
+class TestNetworkRefinerInference:
+    def test_mirrored_answers_are_flipped_back_into_the_crops_frame(self):
+        """The disk sits 1.2 px down and 0.8 px left of the detection and is
+        lit unevenly. A mirror-equivariant network gives the same offset in all
+        four views once each is flipped back, so the spread (and sigma) is ~0;
+        a sign error in any un-mirroring would put that view ~2 px away."""
+        import torch
+
+        frame, truth, seed = _one_disk([-1.2, 0.8])
+        refiner = _network(_ThresholdNet(), passes=1, mirror_mean=False)
+        crops, local = extract_crops(frame, seed, refiner.crop_half_width(6.0))
+        step = 6.0 / refiner.crop_radius
+        sampled = refiner._normalise(refiner._resample(
+            torch.as_tensor(crops), torch.as_tensor(local, dtype=torch.float32), step))
+        views, _ = refiner._views(sampled, mirrored=True)
+        assert views.shape == (4, 1, 2)
+        assert float(views[0].norm()) * step > 1.0             # the disk is well off-centre
+        assert float((views - views[0]).abs().max()) * step < 1e-3
+
+        positions, sigmas = refine_centres([frame], [seed], 6.0, refiner)
+        assert np.hypot(*(positions[0] - truth).T)[0] < 0.5 * np.hypot(*(seed - truth).T)[0]
+        assert sigmas[0][0] < 1e-2
+
+    def test_sigma_is_six_times_the_mirror_spread(self):
+        import torch
+
+        frame, _, seed = _one_disk([0.3, -0.2])
+        refiner = _network(_BiasedNet(2.0), passes=1, mirror_mean=False)
+        crops, local = extract_crops(frame, seed, refiner.crop_half_width(6.0))
+        _, sigma = refiner.refine(crops, local, 6.0)
+
+        step = 6.0 / refiner.crop_radius
+        sampled = refiner._normalise(refiner._resample(
+            torch.as_tensor(crops), torch.as_tensor(local, dtype=torch.float32), step))
+        views, _ = refiner._views(sampled, mirrored=True)
+        spread = float((views - views.mean(0)).norm(dim=2).mean()) * step
+        assert spread > 0.01
+        assert sigma[0] == pytest.approx(6.0 * spread, rel=1e-4)
+
+    def test_an_unsure_disk_is_declined_and_keeps_its_detection(self):
+        """sigma above a quarter of the spot radius: NaN from the refiner, and the
+        stage keeps the detected centre and the detector's own sigma."""
+        frame, _, seed = _one_disk([0.3, -0.2])
+        refiner = _network(_BiasedNet(60.0), passes=1)
+        crops, local = extract_crops(frame, seed, refiner.crop_half_width(6.0))
+        centres, sigma = refiner.refine(crops, local, 6.0)
+        assert np.isnan(centres).all() and np.isnan(sigma).all()
+
+        positions, sigmas = refine_centres([frame], [seed], 6.0, refiner)
+        np.testing.assert_allclose(positions[0], seed, atol=1e-5)
+        assert np.isnan(sigmas[0]).all()
+
+    def test_the_mirror_mean_is_a_contract_option(self):
+        frame, _, seed = _one_disk([0.3, -0.2])
+        crops, local = extract_crops(frame, seed, 20)
+        unbiased = _network(_ThresholdNet(), passes=1, mirror_mean=False).refine(crops, local, 6.0)
+        single = _network(_BiasedNet(2.0), passes=1, mirror_mean=False).refine(crops, local, 6.0)
+        mean = _network(_BiasedNet(2.0), passes=1, mirror_mean=True).refine(crops, local, 6.0)
+        # the bias pushes the plain view along +x; the x-mirrors cancel it in the mean
+        assert single[0][0, 1] - unbiased[0][0, 1] > 0.05
+        assert abs(mean[0][0, 1] - unbiased[0][0, 1]) < 0.2 * (single[0][0, 1] - unbiased[0][0, 1])
+        assert mean[1][0] == pytest.approx(single[1][0], rel=1e-4)
+
+    def test_a_re_crop_pass_corrects_a_network_that_leans_to_the_crop_centre(self):
+        errors = {}
+        for passes in (1, 2, 3):
+            frame, truth, seed = _one_disk([1.5, -1.0], uneven=False)
+            refiner = _network(_CentreSeekingNet(), passes=passes)
+            positions, _ = refine_centres([frame], [seed], 6.0, refiner)
+            errors[passes] = float(np.hypot(*(positions[0] - truth).T)[0])
+        assert errors[1] > 0.3                     # one pass is pulled toward the seed
+        assert errors[2] < 0.5 * errors[1]
+        assert errors[3] <= errors[2] + 1e-6
 
 
 # ── the Find Vectors wiring, with a stand-in detector ──────────────────────────
