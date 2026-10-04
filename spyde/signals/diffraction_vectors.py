@@ -33,7 +33,7 @@ LEGACY_N_COLS = 6
 
 
 def with_all_columns(flat_buffer: np.ndarray) -> np.ndarray:
-    """``flat_buffer`` with every current column: a legacy (N, N_COLS) buffer gains
+    """``flat_buffer`` with every current column: a legacy (N, 6) buffer gains
     NaN confidence and sigma; a current one is returned unchanged (same object)."""
     flat_buffer = np.asarray(flat_buffer)
     if flat_buffer.ndim == 2 and flat_buffer.shape[1] == LEGACY_N_COLS:

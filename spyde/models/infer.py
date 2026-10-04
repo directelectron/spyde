@@ -19,7 +19,7 @@ import sys
 import numpy as np
 import torch
 
-from .centre import CENTRE_SOFTARGMAX, decode_batch_centres
+from .centre import CENTRE_OFFSET, decode_batch_centres
 from .preprocess import estimate_disk_diameter, normalize_input, scale_to_canonical
 from .unet import SpotUNet
 
@@ -246,15 +246,15 @@ def detect(model, frame: np.ndarray, device, thresh: float = 0.3,
            min_distance: int = 4, auto_scale: bool = True,
            bg_sigma: float | None = None,
            spot_diameter: float | None = None,
-           centre: str = CENTRE_SOFTARGMAX,
+           centre: str = CENTRE_OFFSET,
            with_width: bool = False):
     """Detect spots in a single frame. Returns (N,3) [y,x,score] in ORIGINAL coords
     (``with_width``: (N,4) [y,x,score,width], width in original pixels).
 
-    ``centre`` picks where a found disk is placed: ``"softargmax"`` (default) — the
-    softmax-weighted mean of the heatmap over the disk, see :mod:`.centre`; or
-    ``"offset"`` — the frozen decode (argmax pixel + offset head). The set of
-    disks found is the same either way.
+    ``centre`` picks where a found disk is placed: ``"offset"`` (default) — the
+    network's decode, argmax pixel + offset head; or ``"softargmax"`` — the
+    softmax-weighted mean of the heatmap over the disk, see :mod:`.centre` for
+    why it is not the default. The set of disks found is the same either way.
 
     Estimates disk size, rescales to canonical, runs the model, maps positions back.
     ``bg_sigma`` is the local-norm high-pass scale (set by ``calibrate`` for diffuse
@@ -385,7 +385,7 @@ def detect_batch(model, frames, device, thresh: float = 0.3,
                  min_distance: int = 4, auto_scale: bool = True,
                  shared_scale: bool = True, bg_sigma: float | None = None,
                  spot_diameter: float | None = None,
-                 centre: str = CENTRE_SOFTARGMAX,
+                 centre: str = CENTRE_OFFSET,
                  with_width: bool = False):
     """Detect spots in a STACK of frames in one forward pass.
 

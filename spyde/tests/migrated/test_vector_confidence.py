@@ -1,8 +1,8 @@
 """Every diffraction vector carries a positional confidence and uncertainty.
 
-The neural method places each disk at the soft-argmax of the network's heatmap
-over the disk (``spyde.models.centre``) and records the heatmap peak
-(``confidence``) and the centre's standard deviation (``sigma``). Vectors are
+The neural method records each disk's heatmap peak (``confidence``) and the
+centre's standard deviation (``sigma``); ``spyde.models.centre`` also offers
+the soft-argmax of the heatmap as an opt-in centre. Vectors are
 ``(nav_x, nav_y, kx, ky, time, intensity, confidence, sigma)``; buffers and
 files written with the first six columns load with the last two NaN.
 
@@ -155,9 +155,10 @@ def neural_results():
 class TestNeuralCentres:
     def test_softargmax_beats_the_decoded_position_under_dynamical_fill(self, neural_results):
         """On disks whose fill is uneven and points a different way in every
-        frame (40 frames, 839 matched disks, seed 0): soft-argmax 0.33 px RMS
-        from the true outline centre, the frozen decode (argmax pixel + offset
-        head) 0.37 px."""
+        frame (40 frames, 839 matched disks, seed 0): the opt-in soft-argmax is
+        0.33 px RMS from the true outline centre, the default decode (argmax
+        pixel + offset head) 0.37 px. (On real SPED-Ag the soft-argmax carries a
+        ~0.7 % radial bias, which is why it is not the default.)"""
         r = neural_results["dynamical"]
         assert r["softargmax"]["n"] == r["offset"]["n"] > 500
         assert r["softargmax"]["rms"] < r["offset"]["rms"]
