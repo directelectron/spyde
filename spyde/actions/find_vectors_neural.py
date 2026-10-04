@@ -11,8 +11,8 @@ stores: ``[y, x, intensity, confidence, sigma]`` — the raw disk-mean frame
 intensity, the network's heatmap peak, and the centre's positional uncertainty
 (:func:`spyde.models.centre.positional_sigma`).
 
-Centres are the soft-argmax of the heatmap over each disk
-(:mod:`spyde.models.centre`); ``centre="offset"`` restores the frozen decode.
+Centres are the network's decode (argmax pixel + offset head);
+``centre="softargmax"`` is the opt-in alternative in :mod:`spyde.models.centre`.
 
 GPU/CPU: the batch path runs the whole nav chunk through one forward pass on the
 torch GPU when available (``torch_gpu_device()``), per-frame on CPU otherwise —
@@ -155,7 +155,7 @@ def _find_vectors_single_frame_neural(
                                        # None → auto (12, size-scaled for big disks).
     spot_radius: Optional[float] = None,   # user Spot-size (px radius) override for
                                            # the canonical rescale; None → auto.
-    centre: str = "softargmax",            # "offset" = the frozen decode position
+    centre: str = "offset",                # "softargmax": see spyde.models.centre
 ):
     """Neural detector for one diffraction pattern.
 
@@ -296,7 +296,7 @@ def _mps_forward_lock():
 
 
 def _neural_block(b4d, threshold, min_dist, subpixel, beamstop_mask, model_id,
-                  bg_sigma=None, persistence=False, spot_radius=None, centre="softargmax"):
+                  bg_sigma=None, persistence=False, spot_radius=None, centre="offset"):
     """Run the neural detector on a (ny, nx, KY, KX) block → NaN-padded
     (ny, nx, MAX_PEAKS, PEAK_COLS). Batches the whole block through the torch GPU when
     available (internally sub-batched by ``detect_batch``, see infer.py, so a

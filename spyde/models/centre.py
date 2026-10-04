@@ -1,14 +1,16 @@
 """Where a detected disk's centre is, and how well that is known.
 
-``decode`` (vendored, frozen) places a disk at the heatmap's maximum pixel plus
-the network's offset head. That is fine when the disk is evenly lit, but under
-dynamical scattering the intensity inside a disk is uneven and moves, and a
-single pixel plus a learned offset follows it. Taking the **soft-argmax** of
-the heatmap around that pixel — the softmax-weighted mean position of the
-heatmap logits within the disk — uses the whole response the network gives to
-the disk instead of one pixel of it. On synthetic dynamical patterns with known
-centres it lands nearer the true outline centre: 0.33 px RMS against 0.37 px
-for the decode (``spyde/tests/migrated/test_vector_confidence.py``).
+The default centre is the network's own decode: the heatmap's maximum pixel plus
+the offset head (``CENTRE_OFFSET``, identical to the vendored ``decode``).
+
+``CENTRE_SOFTARGMAX`` instead takes the softmax-weighted mean position of the
+heatmap logits over the disk. On synthetic dynamical patterns with known
+centres it lands a little nearer the true outline centre (0.33 px RMS against
+0.37 px, ``spyde/tests/migrated/test_vector_confidence.py``), but on real
+SPED-Ag patterns it places every disk about 0.7 % further from its neighbours
+than the decode does — the network's response is not symmetric about the
+centre — which is enough to break an absolute (CIF-referenced) orientation
+match. So it is opt-in.
 
 Each detection also gets:
 
@@ -33,14 +35,14 @@ CENTRES = (CENTRE_SOFTARGMAX, CENTRE_OFFSET)
 
 @torch.no_grad()
 def decode_batch_centres(hm_logits, off, thresh=0.3, min_distance=3, radius=3.0,
-                         centre: str = CENTRE_SOFTARGMAX):
+                         centre: str = CENTRE_OFFSET):
     """Peaks of a ``(B,1,H,W)`` heatmap batch, as ``(M,5)``
     ``[batch, y, x, confidence, width]`` in working pixels.
 
     The peaks themselves are exactly ``decode.decode_batch``'s (same max-pool,
     same threshold), so switching ``centre`` changes where a disk is placed,
     never which disks are found. ``radius`` (working px) is the window the
-    soft-argmax averages over — the disk's own radius."""
+    soft-argmax and the response width are taken over — the disk's own radius."""
     if centre not in CENTRES:
         raise ValueError(f"centre must be one of {CENTRES}; got {centre!r}")
     hm = torch.sigmoid(hm_logits)
