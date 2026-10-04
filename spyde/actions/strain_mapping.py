@@ -189,6 +189,48 @@ _TRIM_SIGMA = 2.5
 _TRIM_FLOOR = 1e-6
 
 
+# The part of a centre's scatter (px) that photon counting does not see.
+WEIGHT_FLOOR_PX = 0.1
+
+
+def unit_per_px(vecs) -> float:
+    """Reciprocal units per detector pixel (geometric mean of the two signal
+    axes), the factor Find Vectors scales sigma by."""
+    try:
+        sx, sy = (float(a.scale) for a in vecs.sig_axes[:2])
+        return float(np.sqrt(abs(sx * sy))) or 1.0
+    except Exception:
+        return 1.0
+
+
+def vector_weights(rows: np.ndarray, unit_per_pixel: float = 1.0):
+    """Least-squares weight of each vector, from the confidence and positional
+    sigma Find Vectors records: ``confidence / (sigma² + floor²)``, where the
+    floor is WEIGHT_FLOOR_PX converted to reciprocal units.
+
+    The floor is there because sigma is the photon-noise limit only — on a
+    bright disk it is ~0.01 px while the centre actually scatters by tenths of a
+    pixel — so without it a few bright disks would carry the whole fit. A row
+    with no confidence or sigma (vectors from an older file, or a method other
+    than the network) gets the median weight. ``None`` when no row has them, so
+    such vectors fit exactly as before."""
+    from spyde.signals.diffraction_vectors import COL_CONFIDENCE, COL_SIGMA
+
+    rows = np.asarray(rows)
+    if rows.ndim != 2 or rows.shape[1] <= COL_SIGMA or len(rows) == 0:
+        return None
+    confidence = rows[:, COL_CONFIDENCE].astype(float)
+    sigma = rows[:, COL_SIGMA].astype(float)
+    known = np.isfinite(confidence) & np.isfinite(sigma)
+    if not known.any():
+        return None
+    weights = np.empty(len(rows))
+    floor = WEIGHT_FLOOR_PX * unit_per_pixel
+    weights[known] = confidence[known] / (sigma[known] ** 2 + floor ** 2)
+    weights[~known] = np.median(weights[known])
+    return weights
+
+
 def _trim_keep(r: np.ndarray, rms: float, tol: float) -> np.ndarray:
     keep = r <= max(_TRIM_SIGMA * rms, _TRIM_FLOOR)
     if np.isfinite(tol):
@@ -197,10 +239,16 @@ def _trim_keep(r: np.ndarray, rms: float, tol: float) -> np.ndarray:
 
 
 def _fit_pattern_strain_full(g_meas, g_ref, *, tol, min_matches=DEFAULT_MIN_MATCHES,
-                             trim=True):
+                             trim=True, weights=None):
     """fit_pattern_strain + fit-quality extras:
-    ``(exx, eyy, exy, omega, coverage, residual_rms, n_matched)`` or None."""
+    ``(exx, eyy, exy, omega, coverage, residual_rms, n_matched)`` or None.
+    ``weights`` (one per measured vector, see :func:`vector_weights`) make the
+    affine solve a weighted least squares; matching, the trim and the reported
+    residual stay geometric."""
     g_meas = np.asarray(g_meas, dtype=float).reshape(-1, 2)
+    if weights is not None:
+        weights = np.asarray(weights, dtype=float).reshape(-1)
+        weights = weights / weights.mean()
     g_ref = np.asarray(g_ref, dtype=float).reshape(-1, 2)
     if len(g_meas) < 2 or len(g_ref) < 2:
         return None
@@ -231,6 +279,7 @@ def _fit_pattern_strain_full(g_meas, g_ref, *, tol, min_matches=DEFAULT_MIN_MATC
     G_ref = ref_aug[idx[ok]]                                   # (K, 2)
     G_meas = gm[ok]                                            # (K, 2)
     ref_ids = src_idx[idx[ok]]
+    W = None if weights is None else weights[ok]
 
     sol = None
     resid = None
@@ -241,7 +290,11 @@ def _fit_pattern_strain_full(g_meas, g_ref, *, tol, min_matches=DEFAULT_MIN_MATC
             return None
         # Affine least squares: [G_ref | 1] @ M = G_meas, M = [[T^T],[t^T]] (3×2).
         A = np.hstack([G_ref, np.ones((len(G_ref), 1))])
-        sol, *_ = np.linalg.lstsq(A, G_meas, rcond=None)
+        if W is None:
+            sol, *_ = np.linalg.lstsq(A, G_meas, rcond=None)
+        else:
+            root = np.sqrt(W)[:, None]
+            sol, *_ = np.linalg.lstsq(A * root, G_meas * root, rcond=None)
         resid = np.linalg.norm(G_meas - A @ sol, axis=1)
         if it == 0 and trim:
             rms = float(np.sqrt(np.mean(resid ** 2)))
@@ -249,6 +302,8 @@ def _fit_pattern_strain_full(g_meas, g_ref, *, tol, min_matches=DEFAULT_MIN_MATC
             if keep.all():
                 break
             G_ref, G_meas, ref_ids = G_ref[keep], G_meas[keep], ref_ids[keep]
+            if W is not None:
+                W = W[keep]
     T = sol[:2, :].T                                           # 2×2: g_meas ≈ T·g_ref + t
 
     # Report REAL-SPACE lattice strain, not reciprocal: the measured g map as
@@ -433,7 +488,7 @@ def _strain_from_T(T: np.ndarray):
 def compute_strain_field(vecs, ref_yx=None, *, ref_vectors=None,
                          tol: float | None = None,
                          min_matches: int = DEFAULT_MIN_MATCHES, trim: bool = True,
-                         ref_radius: int = 0) -> StrainField:
+                         ref_radius: int = 0, weighted: bool = True) -> StrainField:
     """Strain field of ``vecs`` (a ``SpyDEDiffractionVectors``) measured against a
     reference lattice — either the vectors at reference pixel ``ref_yx = (ry, rx)``
     (relative strain; ε = 0 there by construction) OR an explicit ``ref_vectors``
@@ -444,6 +499,9 @@ def compute_strain_field(vecs, ref_yx=None, *, ref_vectors=None,
     the fit-robustness knobs (see :func:`fit_pattern_strain`). ``ref_radius`` > 0
     pools the reference over a ``(2r+1)²`` neighbourhood of ``ref_yx``
     (:func:`region_reference` — noise-robust consensus; 0 = the single pixel).
+    ``weighted`` fits each pixel by weighted least squares when the vectors
+    carry a confidence and sigma (:func:`vector_weights`); vectors without
+    them fit unweighted either way.
 
     Fits EVERY nav pixel in one vectorized pass (one global KDTree match + batched
     per-pixel normal-equation solve + closed-form 2×2 polar decomposition) rather
@@ -467,15 +525,21 @@ def compute_strain_field(vecs, ref_yx=None, *, ref_vectors=None,
     n_time = getattr(vecs, "n_time", 0)
     if (flat is None or offs is None or n_time != 0 or len(g_ref) < 2):
         return _compute_strain_field_loop(vecs, g_ref, tol, ny, nx,
-                                          min_matches=min_matches, trim=trim)
+                                          min_matches=min_matches, trim=trim,
+                                          weighted=weighted)
 
+    weights = vector_weights(flat, unit_per_px(vecs)) if weighted else None
     return _compute_strain_field_vectorized(flat, offs[-1], g_ref, tol, ny, nx,
-                                            min_matches=min_matches, trim=trim)
+                                            min_matches=min_matches, trim=trim,
+                                            weights=weights)
 
 
 def _compute_strain_field_loop(vecs, g_ref, tol, ny, nx,
-                               min_matches=DEFAULT_MIN_MATCHES, trim=True) -> StrainField:
+                               min_matches=DEFAULT_MIN_MATCHES, trim=True,
+                               weighted=True) -> StrainField:
     """Per-pixel reference path (5-D / non-CSR / degenerate reference)."""
+    scale = unit_per_px(vecs)
+    weighted = weighted and hasattr(vecs, "at")     # a bare kxy source has no weights
     exx = np.full((ny, nx), np.nan, dtype=np.float32)
     eyy = np.full((ny, nx), np.nan, dtype=np.float32)
     exy = np.full((ny, nx), np.nan, dtype=np.float32)
@@ -485,8 +549,10 @@ def _compute_strain_field_loop(vecs, g_ref, tol, ny, nx,
     nm = np.zeros((ny, nx), dtype=np.int32)
     for iy in range(ny):
         for ix in range(nx):
+            weights = vector_weights(vecs.at(iy, ix), scale) if weighted else None
             r = _fit_pattern_strain_full(vecs.kxy_at(iy, ix), g_ref, tol=tol,
-                                         min_matches=min_matches, trim=trim)
+                                         min_matches=min_matches, trim=trim,
+                                         weights=weights)
             if r is not None:
                 (exx[iy, ix], eyy[iy, ix], exy[iy, ix], omega[iy, ix],
                  cov[iy, ix], res[iy, ix], nm[iy, ix]) = r
@@ -495,7 +561,7 @@ def _compute_strain_field_loop(vecs, g_ref, tol, ny, nx,
 
 def _compute_strain_field_vectorized(flat_buffer, x_off, g_ref, tol, ny, nx,
                                      min_matches=DEFAULT_MIN_MATCHES,
-                                     trim=True) -> StrainField:
+                                     trim=True, weights=None) -> StrainField:
     """Whole-field strain in one pass — see :func:`compute_strain_field`.
 
     Mirrors :func:`fit_pattern_strain` exactly (incl. the min-match gate and the
@@ -543,27 +609,38 @@ def _compute_strain_field_vectorized(flat_buffer, x_off, g_ref, tol, ny, nx,
     Gr = np.vstack([ref_aug_raw[idx0[take0]], ref_aug_cen[idx1[take1]]])
     Gm = np.vstack([kxy[take0], kc[take1]])
     rid = np.concatenate([src_idx[idx0[take0]], src_idx[idx1[take1]]])
+    wv = None
+    if weights is not None:
+        # Each pixel's weights scaled to mean 1, as the per-pixel fit does.
+        w_all = np.asarray(weights, dtype=float)[:Ntot]
+        mean = np.bincount(pix, w_all, minlength=P) / np.maximum(counts, 1)
+        w_all = w_all / mean[pix]
+        wv = np.concatenate([w_all[take0], w_all[take1]])
 
     min_m = max(2, int(min_matches))
 
-    def _normal_eqs(pid, Gr, Gm):
+    def _normal_eqs(pid, Gr, Gm, wv=None):
         """Per-pixel affine normal equations for [gx,gy,1]·M = g_meas: the six
-        unique AᵀA entries + AᵀB (3×2) via scatter-add keyed by pixel."""
+        unique AᵀA entries + AᵀB (3×2) via scatter-add keyed by pixel, each
+        match scaled by its weight ``wv`` when given."""
         ax, ay = Gr[:, 0], Gr[:, 1]
+        one = np.ones_like(ax) if wv is None else wv
+        wx, wy = ax * one, ay * one
+        Gw = Gm * one[:, None]
         AtA = np.zeros((P, 3, 3))
         AtB = np.zeros((P, 3, 2))
-        np.add.at(AtA[:, 0, 0], pid, ax * ax)
-        np.add.at(AtA[:, 0, 1], pid, ax * ay)
-        np.add.at(AtA[:, 0, 2], pid, ax)
-        np.add.at(AtA[:, 1, 1], pid, ay * ay)
-        np.add.at(AtA[:, 1, 2], pid, ay)
-        np.add.at(AtA[:, 2, 2], pid, np.ones_like(ax))
+        np.add.at(AtA[:, 0, 0], pid, wx * ax)
+        np.add.at(AtA[:, 0, 1], pid, wx * ay)
+        np.add.at(AtA[:, 0, 2], pid, wx)
+        np.add.at(AtA[:, 1, 1], pid, wy * ay)
+        np.add.at(AtA[:, 1, 2], pid, wy)
+        np.add.at(AtA[:, 2, 2], pid, one)
         AtA[:, 1, 0] = AtA[:, 0, 1]
         AtA[:, 2, 0] = AtA[:, 0, 2]
         AtA[:, 2, 1] = AtA[:, 1, 2]
-        np.add.at(AtB[:, 0, :], pid, ax[:, None] * Gm)
-        np.add.at(AtB[:, 1, :], pid, ay[:, None] * Gm)
-        np.add.at(AtB[:, 2, :], pid, Gm)
+        np.add.at(AtB[:, 0, :], pid, ax[:, None] * Gw)
+        np.add.at(AtB[:, 1, :], pid, ay[:, None] * Gw)
+        np.add.at(AtB[:, 2, :], pid, Gw)
         matched = np.zeros(P, dtype=np.int64); np.add.at(matched, pid, 1)
         detAtA = np.linalg.det(AtA)
         good = (matched >= min_m) & np.isfinite(detAtA) & (np.abs(detAtA) > 1e-12)
@@ -577,7 +654,7 @@ def _compute_strain_field_vectorized(flat_buffer, x_off, g_ref, tol, ny, nx,
         model = np.einsum('kj,kjl->kl', A, sol[pid])                # (K, 2)
         return np.linalg.norm(Gm - model, axis=1)
 
-    sol, good, matched = _normal_eqs(pid, Gr, Gm)
+    sol, good, matched = _normal_eqs(pid, Gr, Gm, wv)
     if trim and len(pid):
         # One trimming pass (same thresholds as _fit_pattern_strain_full): drop
         # matches whose residual exceeds 2.5× their pixel's RMS (abs floor) or
@@ -593,7 +670,9 @@ def _compute_strain_field_vectorized(flat_buffer, x_off, g_ref, tol, ny, nx,
         keep |= ~good[pid]
         if not keep.all():
             pid, Gr, Gm, rid = pid[keep], Gr[keep], Gm[keep], rid[keep]
-            sol, good, matched = _normal_eqs(pid, Gr, Gm)
+            if wv is not None:
+                wv = wv[keep]
+            sol, good, matched = _normal_eqs(pid, Gr, Gm, wv)
 
     # Coverage = #distinct reference reflections matched / len(g_ref), from the
     # FINAL (post-trim) match set.

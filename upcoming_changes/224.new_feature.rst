@@ -1,0 +1,1 @@
+Strain maps now weight each diffraction vector by how well it is located: its confidence over the square of its positional sigma, with a 0.1 px floor. Faint, uncertain spots no longer pull the fit as hard as sharp ones, which makes the maps smoother. Vectors that carry no confidence fit exactly as before. These are vectors saved by earlier versions, or found with NXCORR or DoG.
