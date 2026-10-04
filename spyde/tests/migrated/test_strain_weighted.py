@@ -98,10 +98,10 @@ class TestVectorWeights:
     def test_confidence_over_sigma_squared_with_a_floor(self):
         rows = np.zeros((2, N_COLS))
         rows[:, COL_CONFIDENCE] = [0.9, 0.3]
-        rows[:, COL_SIGMA] = [0.0, 0.2]
+        rows[:, COL_SIGMA] = [0.01, 0.2]
         w = vector_weights(rows, unit_per_pixel=2.0)
         floor = WEIGHT_FLOOR_PX * 2.0
-        np.testing.assert_allclose(w, [0.9 / floor ** 2, 0.3 / (0.04 + floor ** 2)])
+        np.testing.assert_allclose(w, [0.9 / (0.0001 + floor ** 2), 0.3 / (0.04 + floor ** 2)])
 
     def test_a_row_without_confidence_gets_the_median_weight(self):
         rows = np.zeros((3, N_COLS))
@@ -114,6 +114,14 @@ class TestVectorWeights:
         rows = np.full((4, N_COLS), np.nan)
         assert vector_weights(rows) is None
         assert vector_weights(np.zeros((4, LEGACY_N_COLS))) is None
+        assert vector_weights(np.zeros((4, N_COLS))) is None   # columns left at zero
+
+    def test_a_pixel_whose_weights_are_all_zero_fits_unweighted(self):
+        v = _vectors()
+        v.flat_buffer[:, COL_CONFIDENCE] = 0.0
+        weighted = compute_strain_field(v, ref_vectors=G_REF, robust=None, one_per_reflection=False)
+        plain = compute_strain_field(v, ref_vectors=G_REF, robust=None, one_per_reflection=False, weighted=False)
+        np.testing.assert_allclose(weighted.exx, plain.exx, atol=1e-7)
 
 
 # A wider lattice (40 px) so the match radius (a quarter of it, 10 px) admits

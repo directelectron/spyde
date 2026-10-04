@@ -211,8 +211,8 @@ def vector_weights(rows: np.ndarray, unit_per_pixel: float = 1.0):
     The floor is there because sigma is the photon-noise limit only — on a
     bright disk it is ~0.01 px while the centre actually scatters by tenths of a
     pixel — so without it a few bright disks would carry the whole fit. A row
-    with no confidence or sigma (vectors from an older file, or a method other
-    than the network) gets the median weight. ``None`` when no row has them, so
+    with no confidence or sigma (vectors from an older file, a method other
+    than the network, or columns left at zero) gets the median weight. ``None`` when no row has them, so
     such vectors fit exactly as before."""
     from spyde.signals.diffraction_vectors import COL_CONFIDENCE, COL_SIGMA
 
@@ -221,7 +221,8 @@ def vector_weights(rows: np.ndarray, unit_per_pixel: float = 1.0):
         return None
     confidence = rows[:, COL_CONFIDENCE].astype(float)
     sigma = rows[:, COL_SIGMA].astype(float)
-    known = np.isfinite(confidence) & np.isfinite(sigma)
+    # A measured sigma is never zero; zeros mean the columns were never filled.
+    known = np.isfinite(confidence) & np.isfinite(sigma) & (sigma > 0)
     if not known.any():
         return None
     weights = np.empty(len(rows))
@@ -309,7 +310,8 @@ def _fit_pattern_strain_full(g_meas, g_ref, *, tol, min_matches=DEFAULT_MIN_MATC
     g_meas = np.asarray(g_meas, dtype=float).reshape(-1, 2)
     if weights is not None:
         weights = np.asarray(weights, dtype=float).reshape(-1)
-        weights = weights / weights.mean()
+        mean = weights.mean()
+        weights = weights / mean if mean > 0 else np.ones_like(weights)
     g_ref = np.asarray(g_ref, dtype=float).reshape(-1, 2)
     if len(g_meas) < 2 or len(g_ref) < 2:
         return None
@@ -721,7 +723,7 @@ def _compute_strain_field_vectorized(flat_buffer, x_off, g_ref, tol, ny, nx,
         # Each pixel's weights scaled to mean 1, as the per-pixel fit does.
         w_all = np.asarray(weights, dtype=float)[:Ntot]
         mean = np.bincount(pix, w_all, minlength=P) / np.maximum(counts, 1)
-        w_all = w_all / mean[pix]
+        w_all = np.where(mean[pix] > 0, w_all / np.where(mean > 0, mean, 1.0)[pix], 1.0)
         wv = np.concatenate([w_all[take0], w_all[take1]])
 
     min_m = max(2, int(min_matches))
