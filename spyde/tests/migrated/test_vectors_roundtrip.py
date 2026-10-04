@@ -20,7 +20,7 @@ import numpy as np
 import hyperspy.api as hs
 import pytest
 
-from spyde.signals.diffraction_vectors import SpyDEDiffractionVectors, _AxisLite
+from spyde.signals.diffraction_vectors import N_COLS, SpyDEDiffractionVectors, _AxisLite
 from spyde.signals.dense_diffraction_vectors import (
     DenseDiffractionVectors,
     to_dense_signal,
@@ -73,7 +73,7 @@ def _make_vecs_5d(nt=2, ny=3, nx=4, seed=1):
 
 
 def _assert_vecs_equal(a, b):
-    assert np.array_equal(a.flat_buffer, b.flat_buffer)
+    assert np.array_equal(a.flat_buffer, b.flat_buffer, equal_nan=True)
     assert a.full_nav_shape == b.full_nav_shape
     assert a.nav_shape == b.nav_shape
     assert a.kernel_radius_px == b.kernel_radius_px
@@ -91,7 +91,7 @@ class TestDenseConversion:
         vecs = _make_vecs_4d()
         sig = to_dense_signal(vecs)
         assert isinstance(sig, DenseDiffractionVectors)
-        assert sig.data.shape == (len(vecs.flat_buffer), 6)
+        assert sig.data.shape == (len(vecs.flat_buffer), N_COLS)
         assert is_dense_vectors_signal(sig)
         _assert_vecs_equal(vecs, from_dense_signal(sig))
 
@@ -107,11 +107,11 @@ class TestDenseConversion:
         assert sig.metadata.get_item("Signal.signal_type") == SIGNAL_TYPE
 
     def test_column_names_in_metadata(self):
-        """The dense (N,6) buffer is self-documenting for external readers
+        """The dense (N, 8) buffer is self-documenting for external readers
         (mirrors pyxem DiffractionVectors2D's VectorMetadata.column_names)."""
         sig = to_dense_signal(_make_vecs_4d())
         cn = list(sig.metadata.get_item("SpyDE.DiffractionVectors.column_names"))
-        assert cn == ["nav_x", "nav_y", "kx", "ky", "time", "intensity"]
+        assert cn == ["nav_x", "nav_y", "kx", "ky", "time", "intensity", "confidence", "sigma"]
 
     def test_empty_vectors_roundtrip(self, tmp_path):
         """A result with zero vectors must still save/load (zarr can't chunk a
@@ -123,7 +123,7 @@ class TestDenseConversion:
         p = str(tmp_path / "empty.zspy")
         to_dense_signal(empty).save(p)
         v2 = from_dense_signal(hs.load(p))
-        assert v2.flat_buffer.shape == (0, 6)
+        assert v2.flat_buffer.shape == (0, N_COLS)
         assert int(v2.count_map().sum()) == 0
         assert v2.count_map().shape == (3, 4)
 

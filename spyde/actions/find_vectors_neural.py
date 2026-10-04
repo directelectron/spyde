@@ -4,10 +4,15 @@ A third detection method alongside NXCORR and DoG (see ``find_vectors.py``). The
 network (``spyde.models``) is a parameter-free detector: it auto-estimates the
 disk size, runs a small U-Net, and returns subpixel spot positions + a confidence
 score, with its own local-max NMS baked into the decode. So this module is thin —
-it adapts the model's ``(N,3) [y,x,score]`` output to the find-vectors
+it adapts the model's ``[y, x, score, width]`` output to the find-vectors
 ``(corr_map, raw_response, peaks)`` contract, applies the beam-stop rejection the
-same way the other methods do, and (critically) replaces the confidence column
-with the raw disk-mean frame intensity every method stores.
+same way the other methods do, and builds the per-peak record every method
+stores: ``[y, x, intensity, confidence, sigma]`` — the raw disk-mean frame
+intensity, the network's heatmap peak, and the centre's positional uncertainty
+(:func:`spyde.models.centre.positional_sigma`).
+
+Centres are the soft-argmax of the heatmap over each disk
+(:mod:`spyde.models.centre`); ``centre="offset"`` restores the frozen decode.
 
 GPU/CPU: the batch path runs the whole nav chunk through one forward pass on the
 torch GPU when available (``torch_gpu_device()``), per-frame on CPU otherwise —
@@ -73,6 +78,57 @@ def _apply_beamstop(peaks_yx: np.ndarray, beamstop_mask: Optional[np.ndarray],
     return peaks_yx[keep]
 
 
+def _counts_radius(frame: np.ndarray, spot_radius: Optional[float]) -> float:
+    """Radius (px) of the aperture a disk's counts are read in for its sigma: the
+    user's Spot size, else the same autocorrelation disk-size estimate the network
+    scales by. The batch reads it once per block (first frame), as it does the scale."""
+    if spot_radius:
+        return float(spot_radius)
+    from spyde.models.preprocess import estimate_disk_diameter
+    d = estimate_disk_diameter(np.asarray(frame, np.float32))
+    return float(np.clip(0.5 * d, 2.0, 64.0)) if np.isfinite(d) else _INTENSITY_RADIUS
+
+
+def _disk_counts(frame: np.ndarray, pos: np.ndarray, radius: float):
+    """Background-subtracted counts inside ``radius`` of each ``(y, x)`` and the
+    background level per pixel (median of the ring 1-4 px outside the disk)."""
+    r_out = radius + 4.0
+    half = int(np.ceil(r_out)) + 1
+    padded = np.pad(np.asarray(frame, np.float32), half, mode="edge")
+    iy = np.rint(pos[:, 0]).astype(np.intp)
+    ix = np.rint(pos[:, 1]).astype(np.intp)
+    d = np.arange(-half, half + 1)
+    gy = np.clip((iy[:, None] + half + d[None, :])[:, :, None], 0, padded.shape[0] - 1)
+    gx = np.clip((ix[:, None] + half + d[None, :])[:, None, :], 0, padded.shape[1] - 1)
+    crops = padded[gy, gx]                                       # (N, P, P)
+    ry = (iy[:, None] + d[None, :])[:, :, None] - pos[:, 0, None, None]
+    rx = (ix[:, None] + d[None, :])[:, None, :] - pos[:, 1, None, None]
+    r = np.sqrt(ry * ry + rx * rx)
+    ring = (r > radius + 1.0) & (r <= r_out)
+    background = np.array([np.median(c[m]) if m.any() else 0.0 for c, m in zip(crops, ring)],
+                          dtype=np.float64)
+    inside = r <= radius
+    signal = ((crops - background[:, None, None]) * inside).sum((1, 2))
+    return signal, background
+
+
+def _neural_peaks(frame: np.ndarray, pred: np.ndarray, counts_radius: float) -> np.ndarray:
+    """The model's ``(N, 4) [y, x, score, width]`` -> the stored peak record
+    ``(N, PEAK_COLS) [y, x, intensity, confidence, sigma]``. One function for the
+    batch and the single-frame preview, so both give identical columns."""
+    from spyde.actions.find_vectors import PEAK_COLS, _disk_mean_intensity
+    from spyde.models.centre import positional_sigma
+
+    if pred.size == 0:
+        return np.zeros((0, PEAK_COLS), dtype=np.float32)
+    f = np.asarray(frame, np.float32)
+    pos = pred[:, :2]
+    intensity = _disk_mean_intensity(f, pos[:, 0], pos[:, 1], _INTENSITY_RADIUS)
+    signal, background = _disk_counts(f, pos, counts_radius)
+    sigma = positional_sigma(pred[:, 3], signal, background)
+    return np.column_stack([pos, intensity, pred[:, 2], sigma]).astype(np.float32)
+
+
 def _heatmap_response(frame_shape, peaks_yx, threshold) -> np.ndarray:
     """A sparse confidence map for the "show transform" preview toggle: the model's
     per-peak score painted at each detected pixel. (The full dense heatmap isn't
@@ -99,15 +155,16 @@ def _find_vectors_single_frame_neural(
                                        # None → auto (12, size-scaled for big disks).
     spot_radius: Optional[float] = None,   # user Spot-size (px radius) override for
                                            # the canonical rescale; None → auto.
+    centre: str = "softargmax",            # "offset" = the frozen decode position
 ):
     """Neural detector for one diffraction pattern.
 
     Returns ``(corr_map, raw_response, peaks)`` mirroring
-    :func:`find_vectors._find_vectors_single_frame_dog`. ``peaks`` is ``(N, 3)``
-    float32 ``[ky, kx, raw_intensity]`` (the model's position with its confidence
-    replaced by the robust disk-mean frame intensity)."""
+    :func:`find_vectors._find_vectors_single_frame_dog`. ``peaks`` is
+    ``(N, PEAK_COLS)`` float32 ``[ky, kx, raw_intensity, confidence, sigma]`` —
+    see :func:`_neural_peaks`."""
     from spyde import models
-    from spyde.actions.find_vectors import _disk_mean_intensity
+    from spyde.actions.find_vectors import PEAK_COLS
     from spyde.device_lock import accelerator_lock
 
     f = np.asarray(frame, dtype=np.float32)
@@ -121,20 +178,17 @@ def _find_vectors_single_frame_neural(
         pred = models.detect(model, f, device, thresh=float(threshold),
                              min_distance=int(min_distance),
                              bg_sigma=(float(bg_sigma) if bg_sigma is not None else None),
-                             spot_diameter=(2.0 * spot_radius) if spot_radius else None)
-    pred = np.asarray(pred, dtype=np.float32).reshape(-1, 3)
+                             spot_diameter=(2.0 * spot_radius) if spot_radius else None,
+                             centre=centre, with_width=True)
+    pred = np.asarray(pred, dtype=np.float32).reshape(-1, 4)
     pred = _apply_beamstop(pred, beamstop_mask, f.shape)
 
     raw_response = _heatmap_response(f.shape, pred, threshold)
     corr_map = raw_response  # already thresholded (only kept peaks are painted)
 
     if pred.size == 0:
-        return corr_map, raw_response, np.zeros((0, 3), dtype=np.float32)
-
-    pos = pred[:, :2]
-    intens = _disk_mean_intensity(f, pos[:, 0], pos[:, 1], _INTENSITY_RADIUS)
-    peaks = np.column_stack([pos, intens]).astype(np.float32)
-    return corr_map, raw_response, peaks
+        return corr_map, raw_response, np.zeros((0, PEAK_COLS), dtype=np.float32)
+    return corr_map, raw_response, _neural_peaks(f, pred, _counts_radius(f, spot_radius))
 
 
 def _persistence_filter(peaks_grid, ny, nx, tol=3.0, min_neighbors=2):
@@ -163,8 +217,8 @@ def _persistence_filter(peaks_grid, ny, nx, tol=3.0, min_neighbors=2):
                                                       nb[:, 1] - p[1])) <= tol)
             if hits >= min_neighbors:
                 keep.append(p)
-        filtered.append(np.asarray(keep, np.float32).reshape(-1, 3)
-                        if keep else np.zeros((0, 3), np.float32))
+        filtered.append(np.asarray(keep, np.float32).reshape(-1, peaks.shape[1])
+                        if keep else np.zeros((0, peaks.shape[1]), np.float32))
     return filtered
 
 
@@ -189,12 +243,25 @@ def _refine_block(peaks_grid, ny, nx, flat, beamstop_mask):
         if len(peaks) == 0 or len(nbr_idx) < 2:
             out.append(peaks)            # too few neighbours -> don't risk dropping real
             continue
-        nbrs = [peaks_grid[j] for j in nbr_idx]
-        out.append(_refine_mod.refine(
-            peaks, nbrs, frame_shape=(H, W),
+        nbrs = [peaks_grid[j][:, :3] for j in nbr_idx]
+        kept = _refine_mod.refine(
+            peaks[:, :3], nbrs, frame_shape=(H, W),
             w_conf=0.2, w_persist=1.0, w_friedel=0.2,
-            keep_score=0.55, min_persist=0.5))
+            keep_score=0.55, min_persist=0.5)
+        out.append(_with_source_columns(kept, peaks))
     return out
+
+
+def _with_source_columns(kept: np.ndarray, peaks: np.ndarray) -> np.ndarray:
+    """``refine`` works on ``[y, x, score]`` and may merge near-duplicates, so its
+    rows are not a subset of ``peaks``. Carry the remaining columns (confidence,
+    sigma) over from the nearest original peak."""
+    kept = np.asarray(kept, np.float32).reshape(-1, 3)
+    if peaks.shape[1] <= 3 or len(kept) == 0:
+        return kept
+    d = np.hypot(kept[:, None, 0] - peaks[None, :, 0], kept[:, None, 1] - peaks[None, :, 1])
+    source = peaks[d.argmin(1)]
+    return np.column_stack([kept, source[:, 3:]]).astype(np.float32)
 
 
 # ── Neural GPU-lane unset-default (reconciled "2" vs "4") ─────────────────────
@@ -229,9 +296,9 @@ def _mps_forward_lock():
 
 
 def _neural_block(b4d, threshold, min_dist, subpixel, beamstop_mask, model_id,
-                  bg_sigma=None, persistence=False, spot_radius=None):
+                  bg_sigma=None, persistence=False, spot_radius=None, centre="softargmax"):
     """Run the neural detector on a (ny, nx, KY, KX) block → NaN-padded
-    (ny, nx, MAX_PEAKS, 3). Batches the whole block through the torch GPU when
+    (ny, nx, MAX_PEAKS, PEAK_COLS). Batches the whole block through the torch GPU when
     available (internally sub-batched by ``detect_batch``, see infer.py, so a
     1000+ frame nav chunk never allocates activations for more than
     ``SPYDE_NEURAL_BATCH`` frames at once); per-frame CPU otherwise. ``bg_sigma``
@@ -261,11 +328,11 @@ def _neural_block(b4d, threshold, min_dist, subpixel, beamstop_mask, model_id,
         session flips the neural lane to CPU (see ``neural_gpu_demoted`` /
         orchestrate's worker-death retry — fix 4) and the run COMPLETES on CPU."""
     from spyde import models
-    from spyde.actions.find_vectors import MAX_PEAKS, _with_raw_intensity
+    from spyde.actions.find_vectors import MAX_PEAKS, PEAK_COLS
     from spyde.actions.find_vectors.gpu_runtime import _gpu_slots, _gpu_task_allowed
     from spyde.actions.find_vectors_torch import torch_gpu_device
 
-    out = np.full((b4d.shape[0], b4d.shape[1], MAX_PEAKS, 3), np.nan, dtype=np.float32)
+    out = np.full((b4d.shape[0], b4d.shape[1], MAX_PEAKS, PEAK_COLS), np.nan, dtype=np.float32)
     flat = b4d.reshape(-1, b4d.shape[2], b4d.shape[3]).astype(np.float32, copy=False)
 
     model, device = models.get_model(model_id)
@@ -312,13 +379,14 @@ def _neural_block(b4d, threshold, min_dist, subpixel, beamstop_mask, model_id,
                         model, flat, device, thresh=float(threshold),
                         min_distance=int(min_dist),
                         bg_sigma=(float(bg_sigma) if bg_sigma is not None else None),
-                        spot_diameter=(2.0 * spot_radius) if spot_radius else None)
+                        spot_diameter=(2.0 * spot_radius) if spot_radius else None,
+                        centre=centre, with_width=True)
+            counts_radius = _counts_radius(flat[0], spot_radius)
             peaks_list = []
             for i, p in enumerate(raw):
-                p = _apply_beamstop(np.asarray(p, np.float32).reshape(-1, 3),
+                p = _apply_beamstop(np.asarray(p, np.float32).reshape(-1, 4),
                                     beamstop_mask, flat[i].shape)
-                # Model col 2 is confidence → replace with raw disk-mean intensity.
-                peaks_list.append(_with_raw_intensity(flat[i], p, radius=_INTENSITY_RADIUS))
+                peaks_list.append(_neural_peaks(flat[i], p, counts_radius))
     except Exception as _e:
         log.warning("[find_vectors] torch neural GPU path failed (%s); CPU per-frame", _e)
         peaks_list = None
@@ -328,7 +396,7 @@ def _neural_block(b4d, threshold, min_dist, subpixel, beamstop_mask, model_id,
             _find_vectors_single_frame_neural(
                 frame, threshold, min_dist, subpixel=subpixel,
                 beamstop_mask=beamstop_mask, model_id=model_id, bg_sigma=bg_sigma,
-                spot_radius=spot_radius)[2]
+                spot_radius=spot_radius, centre=centre)[2]
             for frame in flat
         ]
 
@@ -340,7 +408,7 @@ def _neural_block(b4d, threshold, min_dist, subpixel, beamstop_mask, model_id,
         iy, ix = divmod(i, b4d.shape[1])
         n = min(len(peaks), MAX_PEAKS)
         if n > 0:
-            out[iy, ix, :n, :] = peaks[:n]
+            out[iy, ix, :n, :peaks.shape[1]] = peaks[:n]
     return out
 
 
@@ -352,10 +420,10 @@ def _find_vectors_chunk_neural(
     """Neural variant of ``_find_vectors_chunk``: nav-blur + ghost-trim (shared with
     the other methods), then the neural detector per frame (GPU-batched when torch
     CUDA/MPS is present). Same output structure as the NXCORR/DoG chunk fns —
-    ``(nav_y, nav_x, MAX_PEAKS, 3)`` (4D) or ``(t, ..., MAX_PEAKS, 3)`` (5D)."""
+    ``(nav_y, nav_x, MAX_PEAKS, PEAK_COLS)`` (4D) or ``(t, ..., MAX_PEAKS, PEAK_COLS)`` (5D)."""
     import time
 
-    from spyde.actions.find_vectors import MAX_PEAKS, _nav_blur_trim
+    from spyde.actions.find_vectors import MAX_PEAKS, PEAK_COLS, _nav_blur_trim
 
     from spyde.actions.find_vectors.chunk import nav_blur, trim_ghost
 
@@ -383,7 +451,7 @@ def _find_vectors_chunk_neural(
                                spot_radius)
     else:
         n_lead = nav_shape[0]
-        out = np.full((n_lead, ny, nx, MAX_PEAKS, 3), np.nan, dtype=np.float32)
+        out = np.full((n_lead, ny, nx, MAX_PEAKS, PEAK_COLS), np.nan, dtype=np.float32)
         for t in range(n_lead):
             out[t] = _neural_block(blurred[t], threshold, min_dist, subpixel,
                                    beamstop_mask, model_id, bg_sigma, persistence,

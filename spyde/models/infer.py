@@ -19,7 +19,7 @@ import sys
 import numpy as np
 import torch
 
-from .decode import decode, decode_batch, split_by_batch
+from .centre import CENTRE_SOFTARGMAX, decode_batch_centres
 from .preprocess import estimate_disk_diameter, normalize_input, scale_to_canonical
 from .unet import SpotUNet
 
@@ -222,11 +222,39 @@ def bg_sigma_from_peak_size(peak_diameter_px: float) -> float:
 
 
 @torch.no_grad()
+def _centre_radius(work_diam: float, md: int) -> float:
+    """Soft-argmax window (working px): the disk's radius, but never past the
+    NMS distance, so a neighbouring disk's response is not averaged in."""
+    r = 0.5 * float(work_diam) if np.isfinite(work_diam) and work_diam > 0 else float(md)
+    return float(max(1.5, min(r, md)))
+
+
+def _frame_rows(res, factor: float, with_width: bool) -> np.ndarray:
+    """``decode_batch_centres`` rows of one frame -> ``[y, x, score(, width)]``
+    in original-frame pixels."""
+    res = res.detach().cpu().numpy() if hasattr(res, "detach") else np.asarray(res)
+    cols = [1, 2, 3, 4] if with_width else [1, 2, 3]
+    out = res[:, cols].astype(np.float32, copy=True)
+    if len(out) and factor != 1.0:
+        out[:, :2] = out[:, :2] / factor          # map back to original coords
+        if with_width:
+            out[:, 3] = out[:, 3] / factor
+    return out
+
+
 def detect(model, frame: np.ndarray, device, thresh: float = 0.3,
            min_distance: int = 4, auto_scale: bool = True,
            bg_sigma: float | None = None,
-           spot_diameter: float | None = None):
-    """Detect spots in a single frame. Returns (N,3) [y,x,score] in ORIGINAL coords.
+           spot_diameter: float | None = None,
+           centre: str = CENTRE_SOFTARGMAX,
+           with_width: bool = False):
+    """Detect spots in a single frame. Returns (N,3) [y,x,score] in ORIGINAL coords
+    (``with_width``: (N,4) [y,x,score,width], width in original pixels).
+
+    ``centre`` picks where a found disk is placed: ``"softargmax"`` (default) — the
+    softmax-weighted mean of the heatmap over the disk, see :mod:`.centre`; or
+    ``"offset"`` — the frozen decode (argmax pixel + offset head). The set of
+    disks found is the same either way.
 
     Estimates disk size, rescales to canonical, runs the model, maps positions back.
     ``bg_sigma`` is the local-norm high-pass scale (set by ``calibrate`` for diffuse
@@ -248,11 +276,9 @@ def detect(model, frame: np.ndarray, device, thresh: float = 0.3,
     nrm = _pad_to_multiple(nrm, levels)
     x = torch.from_numpy(nrm[None, None]).to(device)
     hm, off = model(x)
-    pred = decode(hm[0], off[0], thresh=thresh, min_distance=md)
-    if len(pred) and factor != 1.0:
-        pred = pred.copy()
-        pred[:, :2] = pred[:, :2] / factor          # map back to original coords
-    return pred
+    res = decode_batch_centres(hm, off, thresh=thresh, min_distance=md,
+                               radius=_centre_radius(work_diam, md), centre=centre)
+    return _frame_rows(res, factor, with_width)
 
 
 def _neural_sub_batch_size() -> int:
@@ -358,8 +384,13 @@ def _build_input_stack(frames: np.ndarray, device, factor: float, bg_sigma: floa
 def detect_batch(model, frames, device, thresh: float = 0.3,
                  min_distance: int = 4, auto_scale: bool = True,
                  shared_scale: bool = True, bg_sigma: float | None = None,
-                 spot_diameter: float | None = None):
+                 spot_diameter: float | None = None,
+                 centre: str = CENTRE_SOFTARGMAX,
+                 with_width: bool = False):
     """Detect spots in a STACK of frames in one forward pass.
+
+    ``centre`` and ``with_width`` as in :func:`detect` — the same placement, so the
+    batch and the single-frame preview give the same centres.
 
     ``frames`` is an (N,H,W) array (or a sequence of (H,W) arrays). Returns a list
     of N (Ni,3) [y,x,score] arrays in ORIGINAL frame coordinates — the same per-frame
@@ -402,6 +433,7 @@ def detect_batch(model, frames, device, thresh: float = 0.3,
     md = max(2, int(round(min_distance * factor)))
     work_diam = _estimate_work_diam(frames[0], factor, spot_diameter)
     md, bg_sigma = _big_disk_params(md, bg_sigma, work_diam)
+    radius = _centre_radius(work_diam, md)
 
     levels = int(getattr(model, "levels", 2))
     # Padded (N,1,H',W') U-Net input — built on the model device (GPU) or on the
@@ -425,18 +457,16 @@ def detect_batch(model, frames, device, thresh: float = 0.3,
         # _neural_block) — no extra handling needed here.
         hm, off, cur_model, cur_device = _forward_with_cpu_retry(
             cur_model, cur_device, chunk)
-        res = decode_batch(hm, off, thresh=thresh, min_distance=md)
-        per_frame.extend(split_by_batch(res, chunk.shape[0]))
+        res = decode_batch_centres(hm, off, thresh=thresh, min_distance=md,
+                                   radius=radius, centre=centre)
+        b = res[:, 0].long().cpu().numpy() if len(res) else np.zeros(0, np.int64)
+        res_np = res.cpu().numpy()
+        for f in range(chunk.shape[0]):
+            per_frame.append(_frame_rows(res_np[b == f], factor, with_width))
         del hm, off, res
         if cur_device.type == "cuda":
             torch.cuda.empty_cache()
 
-    if factor != 1.0:
-        for i, p in enumerate(per_frame):
-            if len(p):
-                p = p.copy()
-                p[:, :2] = p[:, :2] / factor
-                per_frame[i] = p
     return per_frame
 
 

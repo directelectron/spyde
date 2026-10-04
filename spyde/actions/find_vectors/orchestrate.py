@@ -32,7 +32,9 @@ from spyde.actions.find_vectors.detectors import (
     _get_disk_fft,
     _make_disk,
 )
-from spyde.actions.find_vectors.gpu_runtime import MAX_PEAKS
+from spyde.actions.find_vectors.gpu_runtime import (
+    MAX_PEAKS, PEAK_COLS, PEAK_CONFIDENCE, PEAK_INTENSITY, PEAK_KX, PEAK_KY, PEAK_SIGMA,
+)
 
 log = logging.getLogger(__name__)
 
@@ -338,7 +340,8 @@ def _do_compute_vectors(
     import functools
     import dask.array as da
     from spyde.signals.diffraction_vectors import (
-        N_COLS, COL_KX, COL_KY, COL_TIME, COL_INTENSITY, SpyDEDiffractionVectors
+        N_COLS, COL_KX, COL_KY, COL_TIME, COL_INTENSITY, COL_CONFIDENCE, COL_SIGMA,
+        SpyDEDiffractionVectors,
     )
     import time
 
@@ -486,8 +489,8 @@ def _do_compute_vectors(
     # ── Build the map_overlap graph ───────────────────────────────────────────
     # trim=False: chunk_fn receives the full ghost-padded block and handles
     # trimming itself so the blur can use all ghost rows for correct boundaries.
-    # drop_axis removes (ky, kx); new_axis adds (MAX_PEAKS, 3).
-    # Output: (nav_y, nav_x, MAX_PEAKS, 3) [4D] or (t, ny, nx, MAX_PEAKS, 3) [5D].
+    # drop_axis removes (ky, kx); new_axis adds (MAX_PEAKS, PEAK_COLS).
+    # Output: (nav_y, nav_x, MAX_PEAKS, PEAK_COLS) [4D] or (t, ny, nx, MAX_PEAKS, PEAK_COLS) [5D].
     # Ghost zones only on the two spatial nav dims — the leading (time) axis
     # has blur sigma 0, so overlapping it would be pure overhead (and the
     # chunk fn does not trim it).
@@ -496,7 +499,7 @@ def _do_compute_vectors(
     depth_dict[nav_dim - 1] = depth_px
     sig_axes_idx = list(range(nav_dim, nav_dim + sig_dim))
     new_axes_idx = list(range(nav_dim, nav_dim + 2))
-    out_chunks = da_data.chunks[:nav_dim] + ((MAX_PEAKS,), (3,))
+    out_chunks = da_data.chunks[:nav_dim] + ((MAX_PEAKS,), (PEAK_COLS,))
 
     chunk_fn = functools.partial(
         _find_vectors_chunk,
@@ -748,14 +751,14 @@ def _do_compute_vectors(
         return None
 
     # ── Unpack padded result into flat buffer (vectorised) ───────────────────
-    # result_padded shape: (nav_y, nav_x, MAX_PEAKS, 3)  [4D]
-    #                   or (t, nav_y, nav_x, MAX_PEAKS, 3) [5D]
+    # result_padded shape: (nav_y, nav_x, MAX_PEAKS, PEAK_COLS)  [4D]
+    #                   or (t, nav_y, nav_x, MAX_PEAKS, PEAK_COLS) [5D]
     # Valid peaks have finite ky (col 0); NaN-padded slots are ignored.
     # np.nonzero returns C-order indices, so the flat buffer comes out already
     # sorted outermost-nav-dim first as SpyDEDiffractionVectors requires.
     valid = np.isfinite(result_padded[..., 0])
     nz = np.nonzero(valid)
-    peaks_flat = result_padded[valid]              # (N_total, 3)
+    peaks_flat = result_padded[valid]              # (N_total, PEAK_COLS)
     N_total = peaks_flat.shape[0]
 
     flat_buffer = np.zeros((N_total, N_COLS), dtype=np.float32)
@@ -767,9 +770,12 @@ def _do_compute_vectors(
         flat_buffer[:, COL_TIME] = t_idx.astype(np.float32)
     flat_buffer[:, 0] = ix_idx
     flat_buffer[:, 1] = iy_idx
-    flat_buffer[:, COL_KX] = peaks_flat[:, 1] * kx_scale + kx_offset
-    flat_buffer[:, COL_KY] = peaks_flat[:, 0] * ky_scale + ky_offset
-    flat_buffer[:, COL_INTENSITY] = peaks_flat[:, 2]
+    flat_buffer[:, COL_KX] = peaks_flat[:, PEAK_KX] * kx_scale + kx_offset
+    flat_buffer[:, COL_KY] = peaks_flat[:, PEAK_KY] * ky_scale + ky_offset
+    flat_buffer[:, COL_INTENSITY] = peaks_flat[:, PEAK_INTENSITY]
+    flat_buffer[:, COL_CONFIDENCE] = peaks_flat[:, PEAK_CONFIDENCE]
+    # sigma is measured in detector pixels; the vectors live in calibrated units
+    flat_buffer[:, COL_SIGMA] = peaks_flat[:, PEAK_SIGMA] * float(np.sqrt(abs(kx_scale * ky_scale)))
 
     # ── Final shm write / completion callback ─────────────────────────────────
     if shm_name is not None or on_chunk_done is not None:

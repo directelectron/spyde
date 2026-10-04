@@ -15,13 +15,32 @@ COL_KX        = 2
 COL_KY        = 3
 COL_TIME      = 4   # -1.0 for 4D datasets (no time axis)
 COL_INTENSITY = 5
-N_COLS        = 6
+# How sure the detector is that a disk is there, 0..1 (the network's heatmap
+# peak). NaN for detectors that do not measure it (NXCORR, DoG).
+COL_CONFIDENCE = 6
+# One standard deviation of the centre, in the same units as kx/ky. NaN for
+# detectors that do not measure it. See spyde.models.centre.positional_sigma.
+COL_SIGMA     = 7
+N_COLS        = 8
 
 # Canonical, positional names for the flat_buffer columns — the single source of
 # truth for "what is in column k". Written into a saved file's metadata
 # (like pyxem's DiffractionVectors2D `VectorMetadata.column_names`) so an external
-# reader can interpret the dense (N, 6) buffer without SpyDE on the path.
-COLUMN_NAMES = ("nav_x", "nav_y", "kx", "ky", "time", "intensity")
+# reader can interpret the dense (N, 8) buffer without SpyDE on the path.
+COLUMN_NAMES = ("nav_x", "nav_y", "kx", "ky", "time", "intensity", "confidence", "sigma")
+# Buffers written before confidence/sigma existed have the first six columns.
+LEGACY_N_COLS = 6
+
+
+def with_all_columns(flat_buffer: np.ndarray) -> np.ndarray:
+    """``flat_buffer`` with every current column: a legacy (N, N_COLS) buffer gains
+    NaN confidence and sigma; a current one is returned unchanged (same object)."""
+    flat_buffer = np.asarray(flat_buffer)
+    if flat_buffer.ndim == 2 and flat_buffer.shape[1] == LEGACY_N_COLS:
+        padded = np.full((flat_buffer.shape[0], N_COLS), np.nan, dtype=np.float32)
+        padded[:, :LEGACY_N_COLS] = flat_buffer
+        return padded
+    return flat_buffer
 
 
 def _build_nav_offsets(
@@ -101,7 +120,7 @@ def _render_disks_block(
 
     Parameters
     ----------
-    rows : (N, 6) flat-buffer rows whose nav coords fall inside this block
+    rows : (N, N_COLS) flat-buffer rows whose nav coords fall inside this block
     block_nav_shape : nav shape of the block — (ny, nx) or (nt, ny, nx)
     sig_hw : (H, W) frame shape in pixels
     x_scale, x_offset, y_scale, y_offset : signal-axis calibration
@@ -154,7 +173,7 @@ class SpyDEDiffractionVectors(RaggedStore):
     """
     Flat-buffer CSR storage for diffraction vectors across a scan.
 
-    flat_buffer : (N_total, 6) float32
+    flat_buffer : (N_total, N_COLS) float32
         columns: [nav_x, nav_y, kx, ky, time, intensity]
         Sorted outermost-nav-dim first: (t, iy, ix) for 5D; (iy, ix) for 4D.
         time = -1.0 for 4D datasets.
@@ -202,7 +221,7 @@ class SpyDEDiffractionVectors(RaggedStore):
     # asserted at import, right below the class.
     columns_schema: ClassVar[tuple] = tuple((n, "f4") for n in COLUMN_NAMES)
 
-    flat_buffer:    np.ndarray          # (N_total, 6) float32
+    flat_buffer:    np.ndarray          # (N_total, N_COLS) float32
     nav_offsets:    List[np.ndarray]    # outermost-first CSR levels
     nav_shape:      tuple               # (nav_y, nav_x)
     full_nav_shape: tuple               # all nav dims outermost-first
@@ -240,6 +259,7 @@ class SpyDEDiffractionVectors(RaggedStore):
         is what keeps pickling size and the 4-D
         ``offsets is nav_offsets[-1]`` relationship unchanged.
         """
+        self.flat_buffer = with_all_columns(self.flat_buffer)
         self._packed = self.flat_buffer
         self._columns = None
         self._levels = self.nav_offsets
@@ -275,7 +295,7 @@ class SpyDEDiffractionVectors(RaggedStore):
 
     def slice_at(self, *nav_indices: int) -> np.ndarray:
         """
-        Return the (N, 6) flat_buffer slice at the given nav indices.
+        Return the (N, N_COLS) flat_buffer slice at the given nav indices.
 
         Partial indexing (fewer indices than nav dims) uses the outer-level
         vector offsets for an O(1) slice of the flat buffer.
@@ -291,7 +311,7 @@ class SpyDEDiffractionVectors(RaggedStore):
         return self.flat_buffer[s:e]
 
     def at(self, iy: int, ix: int) -> np.ndarray:
-        """(N, 6) slice at spatial position (iy, ix) across ALL time steps.
+        """(N, N_COLS) slice at spatial position (iy, ix) across ALL time steps.
         For 4D equivalent to slice_at(iy, ix) — O(1).
         For 5D returns vectors from all t at (iy, ix) — O(N_frame * n_t) scan.
         For 5D per-time access use slice_at(t, iy, ix) instead."""
@@ -308,7 +328,7 @@ class SpyDEDiffractionVectors(RaggedStore):
         return np.concatenate(chunks) if chunks else self.flat_buffer[:0]
 
     def at_t(self, iy: int, ix: int, t: int) -> np.ndarray:
-        """(N, 6) slice at spatial position (iy, ix) for time step t. O(1)."""
+        """(N, N_COLS) slice at spatial position (iy, ix) for time step t. O(1)."""
         if self.n_time > 0:
             return self._slice_flat((t, iy, ix))
         return self.at(iy, ix)  # 4D: no time axis
@@ -318,7 +338,7 @@ class SpyDEDiffractionVectors(RaggedStore):
         return self.at(iy, ix)[:, COL_KX:COL_KY + 1]
 
     def at_nav(self, iy: int, ix: int, lead: tuple = ()) -> np.ndarray:
-        """(N, 6) slice at the FULL nav position.
+        """(N, N_COLS) slice at the FULL nav position.
 
         ``lead`` holds the outer nav coords above the 2-D scan (e.g. the stack /
         time index of a 5-D dataset), in outermost-first data order. With no lead
@@ -381,7 +401,7 @@ class SpyDEDiffractionVectors(RaggedStore):
         return self.count_map_series()[t]
 
     # flatten() is inherited from RaggedStore (the packed backing IS
-    # flat_buffer, so it returns the same (N_total, 6) object it always did).
+    # flat_buffer, so it returns the same (N_total, N_COLS) object it always did).
 
     # ── Virtual imaging ───────────────────────────────────────────────────────
 
@@ -676,7 +696,7 @@ class SpyDEDiffractionVectors(RaggedStore):
     # ── Dense conversion ──────────────────────────────────────────────────────
 
     def to_dense(self, fill_value: float = np.nan, max_vectors: int = None) -> np.ndarray:
-        """Convert to dense (nav_y, nav_x, max_n, 6) array. Cached after first call."""
+        """Convert to dense (nav_y, nav_x, max_n, N_COLS) array. Cached after first call."""
         if self._dense_cache is not None:
             return self._dense_cache
 
@@ -975,7 +995,7 @@ class SpyDEDiffractionVectors(RaggedStore):
             raise NotImplementedError(
                 "nav_offsets for >3 nav dims requires explicit outer columns")
         staged = cls.streaming(full_nav_shape, index_columns=index_columns)
-        staged.append_batch(np.asarray(flat_buffer))
+        staged.append_batch(with_all_columns(flat_buffer))
         staged.finalize()
         nav_offsets = staged.offset_levels()
         nav_shape = full_nav_shape[-2:]
@@ -1027,5 +1047,5 @@ class SpyDEDiffractionVectors(RaggedStore):
 # would produce plausible garbage, not an error. Freeze the agreement at import.
 assert tuple(n for n, _ in SpyDEDiffractionVectors.columns_schema) == COLUMN_NAMES
 assert (COL_NAV_X, COL_NAV_Y, COL_KX, COL_KY,
-        COL_TIME, COL_INTENSITY) == tuple(range(N_COLS))
+        COL_TIME, COL_INTENSITY, COL_CONFIDENCE, COL_SIGMA) == tuple(range(N_COLS))
 assert len(COLUMN_NAMES) == N_COLS
