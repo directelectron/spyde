@@ -178,9 +178,10 @@ class TestFindVectorsNeural:
 
         def _fake_single(frame, threshold, min_distance, *, subpixel=True,
                          beamstop_mask=None, model_id=None, bg_sigma=12.0,
-                         spot_radius=None):
+                         spot_radius=None, centre_refiner=None):
             seen.update(threshold=threshold, bg_sigma=bg_sigma,
-                        model_id=model_id, spot_radius=spot_radius)
+                        model_id=model_id, spot_radius=spot_radius,
+                        centre_refiner=centre_refiner)
             z = np.zeros(frame.shape, np.float32)
             return z, z, np.zeros((0, 3), np.float32)
 
@@ -353,9 +354,10 @@ class TestFindVectorsNeural:
 
         def _fake_chunk(ghost_block, depth_px, nav_dim, sigma, threshold,
                         min_dist, subpixel, beamstop_mask, model_id=None,
-                        bg_sigma=12.0, persistence=False, spot_radius=None):
+                        bg_sigma=12.0, persistence=False, spot_radius=None,
+                        centre_refiner=None):
             seen.update(persistence=persistence, bg_sigma=bg_sigma,
-                        spot_radius=spot_radius)
+                        spot_radius=spot_radius, centre_refiner=centre_refiner)
             return np.full((ghost_block.shape[0], ghost_block.shape[1],
                             MAX_PEAKS, 3), np.nan, np.float32)
 
@@ -363,8 +365,9 @@ class TestFindVectorsNeural:
         block = np.zeros((2, 2, 8, 8), np.float32)
         _find_vectors_chunk(block, 0, 2, 0.0, 5, 0.3, 4, True, None, None, None,
                             method="neural", bg_sigma=6.0, persistence=True,
-                            spot_radius=7.0)
-        assert seen == {"persistence": True, "bg_sigma": 6.0, "spot_radius": 7.0}
+                            spot_radius=7.0, centre_refiner="mask-centroid")
+        assert seen == {"persistence": True, "bg_sigma": 6.0, "spot_radius": 7.0,
+                        "centre_refiner": "mask-centroid"}
 
     def test_default_device_chain(self, monkeypatch):
         """CUDA → MPS → CPU fallback chain (Macs previously never got MPS)."""

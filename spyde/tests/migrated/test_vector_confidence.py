@@ -296,7 +296,7 @@ class TestOverlayShowsConfidence:
 
 class TestMaskedMedian:
     def test_matches_numpy_median_row_by_row(self):
-        from spyde.actions.find_vectors_neural import _masked_median
+        from spyde.models.centre_refine import masked_median
 
         rng = np.random.default_rng(0)
         values = rng.normal(size=(50, 30)).astype(np.float32)
@@ -304,6 +304,6 @@ class TestMaskedMedian:
         mask[0] = False
         mask[1] = False
         mask[1, 3] = True
-        got = _masked_median(values, mask)
+        got = masked_median(values, mask)
         want = [np.median(v[m]) if m.any() else 0.0 for v, m in zip(values, mask)]
         np.testing.assert_allclose(got, want, rtol=0, atol=1e-6)

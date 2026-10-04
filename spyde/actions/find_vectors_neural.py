@@ -13,6 +13,10 @@ intensity, the network's heatmap peak, and the centre's positional uncertainty
 
 Centres are the network's decode (argmax pixel + offset head);
 ``centre="softargmax"`` is the opt-in alternative in :mod:`spyde.models.centre`.
+``centre_refiner`` adds a second stage that re-places every detected disk on
+the raw frame at native resolution (:mod:`spyde.models.centre_refine`) — the
+mask centroid, or a refiner network from the model registry. The batch and the
+single-frame preview both run it through :func:`_refined`, so they agree.
 
 GPU/CPU: the batch path runs the whole nav chunk through one forward pass on the
 torch GPU when available (``torch_gpu_device()``), per-frame on CPU otherwise —
@@ -26,6 +30,8 @@ import sys
 from typing import Optional
 
 import numpy as np
+
+from spyde.models.centre_refine import masked_median
 
 log = logging.getLogger(__name__)
 
@@ -89,18 +95,6 @@ def _counts_radius(frame: np.ndarray, spot_radius: Optional[float]) -> float:
     return float(np.clip(0.5 * d, 2.0, 64.0)) if np.isfinite(d) else _INTENSITY_RADIUS
 
 
-def _masked_median(values: np.ndarray, mask: np.ndarray) -> np.ndarray:
-    """``np.median(values[i][mask[i]])`` for every row in one sort (0 for an
-    empty row). A frame can hold hundreds of disks, and a Python loop of
-    ``np.median`` calls cost ten times the network itself."""
-    n = mask.sum(1)
-    ordered = np.sort(np.where(mask, values, np.inf), axis=1)
-    rows = np.arange(len(values))
-    low = ordered[rows, np.maximum(n - 1, 0) // 2]
-    high = ordered[rows, n // 2 - (n == 0)]
-    return np.where(n > 0, 0.5 * (low.astype(np.float64) + high), 0.0)
-
-
 def _disk_counts(frame: np.ndarray, pos: np.ndarray, radius: float):
     """Background-subtracted counts inside ``radius`` of each ``(y, x)`` and the
     background level per pixel (median of the ring 1-4 px outside the disk)."""
@@ -117,16 +111,19 @@ def _disk_counts(frame: np.ndarray, pos: np.ndarray, radius: float):
     rx = (ix[:, None] + d[None, :])[:, None, :] - pos[:, 1, None, None]
     r = np.sqrt(ry * ry + rx * rx)
     ring = (r > radius + 1.0) & (r <= r_out)
-    background = _masked_median(crops.reshape(len(pos), -1), ring.reshape(len(pos), -1))
+    background = masked_median(crops.reshape(len(pos), -1), ring.reshape(len(pos), -1))
     inside = r <= radius
     signal = ((crops - background[:, None, None]) * inside).sum((1, 2))
     return signal, background
 
 
-def _neural_peaks(frame: np.ndarray, pred: np.ndarray, counts_radius: float) -> np.ndarray:
+def _neural_peaks(frame: np.ndarray, pred: np.ndarray, counts_radius: float,
+                  refined_sigma: Optional[np.ndarray] = None) -> np.ndarray:
     """The model's ``(N, 4) [y, x, score, width]`` -> the stored peak record
     ``(N, PEAK_COLS) [y, x, intensity, confidence, sigma]``. One function for the
-    batch and the single-frame preview, so both give identical columns."""
+    batch and the single-frame preview, so both give identical columns.
+    ``refined_sigma`` is a centre refiner's own uncertainty; where it is finite
+    it replaces the photon-noise estimate."""
     from spyde.actions.find_vectors import PEAK_COLS, _disk_mean_intensity
     from spyde.models.centre import positional_sigma
 
@@ -137,7 +134,30 @@ def _neural_peaks(frame: np.ndarray, pred: np.ndarray, counts_radius: float) -> 
     intensity = _disk_mean_intensity(f, pos[:, 0], pos[:, 1], _INTENSITY_RADIUS)
     signal, background = _disk_counts(f, pos, counts_radius)
     sigma = positional_sigma(pred[:, 3], signal, background)
+    if refined_sigma is not None:
+        sigma = np.where(np.isfinite(refined_sigma), refined_sigma, sigma)
     return np.column_stack([pos, intensity, pred[:, 2], sigma]).astype(np.float32)
+
+
+def _refined(frames, preds, spot_radius, centre_refiner, device=None):
+    """Run the centre stage over a chunk's beam-stop-filtered ``(N, 4)``
+    predictions, one batch for the whole chunk. Returns the predictions with
+    refined ``[y, x]`` and, per frame, the refiner's uncertainty (``None`` when
+    it gives none). With no refiner selected the predictions come back as they
+    went in."""
+    from spyde.models.centre_refine import refine_centres, refiner_for
+
+    refiner = refiner_for(centre_refiner, device)
+    if refiner is None:
+        return preds, [None] * len(preds)
+    positions, sigmas = refine_centres(frames, [p[:, :2] for p in preds],
+                                       spot_radius, refiner)
+    refined = []
+    for pred, position in zip(preds, positions):
+        pred = pred.copy()
+        pred[:, :2] = position
+        refined.append(pred)
+    return refined, (sigmas if sigmas is not None else [None] * len(preds))
 
 
 def _heatmap_response(frame_shape, peaks_yx, threshold) -> np.ndarray:
@@ -167,6 +187,7 @@ def _find_vectors_single_frame_neural(
     spot_radius: Optional[float] = None,   # user Spot-size (px radius) override for
                                            # the canonical rescale; None → auto.
     centre: str = "offset",                # "softargmax": see spyde.models.centre
+    centre_refiner: Optional[str] = None,  # see spyde.models.centre_refine.refiner_for
 ):
     """Neural detector for one diffraction pattern.
 
@@ -193,13 +214,16 @@ def _find_vectors_single_frame_neural(
                              centre=centre, with_width=True)
     pred = np.asarray(pred, dtype=np.float32).reshape(-1, 4)
     pred = _apply_beamstop(pred, beamstop_mask, f.shape)
+    if pred.size == 0:
+        empty = _heatmap_response(f.shape, pred, threshold)
+        return empty, empty, np.zeros((0, PEAK_COLS), dtype=np.float32)
+    counts_radius = _counts_radius(f, spot_radius)
+    (pred,), (refined_sigma,) = _refined([f], [pred], counts_radius, centre_refiner,
+                                         device)
 
     raw_response = _heatmap_response(f.shape, pred, threshold)
     corr_map = raw_response  # already thresholded (only kept peaks are painted)
-
-    if pred.size == 0:
-        return corr_map, raw_response, np.zeros((0, PEAK_COLS), dtype=np.float32)
-    return corr_map, raw_response, _neural_peaks(f, pred, _counts_radius(f, spot_radius))
+    return corr_map, raw_response, _neural_peaks(f, pred, counts_radius, refined_sigma)
 
 
 def _persistence_filter(peaks_grid, ny, nx, tol=3.0, min_neighbors=2):
@@ -307,13 +331,16 @@ def _mps_forward_lock():
 
 
 def _neural_block(b4d, threshold, min_dist, subpixel, beamstop_mask, model_id,
-                  bg_sigma=None, persistence=False, spot_radius=None, centre="offset"):
+                  bg_sigma=None, persistence=False, spot_radius=None, centre="offset",
+                  centre_refiner=None):
     """Run the neural detector on a (ny, nx, KY, KX) block → NaN-padded
     (ny, nx, MAX_PEAKS, PEAK_COLS). Batches the whole block through the torch GPU when
     available (internally sub-batched by ``detect_batch``, see infer.py, so a
     1000+ frame nav chunk never allocates activations for more than
     ``SPYDE_NEURAL_BATCH`` frames at once); per-frame CPU otherwise. ``bg_sigma``
     is the calibrated local-norm high-pass scale (see calibrate_neural).
+    ``centre_refiner`` re-places the detections on the block's frames, all of
+    the block's disks in one refiner batch.
     ``persistence`` drops extraneous (non-neighbour-confirmed) peaks (uses the
     block's scan neighbours).
 
@@ -393,11 +420,13 @@ def _neural_block(b4d, threshold, min_dist, subpixel, beamstop_mask, model_id,
                         spot_diameter=(2.0 * spot_radius) if spot_radius else None,
                         centre=centre, with_width=True)
             counts_radius = _counts_radius(flat[0], spot_radius)
-            peaks_list = []
-            for i, p in enumerate(raw):
-                p = _apply_beamstop(np.asarray(p, np.float32).reshape(-1, 4),
-                                    beamstop_mask, flat[i].shape)
-                peaks_list.append(_neural_peaks(flat[i], p, counts_radius))
+            preds = [_apply_beamstop(np.asarray(p, np.float32).reshape(-1, 4),
+                                     beamstop_mask, flat[i].shape)
+                     for i, p in enumerate(raw)]
+            preds, refined_sigmas = _refined(flat, preds, counts_radius,
+                                             centre_refiner, device)
+            peaks_list = [_neural_peaks(flat[i], p, counts_radius, refined_sigmas[i])
+                          for i, p in enumerate(preds)]
     except Exception as _e:
         log.warning("[find_vectors] torch neural GPU path failed (%s); CPU per-frame", _e)
         peaks_list = None
@@ -407,7 +436,8 @@ def _neural_block(b4d, threshold, min_dist, subpixel, beamstop_mask, model_id,
             _find_vectors_single_frame_neural(
                 frame, threshold, min_dist, subpixel=subpixel,
                 beamstop_mask=beamstop_mask, model_id=model_id, bg_sigma=bg_sigma,
-                spot_radius=spot_radius, centre=centre)[2]
+                spot_radius=spot_radius, centre=centre,
+                centre_refiner=centre_refiner)[2]
             for frame in flat
         ]
 
@@ -426,7 +456,7 @@ def _neural_block(b4d, threshold, min_dist, subpixel, beamstop_mask, model_id,
 def _find_vectors_chunk_neural(
     ghost_block, depth_px, nav_dim, sigma,
     threshold, min_dist, subpixel, beamstop_mask, model_id=None, bg_sigma=None,
-    persistence=False, spot_radius=None,
+    persistence=False, spot_radius=None, centre_refiner=None,
 ):
     """Neural variant of ``_find_vectors_chunk``: nav-blur + ghost-trim (shared with
     the other methods), then the neural detector per frame (GPU-batched when torch
@@ -459,14 +489,14 @@ def _find_vectors_chunk_neural(
     if nav_dim == 2:
         result = _neural_block(blurred, threshold, min_dist, subpixel,
                                beamstop_mask, model_id, bg_sigma, persistence,
-                               spot_radius)
+                               spot_radius, centre_refiner=centre_refiner)
     else:
         n_lead = nav_shape[0]
         out = np.full((n_lead, ny, nx, MAX_PEAKS, PEAK_COLS), np.nan, dtype=np.float32)
         for t in range(n_lead):
             out[t] = _neural_block(blurred[t], threshold, min_dist, subpixel,
                                    beamstop_mask, model_id, bg_sigma, persistence,
-                                   spot_radius)
+                                   spot_radius, centre_refiner=centre_refiner)
         result = out
     if refine_padded:
         result = trim_ghost(result, depth_px, nav_dim)
