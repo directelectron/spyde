@@ -104,7 +104,7 @@ class NetworkRefiner:
         offsets = self._offsets()
         rows = centres[:, 0, None] + offsets[None] * step          # (M, S') crop px
         columns = centres[:, 1, None] + offsets[None] * step
-        count, samples = rows.shape
+        samples = rows.shape[1]
         grid = torch.stack([
             (columns[:, None, :].expand(-1, samples, -1) / (size - 1)) * 2 - 1,
             (rows[:, :, None].expand(-1, -1, samples) / (size - 1)) * 2 - 1], -1)
