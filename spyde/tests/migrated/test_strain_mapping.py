@@ -110,7 +110,7 @@ class TestStrainField:
 def _real_vecs(ny, nx, T_of, *, noise=0.0, seed=0):
     """A real SpyDEDiffractionVectors 4D container (so the CSR/vectorized strain
     path is exercised, not the _MockVecs loop fallback)."""
-    from spyde.signals.diffraction_vectors import SpyDEDiffractionVectors, N_COLS
+    from spyde.signals.diffraction_vectors import SpyDEDiffractionVectors, LEGACY_N_COLS
     rng = np.random.default_rng(seed)
     rows, offsets = [], [0]
     for iy in range(ny):
@@ -121,7 +121,7 @@ def _real_vecs(ny, nx, T_of, *, noise=0.0, seed=0):
             for kx, ky in g:
                 rows.append([ix, iy, kx, ky, -1.0, 1.0])
             offsets.append(len(rows))
-    flat = np.asarray(rows, dtype=np.float32).reshape(-1, N_COLS)
+    flat = np.asarray(rows, dtype=np.float32).reshape(-1, LEGACY_N_COLS)
     off = np.asarray(offsets, dtype=np.int64)
     return SpyDEDiffractionVectors(
         flat_buffer=flat, nav_offsets=[np.arange(ny + 1) * nx, off],

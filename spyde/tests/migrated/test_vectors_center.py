@@ -9,7 +9,7 @@ from __future__ import annotations
 import numpy as np
 
 from spyde.signals.diffraction_vectors import (
-    COL_INTENSITY, COL_KX, COL_KY, N_COLS, SpyDEDiffractionVectors,
+    COL_INTENSITY, COL_KX, COL_KY, LEGACY_N_COLS, SpyDEDiffractionVectors,
 )
 
 
@@ -28,7 +28,7 @@ def _vectors(ny=4, nx=6, drift=(0.3, -0.2), beam=(1.5, -1.0), scale=0.5):
             for dx, dy in ((5.0, 0.0), (0.0, 5.0), (-3.5, -3.5)):
                 rows.append([ix, iy, bx + dx, by + dy, -1.0, 20.0])
             offsets.append(len(rows))
-    flat = np.asarray(rows, dtype=np.float32).reshape(-1, N_COLS)
+    flat = np.asarray(rows, dtype=np.float32).reshape(-1, LEGACY_N_COLS)
     off = np.asarray(offsets, dtype=np.int64)
     vecs = SpyDEDiffractionVectors(
         flat_buffer=flat, nav_offsets=[np.arange(ny + 1) * nx, off],

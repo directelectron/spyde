@@ -23,6 +23,13 @@ log = logging.getLogger(__name__)
 
 # Maximum peaks per frame in GPU subpixel output buffer
 MAX_PEAKS: int = 512
+# Per-frame peak record, the last axis of every (…, MAX_PEAKS, PEAK_COLS) chunk
+# result: position, the frame intensity there, and — for detectors that measure
+# them — how sure the detector is that a disk is there (0..1) and how precisely
+# its centre is known (px, one standard deviation). Detectors that do not
+# measure the last two leave them NaN.
+PEAK_KY, PEAK_KX, PEAK_INTENSITY, PEAK_CONFIDENCE, PEAK_SIGMA = range(5)
+PEAK_COLS: int = 5
 
 # Cache of device-side disk kernel arrays keyed by kernel_r
 _gpu_disk_cache: dict = {}

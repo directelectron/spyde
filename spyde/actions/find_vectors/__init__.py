@@ -35,6 +35,12 @@ from __future__ import annotations
 # ── Public API re-exports (see module docstring) ──────────────────────────────
 from spyde.actions.find_vectors.gpu_runtime import (  # noqa: E402,F401
     MAX_PEAKS,
+    PEAK_COLS,
+    PEAK_CONFIDENCE,
+    PEAK_INTENSITY,
+    PEAK_KX,
+    PEAK_KY,
+    PEAK_SIGMA,
     _cupy_available,
     _gpu_task_allowed,
     _reset_gpu_state,

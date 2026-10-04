@@ -28,6 +28,7 @@ from spyde.actions.find_vectors.detectors import (
 )
 from spyde.actions.find_vectors.gpu_runtime import (
     MAX_PEAKS,
+    PEAK_COLS,
     _GPU_MAX_WARM_FAILURES,
     _GPU_NATIVE_DTYPES,
     _cupy_available,
@@ -91,7 +92,7 @@ def trim_ghost(arr, depth_px, nav_dim):
     """Cut the ghost margin off the two SPATIAL nav axes.
 
     Works on a data block (nav…, KY, KX) or on a per-frame RESULT array
-    (nav…, MAX_PEAKS, 3) — only the leading nav axes are touched, and they sit at
+    (nav…, MAX_PEAKS, PEAK_COLS) — only the leading nav axes are touched, and they sit at
     the same positions in both."""
     if depth_px <= 0:
         return arr
@@ -106,9 +107,9 @@ def trim_ghost(arr, depth_px, nav_dim):
 
 def _dog_block(b4d, sigma1, sigma2, threshold, min_dist, subpixel, beamstop_mask):
     """Run the DoG detector on a (ny, nx, KY, KX) block → NaN-padded
-    (ny, nx, MAX_PEAKS, 3).  Batches on the torch GPU when available; otherwise
+    (ny, nx, MAX_PEAKS, PEAK_COLS).  Batches on the torch GPU when available; otherwise
     the numpy per-frame core."""
-    out = np.full((b4d.shape[0], b4d.shape[1], MAX_PEAKS, 3), np.nan, dtype=np.float32)
+    out = np.full((b4d.shape[0], b4d.shape[1], MAX_PEAKS, PEAK_COLS), np.nan, dtype=np.float32)
     flat = b4d.reshape(-1, b4d.shape[2], b4d.shape[3])
     peaks_list = None
     try:
@@ -137,7 +138,7 @@ def _dog_block(b4d, sigma1, sigma2, threshold, min_dist, subpixel, beamstop_mask
         iy, ix = divmod(i, b4d.shape[1])
         n = min(len(peaks), MAX_PEAKS)
         if n > 0:
-            out[iy, ix, :n, :] = peaks[:n]
+            out[iy, ix, :n, :peaks.shape[1]] = peaks[:n]
     return out
 
 
@@ -158,7 +159,7 @@ def _find_vectors_chunk_dog(
         core_shape = result.shape[:2]
     else:
         n_lead = nav_shape[0]
-        out = np.full((n_lead, ny, nx, MAX_PEAKS, 3), np.nan, dtype=np.float32)
+        out = np.full((n_lead, ny, nx, MAX_PEAKS, PEAK_COLS), np.nan, dtype=np.float32)
         for t in range(n_lead):
             out[t] = _dog_block(blurred[t], sigma1, sigma2, threshold, min_dist,
                                 subpixel, beamstop_mask)
@@ -201,7 +202,7 @@ def _find_vectors_chunk(
                      → local-max kernel (NMS)
                      → subpixel CoM kernel
                      → [D2H sparse peaks]
-        → pack into (nav_y, nav_x, MAX_PEAKS, 3) NaN-padded float32
+        → pack into (nav_y, nav_x, MAX_PEAKS, PEAK_COLS) NaN-padded float32
 
     Falls back to scipy + CPU per-frame loop if CUDA is unavailable or this
     worker is not the designated GPU worker (see _gpu_task_allowed /
@@ -212,20 +213,20 @@ def _find_vectors_chunk(
     we trim them back before NXCORR so no ghost pixels appear in the output.
 
     For 5D (nav_dim=3) the leading dimension is time; we process each t-slice
-    as an independent 4D block and stack into (t, ny, nx, MAX_PEAKS, 3).
+    as an independent 4D block and stack into (t, ny, nx, MAX_PEAKS, PEAK_COLS).
 
     Returns
     -------
-    float32 ndarray (nav_y, nav_x, MAX_PEAKS, 3)          [4D]
-                 or (t, nav_y, nav_x, MAX_PEAKS, 3)        [5D]
+    float32 ndarray (nav_y, nav_x, MAX_PEAKS, PEAK_COLS)          [4D]
+                 or (t, nav_y, nav_x, MAX_PEAKS, PEAK_COLS)        [5D]
     """
     # Zero-size blocks (dask meta inference calls the chunk fn on empty
     # arrays in the CLIENT process) — return an empty result of the right
     # structure; an empty grid is an invalid CUDA launch.
     if ghost_block.size == 0:
         if nav_dim == 2:
-            return np.empty((0, 0, MAX_PEAKS, 3), dtype=np.float32)
-        return np.empty((0, 0, 0, MAX_PEAKS, 3), dtype=np.float32)
+            return np.empty((0, 0, MAX_PEAKS, PEAK_COLS), dtype=np.float32)
+        return np.empty((0, 0, 0, MAX_PEAKS, PEAK_COLS), dtype=np.float32)
 
     # ── DoG band-pass detector ────────────────────────────────────────────────
     # The numba-CUDA NXCORR kernels below are disk-matched-filter specific, so
@@ -309,7 +310,7 @@ def _find_vectors_chunk(
     ny, nx = nav_shape[-2:]
 
     def _cpu_block(b4d):
-        out = np.full((b4d.shape[0], b4d.shape[1], MAX_PEAKS, 3), np.nan, dtype=np.float32)
+        out = np.full((b4d.shape[0], b4d.shape[1], MAX_PEAKS, PEAK_COLS), np.nan, dtype=np.float32)
         flat = b4d.reshape(-1, b4d.shape[2], b4d.shape[3])
         # Fast path: batch the whole block's NXCORR on the torch GPU (Apple-MPS on
         # a MacBook, CUDA otherwise). Reached when the numba.cuda kernels above
@@ -344,7 +345,7 @@ def _find_vectors_chunk(
             iy, ix = divmod(i, b4d.shape[1])
             n = min(len(peaks), MAX_PEAKS)
             if n > 0:
-                out[iy, ix, :n, :] = peaks[:n]
+                out[iy, ix, :n, :peaks.shape[1]] = peaks[:n]
         return out
 
     t_find = time.perf_counter()
@@ -353,7 +354,7 @@ def _find_vectors_chunk(
         core_shape = result.shape[:2]
     else:
         n_lead = nav_shape[0]
-        out = np.full((n_lead, ny, nx, MAX_PEAKS, 3), np.nan, dtype=np.float32)
+        out = np.full((n_lead, ny, nx, MAX_PEAKS, PEAK_COLS), np.nan, dtype=np.float32)
         for t in range(n_lead):
             out[t] = _cpu_block(blurred[t])
         result = out
@@ -697,7 +698,7 @@ def _find_vectors_chunk_gpu_impl(
                 raw_corr_obj, peak_mask_d, thr, min_d, iH, iW,
             )
             if subpixel:
-                peaks_out_d = _gpu_pool_get((N, MAX_PEAKS, 3), np.float32)
+                peaks_out_d = _gpu_pool_get((N, MAX_PEAKS, 3), np.float32)   # the kernel writes [ky, kx, score]
                 n_peaks_d = _gpu_pool_get((N,), np.int32)
                 n_peaks_d.copy_to_device(np.zeros(N, dtype=np.int32),
                                          stream=stream)
@@ -760,9 +761,9 @@ def _find_vectors_chunk_gpu_impl(
             # so the DMA from this buffer has completed.
             _pinned_pool_put(pinned)
 
-        # Pack into (NY, NX, MAX_PEAKS, 3) NaN-padded
+        # Pack into (NY, NX, MAX_PEAKS, PEAK_COLS) NaN-padded
         t0 = time.perf_counter()
-        out = np.full((NY, NX, MAX_PEAKS, 3), np.nan, dtype=np.float32)
+        out = np.full((NY, NX, MAX_PEAKS, PEAK_COLS), np.nan, dtype=np.float32)
         min_d2 = int(min_dist) * int(min_dist)
         # Raw frames for intensity sampling. `block4d_cpu` is the FULL ghost
         # block (NY_g x NX_g), but the device section trimmed the ghost zone:
@@ -826,7 +827,7 @@ def _find_vectors_chunk_gpu_impl(
                                               radius=kernel_r)
             n = min(len(frame_peaks), MAX_PEAKS)
             if n > 0:
-                out[iy, ix, :n, :] = frame_peaks[:n]
+                out[iy, ix, :n, :frame_peaks.shape[1]] = frame_peaks[:n]
         timings["pack"] += time.perf_counter() - t0
 
         return out
@@ -842,7 +843,7 @@ def _find_vectors_chunk_gpu_impl(
         nx_ghost = nav_shape_ghost[2]
         ny = max(1, ny_ghost - 2 * depth_px)
         nx = max(1, nx_ghost - 2 * depth_px)
-        out5 = np.full((n_lead, ny, nx, MAX_PEAKS, 3), np.nan, dtype=np.float32)
+        out5 = np.full((n_lead, ny, nx, MAX_PEAKS, PEAK_COLS), np.nan, dtype=np.float32)
         for t in range(n_lead):
             out5[t] = _process_4d(block_host[t])
         result = out5

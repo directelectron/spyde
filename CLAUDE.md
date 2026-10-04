@@ -118,7 +118,7 @@ Key methods: `.submit()`, `.compute()`, `.compute_chunks_progressive()` (streami
 WIP modules for live microscope control: camera, stage, STEM, TEM, particle scanning, reference.
 
 ### Signals (`spyde/signals/`)
-- `diffraction_vectors.py`: `SpyDEDiffractionVectors` — GPU-optimized CSR flat-buffer container for ragged diffraction vectors. Stores `(nav_x, nav_y, kx, ky, intensity)` with an offsets array (row-pointers). Key methods: `.at()`, `.kxy_at()`, `.count_map()`, `.to_dense()` (cached), `.to_pyxem()`, `.cluster()`, `.get_strain_maps()`.
+- `diffraction_vectors.py`: `SpyDEDiffractionVectors` — GPU-optimized CSR flat-buffer container for ragged diffraction vectors. Stores `(nav_x, nav_y, kx, ky, time, intensity, confidence, sigma)` with an offsets array (row-pointers); `confidence`/`sigma` are NaN for detectors that do not measure them and for buffers saved before they existed (`with_all_columns` pads a six-column buffer). Key methods: `.at()`, `.kxy_at()`, `.count_map()`, `.to_dense()` (cached), `.to_pyxem()`, `.cluster()`, `.get_strain_maps()`.
 
 ### Vector orientation mapping (`spyde/actions/`)
 Detected diffraction spots → an orientation (and strain) per scan position. The match is **correlation against a zone-axis template library**, the ACOM method (Ophus et al. 2022): each candidate zone axis is scored by a sparse polar correlation whose in-plane angle is an FFT axis, so all in-plane rotations are tested in one transform rather than one at a time.

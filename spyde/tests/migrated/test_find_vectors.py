@@ -24,7 +24,7 @@ from spyde.actions.find_vectors import (
     _make_disk,
     _nav_chunk_size,
 )
-from spyde.signals.diffraction_vectors import SpyDEDiffractionVectors
+from spyde.signals.diffraction_vectors import N_COLS, SpyDEDiffractionVectors
 from spyde.tests.migrated._perf import budget_ms
 
 
@@ -349,7 +349,7 @@ def test_at_correct_row_count():
     vecs = _make_vecs((3, 3), n_per_pos=4)
     for iy in range(3):
         for ix in range(3):
-            assert vecs.at(iy, ix).shape == (4, 6)
+            assert vecs.at(iy, ix).shape == (4, N_COLS)
 
 
 def test_kxy_at_correct_columns():
@@ -367,14 +367,14 @@ def test_count_map_shape_and_values():
 def test_to_dense_shape_and_cache():
     vecs = _make_vecs((2, 3), n_per_pos=5)
     d1 = vecs.to_dense()
-    assert d1.shape == (2, 3, 5, 6)
+    assert d1.shape == (2, 3, 5, N_COLS)
     d2 = vecs.to_dense()
     assert d1 is d2
 
 
 def test_flatten_full_buffer():
     vecs = _make_vecs((2, 2), n_per_pos=3)
-    assert vecs.flatten().shape == (12, 6)
+    assert vecs.flatten().shape == (12, N_COLS)
 
 
 def test_from_ragged_roundtrip():

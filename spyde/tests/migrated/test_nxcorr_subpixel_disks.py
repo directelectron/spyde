@@ -89,6 +89,6 @@ class TestNxcorrSubpixelDisks:
         block = frames.reshape(3, 3, FRAME, FRAME)
         out = _find_vectors_chunk_gpu(block, 0, 2, 0.0, radius, 0.5, max(1, radius // 2),
                                       True, None, _disk_stats(radius))
-        flat = out.reshape(9, out.shape[2], 3)
+        flat = out.reshape(9, out.shape[2], out.shape[3])
         peaks = [p[np.isfinite(p[:, 0])] for p in flat]
         _assert_subpixel(_errors(peaks, truth), "gpu", radius)
