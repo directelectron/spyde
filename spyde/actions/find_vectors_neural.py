@@ -89,6 +89,18 @@ def _counts_radius(frame: np.ndarray, spot_radius: Optional[float]) -> float:
     return float(np.clip(0.5 * d, 2.0, 64.0)) if np.isfinite(d) else _INTENSITY_RADIUS
 
 
+def _masked_median(values: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """``np.median(values[i][mask[i]])`` for every row in one sort (0 for an
+    empty row). A frame can hold hundreds of disks, and a Python loop of
+    ``np.median`` calls cost ten times the network itself."""
+    n = mask.sum(1)
+    ordered = np.sort(np.where(mask, values, np.inf), axis=1)
+    rows = np.arange(len(values))
+    low = ordered[rows, np.maximum(n - 1, 0) // 2]
+    high = ordered[rows, n // 2 - (n == 0)]
+    return np.where(n > 0, 0.5 * (low.astype(np.float64) + high), 0.0)
+
+
 def _disk_counts(frame: np.ndarray, pos: np.ndarray, radius: float):
     """Background-subtracted counts inside ``radius`` of each ``(y, x)`` and the
     background level per pixel (median of the ring 1-4 px outside the disk)."""
@@ -105,8 +117,7 @@ def _disk_counts(frame: np.ndarray, pos: np.ndarray, radius: float):
     rx = (ix[:, None] + d[None, :])[:, None, :] - pos[:, 1, None, None]
     r = np.sqrt(ry * ry + rx * rx)
     ring = (r > radius + 1.0) & (r <= r_out)
-    background = np.array([np.median(c[m]) if m.any() else 0.0 for c, m in zip(crops, ring)],
-                          dtype=np.float64)
+    background = _masked_median(crops.reshape(len(pos), -1), ring.reshape(len(pos), -1))
     inside = r <= radius
     signal = ((crops - background[:, None, None]) * inside).sum((1, 2))
     return signal, background

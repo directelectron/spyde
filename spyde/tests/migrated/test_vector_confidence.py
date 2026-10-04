@@ -292,3 +292,18 @@ class TestOverlayShowsConfidence:
         rows[:, COL_CONFIDENCE] = [0.9, UNSURE_BELOW - 0.1, np.nan]
         out = found_vector_offsets(rows=rows, pixels=DetectorPixels.from_axes(v.sig_axes))
         assert len(out["found"]) == 2 and len(out["unsure"]) == 1
+
+
+class TestMaskedMedian:
+    def test_matches_numpy_median_row_by_row(self):
+        from spyde.actions.find_vectors_neural import _masked_median
+
+        rng = np.random.default_rng(0)
+        values = rng.normal(size=(50, 30)).astype(np.float32)
+        mask = rng.random((50, 30)) < 0.4
+        mask[0] = False
+        mask[1] = False
+        mask[1, 3] = True
+        got = _masked_median(values, mask)
+        want = [np.median(v[m]) if m.any() else 0.0 for v, m in zip(values, mask)]
+        np.testing.assert_allclose(got, want, rtol=0, atol=1e-6)
