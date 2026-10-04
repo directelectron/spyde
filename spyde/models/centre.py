@@ -7,8 +7,8 @@ single pixel plus a learned offset follows it. Taking the **soft-argmax** of
 the heatmap around that pixel — the softmax-weighted mean position of the
 heatmap logits within the disk — uses the whole response the network gives to
 the disk instead of one pixel of it. On synthetic dynamical patterns with known
-centres it roughly halves the strain error of the decoded position (see
-``spyde/tests/migrated/test_vector_confidence.py``).
+centres it lands nearer the true outline centre: 0.33 px RMS against 0.37 px
+for the decode (``spyde/tests/migrated/test_vector_confidence.py``).
 
 Each detection also gets:
 
