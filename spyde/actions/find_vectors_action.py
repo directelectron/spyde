@@ -50,6 +50,10 @@ DEFAULTS: dict = dict(
     # own autocorrelation estimate; the wizard always sends its auto-seeded
     # Spot-size slider so the UI knob is the single source of truth.
     spot_radius=0.0,
+    # Neural centre stage (spyde.models.centre_refine): "decode" keeps the
+    # network's own centres; "mask-centroid" or a refiner model id re-places
+    # every disk on the raw frame. Preview and batch read the same key.
+    centre_refiner="decode",
     # Neural stage-2 refine: drop peaks not confirmed by scan neighbours
     # (models/refine.py). BATCH-only (the preview has no neighbours) and
     # default-off until the eval benchmark says it should be on (plan Phase 3).
@@ -105,21 +109,27 @@ def find_diffraction_vectors(ctx, action_name: str = "Find Diffraction Vectors",
 
 
 def _ensure_model_local(p: dict) -> None:
-    """Resolve the neural model's weights to a LOCAL file before the compute is
+    """Resolve the neural model's weights — the detector's and a centre refiner
+    network's — to LOCAL files before the compute is
     submitted, so dask workers never touch the network (a first-use HF-hosted
     model downloads once, with a status line, instead of N times concurrently).
     No-op for non-neural methods; on failure ``get_model``'s bundled-default
     fallback takes over on the workers."""
     if str(p.get("method", "")).lower() != "neural":
         return
-    try:
-        from spyde import models
-        mid = p.get("model_id") or None
-        if not models.is_cached(mid):
-            emit_status(f"Find Vectors: downloading model {mid or 'default'}…")
-        models.ensure_local(mid)
-    except Exception as e:
-        log.debug("ensure_local(%r) failed: %s", p.get("model_id"), e)
+    from spyde import models
+    from spyde.models.centre_refine import CENTRE_DECODE, CENTRE_MASK_CENTROID
+
+    model_ids = [p.get("model_id") or None]
+    if p.get("centre_refiner") not in (None, "", CENTRE_DECODE, CENTRE_MASK_CENTROID):
+        model_ids.append(p["centre_refiner"])
+    for mid in model_ids:
+        try:
+            if not models.is_cached(mid):
+                emit_status(f"Find Vectors: downloading model {mid or 'default'}…")
+            models.ensure_local(mid)
+        except Exception as e:
+            log.debug("ensure_local(%r) failed: %s", mid, e)
 
 
 def _start_batch(session, plot, src_tree, p: dict, *, overlay_visible: bool = True):
@@ -961,9 +971,9 @@ def fv_tune(session, plot, payload) -> None:
         from spyde.actions.vector_overlay import tune_find_vectors_preview
         try:
             tune_find_vectors_preview(tree, prev, coerced)
-            log.info("[fv-tune] parameters APPLIED thr=%s md=%s kr=%s",
+            log.info("[fv-tune] parameters APPLIED thr=%s md=%s kr=%s centre=%s",
                      coerced.get("threshold"), coerced.get("min_distance"),
-                     coerced.get("kernel_radius"))
+                     coerced.get("kernel_radius"), coerced.get("centre_refiner"))
         except Exception as e:
             log.exception("[fv-tune] applying the parameters FAILED: %s", e)
 
@@ -994,11 +1004,12 @@ def fv_run(session, plot, payload) -> None:
 
 
 def fv_models(session, plot, payload) -> None:
-    """Emit the available neural models for the wizard's Model dropdown.
+    """Emit the available neural models for the wizard's Model and Centre dropdowns.
 
     Payload: ``{type: "fv_models", window_id, default, models: [{id, label,
-    version, notes}]}`` — straight from the model registry (bundled manifest
-    merged with any user-installed models)."""
+    version, notes}], refiners: [...same]}`` — straight from the model registry
+    (bundled manifest merged with any user-installed models). ``models`` lists
+    detectors only; ``refiners`` the centre-refiner networks."""
     from spyde.models import available_models
     msg = {"type": "fv_models",
            "window_id": (payload or {}).get("window_id",

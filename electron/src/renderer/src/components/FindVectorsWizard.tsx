@@ -13,7 +13,9 @@
  *     canonical rescale + NMS + marker radius) and Threshold (model confidence,
  *     ~0.3). Nav blur is never applied for neural; the high-pass (bg σ) is
  *     auto-calibrated invisibly (`fv_calibration`). Model dropdown + ↻ refresh
- *     from the registry (`fv_models`). The default method.
+ *     from the registry (`fv_models`). Centre dropdown: keep the network's
+ *     decode, or re-place every disk on the raw frame (mask centroid, or a
+ *     refiner network the registry lists). The default method.
  *   • NXCORR — window-normalised cross-correlation against a flat disk
  *     (Disk Radius slider; threshold is a [-1,1] correlation score).
  *   • DoG — Difference-of-Gaussians band-pass, best for small (2-3 px) spots
@@ -36,6 +38,13 @@ const METHODS: readonly { value: Method; label: string }[] = [
   { value: 'nxcorr', label: 'NXCORR (disk)' },
   { value: 'dog', label: 'DoG (small spots)' },
 ]
+// The centre stage: the two built-in choices, then any refiner networks the
+// registry lists (`fv_models` → refiners). Mirrors spyde.models.centre_refine.
+const CENTRE_BUILT_IN: readonly { value: string; label: string }[] = [
+  { value: 'decode', label: 'Network decode' },
+  { value: 'mask-centroid', label: 'Mask centroid' },
+]
+
 // Sensible threshold default per method (neural confidence vs NXCORR score vs DoG SNR).
 const THR_DEFAULT: Record<Method, number> = { neural: 0.3, nxcorr: 0.5, dog: 10 }
 
@@ -43,7 +52,7 @@ const THR_DEFAULT: Record<Method, number> = { neural: 0.3, nxcorr: 0.5, dog: 10 
 // so the caret closing on Compute doesn't lose the tuning — reopening restores
 // the last-used parameters.
 interface FvSaved {
-  method: Method; modelId: string; sigma: number; radius: number
+  method: Method; modelId: string; centreRefiner: string; sigma: number; radius: number
   sigma1: number; sigma2: number; bgSigma: number
   threshold: number; minDist: number; subpixel: boolean; beamstop: boolean
   beamstopDilate: number; showTransform: boolean; persistence: boolean
@@ -60,6 +69,8 @@ export function FindVectorsWizard({ caretPos, windowId, sendAction, onClose }: P
   const [method, setMethod] = React.useState<Method>(saved?.method ?? 'neural')
   const [modelId, setModelId] = React.useState(saved?.modelId ?? '')
   const [models, setModels] = React.useState<readonly { value: string; label: string }[]>([])
+  const [centreRefiner, setCentreRefiner] = React.useState(saved?.centreRefiner ?? 'decode')
+  const [refiners, setRefiners] = React.useState<readonly { value: string; label: string }[]>([])
   const [sigma, setSigma] = React.useState(saved?.sigma ?? 0)
   const [radius, setRadius] = React.useState(saved?.radius ?? 5)
   const [sigma1, setSigma1] = React.useState(saved?.sigma1 ?? 0.8)
@@ -76,20 +87,21 @@ export function FindVectorsWizard({ caretPos, windowId, sendAction, onClose }: P
 
   React.useEffect(() => {
     _fvStore.set(windowId, {
-      method, modelId, sigma, radius, sigma1, sigma2, bgSigma, threshold, minDist, subpixel,
-      beamstop, beamstopDilate, showTransform, persistence,
+      method, modelId, centreRefiner, sigma, radius, sigma1, sigma2, bgSigma, threshold, minDist,
+      subpixel, beamstop, beamstopDilate, showTransform, persistence,
     })
-  }, [windowId, method, modelId, sigma, radius, sigma1, sigma2, bgSigma, threshold, minDist,
-      subpixel, beamstop, beamstopDilate, showTransform, persistence])
+  }, [windowId, method, modelId, centreRefiner, sigma, radius, sigma1, sigma2, bgSigma, threshold,
+      minDist, subpixel, beamstop, beamstopDilate, showTransform, persistence])
 
   // Live refs so the debounced tune always sends the latest of EVERY control.
-  const vals = React.useRef({ method, modelId, sigma, radius, sigma1, sigma2, bgSigma, threshold, minDist, subpixel, beamstop, beamstopDilate, showTransform, persistence })
-  vals.current = { method, modelId, sigma, radius, sigma1, sigma2, bgSigma, threshold, minDist, subpixel, beamstop, beamstopDilate, showTransform, persistence }
+  const vals = React.useRef({ method, modelId, centreRefiner, sigma, radius, sigma1, sigma2, bgSigma, threshold, minDist, subpixel, beamstop, beamstopDilate, showTransform, persistence })
+  vals.current = { method, modelId, centreRefiner, sigma, radius, sigma1, sigma2, bgSigma, threshold, minDist, subpixel, beamstop, beamstopDilate, showTransform, persistence }
   const params = () => {
     const v = vals.current
     const neural = v.method === 'neural'
     return {
       method: v.method, model_id: v.modelId,
+      centre_refiner: neural ? v.centreRefiner : 'decode',
       // Neural never applies nav blur (the backend forces it too); the Spot
       // size slider is the single scale knob — it drives the model's rescale
       // (spot_radius) and the NMS min-distance (~radius/2).
@@ -130,6 +142,8 @@ export function FindVectorsWizard({ caretPos, windowId, sendAction, onClose }: P
   useWizardEvent('spyde:fv_models', windowId, (d) => {
     const list = Array.isArray(d.models) ? (d.models as { id: string; label?: string }[]) : []
     setModels(list.map((m) => ({ value: m.id, label: m.label ?? m.id })))
+    const refinerList = Array.isArray(d.refiners) ? (d.refiners as { id: string; label?: string }[]) : []
+    setRefiners(refinerList.map((m) => ({ value: m.id, label: m.label ?? m.id })))
     // '' = registry default; surface it as the concrete id once known.
     if (!vals.current.modelId && typeof d.default === 'string') setModelId(d.default)
     if (d.refreshed) setStatus(`Model list refreshed — ${list.length} available.`)
@@ -214,6 +228,12 @@ export function FindVectorsWizard({ caretPos, windowId, sendAction, onClose }: P
             <button data-testid="fv-refresh-models" style={refreshBtnStyle}
               title="Check Hugging Face for new models" onClick={refreshModels}>↻</button>
           </div>
+        </Field>
+      )}
+      {isNeural && (
+        <Field label="Centre">
+          <Select testid="fv-centre" value={centreRefiner}
+            options={[...CENTRE_BUILT_IN, ...refiners]} onChange={live(setCentreRefiner)} />
         </Field>
       )}
       <div style={gridStyle}>
