@@ -169,6 +169,7 @@ def _create_blank_ipf_window(session, src, ny, nx):
         session, title=f"{base} — Orientation (IPF-Z)",
         data=np.zeros((ny, nx), dtype=np.float32),
         provenance={"action": "Orientation Mapping", "source_title": base},
+        filling="Orientation Mapping",
     )
 
 
@@ -216,8 +217,13 @@ def _compute_with_live_ipf(session, src, src_tree, sim, params):
             sp.needs_auto_level = True
             sp.set_data(np.nan_to_num(z).clip(0, 255).astype(np.uint8))
 
-    stop_poll = live_fill_poller((ny, nx, 9), shm_name, _paint,
-                                 interval=0.4, name="om-poll")
+    try:
+        stop_poll = live_fill_poller((ny, nx, 9), shm_name, _paint,
+                                     interval=0.4, name="om-poll")
+    except Exception:
+        from spyde.actions.lifecycle import unlock_tree
+        unlock_tree(om_tree)     # the fill never started, so nothing will
+        raise
     # Cancellation: register a stopped_flag on the source tree AND the result
     # (IPF) tree — closing either stops the dense match on the cluster instead
     # of running the whole-field compute to completion.
@@ -231,6 +237,9 @@ def _compute_with_live_ipf(session, src, src_tree, sim, params):
                                       stopped_flag=stopped_flag)
     finally:
         stop_poll()
+        # Released on every exit of the fill, a cancel or failure included.
+        from spyde.actions.lifecycle import unlock_tree
+        unlock_tree(om_tree)
         for _t in {id(src_tree): src_tree, id(om_tree): om_tree}.values():
             if _t is not None and hasattr(_t, "unregister_cancel"):
                 _t.unregister_cancel(flag=stopped_flag)

@@ -755,6 +755,11 @@ def _run_indexing(session, tree, wiz, *, keep, refine, steps):
         for t in trees.values():
             if t is not None and hasattr(t, "unregister_cancel"):
                 t.unregister_cancel(flag=stopped)
+        # Every exit of the fill — including a cancel or a failure — releases
+        # the window; the finalize below adds its quality views as nodes,
+        # which a locked tree would refuse.
+        from spyde.actions.lifecycle import unlock_tree
+        unlock_tree(ipf_tree)
 
     tree.orientation_map = om
 
@@ -855,6 +860,7 @@ def _open_ipf_window(session, src, ny, nx):
         session, title=f"{base} — Orientation (IPF-Z)",
         data=np.zeros((ny, nx), dtype=np.float32),
         provenance={"action": "EBSD Indexing", "source_title": base},
+        filling="EBSD Indexing",
     )
 
 

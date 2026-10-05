@@ -80,7 +80,10 @@ if (typeof document !== 'undefined' && !document.getElementById(STYLE_ID)) {
     '@keyframes spyde-pop-up{from{opacity:0;transform:translate(-50%,6px)}to{opacity:1;transform:translate(-50%,0)}}' +
     '.spyde-tb-btn{background:none;border:none;color:#cdd6f4;cursor:pointer;width:30px;height:30px;' +
     'border-radius:6px;display:flex;align-items:center;justify-content:center;transition:background 90ms}' +
-    '.spyde-tb-btn:hover{background:rgba(137,180,250,0.18)}'
+    '.spyde-tb-btn:hover:not(:disabled){background:rgba(137,180,250,0.18)}' +
+    // A disabled button still matches :hover, so without this the locked
+    // buttons keep lighting up under the cursor and read as clickable.
+    '.spyde-tb-btn:disabled{cursor:not-allowed}'
   document.head.appendChild(s)
 }
 
@@ -282,6 +285,11 @@ export function FloatingToolbar({
   if (!shown.length) return null
 
   const click = (a: ToolbarAction) => {
+    // Locked window (a progressive batch is still filling this tree): the
+    // button is rendered `disabled` so this should be unreachable, and the
+    // backend refuses the action regardless — belt and braces against a stale
+    // config, since the cost of getting it wrong is a node on a half-built tree.
+    if (a.disabled) return
     if (live.has(a.name)) {
       sendAction('set_action_active', { name: a.name, active: false }, windowId)
       setOpenName(null)
@@ -377,10 +385,25 @@ export function FloatingToolbar({
         return (
           <button
             key={a.name}
-            title={a.beta ? `${a.name} (Beta — still under development)` : a.name}
+            title={a.disabled
+              ? `${a.name} — unavailable: ${a.disabled_reason ?? 'this window is still computing'}`
+              : a.beta ? `${a.name} (Beta — still under development)` : a.name}
             data-testid={`action-btn-${a.name}`}
             className="spyde-tb-btn"
-            style={{ ...(active ? styles.btnActive : {}), position: 'relative' }}
+            disabled={!!a.disabled}
+            style={{
+              ...(active ? styles.btnActive : {}),
+              position: 'relative',
+              // Dimmed + not-allowed rather than hidden: the action comes BACK
+              // when the batch finishes, and a button that vanishes and returns
+              // reads as a glitch (the requires_vectors gates hide because those
+              // actions genuinely do not apply to the data; this one is "not
+              // yet"). Both cues, because opacity alone on a dark theme is easy
+              // to miss.
+              ...(a.disabled
+                ? { opacity: 0.3, cursor: 'not-allowed', filter: 'grayscale(1)' }
+                : {}),
+            }}
             onClick={() => click(a)}
           >
             {a.icon && a.icon.endsWith('.svg')

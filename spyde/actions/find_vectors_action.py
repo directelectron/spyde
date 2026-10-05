@@ -183,6 +183,10 @@ def _start_batch(session, plot, src_tree, p: dict, *, overlay_visible: bool = Tr
         provenance={"action": "Find Diffraction Vectors",
                     "source_title": base_title,
                     "source_node": _node_name(src_tree, src), "params": dict(p)},
+        # LOCKED until the vectors attach: released in _finalize and again in
+        # the batch teardown below, which is the one a cancelled or failed run
+        # reaches.
+        filling="Find Diffraction Vectors",
     )
 
     emit_status("Finding diffraction vectors…")
@@ -238,6 +242,7 @@ def _start_batch(session, plot, src_tree, p: dict, *, overlay_visible: bool = Tr
         sig_hw=(int(am.signal_axes[1].size), int(am.signal_axes[0].size)),
         kernel_radius_px=float(p.get("kernel_radius", 5)),
     )
+    from spyde.actions.lifecycle import unlock_tree
     preview = attach_signal_preview(
         session, new_tree, render=live_frames.render,
         nav_shape=nav_shape_full, name="fv-signal",
@@ -317,6 +322,11 @@ def _start_batch(session, plot, src_tree, p: dict, *, overlay_visible: bool = Tr
             if preview is not None:
                 preview.close()
             live_frames.clear()
+            # Release the compute lock unconditionally. _finalize already did on
+            # the success path; this is the one that matters when the batch was
+            # cancelled or raised — a stranded lock would leave the window
+            # refusing every action for the rest of the session.
+            unlock_tree(new_tree)
             new_tree._fv_batch_running = False
             src_tree._fv_batch_running = False
             # Reset the workers' RSS accounting after the batch churn — see
@@ -461,6 +471,12 @@ def _finalize(tree, vecs) -> None:
         log.debug("clearing stale cached dask array failed: %s", e)
     from spyde.actions.lifecycle import attach_container
     attach_container(tree, vecs, name="diffraction_vectors")
+    # The result has landed, so the window is a whole dataset again: release the
+    # compute lock HERE, alongside the attach it guards (a batch that fails or is
+    # cancelled never reaches this line, which is why _start_batch's teardown
+    # unlocks too — lifecycle.unlock_tree is idempotent).
+    from spyde.actions.lifecycle import unlock_tree
+    unlock_tree(tree)
 
     # Paint the count map onto the SPATIAL (2-D) navigator plot. For a 5-D stack
     # the navigator is multi-level; _first_nav_plot may return the OUTER (1-D
