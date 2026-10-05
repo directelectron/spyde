@@ -32,6 +32,7 @@ import numpy as np
 import pytest
 import dask.array as da
 import hyperspy.api as hs
+from spyde.signals.diffraction_vectors import N_COLS
 
 from spyde.actions.find_vectors import _do_compute_vectors, _nav_chunk_size
 
@@ -144,7 +145,7 @@ def test_dask_path_never_computes_full_array():
 
     assert not full_computed_on_raw[0]
     assert vecs.nav_shape == nav
-    assert vecs.flat_buffer.shape[1] == 6
+    assert vecs.flat_buffer.shape[1] == N_COLS
 
 
 def test_numpy_path_allowed_to_hold_full_array():
@@ -250,7 +251,7 @@ def test_5d_nav_shape():
     vecs = _do_compute_vectors(sig, params, None, None)
     # nav_shape should be (4, 4), not (2, 4) or (2, 4, 4)
     assert vecs.nav_shape == (4, 4), f"Got nav_shape={vecs.nav_shape}"
-    assert vecs.flat_buffer.shape[1] == 6
+    assert vecs.flat_buffer.shape[1] == N_COLS
 
 
 def test_high_threshold_gives_fewer_vectors():

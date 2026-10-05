@@ -7,17 +7,20 @@ Motivation
 pyxem's ``DiffractionVectors2D`` is a *ragged* (object-array) signal — one
 variable-length ``(N_i, 2)`` array per navigation position. Ragged arrays
 serialize poorly (object dtype, no chunking, slow save/load). This is the dense
-alternative: the **whole scan's vectors live in one contiguous ``(N_total, 6)``
+alternative: the **whole scan's vectors live in one contiguous ``(N_total, 8)``
 float32 buffer** — the same CSR flat buffer ``SpyDEDiffractionVectors`` keeps in
 memory — and the navigation grouping is carried by a row-pointer (offsets) array
-in metadata. No padding (unlike a ``(ny, nx, max_n, 6)`` dense block), no object
+in metadata. No padding (unlike a ``(ny, nx, max_n, 8)`` dense block), no object
 dtype, exact mirror of the in-memory structure.
 
 Layout
 ------
-``.data``                : (N_total, 6) float32 — the flat buffer
-                           columns [nav_x, nav_y, kx, ky, time, intensity]
-                           (see ``spyde.signals.diffraction_vectors`` COL_*).
+``.data``                : (N_total, 8) float32 — the flat buffer
+                           columns [nav_x, nav_y, kx, ky, time, intensity,
+                           confidence, sigma] (see
+                           ``spyde.signals.diffraction_vectors`` COL_*). Files
+                           written before confidence/sigma existed hold the
+                           first six; they load with those two columns NaN.
 ``metadata.SpyDE.DiffractionVectors``:
     nav_offsets        : list of int64 row-pointer arrays (outermost-first CSR;
                          only the innermost is strictly needed — the rest rebuild
@@ -46,7 +49,7 @@ from __future__ import annotations
 import numpy as np
 from hyperspy.signals import BaseSignal
 
-from spyde.signals.diffraction_vectors import COLUMN_NAMES
+from spyde.signals.diffraction_vectors import COLUMN_NAMES, N_COLS
 
 # Where the reconstruction metadata lives on the signal.
 META_ROOT = "SpyDE.DiffractionVectors"
@@ -56,13 +59,13 @@ SIGNAL_TYPE = "spyde_dense_diffraction_vectors"
 class DenseDiffractionVectors(BaseSignal):
     """Dense flat-buffer storage of a diffraction-vectors result.
 
-    Not ragged: ``.data`` is one ``(N_total, 6)`` buffer for the whole scan, with
+    Not ragged: ``.data`` is one ``(N_total, 8)`` buffer for the whole scan, with
     the per-position grouping carried by the CSR offsets in metadata. Convert to
     the in-memory :class:`SpyDEDiffractionVectors` with :meth:`to_spyde_vectors`.
     """
 
     _signal_type = SIGNAL_TYPE
-    _signal_dimension = 1   # rows are 6-vectors; nav axis is "vector index"
+    _signal_dimension = 1   # rows are 8-vectors; nav axis is "vector index"
 
     def to_spyde_vectors(self):
         """Reconstruct the in-memory :class:`SpyDEDiffractionVectors`."""
@@ -93,14 +96,14 @@ def to_dense_signal(vecs) -> DenseDiffractionVectors:
     flat = np.ascontiguousarray(np.asarray(vecs.flat_buffer, dtype=np.float32))
     # Zarr can't chunk a zero-length axis (ceildiv by 0). For an empty result,
     # write a single zero sentinel row and record the true count so load restores
-    # the empty (0, 6) buffer.
+    # the empty (0, N_COLS) buffer.
     n_vectors = int(flat.shape[0])
     if n_vectors == 0:
-        flat = np.zeros((1, 6), dtype=np.float32)
+        flat = np.zeros((1, N_COLS), dtype=np.float32)
     sig = DenseDiffractionVectors(flat)
     sig.metadata.set_item(f"{META_ROOT}.n_vectors", n_vectors)
     # Positional column semantics so an external reader (no SpyDE) can interpret
-    # the dense (N, 6) buffer — mirrors pyxem's VectorMetadata.column_names.
+    # the dense (N, N_COLS) buffer — mirrors pyxem's VectorMetadata.column_names.
     sig.metadata.set_item(f"{META_ROOT}.column_names", list(COLUMN_NAMES))
     sig.metadata.set_item(f"{META_ROOT}.nav_offsets",
                           [np.asarray(o, dtype=np.int64) for o in vecs.nav_offsets])
@@ -123,9 +126,10 @@ def to_dense_signal(vecs) -> DenseDiffractionVectors:
 def from_dense_signal(sig) -> "object":
     """Reconstruct a :class:`SpyDEDiffractionVectors` from a loaded
     :class:`DenseDiffractionVectors` (or any signal carrying the
-    ``SpyDE.DiffractionVectors`` metadata + an ``(N, 6)`` flat buffer)."""
+    ``SpyDE.DiffractionVectors`` metadata + an ``(N, 6)`` or ``(N, 8)`` flat
+    buffer; a six-column file gets NaN confidence and sigma)."""
     from spyde.signals.diffraction_vectors import (
-        SpyDEDiffractionVectors, _AxisLite,
+        LEGACY_N_COLS, SpyDEDiffractionVectors, _AxisLite, with_all_columns,
     )
 
     if not sig.metadata.has_item(META_ROOT):
@@ -138,14 +142,15 @@ def from_dense_signal(sig) -> "object":
     md = sig.metadata.get_item(META_ROOT).as_dictionary()
 
     flat_buffer = np.ascontiguousarray(np.asarray(sig.data, dtype=np.float32))
-    if flat_buffer.ndim != 2 or flat_buffer.shape[1] != 6:
+    if flat_buffer.ndim != 2 or flat_buffer.shape[1] not in (LEGACY_N_COLS, N_COLS):
         raise ValueError(
-            f"DenseDiffractionVectors data must be (N, 6); got {flat_buffer.shape}"
+            f"DenseDiffractionVectors data must be (N, {LEGACY_N_COLS}) or (N, {N_COLS}); "
+            f"got {flat_buffer.shape}"
         )
     # An empty result was written with a single sentinel row (see to_dense_signal);
-    # n_vectors records the true count so we restore the genuine (0, 6) buffer.
+    # n_vectors records the true count so we restore the genuine empty buffer.
     n_vectors = int(md.get("n_vectors", flat_buffer.shape[0]))
-    flat_buffer = flat_buffer[:n_vectors]
+    flat_buffer = with_all_columns(flat_buffer[:n_vectors])
 
     full_nav_shape = tuple(int(s) for s in md["full_nav_shape"])
     sig_shape = tuple(int(s) for s in md["sig_shape"])

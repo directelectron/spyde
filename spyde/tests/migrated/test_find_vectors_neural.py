@@ -203,7 +203,7 @@ class TestFindVectorsNeural:
         monkeypatch.setattr(smodels, "get_model", lambda mid=None: (None, "cpu"))
 
         def _fake_detect(model, f, device, thresh=0.3, min_distance=4,
-                         auto_scale=True, bg_sigma=12.0, spot_diameter=None):
+                         auto_scale=True, bg_sigma=12.0, spot_diameter=None, **_):
             seen.update(spot_diameter=spot_diameter)
             return np.zeros((0, 3), np.float32)
 

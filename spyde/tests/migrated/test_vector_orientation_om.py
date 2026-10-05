@@ -285,7 +285,7 @@ class TestTheMatchIsBanded:
         radii (Å⁻¹), the same at every position, so every band has peaks to
         match."""
         from spyde.signals.diffraction_vectors import (
-            SpyDEDiffractionVectors, N_COLS,
+            SpyDEDiffractionVectors, LEGACY_N_COLS,
         )
         angles = np.deg2rad(np.arange(0, 360, 60))
         spots = [(0.0, 0.0)] + [(0.42 * np.cos(a), 0.42 * np.sin(a))
@@ -296,7 +296,7 @@ class TestTheMatchIsBanded:
                 for kx, ky in spots:
                     rows.append([ix, iy, kx, ky, -1.0, 1.0])
                 offsets.append(len(rows))
-        flat = np.asarray(rows, dtype=np.float32).reshape(-1, N_COLS)
+        flat = np.asarray(rows, dtype=np.float32).reshape(-1, LEGACY_N_COLS)
         off = np.asarray(offsets, dtype=np.int64)
         return SpyDEDiffractionVectors(
             flat_buffer=flat, nav_offsets=[np.arange(ny + 1) * nx, off],

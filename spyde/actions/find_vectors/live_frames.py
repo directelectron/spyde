@@ -119,7 +119,7 @@ class LiveVectorFrames:
             arr, local = self._locate(idx)
             if arr is None:
                 return None
-            peaks = np.asarray(arr[local])              # (n_slots, 3)
+            peaks = np.asarray(arr[local])              # (n_slots, PEAK_COLS)
             good = np.isfinite(peaks[:, 0])
             peaks = peaks[good]
             rows = np.zeros((peaks.shape[0], N_COLS), dtype=np.float32)
