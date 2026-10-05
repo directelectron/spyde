@@ -323,6 +323,28 @@ class TestRefinerRegistry:
         normalised = refiner._normalise(torch.as_tensor(sampled[None, None], dtype=torch.float32))
         assert float(normalised[0, 0][torch.as_tensor(ring)].abs().max()) == 0.0
 
+    def test_a_local_checkpoint_can_be_named_by_path(self, tmp_path, monkeypatch):
+        """``"source": {"type": "file", "path": ...}``: try a checkpoint that is
+        still being trained without publishing it."""
+        from spyde.models import registry
+
+        weights = tmp_path / "trial.pt"
+        _write_stub_refiner(weights)
+        (tmp_path / "registry.json").write_text(json.dumps({"models": [
+            {"id": "trial", "kind": "refiner", "arch": {"base": 4},
+             "source": {"type": "file", "path": str(weights)}},
+            {"id": "missing", "kind": "refiner",
+             "source": {"type": "file", "path": str(tmp_path / "nope.pt")}}]}))
+        monkeypatch.setattr(registry, "user_models_dir", lambda: str(tmp_path))
+        monkeypatch.setattr(registry, "_REFINER_CACHE", {})
+        registry._invalidate_manifest()
+        try:
+            assert registry.is_cached("trial") and not registry.is_cached("missing")
+            assert registry.get_refiner("trial", "cpu").crop_half == 16
+            assert refiner_for("missing") is None
+        finally:
+            registry._invalidate_manifest()
+
     def test_a_detector_is_not_a_refiner(self, stub_registry):
         with pytest.raises(ValueError):
             stub_registry.get_refiner(stub_registry.default_model_id(), "cpu")

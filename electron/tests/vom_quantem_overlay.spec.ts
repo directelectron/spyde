@@ -25,7 +25,11 @@ const { launchApp, backendAction, waitForSubwindowCount, countColorPixels } =
   require('./_harness.cjs')
 
 const CIF = join(__dirname, '..', '..', 'spyde', 'tests', 'Silver__0011135.cif')
-const SHOTS = join(__dirname, '..', 'vom_quantem_shots')
+// The Find Vectors centre stage to run with (`decode`, `mask-centroid`, or a
+// refiner model id). Unset keeps the wizard's default, which is what CI runs;
+// set it to check that a centre option keeps the absolute (CIF) scale.
+const CENTRE = process.env.SPYDE_E2E_FV_CENTRE ?? ''
+const SHOTS = join(__dirname, '..', CENTRE ? `vom_quantem_shots_${CENTRE}` : 'vom_quantem_shots')
 
 let ctx: any
 
@@ -60,6 +64,11 @@ test('the matched pattern lands on the measured peaks and follows the crosshair'
   await sig.getByTestId('subwindow-titlebar').hover()
   await sig.getByTestId('action-btn-Find Diffraction Vectors').click()
   await expect(page.getByTestId('find-vectors-wizard')).toBeVisible()
+  if (CENTRE) {
+    await page.getByTestId('fv-centre').click()
+    await page.getByTestId(`fv-centre-opt-${CENTRE}`).click()
+    await ctx.backend.waitForLog(`centre=${CENTRE}`, 60_000)
+  }
   await page.screenshot({ path: join(SHOTS, '01-find-vectors-preview.png') })
 
   const before = await page.getByTestId('subwindow').count()
