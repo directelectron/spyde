@@ -42,6 +42,14 @@ CENTRE_MASK_CENTROID = "mask-centroid"
 # The largest move the stage accepts, as a fraction of the spot radius.
 MAX_SHIFT_FRACTION = 0.5
 
+# Below this spot radius (native px) every refiner keeps the detector's centres.
+# On disks this small the raw crop holds too few pixels to beat the network's
+# decode: on SPED-Ag (R ~ 3 px) refining raised the in-grain speckle from 0.036
+# to 0.047, and the mask centroid's scatter failed the CIF-referenced
+# orientation check that the decode passes. A refiner's ``min_spot_radius``
+# overrides it (0 turns the gate off).
+DEFAULT_MIN_SPOT_RADIUS = 5.0
+
 # Crops refined per batch. A chunk can hold 10^5 disks; this bounds the crop
 # stack (and a network's activations) whatever the chunk size.
 DEFAULT_BATCH = 4096
@@ -157,10 +165,14 @@ class MaskCentroidRefiner:
     * weight — ``clip((value - background) / (0.3 * (plateau - background)), 0, 1)``
       within 3 px of the spot radius, on the crop lightly smoothed (3 x 3 mean).
 
-    A disk with no plateau above its background is declined (NaN)."""
+    A disk with no plateau above its background is declined (NaN). Below
+    ``min_spot_radius`` the stage is skipped (see ``DEFAULT_MIN_SPOT_RADIUS``)."""
 
     fraction = 0.3
     iterations = 4
+
+    def __init__(self, min_spot_radius: float = DEFAULT_MIN_SPOT_RADIUS):
+        self.min_spot_radius = float(min_spot_radius)
 
     def crop_half_width(self, spot_radius: float) -> int:
         # The support window (radius + 3) around a centre that has moved by up
