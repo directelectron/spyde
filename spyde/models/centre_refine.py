@@ -83,14 +83,19 @@ def extract_crops(frame: np.ndarray, centres: np.ndarray, half_width: int):
     size = 2 * half_width + 1
     if len(centres) == 0:
         return np.zeros((0, size, size), np.float32), np.zeros((0, 2))
-    padded = np.pad(frame, half_width + 1)
+    height, width = frame.shape
     nearest = np.rint(centres).astype(np.intp)
-    nearest[:, 0] = np.clip(nearest[:, 0], 0, frame.shape[0] - 1)
-    nearest[:, 1] = np.clip(nearest[:, 1], 0, frame.shape[1] - 1)
+    nearest[:, 0] = np.clip(nearest[:, 0], 0, height - 1)
+    nearest[:, 1] = np.clip(nearest[:, 1], 0, width - 1)
     offsets = np.arange(-half_width, half_width + 1)
-    rows = nearest[:, 0, None] + 1 + half_width + offsets
-    columns = nearest[:, 1, None] + 1 + half_width + offsets
-    crops = padded[rows[:, :, None], columns[:, None, :]]
+    rows = nearest[:, 0, None] + offsets
+    columns = nearest[:, 1, None] + offsets
+    # Gather only the windows. Padding the frame instead copies all of it for
+    # every frame, which on 512 x 512 frames cost four times the network.
+    crops = frame[np.clip(rows, 0, height - 1)[:, :, None], np.clip(columns, 0, width - 1)[:, None, :]]
+    inside = (((rows >= 0) & (rows < height))[:, :, None]
+              & ((columns >= 0) & (columns < width))[:, None, :])
+    crops = np.where(inside, crops, np.float32(0))
     local = centres - (nearest - half_width)
     return crops, local
 
