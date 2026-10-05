@@ -38,6 +38,19 @@
                 "uncertainty": "head", "max_sigma_fraction": 0.25, "min_spot_radius": 5.0},
       "sha256": "a025edca628106decef6ae6edb753a4ec330211daa41144d623b79460889261c",
       "source": {"type": "bundled", "file": "centre_fast_f3.pt"}
+    },
+    {
+      "id": "centre-fast-f5-v1",
+      "kind": "refiner",
+      "label": "Fast centre network F5 (bundled)",
+      "version": 1,
+      "notes": "F3's layout at a finer crop (spot radius -> 10 crop px, 33 px crop). The lowest scan-varying Friedel error of the stage-2 options on real GaN (1.18 px on the per-tilt-corrected sum; N/S 0.405), about 0.3 s per 1024 frames on a GPU. Its sigma head runs about twice F3's, so at the shared 0.25 R limit it declines more disks and leaves them where the detector put them. Skipped below a 5 px spot radius.",
+      "arch": {"base": 8, "levels": 2, "depthwise": 0, "sigma_head": 1},
+      "input": {"crop_radius": 10.0, "crop_half": 16, "annulus": [0.78, 1.0],
+                "normalisation": "mean", "passes": 2, "recrop_over": 0.15,
+                "uncertainty": "head", "max_sigma_fraction": 0.25, "min_spot_radius": 5.0},
+      "sha256": "f5d751ceb290a868b116775eca2fa8af2e56440a9a93432a2bbb087c0492ff7c",
+      "source": {"type": "bundled", "file": "centre_fast_f5.pt"}
     }
   ]
 }
