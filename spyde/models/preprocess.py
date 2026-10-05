@@ -16,7 +16,7 @@ diameter.
 Usage at inference:
     diam = estimate_disk_diameter(frame)
     scaled, factor = scale_to_canonical(frame, diam)        # disks -> ~CANONICAL px
-    # run model on `scaled`, then map predicted positions back with /factor
+    # run model on `scaled`, then map predicted positions back (infer._to_frame_coordinates)
 """
 from __future__ import annotations
 
@@ -125,8 +125,8 @@ def scale_to_canonical(frame: np.ndarray, diameter: float | None = None,
     """Resample ``frame`` so its disks land at ~``target`` px. Returns
     (scaled, factor), bounded by SCALE_CLIP (see the constants above for why the
     old upsample-only policy was wrong). A predicted position p in the scaled
-    frame maps back as p / factor. ``diameter`` may be passed to reuse one
-    estimate across a stack."""
+    frame maps back as p * (n - 1) / (out - 1), see infer._to_frame_coordinates.
+    ``diameter`` may be passed to reuse one estimate across a stack."""
     from scipy.ndimage import zoom
 
     if diameter is None:

@@ -153,22 +153,6 @@ def _mask_radius(work_diam: float) -> float:
     return 0.5 * CANONICAL_DIAMETER
 
 
-def _to_frame(peaks, factor: float, shape):
-    """Working-resolution peaks back to frame px.
-
-    The zoom to working resolution is endpoint-aligned (``scale_to_canonical``,
-    ``preprocess_torch.scale_batch``): an axis of n px becomes round(n * factor) px with
-    the first and last pixel centres fixed, so a position maps back by
-    (n - 1) / (round(n * factor) - 1), not by 1 / factor. The two differ by up to
-    0.5 % of the position, about 1.3 px at the edge of a 512 px frame."""
-    if not len(peaks):
-        return peaks
-    peaks = np.array(peaks, copy=True)
-    for axis, n in enumerate(shape[-2:]):
-        peaks[:, axis] = peaks[:, axis] * ((n - 1) / (int(round(n * factor)) - 1))
-    return peaks
-
-
 def _pad_to_multiple(nrm: np.ndarray, levels: int):
     """Reflect-pad H,W up to a multiple of 2**levels so the U-Net pool/upsample
     line up. Returns the padded array (unchanged if already aligned)."""
@@ -257,6 +241,25 @@ def bg_sigma_from_peak_size(peak_diameter_px: float) -> float:
     return float(np.clip(1.2 * peak_diameter_px, 4.0, 24.0))
 
 
+def _to_frame_coordinates(peaks: np.ndarray, frame_shape, factor: float) -> np.ndarray:
+    """Map peak ``(y, x)`` from the rescaled working frame back to the frame.
+
+    The rescale (``scipy.ndimage.zoom(order=1)`` and its torch twin) aligns the
+    first and last pixel centres, so working pixel ``i`` sits at frame position
+    ``i * (n - 1) / (out - 1)`` with ``out = round(n * factor)`` -- not at
+    ``i / factor``. The two differ by the rounding of the output size: a uniform
+    scale error of up to ~0.6 %, invisible in relative strain but a bias of that
+    size in absolute strain and up to ~0.7 px at the far edge of a 128 px frame.
+    Only this inverse changes; the forward rescale stays as trained."""
+    if factor == 1.0 or len(peaks) == 0:
+        return peaks
+    peaks = peaks.copy()
+    for axis, n in enumerate(frame_shape[:2]):
+        out = int(round(n * factor))
+        peaks[:, axis] = peaks[:, axis] * ((n - 1) / (out - 1))
+    return peaks
+
+
 @torch.no_grad()
 def detect(model, frame: np.ndarray, device, thresh: float = 0.3,
            min_distance: int = 4, auto_scale: bool = True,
@@ -287,9 +290,7 @@ def detect(model, frame: np.ndarray, device, thresh: float = 0.3,
     pred = decode(outputs[0][0], outputs[1][0], thresh=thresh, min_distance=md,
                   mask_logits=outputs[2][0] if len(outputs) > 2 else None,
                   radius=_mask_radius(work_diam))
-    if factor != 1.0:
-        pred = _to_frame(pred, factor, frame.shape)   # map back to original coords
-    return pred
+    return _to_frame_coordinates(pred, frame.shape, factor)
 
 
 def _neural_sub_batch_size() -> int:
@@ -465,14 +466,12 @@ def detect_batch(model, frames, device, thresh: float = 0.3,
             cur_model, cur_device, chunk)
         res = decode_batch(outputs[0], outputs[1], thresh=thresh, min_distance=md,
                            mask_logits=outputs[2] if len(outputs) > 2 else None, radius=mask_radius)
-        peaks = split_by_batch(res, chunk.shape[0])
-        if factor != 1.0:
-            peaks = [_to_frame(p, factor, frames.shape) for p in peaks]
-        per_frame.extend(peaks)
+        per_frame.extend(split_by_batch(res, chunk.shape[0]))
         del outputs, res
         if cur_device.type == "cuda":
             torch.cuda.empty_cache()
-    return per_frame
+
+    return [_to_frame_coordinates(p, frames.shape[1:], factor) for p in per_frame]
 
 
 @torch.no_grad()

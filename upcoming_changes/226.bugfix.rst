@@ -1,1 +1,0 @@
-Neural disk positions on downsampled frames were up to 0.5 % too close to the frame origin (about 1.3 px at the edge of a 512 px frame), because they were mapped back by the scale factor instead of through the zoom that produced them.

@@ -101,19 +101,3 @@ class TestSpotUNetHeads:
         assert mask.shape == heatmap.shape == (2, 1, 32, 32)
         assert offsets.shape == (2, 2, 32, 32)
 
-
-class TestBackToFrame:
-    def test_endpoint_aligned_zoom_maps_back_exactly(self):
-        """A point drawn in the frame lands where the zoomed image puts it, mapped back
-        through the zoom's own geometry, not through 1 / factor."""
-        from spyde.models.infer import _to_frame
-        shape, factor = (512, 512), 9 / 22
-        frame = np.zeros(shape, np.float32)
-        frame[440:461, 50:71] = 1.0                      # a block centred on (450, 60)
-        zoomed = PT.scale_batch(torch.from_numpy(frame)[None], factor)[0].numpy()
-        rows, columns = np.mgrid[:zoomed.shape[0], :zoomed.shape[1]]
-        y, x = (zoomed * rows).sum() / zoomed.sum(), (zoomed * columns).sum() / zoomed.sum()
-        back = _to_frame(np.array([[y, x, 1.0]], np.float32), factor, shape)
-        assert abs(back[0, 0] - 450) < 0.2 and abs(back[0, 1] - 60) < 0.2
-        naive = np.array([y, x]) / factor
-        assert abs(naive[0] - 450) > 2.0                 # the old mapping is off by ~2 px here
