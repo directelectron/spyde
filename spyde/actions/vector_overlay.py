@@ -249,7 +249,7 @@ def _transform_levels(response, method: str, threshold: float):
 
 
 def find_vectors_preview(window, centre=None, *, params: dict, sigma: float,
-                         beamstop_mask, show_transform: bool) -> dict:
+                         beamstop_mask, show_transform: bool, position=None) -> dict:
     """The peaks the detector finds in the frame under the crosshair, the image
     it found them in when the transform view is on, and the beam stop it
     excluded.
@@ -273,8 +273,11 @@ def find_vectors_preview(window, centre=None, *, params: dict, sigma: float,
         # peaks are [ky_row, kx_col, value] in pixels; a marker is (x, y).
         offsets = np.column_stack([peaks[:, 1], peaks[:, 0]]).astype(np.float32)
     threshold = float(params.get("threshold", 0.0))
+    # ``index`` is the navigation position these peaks were found at, so a
+    # double-click on them (find_vectors_adapt) knows which pattern it marks.
     value = {"peaks": {"data": offsets, "radius": _preview_marker_radius(params)},
-             "transform": None, "mask": beamstop_mask, "threshold": threshold}
+             "transform": None, "mask": beamstop_mask, "threshold": threshold,
+             "index": None if position is None else tuple(int(v) for v in position)}
     if response is not None:
         response = np.asarray(response, dtype=np.float32)
         levels = _transform_levels(
@@ -353,6 +356,7 @@ def attach_find_vectors_preview(dp_plot, signal, tree, params: dict,
         static={"params": _detector_params(params), "sigma": sigma,
                 "beamstop_mask": None,
                 "show_transform": bool(params.get("show_transform"))},
+        iterating={"position": NavigationPosition()},
         on_value=lambda value: _emit_preview_histogram(dp_plot, value),
     )
     request_beamstop(tree, node, params)

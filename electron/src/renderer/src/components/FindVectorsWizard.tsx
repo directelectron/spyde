@@ -18,10 +18,20 @@
  *     (Disk Radius slider; threshold is a [-1,1] correlation score).
  *   • DoG — Difference-of-Gaussians band-pass, best for small (2-3 px) spots
  *     and beam-stopped patterns (σ₁/σ₂ sliders; threshold is a band-pass SNR).
+ *
+ * Teach (neural only): double-clicks on the pattern are handled by the backend
+ * (spyde/actions/find_vectors_adapt.py) — a circle → "not a disk", empty
+ * pattern → "a disk is here", a mark → removed. It refits a copy of the model
+ * about a second after the last mark and reports `fv_adapt_state`; the caret
+ * adopts the taught model as its Model so the preview and Compute both use it.
+ * A fit is an unsaved draft until it is named (the name field under the Model
+ * dropdown, Enter saves); named models are offered on every dataset, can be
+ * renamed or deleted from the dropdown's rows, and can be adapted again.
  */
 import React from 'react'
 import { WizardShell, Field, Slider, Select, Check, S } from './WizardShell'
 import { useWizardLifecycle, useDebouncedAction, useWizardEvent } from './wizardHooks'
+import { ModelMenu, ModelInfo } from './ModelMenu'
 
 interface Props {
   caretPos: React.CSSProperties
@@ -32,7 +42,7 @@ interface Props {
 
 type Method = 'neural' | 'nxcorr' | 'dog'
 const METHODS: readonly { value: Method; label: string }[] = [
-  { value: 'neural', label: 'Neural (SpotUNet)' },
+  { value: 'neural', label: 'Neural network' },
   { value: 'nxcorr', label: 'NXCORR (disk)' },
   { value: 'dog', label: 'DoG (small spots)' },
 ]
@@ -59,7 +69,7 @@ export function FindVectorsWizard({ caretPos, windowId, sendAction, onClose }: P
   const saved = _fvStore.get(windowId)
   const [method, setMethod] = React.useState<Method>(saved?.method ?? 'neural')
   const [modelId, setModelId] = React.useState(saved?.modelId ?? '')
-  const [models, setModels] = React.useState<readonly { value: string; label: string }[]>([])
+  const [models, setModels] = React.useState<readonly ModelInfo[]>([])
   const [sigma, setSigma] = React.useState(saved?.sigma ?? 0)
   const [radius, setRadius] = React.useState(saved?.radius ?? 5)
   const [sigma1, setSigma1] = React.useState(saved?.sigma1 ?? 0.8)
@@ -73,6 +83,7 @@ export function FindVectorsWizard({ caretPos, windowId, sendAction, onClose }: P
   const [showTransform, setShowTransform] = React.useState(saved?.showTransform ?? false)
   const [persistence, setPersistence] = React.useState(saved?.persistence ?? false)
   const [status, setStatus] = React.useState('Tune the parameters — peaks preview under the crosshair.')
+  const [teach, setTeach] = React.useState<TeachState>(TEACH_EMPTY)
 
   React.useEffect(() => {
     _fvStore.set(windowId, {
@@ -128,10 +139,17 @@ export function FindVectorsWizard({ caretPos, windowId, sendAction, onClose }: P
     sendRef.current('fv_models', {}, windowId)
   }, [windowId])
   useWizardEvent('spyde:fv_models', windowId, (d) => {
-    const list = Array.isArray(d.models) ? (d.models as { id: string; label?: string }[]) : []
-    setModels(list.map((m) => ({ value: m.id, label: m.label ?? m.id })))
-    // '' = registry default; surface it as the concrete id once known.
-    if (!vals.current.modelId && typeof d.default === 'string') setModelId(d.default)
+    const list = Array.isArray(d.models) ? (d.models as ModelInfo[]) : []
+    setModels(list.map((m) => ({ ...m, label: m.label ?? m.id })))
+    // '' = registry default; surface it as the concrete id once known. A model
+    // that is no longer listed (deleted, or an unsaved draft that was discarded)
+    // falls back to the default too.
+    const current = vals.current.modelId
+    if (typeof d.default === 'string' && (!current || !list.some((m) => m.id === current))) {
+      setModelId(d.default)
+      vals.current = { ...vals.current, modelId: d.default }
+      if (current) tune()
+    }
     if (d.refreshed) setStatus(`Model list refreshed — ${list.length} available.`)
   })
 
@@ -162,6 +180,32 @@ export function FindVectorsWizard({ caretPos, windowId, sendAction, onClose }: P
     if (adopted) {
       const conf = typeof d.confidence === 'number' ? ` (conf ${d.confidence.toFixed(2)})` : ''
       setStatus(`Auto-calibrated background removal${conf}.`)
+      tune()
+    }
+  })
+
+  // Teach: the backend owns the marks and the taught model; the caret follows
+  // its Model choice so the preview and Compute both use the taught model, and
+  // goes back to the original one on Revert.
+  const teachRef = React.useRef<string | null>(null)
+  useWizardEvent('spyde:fv_adapt_state', windowId, (d) => {
+    const taught = typeof d.model_id === 'string' ? d.model_id : null
+    const base = typeof d.base_model_id === 'string' ? d.base_model_id : ''
+    setTeach({
+      marks: Number(d.marks ?? 0), disk: Number(d.disk ?? 0), notDisk: Number(d.not_disk ?? 0),
+      busy: Boolean(d.busy), taught, unsaved: Boolean(d.unsaved),
+      learned: typeof d.marks_learned === 'number' ? d.marks_learned : null,
+      learnable: typeof d.marks_total === 'number' ? d.marks_total : null,
+      defaultName: typeof d.default_name === 'string' ? d.default_name : '',
+      originalF1: typeof d.original_f1 === 'number' ? d.original_f1 : null,
+      originalF1Base: typeof d.original_f1_base === 'number' ? d.original_f1_base : null,
+    })
+    if (typeof d.status === 'string') setStatus(d.status)
+    const want = taught ?? (teachRef.current ? base : vals.current.modelId)
+    teachRef.current = taught
+    if (want !== vals.current.modelId) {
+      setModelId(want)
+      vals.current = { ...vals.current, modelId: want }
       tune()
     }
   })
@@ -207,14 +251,18 @@ export function FindVectorsWizard({ caretPos, windowId, sendAction, onClose }: P
         <Select testid="fv-method" value={method} options={METHODS} onChange={onMethod} />
       </Field>
       {isNeural && models.length > 0 && (
-        <Field label="Model">
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
           <div style={modelRowStyle}>
-            <Select testid="fv-model" value={modelId} options={models}
-              onChange={live(setModelId)} />
+            <label style={{ ...S.lbl, flex: 1 }}>Model</label>
             <button data-testid="fv-refresh-models" style={refreshBtnStyle}
               title="Check Hugging Face for new models" onClick={refreshModels}>↻</button>
           </div>
-        </Field>
+          <ModelMenu testid="fv-model" models={models} value={modelId} onChange={live(setModelId)}
+            onRename={(id, name) => sendRef.current('fv_model_name', { model_id: id, name }, windowId)}
+            onDelete={(id) => sendRef.current('fv_model_delete', { model_id: id }, windowId)} />
+          <NameDraft model={models.find((m) => m.id === modelId)} teach={teach}
+            send={(action, payload) => sendRef.current(action, payload, windowId)} />
+        </div>
       )}
       <div style={gridStyle}>
         {!isNeural && (
@@ -284,9 +332,86 @@ export function FindVectorsWizard({ caretPos, windowId, sendAction, onClose }: P
             label="Neighbor refine" />
         )}
       </div>
+      {isNeural && (
+        <div data-testid="fv-teach" style={teachStyle}
+          title={'Double-click a circle that is not a disk, or a disk it missed; double-click a mark to remove it. '
+            + 'The model is refitted on your marks about a second after the last one.'}>
+          <div style={teachRowStyle}>
+            <span data-testid="fv-teach-count" style={{ flex: 1 }}>
+              {teach.marks === 0
+                ? 'Teach: double-click a wrong circle or a missed disk'
+                : `Teach: ${teach.notDisk} wrong · ${teach.disk} missed${teach.busy ? ' — adapting…' : ''}`}
+            </span>
+            <button data-testid="fv-adapt" style={smallBtnStyle} disabled={teach.marks === 0 || teach.busy}
+              onClick={() => sendRef.current('fv_adapt', {}, windowId)}>Adapt</button>
+            <button data-testid="fv-adapt-revert" style={smallBtnStyle}
+              disabled={teach.marks === 0 && !teach.taught}
+              onClick={() => sendRef.current('fv_adapt_revert', {}, windowId)}>Revert</button>
+          </div>
+          {teach.taught && teach.originalF1 !== null && (
+            <div data-testid="fv-teach-gauge"
+              style={{ color: teach.originalF1 < 0.7 ? '#ff9a3c' : '#a6adc8' }}
+              title="F1 on the synthetic patterns the model was trained on: how far teaching pulled it toward this dataset">
+              {teach.learned !== null && teach.learnable !== null && teach.learned < teach.learnable
+                ? `${teach.learned} of ${teach.learnable} marks learned · `
+                : ''}
+              {teach.originalF1 < 0.7 ? 'Now specific to this dataset' : 'Using the taught model'}
+              {` · general F1 ${teach.originalF1.toFixed(2)}`}
+              {teach.originalF1Base !== null ? ` (was ${teach.originalF1Base.toFixed(2)})` : ''}
+            </div>
+          )}
+        </div>
+      )}
       <button data-testid="fv-compute" style={S.primary} onClick={compute}>Compute</button>
     </WizardShell>
   )
+}
+
+interface TeachState {
+  marks: number; disk: number; notDisk: number; busy: boolean; taught: string | null
+  unsaved: boolean; defaultName: string; learned: number | null; learnable: number | null
+  originalF1: number | null; originalF1Base: number | null
+}
+const TEACH_EMPTY: TeachState = {
+  marks: 0, disk: 0, notDisk: 0, busy: false, taught: null, unsaved: false, defaultName: '',
+  learned: null, learnable: null, originalF1: null, originalF1Base: null,
+}
+
+/** Under the Model dropdown: name the fit that was just made (Enter saves). A
+ * named model's Rename / Delete live on its row in the dropdown. */
+function NameDraft({ model, teach, send }: {
+  model: ModelInfo | undefined
+  teach: TeachState
+  send: (action: string, payload: Record<string, unknown>) => void
+}) {
+  const naming = Boolean(model?.unsaved && model.id === teach.taught)
+  const [text, setText] = React.useState('')
+  React.useEffect(() => {
+    setText(teach.defaultName || model?.label || '')
+  }, [model?.id, naming, teach.defaultName])  // eslint-disable-line react-hooks/exhaustive-deps
+  if (!naming || !model) return null
+  const save = () => {
+    const name = text.trim()
+    if (name) send('fv_model_name', { model_id: model.id, name })
+  }
+  return (
+    <div style={actionRowStyle}>
+      <input data-testid="fv-model-name-input" style={{ ...S.num, flex: 1, minWidth: 0 }} value={text}
+        placeholder="Name this model" onChange={(e) => setText(e.target.value)}
+        onKeyDown={(e) => { if (e.key === 'Enter') save() }} />
+      <button data-testid="fv-model-save" style={smallBtnStyle} disabled={!text.trim()} onClick={save}>Save</button>
+    </div>
+  )
+}
+const actionRowStyle: React.CSSProperties = { display: 'flex', alignItems: 'center', gap: 4 }
+const teachStyle: React.CSSProperties = {
+  display: 'flex', flexDirection: 'column', gap: 3, fontSize: 11,
+  borderTop: '1px solid #333', paddingTop: 6,
+}
+const teachRowStyle: React.CSSProperties = { display: 'flex', alignItems: 'center', gap: 4 }
+const smallBtnStyle: React.CSSProperties = {
+  flex: '0 0 auto', padding: '1px 6px', fontSize: 11, background: 'transparent', color: 'inherit',
+  border: '1px solid #555', borderRadius: 4, cursor: 'pointer',
 }
 
 const gridStyle: React.CSSProperties = {

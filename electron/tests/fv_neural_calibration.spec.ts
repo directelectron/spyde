@@ -57,9 +57,11 @@ test('neural wizard: bg-σ control, auto-calibration, model refresh, compute', a
   await expect(page.getByTestId('fv-refresh-models')).toBeVisible()
   await page.screenshot({ path: 'fv_neural_shots/01-wizard-open.png' })
 
-  // The themed Model dropdown opens with the menubar look (screenshot check).
+  // The themed Model dropdown lists every bundled model, each with its icon.
   await page.getByTestId('fv-model').click()
   await expect(page.getByTestId('fv-model-opt-spotunet-production-v2')).toBeVisible()
+  await page.getByTestId('fv-model-opt-spotunet-production-v2').hover()
+  await expect(page.getByTestId('fv-model-card')).toBeVisible()
   await page.screenshot({ path: 'fv_neural_shots/01b-model-dropdown.png' })
   await page.keyboard.press('Escape')
 
