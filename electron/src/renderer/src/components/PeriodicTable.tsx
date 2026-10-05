@@ -23,6 +23,7 @@ import React from 'react'
 import { createPortal } from 'react-dom'
 import type { SamplePhase } from '../kernel/SpyDEContext'
 import { useCifRecents, RecentCifs, fileName } from './CifRecents'
+import { NumInput } from './WizardShell'
 
 interface El { z: number; sym: string; row: number; col: number; cat: Cat }
 type Cat = 'alkali' | 'alkaline' | 'tm' | 'post' | 'metalloid' | 'nonmetal'
@@ -123,33 +124,6 @@ const formatNumber = (value: number | null) =>
   (value == null ? '–' : (Math.round(value * 1000) / 1000).toString())
 const newPhaseId = () => Math.random().toString(36).slice(2, 14)
 
-/** A percentage typed into a phase. Saved when the field loses focus (or on
- *  Enter) rather than per keystroke: saving "12." as 12 would make it
- *  impossible to type 12.5. */
-function PercentInput({ value, onCommit, testid }: {
-  value: number | undefined
-  onCommit: (value: number | null) => void
-  testid: string
-}) {
-  const [draft, setDraft] = React.useState<string | null>(null)
-  // Show the typed text until the saved value comes back, not the old value.
-  React.useEffect(() => { setDraft(null) }, [value])
-  const commit = () => {
-    if (draft == null) return
-    const text = draft.trim()
-    const number = text === '' ? null : parseFloat(text)
-    if (Number.isNaN(number) || number === (value ?? null)) setDraft(null)
-    else onCommit(number)
-  }
-  return (
-    <input data-testid={testid} style={S.percentInput} placeholder="%"
-      value={draft ?? (value ?? '')}
-      onChange={event => setDraft(event.target.value)}
-      onBlur={commit}
-      onKeyDown={event => { if (event.key === 'Enter') event.currentTarget.blur() }} />
-  )
-}
-
 export function PeriodicTable({ windowId, phases, sendAction, onClose }: Props) {
   // The phase the table edits. An id no phase has yet is the phase the next
   // edit creates, shown after the others.
@@ -167,6 +141,10 @@ export function PeriodicTable({ windowId, phases, sendAction, onClose }: Props) 
   const { recents, remember } = useCifRecents()
   const act = (action: string, payload: Record<string, unknown>) =>
     sendAction(action, { phase: selectedId, ...payload }, windowId)
+  // Only the edited element is sent, so saves made before a reply cannot
+  // overwrite each other; null clears the percentage.
+  const setPercent = (symbol: string, percent: number | null) =>
+    act('set_phase_percentages', { percentages: { [symbol]: percent } })
 
   React.useEffect(() => {
     const onResults = (event: Event) => {
@@ -283,10 +261,11 @@ export function PeriodicTable({ windowId, phases, sendAction, onClose }: Props) 
                     <span style={{ ...S.chipSymbol, color: colorOf(symbol), opacity: trace ? 0.6 : 1 }}>
                       {symbol}
                     </span>
-                    <PercentInput testid={`phase-${position}-pct-${symbol}`}
-                      value={phase?.percentages[symbol]}
-                      onCommit={value => act('set_phase_percentages',
-                        { percentages: { [symbol]: value } })} />
+                    <NumInput testid={`phase-${position}-pct-${symbol}`} placeholder="%"
+                      value={phase?.percentages[symbol] ?? null} style={S.percentInput}
+                      min={0} max={100} accept={value => value >= 0 && value <= 100}
+                      onChange={value => setPercent(symbol, value)}
+                      onClear={() => setPercent(symbol, null)} />
                     <button data-testid={`phase-${position}-trace-${symbol}`}
                       data-on={trace ? 'true' : undefined}
                       title={trace
@@ -422,7 +401,7 @@ const S: Record<string, React.CSSProperties> = {
   },
   chipSymbol: { fontSize: 12, fontWeight: 700 },
   percentInput: {
-    width: 38, background: '#181825', border: '1px solid #313244', borderRadius: 8,
+    width: 52, background: '#181825', border: '1px solid #313244', borderRadius: 8,
     color: '#cdd6f4', fontSize: 10, padding: '2px 4px', textAlign: 'center',
   },
   trace: {
