@@ -257,13 +257,21 @@ STUB_ID = "centre-stub-v1"
 F3_ID = "centre-fast-f3-v1"
 F5_ID = "centre-fast-f5-v1"
 FAST_IDS = (F3_ID, F5_ID)
-#: Per bundled fast refiner: its parity fixture (CPU output of the training
-#: code's ``fastref.refine`` on 8 GaN-like frames, R = 11) and crop geometry.
-FAST_REFINERS = {
-    F3_ID: dict(reference=Path(__file__).resolve().parents[1] / "f3_parity_reference.npz",
-                crop=(8.0, 13)),
-    F5_ID: dict(reference=Path(__file__).resolve().parents[1] / "f5_parity_reference.npz",
-                crop=(10.0, 16)),
+#: Per bundled fast refiner: its crop geometry and the checkpoint's sigma_scale.
+FAST_REFINERS = {F3_ID: dict(crop=(8.0, 13), sigma_scale=1.1276),
+                 F5_ID: dict(crop=(10.0, 16), sigma_scale=0.9776)}
+_TESTS = Path(__file__).resolve().parents[1]
+#: Parity fixtures: the CPU output of the training code's ``fastref.refine``
+#: with the calibrated checkpoint, R = 11. "sparse" is 8 low-count frames (112
+#: disks) where F5's head reads high and it declines 67; "gan" is 8 real GaN
+#: frames with E7 seeds (92 disks), where neither declines any.
+#: (model, fixture file, largest centre difference allowed, px) — the GaN
+#: frames carry counts up to ~1e4, where the float32 resampling differs from
+#: the training code's gather by up to 8e-5 px.
+FAST_FIXTURES = {
+    "F3-sparse": (F3_ID, _TESTS / "f3_parity_reference.npz", 5e-5),
+    "F5-sparse": (F5_ID, _TESTS / "f5_parity_reference.npz", 5e-5),
+    "F5-gan": (F5_ID, _TESTS / "f5_parity_reference_gan.npz", 1e-4),
 }
 
 
@@ -584,28 +592,33 @@ class TestNetworkRefinerInference:
 
 # ── the fast refiners (F3, F5): their own layout, a sigma head, a radius gate ──
 
-def _fast_reference(model_id=F3_ID):
+def _fast_reference(fixture="F3-sparse"):
     """Frames, per-frame seeds and the centres + sigma the training code's
-    ``fastref.refine`` gave for them on the CPU (8 GaN-like frames, R = 11)."""
-    reference = np.load(FAST_REFINERS[model_id]["reference"])
+    ``fastref.refine`` gave for them on the CPU (see ``FAST_FIXTURES``)."""
+    reference = np.load(FAST_FIXTURES[fixture][1])
     split = np.cumsum(reference["counts"])[:-1]
     return (list(reference["frames"].astype(np.float32)),
             np.split(reference["seeds"][:, :2], split), float(reference["radius"]),
             reference["centres"], reference["sigma"])
 
 
-@pytest.fixture(params=FAST_IDS)
-def fast_refiner(request):
-    """A fresh load of each bundled fast refiner from its registry entry (not
-    the shared cache, which these tests patch and hook)."""
+def _load_fast(model_id):
+    """A fresh load of a bundled fast refiner from its registry entry (not the
+    shared cache, which these tests patch and hook)."""
     from spyde.models import centre_network, registry
 
     registry._invalidate_manifest()
-    entry = registry._entry(request.param)
+    entry = registry._entry(model_id)
     refiner = centre_network.load_refiner(registry._resolve_weights(entry), "cpu",
                                           arch=entry.get("arch"), contract=entry.get("input"))
-    refiner.model_id = request.param
+    refiner.model_id = model_id
+    refiner.fixture = "F3-sparse" if model_id == F3_ID else "F5-gan"
     return refiner
+
+
+@pytest.fixture(params=FAST_IDS)
+def fast_refiner(request):
+    return _load_fast(request.param)
 
 
 class TestFastRefiner:
@@ -617,14 +630,21 @@ class TestFastRefiner:
         assert (fast_refiner.crop_radius, fast_refiner.crop_half) == expected
         assert fast_refiner.normalisation == "mean" and fast_refiner.uncertainty == "head"
         assert (fast_refiner.recrop_over, fast_refiner.min_spot_radius) == (0.15, 5.0)
+        # sigma is scaled by R / crop_radius of THIS checkpoint and its own calibration
+        assert fast_refiner.sigma_scale == pytest.approx(
+            FAST_REFINERS[fast_refiner.model_id]["sigma_scale"], abs=1e-4)
 
-    def test_matches_the_training_code_on_the_cpu(self, fast_refiner):
-        """F3 agreed to 3e-5 px (centres) and 2e-5 px (sigma) when measured.
-        F5 declines 69 of the 112 disks here: its sigma head runs about twice
-        F3's, and its median sigma (0.26 R) sits just over the 0.25 R limit."""
-        frames, seeds, radius, centres, sigma = _fast_reference(fast_refiner.model_id)
-        positions, sigmas = refine_centres(frames, seeds, radius, fast_refiner)
-        np.testing.assert_allclose(np.concatenate(positions), centres, rtol=0, atol=5e-5)
+    @pytest.mark.parametrize("fixture", sorted(FAST_FIXTURES))
+    def test_matches_the_training_code_on_the_cpu(self, fixture):
+        """Measured: centres within 3e-5 px on the sparse frames and 8e-5 px on
+        the real GaN frames; sigma within 2e-5 px. On real GaN F5 declines none
+        of the 92 disks (median sigma 0.106 R); on the sparse frames its head
+        reads high and it declines 67 of 112, as the training code does."""
+        model_id, _, tolerance = FAST_FIXTURES[fixture]
+        refiner = _load_fast(model_id)
+        frames, seeds, radius, centres, sigma = _fast_reference(fixture)
+        positions, sigmas = refine_centres(frames, seeds, radius, refiner)
+        np.testing.assert_allclose(np.concatenate(positions), centres, rtol=0, atol=tolerance)
         got = np.concatenate(sigmas)
         assert (np.isnan(got) == np.isnan(sigma)).all()
         np.testing.assert_allclose(got[np.isfinite(got)], sigma[np.isfinite(sigma)],
@@ -633,7 +653,7 @@ class TestFastRefiner:
     def test_one_view_and_a_second_pass_only_for_disks_that_moved(self, fast_refiner):
         """The sigma head needs no mirrors; the re-crop pass sees only the disks
         the first pass moved by more than 0.15 R."""
-        frames, seeds, radius, _, _ = _fast_reference(fast_refiner.model_id)
+        frames, seeds, radius, _, _ = _fast_reference(fast_refiner.fixture)
         batches = []
         fast_refiner.net.register_forward_pre_hook(lambda module, inputs: batches.append(len(inputs[0])))
         refine_centres(frames, seeds, radius, fast_refiner)
@@ -645,14 +665,14 @@ class TestFastRefiner:
         """Below the contract's 5 px spot radius the stage is skipped outright."""
         called = []
         monkeypatch.setattr(fast_refiner, "refine", lambda *a: called.append(1))
-        frames, seeds, _, _, _ = _fast_reference(fast_refiner.model_id)
+        frames, seeds, _, _, _ = _fast_reference(fast_refiner.fixture)
         positions, sigmas = refine_centres(frames, seeds, 4.0, fast_refiner)
         assert not called and sigmas is None
         for got, seed in zip(positions, seeds):
             np.testing.assert_array_equal(got, seed.astype(np.float32))
 
     def test_a_disk_whose_head_sigma_is_too_large_is_declined(self, fast_refiner, monkeypatch):
-        frames, seeds, radius, _, _ = _fast_reference(fast_refiner.model_id)
+        frames, seeds, radius, _, _ = _fast_reference(fast_refiner.fixture)
         monkeypatch.setattr(fast_refiner, "max_sigma_fraction", 1e-6)
         positions, sigmas = refine_centres(frames[:1], seeds[:1], radius, fast_refiner)
         np.testing.assert_allclose(positions[0], seeds[0], atol=1e-5)
@@ -867,17 +887,17 @@ _DRIVER = textwrap.dedent(r"""
         elif mode == "f3_cuda":
             if not torch.cuda.is_available():
                 return {"skipped": True}
-            from test_centre_refiner import _fast_reference, FAST_IDS
+            from test_centre_refiner import _fast_reference, FAST_FIXTURES
             from spyde.models import registry
             from spyde.models.centre_refine import refine_centres
             torch.nn.functional.linear(torch.zeros(1, 1, device="cuda"),
                                        torch.zeros(1, 1, device="cuda"))
-            for model_id in FAST_IDS:
-                frames, seeds, radius, centres, sigma = _fast_reference(model_id)
+            for fixture, (model_id, _, _) in FAST_FIXTURES.items():
+                frames, seeds, radius, centres, sigma = _fast_reference(fixture)
                 positions, sigmas = refine_centres(frames, seeds, radius,
                                                    registry.get_refiner(model_id, "cuda"))
                 got = np.concatenate(sigmas)
-                out[model_id] = dict(
+                out[fixture] = dict(
                     centre_difference=float(np.abs(np.concatenate(positions) - centres).max()),
                     sigma_difference=float(np.nanmax(np.abs(got - sigma))),
                     declined_match=bool((np.isnan(got) == np.isnan(sigma)).all()))
@@ -931,14 +951,16 @@ class TestWithTheDetectorNetwork:
         assert 0.02 < result[CENTRE_MASK_CENTROID]["mean_move"] < 1.0
 
     def test_the_fast_refiners_match_the_training_code_on_cuda(self, network_results):
+        """Against the CPU reference, so the device's own float32 rounding adds
+        to the comparison: measured up to 8e-5 px."""
         results = network_results["f3_cuda"]
         if results.get("skipped"):
             pytest.skip("no CUDA device")
-        for model_id in FAST_IDS:
-            result = results[model_id]
-            assert result["declined_match"], model_id
-            assert result["centre_difference"] < 5e-5, model_id
-            assert result["sigma_difference"] < 5e-5, model_id
+        for fixture in FAST_FIXTURES:
+            result = results[fixture]
+            assert result["declined_match"], fixture
+            assert result["centre_difference"] < 1e-4, fixture
+            assert result["sigma_difference"] < 5e-5, fixture
 
     def test_the_mask_centroid_beats_the_decode_on_uneven_disks(self, network_results):
         result = network_results["accuracy"]
