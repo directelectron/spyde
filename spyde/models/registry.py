@@ -51,6 +51,10 @@ detector. The detector list, its default and ``get_model`` never see a
 refiner; ``available_models()["refiners"]`` and ``get_refiner`` never see a
 detector.
 
+A user manifest entry may also name a local checkpoint,
+``"source": {"type": "file", "path": "..."}``, to try a model in the app
+before it is published.
+
 Users pick the new model up via Find Vectors → Model dropdown → refresh
 (``fv_refresh_models`` → ``refresh_remote_registry()``); no SpyDE release
 needed. To make a proven model the offline/first-run default for a SpyDE
@@ -246,6 +250,12 @@ def _resolve_weights(entry: dict) -> str:
         path = _resolve_bundled(source)
     elif stype == "hf":
         path = _resolve_hf(source)
+    elif stype == "file":
+        # A checkpoint on this machine, named by path — how a model still being
+        # trained is tried in the app before it is published.
+        path = os.path.expanduser(source["path"])
+        if not os.path.exists(path):
+            raise FileNotFoundError(path)
     else:
         raise ValueError(f"unknown model source type {stype!r} for {entry.get('id')}")
     expected = entry.get("sha256") or source.get("sha256")
@@ -264,6 +274,8 @@ def is_cached(model_id: Optional[str] = None) -> bool:
     if entry is None:
         return True                      # unknown id resolves to bundled default
     source = entry.get("source", {})
+    if source.get("type") == "file":
+        return os.path.exists(os.path.expanduser(source.get("path", "")))
     if source.get("type") != "hf":
         return True
     return os.path.exists(os.path.join(user_models_dir(), source.get("file", "")))
