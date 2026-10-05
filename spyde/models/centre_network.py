@@ -50,11 +50,13 @@ Inference options (``input`` keys):
 
 Uncertainty:
 
-* ``"head"`` — ``exp(log_sigma) x R / crop_radius``, one view. On real disks it
-  RANKS centres well (Spearman 0.42-0.66 against a Friedel-midpoint test, where
-  the mirror spread scores 0.0-0.3), but its absolute scale is off by about 2x
-  either way: use it to rank vectors or weight them relative to each other, not
-  as a calibrated error bar.
+* ``"head"`` — ``exp(log_sigma) x sigma_scale x R / crop_radius``, one view.
+  ``sigma_scale`` is the checkpoint's own calibration factor (the trainer
+  stores it per checkpoint; 1 when absent; a contract value wins). On real
+  disks the head RANKS centres well (Spearman 0.42-0.66 against a
+  Friedel-midpoint test, where the mirror spread scores 0.0-0.3), but its
+  absolute scale is uncertain to about 2x either way: use it to rank vectors or
+  weight them relative to each other, not as a calibrated error bar.
 * ``"mirror"`` — the network also runs on the crop flipped in x, in y and in
   both; the three answers are flipped back, and ``sigma_per_spread`` (6) x the
   spread (mean distance of the four centres from their mean, native px) is the
@@ -207,6 +209,7 @@ class NetworkRefiner:
                  uncertainty: str = UNCERTAINTY_MIRROR, mirror_mean: bool = True,
                  sigma_per_spread: float = DEFAULT_SIGMA_PER_SPREAD,
                  max_sigma_fraction: float = DEFAULT_MAX_SIGMA_FRACTION,
+                 sigma_scale: float = 1.0,
                  min_spot_radius: float = DEFAULT_MIN_SPOT_RADIUS):
         if normalisation not in NORMALISATIONS:
             raise ValueError(f"unknown refiner normalisation {normalisation!r}; "
@@ -225,6 +228,7 @@ class NetworkRefiner:
         self.mirror_mean = bool(mirror_mean)
         self.sigma_per_spread = float(sigma_per_spread)
         self.max_sigma_fraction = float(max_sigma_fraction)
+        self.sigma_scale = float(sigma_scale)
         self.min_spot_radius = float(min_spot_radius)
 
     def crop_half_width(self, spot_radius: float) -> int:
@@ -324,7 +328,7 @@ class NetworkRefiner:
         views, area, log_sigma = self._views(sampled, mirrored)
         offset = views.mean(0) if mirrored and self.mirror_mean else views[0]
         if self.uncertainty == UNCERTAINTY_HEAD:
-            sigma = torch.exp(log_sigma) * step
+            sigma = torch.exp(log_sigma) * step * self.sigma_scale
         elif mirrored:
             sigma = self.sigma_per_spread * (views - views.mean(0)).norm(dim=2).mean(0) * step
         else:
@@ -412,4 +416,5 @@ def load_refiner(path, device, arch: dict | None = None, contract: dict | None =
         sigma_per_spread=float(contract.get("sigma_per_spread", DEFAULT_SIGMA_PER_SPREAD)),
         max_sigma_fraction=float(contract.get("max_sigma_fraction",
                                               DEFAULT_MAX_SIGMA_FRACTION)),
-        min_spot_radius=float(contract.get("min_spot_radius", DEFAULT_MIN_SPOT_RADIUS)))
+        min_spot_radius=float(contract.get("min_spot_radius", DEFAULT_MIN_SPOT_RADIUS)),
+        sigma_scale=float(contract.get("sigma_scale", checkpoint.get("sigma_scale", 1.0))))
