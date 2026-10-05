@@ -42,7 +42,7 @@ SCALE_CLIP = (0.3, 3.0)
 
 
 def normalize_input(frame: np.ndarray, local: bool = True,
-                    bg_sigma: float = 12.0) -> np.ndarray:
+                    bg_sigma: float = 12.0, mad_floor: float | None = None) -> np.ndarray:
     """log1p + robust standardization. Shared train+infer.
 
     log1p compresses the huge spot/background dynamic range; median/MAD is robust to
@@ -53,14 +53,22 @@ def normalize_input(frame: np.ndarray, local: bool = True,
     normalization. This makes a spot a local bump above ITS surroundings regardless
     of a spatially-varying diffuse background across the FOV (the hard case). bg_sigma
     should be a few times the disk size so it removes background, not the spots.
+
+    ``mad_floor`` bounds the robust scale from below. On sparse counted frames (most
+    pixels zero) the median absolute deviation is ~0, so single counts become 1e5-1e6
+    units and a network fires on every one of them. Real 4D-STEM data measures
+    0.13-2.0, so a floor of 0.05 never binds there. A model trained with a floor
+    declares it in its registry entry; ``None`` keeps the original maths.
     """
     x = np.log1p(np.clip(frame, 0, None).astype(np.float32))
     if local:
         from scipy.ndimage import gaussian_filter
         x = x - gaussian_filter(x, bg_sigma)
     med = np.median(x)
-    mad = np.median(np.abs(x - med)) + 1e-6
-    return (x - med) / (1.4826 * mad)
+    scale = 1.4826 * (np.median(np.abs(x - med)) + 1e-6)
+    if mad_floor is not None:
+        scale = max(scale, mad_floor)
+    return (x - med) / scale
 
 
 def estimate_disk_diameter(frame: np.ndarray, hp_sigma: float = 20.0) -> float:

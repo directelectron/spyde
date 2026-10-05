@@ -11,6 +11,15 @@
       "source": {"type": "bundled", "file": "spotunet_anyscale8_peaked_sharpened.pt"}
     },
     {
+      "id": "spotunet-dynamical-mask8-v1",
+      "label": "SpotUNet dynamical, mask head (bundled)",
+      "version": 1,
+      "notes": "anyscale8 fine-tuned on multislice-filled (dynamical) disks rendered with counted and integrating detector noise, then self-trained on real 4D-STEM frames whose labels are persistence- and Friedel-verified. A disk-coverage head places each disk at the centroid of its predicted aperture, so the centre follows the disk edge rather than where the intensity sits inside it. Halves the centre error on dynamical disks and cuts false positives on sparse counted data; on real SPED-Ag the in-grain strain speckle drops from 0.063 to 0.036 %.",
+      "arch": {"base": 8, "in_ch": 1, "levels": 3, "mask_head": true},
+      "sha256": "807c8039707aca08fdc75cfc527e167e5929b12bcf0750ddb0d7370b32444714",
+      "source": {"type": "bundled", "file": "spotunet_dynamical_mask8.pt"}
+    },
+    {
       "id": "spotunet-production-v2",
       "label": "SpotUNet production (bundled)",
       "version": 2,
