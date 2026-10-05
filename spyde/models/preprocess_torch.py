@@ -91,24 +91,27 @@ def _median_lastdim(flat: torch.Tensor) -> torch.Tensor:
 
 
 def normalize_input_batch(x: torch.Tensor, bg_sigma: float = 12.0,
-                          local: bool = True) -> torch.Tensor:
+                          local: bool = True, mad_floor: float | None = None) -> torch.Tensor:
     """Batched, on-device ``preprocess.normalize_input`` (log1p + robust standardise,
     optional local-background subtraction). ``x`` is ``(N, H, W)`` float; returns the
-    same shape. Matches the numpy maths (see module docstring)."""
+    same shape. Matches the numpy maths (see module docstring), including the
+    optional floor on the robust scale (``preprocess.normalize_input``)."""
     x = torch.log1p(x.clamp(min=0))
     if local:
         x = x - gaussian_blur2d(x.unsqueeze(1), float(bg_sigma)).squeeze(1)
     flat = x.reshape(x.shape[0], -1)
     med = _median_lastdim(flat)
-    mad = _median_lastdim((flat - med).abs()) + 1e-6
-    return ((flat - med) / (1.4826 * mad)).reshape_as(x)
+    scale = 1.4826 * (_median_lastdim((flat - med).abs()) + 1e-6)
+    if mad_floor is not None:
+        scale = scale.clamp_min(mad_floor)
+    return ((flat - med) / scale).reshape_as(x)
 
 
 def scale_batch(x: torch.Tensor, factor: float) -> torch.Tensor:
     """Batched, on-device ``scipy.ndimage.zoom(order=1)`` (bilinear, grid_mode=False):
     output size ``round(n*factor)`` per axis, endpoint-aligned. ``x`` is ``(N, H, W)``.
     Returns ``(N, round(H*factor), round(W*factor))``. Caller maps predicted positions
-    back with ``/factor`` exactly as with the scipy path."""
+    back with ``infer._to_frame_coordinates`` exactly as with the scipy path."""
     _, H, W = x.shape
     out_h = int(round(H * factor))
     out_w = int(round(W * factor))

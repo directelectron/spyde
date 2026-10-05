@@ -1,0 +1,1 @@
+Find Vectors offered a new neural model, "SpotUNet dynamical, mask head", which places each disk on its aperture edge instead of where the intensity sits inside it, halving the centre error on dynamically filled disks and no longer flooding sparse counted frames with false detections.
