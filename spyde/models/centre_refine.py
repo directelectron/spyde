@@ -15,7 +15,8 @@ cut around each detection's nearest pixel; ``centres`` is ``(M, 2)`` ``[y, x]``,
 the detections in crop pixels. It returns the refined ``(M, 2)`` centres in the
 same crop pixels and an ``(M,)`` positional uncertainty in pixels, or ``None``
 for the uncertainty when it has none (the caller keeps its own). A refiner
-declines a disk by returning NaN for it.
+declines a disk by returning NaN for it. A refiner may also carry a
+``min_spot_radius``: below it the stage is skipped and every detection kept.
 
 The stage keeps the detection's centre for a declined disk and for any centre
 that moves more than half a spot radius: no refiner sees enough of the frame to
@@ -99,8 +100,10 @@ def refine_centres(frames: Sequence[np.ndarray], positions: Sequence[np.ndarray]
     none. Each disk's result depends only on its own crop, so refining one
     frame alone gives the same answer as refining it inside a chunk."""
     radius = float(spot_radius)
-    half_width = int(refiner.crop_half_width(radius))
     refined = [np.asarray(p, np.float32).reshape(-1, 2).copy() for p in positions]
+    if radius < float(getattr(refiner, "min_spot_radius", 0.0)):
+        return refined, None
+    half_width = int(refiner.crop_half_width(radius))
     sigmas: list = [np.full(len(p), np.nan, np.float32) for p in refined]
     has_sigma = True
 

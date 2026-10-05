@@ -19,6 +19,7 @@ import subprocess
 import sys
 import textwrap
 import types
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -218,6 +219,8 @@ def _write_stub_refiner(path, base=4):
 
 
 STUB_ID = "centre-stub-v1"
+F3_ID = "centre-fast-f3-v1"
+F3_REFERENCE = Path(__file__).resolve().parents[1] / "f3_parity_reference.npz"
 
 
 @pytest.fixture
@@ -250,18 +253,23 @@ class TestRefinerRegistry:
     def test_the_detector_list_never_offers_a_refiner(self, stub_registry):
         available = stub_registry.available_models()
         assert STUB_ID not in [m["id"] for m in available["models"]]
-        assert [m["id"] for m in available["refiners"]] == [STUB_ID]
-        assert available["refiners"][0]["label"] == "Centre stub"
+        refiners = {m["id"]: m for m in available["refiners"]}
+        assert set(refiners) == {STUB_ID, F3_ID}
+        assert refiners[STUB_ID]["label"] == "Centre stub"
         assert available["default"] != STUB_ID
         assert stub_registry.default_model_id() in [m["id"] for m in available["models"]]
 
-    def test_the_bundled_manifest_alone_has_no_refiner_yet(self, monkeypatch):
+    def test_the_bundled_manifest_ships_the_fast_refiner_and_not_as_a_detector(self, monkeypatch):
         from spyde.models import registry
 
         monkeypatch.setattr(registry, "_load_user_manifest", lambda: None)
         registry._invalidate_manifest()
         try:
-            assert registry.available_models()["refiners"] == []
+            available = registry.available_models()
+            assert [m["id"] for m in available["refiners"]] == [F3_ID]
+            assert F3_ID not in [m["id"] for m in available["models"]]
+            assert available["default"] != F3_ID
+            assert registry.is_cached(F3_ID)
         finally:
             registry._invalidate_manifest()
 
@@ -394,7 +402,7 @@ class TestNetworkRefinerInference:
         step = 6.0 / refiner.crop_radius
         sampled = refiner._normalise(refiner._resample(
             torch.as_tensor(crops), torch.as_tensor(local, dtype=torch.float32), step))
-        views, _ = refiner._views(sampled, mirrored=True)
+        views, _, _ = refiner._views(sampled, mirrored=True)
         assert views.shape == (4, 1, 2)
         assert float(views[0].norm()) * step > 1.0             # the disk is well off-centre
         assert float((views - views[0]).abs().max()) * step < 1e-3
@@ -414,7 +422,7 @@ class TestNetworkRefinerInference:
         step = 6.0 / refiner.crop_radius
         sampled = refiner._normalise(refiner._resample(
             torch.as_tensor(crops), torch.as_tensor(local, dtype=torch.float32), step))
-        views, _ = refiner._views(sampled, mirrored=True)
+        views, _, _ = refiner._views(sampled, mirrored=True)
         spread = float((views - views.mean(0)).norm(dim=2).mean()) * step
         assert spread > 0.01
         assert sigma[0] == pytest.approx(6.0 * spread, rel=1e-4)
@@ -506,6 +514,78 @@ class TestNetworkRefinerInference:
         assert errors[1] > 0.3                     # one pass is pulled toward the seed
         assert errors[2] < 0.5 * errors[1]
         assert errors[3] <= errors[2] + 1e-6
+
+
+# ── the fast refiner (F3): its own layout, a sigma head, a radius gate ─────────
+
+def _f3_reference():
+    """Frames, per-frame seeds and the centres + sigma the training code's
+    ``fastref.refine`` gave for them on the CPU (8 GaN-like frames, R = 11)."""
+    reference = np.load(F3_REFERENCE)
+    split = np.cumsum(reference["counts"])[:-1]
+    return (list(reference["frames"].astype(np.float32)),
+            np.split(reference["seeds"][:, :2], split), float(reference["radius"]),
+            reference["centres"], reference["sigma"])
+
+
+@pytest.fixture
+def f3_refiner():
+    """A fresh F3 load from the bundled registry entry (not the shared cache,
+    which these tests patch and hook)."""
+    from spyde.models import centre_network, registry
+
+    registry._invalidate_manifest()
+    entry = registry._entry(F3_ID)
+    return centre_network.load_refiner(registry._resolve_weights(entry), "cpu",
+                                       arch=entry.get("arch"), contract=entry.get("input"))
+
+
+class TestFastRefiner:
+    def test_the_bundled_checkpoint_loads_in_its_own_layout(self, f3_refiner):
+        from spyde.models.centre_network import FastCentreNet
+
+        assert isinstance(f3_refiner.net, FastCentreNet)
+        assert (f3_refiner.crop_radius, f3_refiner.crop_half) == (8.0, 13)
+        assert f3_refiner.normalisation == "mean" and f3_refiner.uncertainty == "head"
+        assert (f3_refiner.recrop_over, f3_refiner.min_spot_radius) == (0.15, 5.0)
+
+    def test_matches_the_training_code_on_the_cpu(self, f3_refiner):
+        """Agreed to 3e-5 px (centres) and 2e-5 px (sigma) when measured."""
+        frames, seeds, radius, centres, sigma = _f3_reference()
+        positions, sigmas = refine_centres(frames, seeds, radius, f3_refiner)
+        np.testing.assert_allclose(np.concatenate(positions), centres, rtol=0, atol=5e-5)
+        got = np.concatenate(sigmas)
+        assert (np.isnan(got) == np.isnan(sigma)).all()
+        np.testing.assert_allclose(got[np.isfinite(got)], sigma[np.isfinite(sigma)],
+                                   rtol=0, atol=5e-5)
+
+    def test_one_view_and_a_second_pass_only_for_disks_that_moved(self, f3_refiner):
+        """The sigma head needs no mirrors; the re-crop pass sees only the disks
+        the first pass moved by more than 0.15 R."""
+        frames, seeds, radius, _, _ = _f3_reference()
+        batches = []
+        f3_refiner.net.register_forward_pre_hook(lambda module, inputs: batches.append(len(inputs[0])))
+        refine_centres(frames, seeds, radius, f3_refiner)
+        total = sum(len(s) for s in seeds)
+        assert batches[0] == total
+        assert len(batches) <= 2 and (len(batches) == 1 or batches[1] < total)
+
+    def test_small_disks_keep_the_detector_centres(self, f3_refiner, monkeypatch):
+        """Below the contract's 5 px spot radius the stage is skipped outright."""
+        called = []
+        monkeypatch.setattr(f3_refiner, "refine", lambda *a: called.append(1))
+        frames, seeds, _, _, _ = _f3_reference()
+        positions, sigmas = refine_centres(frames, seeds, 4.0, f3_refiner)
+        assert not called and sigmas is None
+        for got, seed in zip(positions, seeds):
+            np.testing.assert_array_equal(got, seed.astype(np.float32))
+
+    def test_a_disk_whose_head_sigma_is_too_large_is_declined(self, f3_refiner, monkeypatch):
+        frames, seeds, radius, _, _ = _f3_reference()
+        monkeypatch.setattr(f3_refiner, "max_sigma_fraction", 1e-6)
+        positions, sigmas = refine_centres(frames[:1], seeds[:1], radius, f3_refiner)
+        np.testing.assert_allclose(positions[0], seeds[0], atol=1e-5)
+        assert np.isnan(sigmas[0]).all()
 
 
 # ── the Find Vectors wiring, with a stand-in detector ──────────────────────────
@@ -696,7 +776,7 @@ _DRIVER = textwrap.dedent(r"""
         out = {}
         frames, truth = frames_and_truth()
         if mode == "parity":
-            for choice in ("mask-centroid", STUB_ID):
+            for choice in ("mask-centroid", STUB_ID, "centre-fast-f3-v1"):
                 block = neural._neural_block(frames.reshape(2, 2, *frames.shape[1:]), 0.3, 3,
                                              True, None, None, spot_radius=6.0,
                                              centre_refiner=choice)
@@ -713,6 +793,21 @@ _DRIVER = textwrap.dedent(r"""
                     moved.append(np.hypot(*(preview[:, :2] - decode[:, :2]).T))
                 out[choice] = dict(max_abs_difference=worst,
                                    mean_move=float(np.mean(np.concatenate(moved))))
+        elif mode == "f3_cuda":
+            if not torch.cuda.is_available():
+                return {"skipped": True}
+            from test_centre_refiner import _f3_reference, F3_ID
+            from spyde.models import registry
+            from spyde.models.centre_refine import refine_centres
+            torch.nn.functional.linear(torch.zeros(1, 1, device="cuda"),
+                                       torch.zeros(1, 1, device="cuda"))
+            frames, seeds, radius, centres, sigma = _f3_reference()
+            positions, sigmas = refine_centres(frames, seeds, radius,
+                                               registry.get_refiner(F3_ID, "cuda"))
+            got = np.concatenate(sigmas)
+            out["centre_difference"] = float(np.abs(np.concatenate(positions) - centres).max())
+            out["sigma_difference"] = float(np.nanmax(np.abs(got - sigma)))
+            out["declined_match"] = bool((np.isnan(got) == np.isnan(sigma)).all())
         elif mode == "accuracy":
             for choice in ("decode", "mask-centroid"):
                 errors = []
@@ -739,14 +834,14 @@ def network_results():
     from pathlib import Path
 
     environment = dict(os.environ, SPYDE_TEST_DIR=str(Path(__file__).parent))
-    proc = subprocess.run([sys.executable, "-c", _DRIVER, "parity", "accuracy"],
+    proc = subprocess.run([sys.executable, "-c", _DRIVER, "parity", "accuracy", "f3_cuda"],
                           capture_output=True, text=True, timeout=900, env=environment)
     out = {}
     for line in proc.stdout.splitlines():
         if line.startswith("RESULT_JSON "):
             _, mode, payload = line.split(" ", 2)
             out[mode] = json.loads(payload)
-    if len(out) < 2:
+    if len(out) < 3:
         pytest.fail(f"refiner driver failed:\n{proc.stdout[-3000:]}\n{proc.stderr[-3000:]}")
     return out
 
@@ -761,6 +856,14 @@ class TestWithTheDetectorNetwork:
         on average; the random stub network moves some (or declines them)."""
         result = network_results["parity"]
         assert 0.02 < result[CENTRE_MASK_CENTROID]["mean_move"] < 1.0
+
+    def test_the_fast_refiner_matches_the_training_code_on_cuda(self, network_results):
+        result = network_results["f3_cuda"]
+        if result.get("skipped"):
+            pytest.skip("no CUDA device")
+        assert result["declined_match"]
+        assert result["centre_difference"] < 5e-5
+        assert result["sigma_difference"] < 5e-5
 
     def test_the_mask_centroid_beats_the_decode_on_uneven_disks(self, network_results):
         result = network_results["accuracy"]

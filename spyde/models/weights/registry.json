@@ -25,6 +25,19 @@
       "notes": "Earlier edge-trained detector. Kept as a fallback.",
       "arch": {"base": 16, "in_ch": 1, "levels": 2},
       "source": {"type": "bundled", "file": "spotunet_base16.pt"}
+    },
+    {
+      "id": "centre-fast-f3-v1",
+      "kind": "refiner",
+      "label": "Fast centre network F3 (bundled)",
+      "version": 1,
+      "notes": "Segments the disk in a 27 px crop of the raw frame (spot radius -> 8 crop px) and takes the coverage centroid; re-crops only disks the first pass moved by more than 0.15 R. Matches R1 on real GaN (N/S 0.405 vs 0.399) at about 5x the speed. Its sigma head ranks centres well, but its absolute scale is off by about 2x. Skipped below a 5 px spot radius, where refining hurts.",
+      "arch": {"base": 8, "levels": 2, "depthwise": 0, "sigma_head": 1},
+      "input": {"crop_radius": 8.0, "crop_half": 13, "annulus": [0.78, 1.0],
+                "normalisation": "mean", "passes": 2, "recrop_over": 0.15,
+                "uncertainty": "head", "max_sigma_fraction": 0.25, "min_spot_radius": 5.0},
+      "sha256": "a025edca628106decef6ae6edb753a4ec330211daa41144d623b79460889261c",
+      "source": {"type": "bundled", "file": "centre_fast_f3.pt"}
     }
   ]
 }
