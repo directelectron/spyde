@@ -43,11 +43,11 @@ Shipping a revised model (the author-side contract):
 Centre refiners (``spyde.models.centre_network``) are registered the same way
 with ``"kind": "refiner"`` and an ``input`` block stating their crop contract
 (``crop_radius``, ``crop_half``, ``annulus``, ``normalisation``) and inference
-options (``passes``, ``mirror_mean``, ``sigma_per_spread``,
-``max_sigma_fraction``); ``centre_network``'s docstring defines each. For example
-``"input": {"crop_half": 20, "annulus": [0.78, 1.0]}`` for R3 on, which crop
-41 px. An entry without a ``kind``
-is a detector. The detector list, its default and ``get_model`` never see a
+options (``passes``, ``recrop_over``, ``uncertainty``, ``mirror_mean``,
+``sigma_per_spread``, ``max_sigma_fraction``, ``min_spot_radius``);
+``centre_network``'s docstring defines each. The bundled fast refiner
+(``centre-fast-f3-v1``) is a worked example. An entry without a ``kind`` is a
+detector. The detector list, its default and ``get_model`` never see a
 refiner; ``available_models()["refiners"]`` and ``get_refiner`` never see a
 detector.
 

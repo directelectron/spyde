@@ -44,6 +44,8 @@ test('neural wizard: Centre = Mask centroid previews and computes', async () => 
   await centre.click()
   await expect(page.getByTestId('fv-centre-opt-decode')).toBeVisible()
   await expect(page.getByTestId('fv-centre-opt-mask-centroid')).toBeVisible()
+  // The bundled fast refiner network is listed from the registry.
+  await expect(page.getByTestId('fv-centre-opt-centre-fast-f3-v1')).toBeVisible()
   await page.screenshot({ path: `${SHOTS}/01-centre-dropdown.png` })
 
   await page.getByTestId('fv-centre-opt-mask-centroid').click()
