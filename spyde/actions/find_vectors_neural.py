@@ -17,6 +17,9 @@ Centres are the network's decode (argmax pixel + offset head);
 the raw frame at native resolution (:mod:`spyde.models.centre_refine`) — the
 mask centroid, or a refiner network from the model registry. The batch and the
 single-frame preview both run it through :func:`_refined`, so they agree.
+``symmetry_refiner`` adds the third stage, which refines each frame's disks
+together (:mod:`spyde.models.symmetry_refine`); both paths run it through
+:func:`_symmetrised`.
 
 GPU/CPU: the batch path runs the whole nav chunk through one forward pass on the
 torch GPU when available (``torch_gpu_device()``), per-frame on CPU otherwise —
@@ -160,6 +163,31 @@ def _refined(frames, preds, spot_radius, centre_refiner, device=None):
     return refined, (sigmas if sigmas is not None else [None] * len(preds))
 
 
+def _symmetrised(records_list, spot_radius, symmetry_refiner, device=None):
+    """Run the symmetry stage over a chunk's peak records ``[y, x, intensity,
+    confidence, sigma]``, one call for the whole chunk. Moves positions and,
+    where the refiner reports one, replaces sigma. Intensity is left as read
+    at the centre stage's position. No refiner selected: the records unchanged."""
+    from spyde.models.symmetry_refine import (
+        FrameDisks, beam_from_records, refine_frames, symmetry_refiner_for,
+    )
+
+    refiner = symmetry_refiner_for(symmetry_refiner, device)
+    if refiner is None:
+        return records_list
+    frames = [FrameDisks(positions=r[:, :2], sigma=r[:, 4], confidence=r[:, 3],
+                         beam=beam_from_records(r)) for r in records_list]
+    positions, sigmas = refine_frames(frames, spot_radius, refiner)
+    out = []
+    for index, records in enumerate(records_list):
+        records = records.copy()
+        records[:, :2] = positions[index]
+        if sigmas is not None:
+            records[:, 4] = np.where(np.isfinite(sigmas[index]), sigmas[index], records[:, 4])
+        out.append(records)
+    return out
+
+
 def _heatmap_response(frame_shape, peaks_yx, threshold) -> np.ndarray:
     """A sparse confidence map for the "show transform" preview toggle: the model's
     per-peak score painted at each detected pixel. (The full dense heatmap isn't
@@ -188,6 +216,7 @@ def _find_vectors_single_frame_neural(
                                            # the canonical rescale; None → auto.
     centre: str = "offset",                # "softargmax": see spyde.models.centre
     centre_refiner: Optional[str] = None,  # see spyde.models.centre_refine.refiner_for
+    symmetry_refiner: Optional[str] = None,  # see spyde.models.symmetry_refine
 ):
     """Neural detector for one diffraction pattern.
 
@@ -223,7 +252,9 @@ def _find_vectors_single_frame_neural(
 
     raw_response = _heatmap_response(f.shape, pred, threshold)
     corr_map = raw_response  # already thresholded (only kept peaks are painted)
-    return corr_map, raw_response, _neural_peaks(f, pred, counts_radius, refined_sigma)
+    records = _neural_peaks(f, pred, counts_radius, refined_sigma)
+    (records,) = _symmetrised([records], counts_radius, symmetry_refiner, device)
+    return corr_map, raw_response, records
 
 
 def _persistence_filter(peaks_grid, ny, nx, tol=3.0, min_neighbors=2):
@@ -332,7 +363,7 @@ def _mps_forward_lock():
 
 def _neural_block(b4d, threshold, min_dist, subpixel, beamstop_mask, model_id,
                   bg_sigma=None, persistence=False, spot_radius=None, centre="offset",
-                  centre_refiner=None):
+                  centre_refiner=None, symmetry_refiner=None):
     """Run the neural detector on a (ny, nx, KY, KX) block → NaN-padded
     (ny, nx, MAX_PEAKS, PEAK_COLS). Batches the whole block through the torch GPU when
     available (internally sub-batched by ``detect_batch``, see infer.py, so a
@@ -340,7 +371,8 @@ def _neural_block(b4d, threshold, min_dist, subpixel, beamstop_mask, model_id,
     ``SPYDE_NEURAL_BATCH`` frames at once); per-frame CPU otherwise. ``bg_sigma``
     is the calibrated local-norm high-pass scale (see calibrate_neural).
     ``centre_refiner`` re-places the detections on the block's frames, all of
-    the block's disks in one refiner batch.
+    the block's disks in one refiner batch; ``symmetry_refiner`` then refines
+    each frame's disks together, the block's frames in one call.
     ``persistence`` drops extraneous (non-neighbour-confirmed) peaks (uses the
     block's scan neighbours).
 
@@ -441,6 +473,10 @@ def _neural_block(b4d, threshold, min_dist, subpixel, beamstop_mask, model_id,
             for frame in flat
         ]
 
+    if symmetry_refiner:
+        peaks_list = _symmetrised(peaks_list, _counts_radius(flat[0], spot_radius),
+                                  symmetry_refiner, device)
+
     if persistence:
         peaks_list = _refine_block(peaks_list, b4d.shape[0], b4d.shape[1],
                                    flat, beamstop_mask)
@@ -456,7 +492,7 @@ def _neural_block(b4d, threshold, min_dist, subpixel, beamstop_mask, model_id,
 def _find_vectors_chunk_neural(
     ghost_block, depth_px, nav_dim, sigma,
     threshold, min_dist, subpixel, beamstop_mask, model_id=None, bg_sigma=None,
-    persistence=False, spot_radius=None, centre_refiner=None,
+    persistence=False, spot_radius=None, centre_refiner=None, symmetry_refiner=None,
 ):
     """Neural variant of ``_find_vectors_chunk``: nav-blur + ghost-trim (shared with
     the other methods), then the neural detector per frame (GPU-batched when torch
@@ -489,14 +525,16 @@ def _find_vectors_chunk_neural(
     if nav_dim == 2:
         result = _neural_block(blurred, threshold, min_dist, subpixel,
                                beamstop_mask, model_id, bg_sigma, persistence,
-                               spot_radius, centre_refiner=centre_refiner)
+                               spot_radius, centre_refiner=centre_refiner,
+                               symmetry_refiner=symmetry_refiner)
     else:
         n_lead = nav_shape[0]
         out = np.full((n_lead, ny, nx, MAX_PEAKS, PEAK_COLS), np.nan, dtype=np.float32)
         for t in range(n_lead):
             out[t] = _neural_block(blurred[t], threshold, min_dist, subpixel,
                                    beamstop_mask, model_id, bg_sigma, persistence,
-                                   spot_radius, centre_refiner=centre_refiner)
+                                   spot_radius, centre_refiner=centre_refiner,
+                                   symmetry_refiner=symmetry_refiner)
         result = out
     if refine_padded:
         result = trim_ghost(result, depth_px, nav_dim)

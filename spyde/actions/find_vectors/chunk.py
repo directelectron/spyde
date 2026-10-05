@@ -191,6 +191,7 @@ def _find_vectors_chunk(
     persistence: bool = False,
     spot_radius=None,
     centre_refiner=None,
+    symmetry_refiner=None,
 ) -> np.ndarray:
     """
     Full pipeline for one ghost-padded nav chunk.
@@ -253,6 +254,7 @@ def _find_vectors_chunk(
             threshold, min_dist, subpixel, beamstop_mask,
             model_id=model_id, bg_sigma=bg_sigma, persistence=persistence,
             spot_radius=spot_radius, centre_refiner=centre_refiner,
+            symmetry_refiner=symmetry_refiner,
         )
 
     # ── Try GPU path ──────────────────────────────────────────────────────────

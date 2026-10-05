@@ -731,6 +731,7 @@ def _find_peaks_single_frame(frame, params, *, beamstop_mask=None,
             spot_radius=float(params.get("spot_radius") or 0.0) or None,
             # Same key the batch reads, so the preview shows refined centres too.
             centre_refiner=(params.get("centre_refiner") or None),
+            symmetry_refiner=(params.get("symmetry_refiner") or None),
         )
     elif method == METHOD_DOG:
         out = _find_vectors_single_frame_dog(

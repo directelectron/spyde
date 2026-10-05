@@ -15,7 +15,10 @@
  *     auto-calibrated invisibly (`fv_calibration`). Model dropdown + ↻ refresh
  *     from the registry (`fv_models`). Centre dropdown: keep the network's
  *     decode, or re-place every disk on the raw frame (mask centroid, or a
- *     refiner network the registry lists). The default method.
+ *     refiner network the registry lists). Sample: Crystalline / Amorphous, and
+ *     for crystalline data a Symmetry dropdown (off, the Friedel-pair
+ *     baseline, or a symmetry model) that refines each frame's disks together.
+ *     The default method.
  *   • NXCORR — window-normalised cross-correlation against a flat disk
  *     (Disk Radius slider; threshold is a [-1,1] correlation score).
  *   • DoG — Difference-of-Gaussians band-pass, best for small (2-3 px) spots
@@ -45,6 +48,18 @@ const CENTRE_BUILT_IN: readonly { value: string; label: string }[] = [
   { value: 'mask-centroid', label: 'Mask centroid' },
 ]
 
+// The symmetry stage: off, the classical Friedel baseline, then any symmetry
+// models the registry lists. Mirrors spyde.models.symmetry_refine.
+const SYMMETRY_BUILT_IN: readonly { value: string; label: string }[] = [
+  { value: 'off', label: 'Off' },
+  { value: 'friedel', label: 'Friedel pairs (baseline)' },
+]
+type SampleType = 'crystalline' | 'amorphous'
+const SAMPLE_TYPES: readonly { value: SampleType; label: string }[] = [
+  { value: 'crystalline', label: 'Crystalline' },
+  { value: 'amorphous', label: 'Amorphous' },
+]
+
 // Sensible threshold default per method (neural confidence vs NXCORR score vs DoG SNR).
 const THR_DEFAULT: Record<Method, number> = { neural: 0.3, nxcorr: 0.5, dog: 10 }
 
@@ -52,7 +67,8 @@ const THR_DEFAULT: Record<Method, number> = { neural: 0.3, nxcorr: 0.5, dog: 10 
 // so the caret closing on Compute doesn't lose the tuning — reopening restores
 // the last-used parameters.
 interface FvSaved {
-  method: Method; modelId: string; centreRefiner: string; sigma: number; radius: number
+  method: Method; modelId: string; centreRefiner: string; symmetryRefiner: string
+  sampleType: SampleType; sigma: number; radius: number
   sigma1: number; sigma2: number; bgSigma: number
   threshold: number; minDist: number; subpixel: boolean; beamstop: boolean
   beamstopDilate: number; showTransform: boolean; persistence: boolean
@@ -71,6 +87,9 @@ export function FindVectorsWizard({ caretPos, windowId, sendAction, onClose }: P
   const [models, setModels] = React.useState<readonly { value: string; label: string }[]>([])
   const [centreRefiner, setCentreRefiner] = React.useState(saved?.centreRefiner ?? 'decode')
   const [refiners, setRefiners] = React.useState<readonly { value: string; label: string }[]>([])
+  const [symmetryRefiner, setSymmetryRefiner] = React.useState(saved?.symmetryRefiner ?? 'off')
+  const [symmetryModels, setSymmetryModels] = React.useState<readonly { value: string; label: string }[]>([])
+  const [sampleType, setSampleType] = React.useState<SampleType>(saved?.sampleType ?? 'crystalline')
   const [sigma, setSigma] = React.useState(saved?.sigma ?? 0)
   const [radius, setRadius] = React.useState(saved?.radius ?? 5)
   const [sigma1, setSigma1] = React.useState(saved?.sigma1 ?? 0.8)
@@ -87,21 +106,26 @@ export function FindVectorsWizard({ caretPos, windowId, sendAction, onClose }: P
 
   React.useEffect(() => {
     _fvStore.set(windowId, {
-      method, modelId, centreRefiner, sigma, radius, sigma1, sigma2, bgSigma, threshold, minDist,
-      subpixel, beamstop, beamstopDilate, showTransform, persistence,
+      method, modelId, centreRefiner, symmetryRefiner, sampleType, sigma, radius, sigma1, sigma2,
+      bgSigma, threshold, minDist, subpixel, beamstop, beamstopDilate, showTransform, persistence,
     })
-  }, [windowId, method, modelId, centreRefiner, sigma, radius, sigma1, sigma2, bgSigma, threshold,
-      minDist, subpixel, beamstop, beamstopDilate, showTransform, persistence])
+  }, [windowId, method, modelId, centreRefiner, symmetryRefiner, sampleType, sigma, radius, sigma1,
+      sigma2, bgSigma, threshold, minDist, subpixel, beamstop, beamstopDilate, showTransform,
+      persistence])
 
   // Live refs so the debounced tune always sends the latest of EVERY control.
-  const vals = React.useRef({ method, modelId, centreRefiner, sigma, radius, sigma1, sigma2, bgSigma, threshold, minDist, subpixel, beamstop, beamstopDilate, showTransform, persistence })
-  vals.current = { method, modelId, centreRefiner, sigma, radius, sigma1, sigma2, bgSigma, threshold, minDist, subpixel, beamstop, beamstopDilate, showTransform, persistence }
+  const vals = React.useRef({ method, modelId, centreRefiner, symmetryRefiner, sampleType, sigma, radius, sigma1, sigma2, bgSigma, threshold, minDist, subpixel, beamstop, beamstopDilate, showTransform, persistence })
+  vals.current = { method, modelId, centreRefiner, symmetryRefiner, sampleType, sigma, radius, sigma1, sigma2, bgSigma, threshold, minDist, subpixel, beamstop, beamstopDilate, showTransform, persistence }
   const params = () => {
     const v = vals.current
     const neural = v.method === 'neural'
     return {
       method: v.method, model_id: v.modelId,
       centre_refiner: neural ? v.centreRefiner : 'decode',
+      // Amorphous data has no Friedel pairs or lattice; the backend forces
+      // the symmetry stage off for it as well.
+      sample_type: v.sampleType,
+      symmetry_refiner: neural && v.sampleType === 'crystalline' ? v.symmetryRefiner : 'off',
       // Neural never applies nav blur (the backend forces it too); the Spot
       // size slider is the single scale knob — it drives the model's rescale
       // (spot_radius) and the NMS min-distance (~radius/2).
@@ -144,6 +168,8 @@ export function FindVectorsWizard({ caretPos, windowId, sendAction, onClose }: P
     setModels(list.map((m) => ({ value: m.id, label: m.label ?? m.id })))
     const refinerList = Array.isArray(d.refiners) ? (d.refiners as { id: string; label?: string }[]) : []
     setRefiners(refinerList.map((m) => ({ value: m.id, label: m.label ?? m.id })))
+    const symmetryList = Array.isArray(d.symmetry) ? (d.symmetry as { id: string; label?: string }[]) : []
+    setSymmetryModels(symmetryList.map((m) => ({ value: m.id, label: m.label ?? m.id })))
     // '' = registry default; surface it as the concrete id once known.
     if (!vals.current.modelId && typeof d.default === 'string') setModelId(d.default)
     if (d.refreshed) setStatus(`Model list refreshed — ${list.length} available.`)
@@ -234,6 +260,18 @@ export function FindVectorsWizard({ caretPos, windowId, sendAction, onClose }: P
         <Field label="Centre">
           <Select testid="fv-centre" value={centreRefiner}
             options={[...CENTRE_BUILT_IN, ...refiners]} onChange={live(setCentreRefiner)} />
+        </Field>
+      )}
+      {isNeural && (
+        <Field label="Sample">
+          <Select testid="fv-sample-type" value={sampleType} options={SAMPLE_TYPES}
+            onChange={live(setSampleType)} />
+        </Field>
+      )}
+      {isNeural && sampleType === 'crystalline' && (
+        <Field label="Symmetry">
+          <Select testid="fv-symmetry" value={symmetryRefiner}
+            options={[...SYMMETRY_BUILT_IN, ...symmetryModels]} onChange={live(setSymmetryRefiner)} />
         </Field>
       )}
       <div style={gridStyle}>
