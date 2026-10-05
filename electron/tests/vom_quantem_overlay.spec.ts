@@ -11,8 +11,9 @@
  *
  * What only pixels can show, and why each screenshot is taken:
  *   - measured vectors red, matched pattern green, green sitting on red;
- *   - the Refine readout reports a fit worth believing (a small residual and
- *     a matched count near the number of peaks), not merely a non-empty string.
+ *   - the Refine readout reports a fit worth believing (a small residual over
+ *     the paired peaks, and most simulated spots paired), not merely a
+ *     non-empty string.
  *
  * Following the navigator is NOT covered here, though it works — see the note
  * at the drag near the end of the test for what could not be driven from
@@ -62,6 +63,10 @@ test('the matched pattern lands on the measured peaks and follows the crosshair'
   await expect(page.getByTestId('find-vectors-wizard')).toBeVisible()
   await page.screenshot({ path: join(SHOTS, '01-find-vectors-preview.png') })
 
+  // Compute is held until the spot-size estimate and the neural calibration
+  // have landed. Clicking earlier ran the batch with whichever of them had
+  // arrived, and the fit downstream changed with it.
+  await expect(page.getByTestId('fv-compute')).toBeEnabled({ timeout: 120_000 })
   const before = await page.getByTestId('subwindow').count()
   await page.getByTestId('fv-compute').click()
   await expect.poll(() => page.getByTestId('subwindow').count(), {
@@ -127,14 +132,29 @@ test('the matched pattern lands on the measured peaks and follows the crosshair'
     .toContainText(/εxx/, { timeout: 60_000 })
   const readout = await page.getByTestId('vom-strain-readout').textContent()
   console.log('readout at rest:', readout)
-  const residual = Number(/resid=([0-9.]+)/.exec(readout ?? '')?.[1] ?? NaN)
+  const matchedResidual = Number(
+    /matched resid=([0-9.]+)/.exec(readout ?? '')?.[1] ?? NaN)
   const matched = Number(/matched=([0-9]+)/.exec(readout ?? '')?.[1] ?? NaN)
-  // On a real Ag pattern the matched reflections should sit within about the
-  // pairing distance (0.05 1/A); an unmatched pattern lands an order of
-  // magnitude out, which is what the synthetic-disk fixture produced.
-  expect(residual, `residual ${residual} suggests nothing was matched`)
-    .toBeLessThan(0.05)
-  expect(matched, 'a real pattern should explain several peaks').toBeGreaterThan(3)
+  // Judged on the peaks the fit pairs with a simulated reflection, not on the
+  // median over every detected peak (the readout's plain "resid"). The neural
+  // calibration chooses a background sigma of 4 on this scan, and at 4 the
+  // detector finds 132 peaks here against 73 at the uncalibrated 12. The 90
+  // left unpaired are weaker reflections the simulation leaves out, 28 of
+  // them beyond its reciprocal cutoff, and they put the plain median at 0.17
+  // 1/A on the SAME orientation (0.07 deg apart) and strain. On the paired
+  // peaks the fit is 0.004 1/A at sigma 4 and 0.006 at 12, with every one of
+  // the 42 simulated spots paired at 4.
+  //
+  // A pair only counts inside the pairing distance (0.05 1/A), so a wrong
+  // orientation still pairs a few peaks, scattered across that disc with a
+  // median near 0.035. Hence a bound well inside it, and a count well above
+  // what chance pairs.
+  expect(matchedResidual, `matched residual ${matchedResidual}: the paired peaks are not on the fit`)
+    .toBeLessThan(0.015)
+  // `matched` counts detected peaks with a simulated spot inside that
+  // distance: 42 here, one on each of the 42 spots the simulation draws.
+  expect(matched, 'a real pattern should explain most of its simulated spots')
+    .toBeGreaterThan(30)
   await page.screenshot({ path: join(SHOTS, '03-refine-readout.png') })
 
   // ── it must follow the navigator ─────────────────────────────────────────

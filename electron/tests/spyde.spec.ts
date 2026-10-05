@@ -475,9 +475,37 @@ test('Find Diffraction Vectors opens the staged wizard (live preview + Compute)'
   await expect.poll(async () => (await sentActions()).map((s: any) => s.action))
     .toContain('fv_tune')
 
+  // The backend is mocked, so nothing reports the automatic estimates as
+  // done, and Compute is held until something does.
+  await expect(page.getByTestId('fv-compute')).toBeDisabled()
+  await expect(page.getByTestId('fv-compute')).toHaveText('Calibrating…')
+
+  // Estimates that land after a hand edit leave the edited value alone: the
+  // threshold above, and the spot size here.
+  await page.getByTestId('fv-spot-size').evaluate((el: HTMLInputElement) => {
+    const setter = Object.getOwnPropertyDescriptor(
+      window.HTMLInputElement.prototype, 'value')!.set!
+    setter.call(el, '12')
+    el.dispatchEvent(new Event('input', { bubbles: true }))
+  })
+  await inject({ type: 'fv_auto_params', window_id: 1, kernel_radius: 7, min_distance: 3 })
+  await inject({ type: 'fv_calibration', window_id: 1, bg_sigma: 8, thresh: 0.22 })
+  await inject({ type: 'fv_estimates_done', window_id: 1 })
+  await expect(page.getByTestId('fv-compute')).toBeEnabled()
+  await expect(page.getByTestId('fv-compute')).toHaveText('Compute')
+  await expect(page.getByTestId('fv-spot-size')).toHaveValue('12')
+  await expect(page.getByTestId('fv-threshold')).toHaveValue('0.45')
+
   // Compute → fv_run, and the caret collapses back into the toolbar button.
   await page.getByTestId('fv-compute').click()
   await expect(page.getByTestId('find-vectors-wizard')).toBeHidden()
+
+  // The batch runs with what the caret showed, plus the calibrated high-pass,
+  // which has no control of its own.
+  const run = (await sentActions()).find((s: any) => s.action === 'fv_run')
+  expect(run.payload).toMatchObject({
+    spot_radius: 12, kernel_radius: 12, threshold: 0.45, bg_sigma: 8,
+  })
 
   await expect.poll(async () => {
     const names = (await sentActions()).map((s: any) => s.action)

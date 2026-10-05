@@ -32,6 +32,8 @@ interface Props {
 interface VomFit {
   ok: boolean; exx?: number; eyy?: number; exy?: number
   residual?: number; friedel?: number | null; matched?: number
+  // The same distance over the matched peaks alone; null with none matched.
+  matched_residual?: number | null
 }
 
 // Per-window wizard state, kept OUTSIDE the component so it survives the
@@ -174,7 +176,7 @@ export function VectorOrientationWizard({ caretPos, windowId, sendAction, onClos
             treated as excited. Defaults 0.05 and 0.04 Å⁻¹.</div>
           <div data-testid="vom-strain-readout" style={S.hint}>
             {fit && fit.ok
-              ? `εxx=${pct(fit.exx)}  εyy=${pct(fit.eyy)}  εxy=${pct(fit.exy)}  ·  resid=${fit.residual?.toFixed(4)}  matched=${fit.matched}`
+              ? `εxx=${pct(fit.exx)}  εyy=${pct(fit.eyy)}  εxy=${pct(fit.exy)}  ·  resid=${fit.residual?.toFixed(4)}  matched=${fit.matched}  matched resid=${fit.matched_residual?.toFixed(4) ?? '–'}`
               : 'No fit yet — move the crosshair to a pattern with ≥5 vectors.'}
           </div>
         </div>

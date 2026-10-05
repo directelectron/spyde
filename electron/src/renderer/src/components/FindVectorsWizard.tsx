@@ -7,6 +7,11 @@
  * "Compute" (`fv_run`) runs the full-dataset batch → a new vectors window;
  * closing the caret tears the preview down (`fv_close`).
  *
+ * Compute is held until the backend's automatic estimates for this open have
+ * all arrived (`fv_estimates_done`), so the batch runs with the parameters the
+ * caret shows rather than whichever ones had landed by the click. A value the
+ * user set by hand is never replaced by a late estimate.
+ *
  * Three detection methods:
  *   • Neural — the SpotUNet disk detector. Deliberately MINIMAL controls
  *     (user decision 2026-07-16): Spot size (auto-seeded; drives the model's
@@ -73,6 +78,9 @@ export function FindVectorsWizard({ caretPos, windowId, sendAction, onClose }: P
   const [showTransform, setShowTransform] = React.useState(saved?.showTransform ?? false)
   const [persistence, setPersistence] = React.useState(saved?.persistence ?? false)
   const [status, setStatus] = React.useState('Tune the parameters — peaks preview under the crosshair.')
+  const [estimating, setEstimating] = React.useState(true)
+  // Controls the user has moved by hand since this caret opened.
+  const handEdited = React.useRef(new Set<'radius' | 'minDist' | 'threshold'>())
 
   React.useEffect(() => {
     _fvStore.set(windowId, {
@@ -118,6 +126,8 @@ export function FindVectorsWizard({ caretPos, windowId, sendAction, onClose }: P
   const sendTune = useDebouncedAction(sendAction, 'fv_tune', windowId)
   const tune = () => sendTune(params)
   const live = <T,>(set: (v: T) => void) => (v: T) => { set(v); tune() }
+  const byHand = <T,>(key: 'radius' | 'minDist' | 'threshold', set: (v: T) => void) =>
+    live((v: T) => { handEdited.current.add(key); set(v) })
 
   // Populate the Model dropdown from the backend registry. Requested ONCE on
   // mount via a ref (sendAction must never be an effect dep — it's recreated
@@ -153,8 +163,8 @@ export function FindVectorsWizard({ caretPos, windowId, sendAction, onClose }: P
       vals.current = { ...vals.current, bgSigma: d.bg_sigma }
       adopted = true
     }
-    if (typeof d.thresh === 'number' && vals.current.threshold === THR_DEFAULT.neural
-        && d.thresh !== THR_DEFAULT.neural) {
+    if (typeof d.thresh === 'number' && !handEdited.current.has('threshold')
+        && vals.current.threshold === THR_DEFAULT.neural && d.thresh !== THR_DEFAULT.neural) {
       setThreshold(d.thresh)
       vals.current = { ...vals.current, threshold: d.thresh }
       adopted = true
@@ -172,11 +182,16 @@ export function FindVectorsWizard({ caretPos, windowId, sendAction, onClose }: P
   useWizardEvent('spyde:fv_auto_params', windowId, (d) => {
     if (autoApplied.current) return
     autoApplied.current = true
-    if (typeof d.kernel_radius === 'number') setRadius(d.kernel_radius)
-    if (typeof d.min_distance === 'number') setMinDist(d.min_distance)
-    setStatus(`Spot size auto-set to ${d.kernel_radius} px from the pattern.`)
+    const radiusFree = !handEdited.current.has('radius')
+    if (radiusFree && typeof d.kernel_radius === 'number') setRadius(d.kernel_radius)
+    if (!handEdited.current.has('minDist') && typeof d.min_distance === 'number') {
+      setMinDist(d.min_distance)
+    }
+    if (radiusFree) setStatus(`Spot size auto-set to ${d.kernel_radius} px from the pattern.`)
     tune()
   })
+
+  useWizardEvent('spyde:fv_estimates_done', windowId, () => setEstimating(false))
 
   // Switching method resets the threshold to that method's natural scale and
   // re-runs the preview (NXCORR score and DoG SNR are not comparable numbers).
@@ -230,12 +245,13 @@ export function FindVectorsWizard({ caretPos, windowId, sendAction, onClose }: P
           // model's canonical rescale, the NMS spacing and the marker radius.
           <Cell label="Spot size (px)">
             <Slider testid="fv-spot-size" value={radius} min={2} max={30} step={1}
-              onChange={live(setRadius)} />
+              onChange={byHand('radius', setRadius)} />
           </Cell>
         )}
         {!isDog && !isNeural && (
           <Cell label="Disk Radius">
-            <Slider testid="fv-radius" value={radius} min={1} max={30} step={1} onChange={live(setRadius)} />
+            <Slider testid="fv-radius" value={radius} min={1} max={30} step={1}
+              onChange={byHand('radius', setRadius)} />
           </Cell>
         )}
         {isDog && (
@@ -253,11 +269,12 @@ export function FindVectorsWizard({ caretPos, windowId, sendAction, onClose }: P
         <Cell label={isDog ? 'Threshold (SNR)' : isNeural ? 'Threshold (conf.)' : 'Threshold'}>
           <Slider testid="fv-threshold" value={threshold}
             min={0} max={isDog ? 30 : 1} step={isDog ? 0.5 : 0.05}
-            onChange={live(setThreshold)} fmt={(n) => (isDog ? n.toFixed(1) : n.toFixed(2))} />
+            onChange={byHand('threshold', setThreshold)} fmt={(n) => (isDog ? n.toFixed(1) : n.toFixed(2))} />
         </Cell>
         {!isNeural && (
           <Cell label="Min Distance">
-            <Slider testid="fv-mindist" value={minDist} min={1} max={30} step={1} onChange={live(setMinDist)} />
+            <Slider testid="fv-mindist" value={minDist} min={1} max={30} step={1}
+              onChange={byHand('minDist', setMinDist)} />
           </Cell>
         )}
         {beamstop && (
@@ -284,7 +301,11 @@ export function FindVectorsWizard({ caretPos, windowId, sendAction, onClose }: P
             label="Neighbor refine" />
         )}
       </div>
-      <button data-testid="fv-compute" style={S.primary} onClick={compute}>Compute</button>
+      <button data-testid="fv-compute" disabled={estimating} onClick={compute}
+        style={{ ...S.primary, ...(estimating ? S.primaryBusy : null) }}
+        title={estimating ? 'Estimating the spot size and calibrating from the pattern' : undefined}>
+        {estimating ? 'Calibrating…' : 'Compute'}
+      </button>
     </WizardShell>
   )
 }
