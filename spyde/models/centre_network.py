@@ -44,9 +44,9 @@ Inference options (``input`` keys):
 * ``mirror_mean`` (default true, mirror uncertainty only) — the final pass's
   centre is the mean over the crop and its three mirrors. That pass runs the
   mirrors for the uncertainty anyway, so this costs nothing.
-* ``min_spot_radius`` (default 0) — below this spot radius (native px) the stage
-  is skipped and the detector's centres are kept. Refining tiny disks hurts:
-  on SPED-Ag (R ~ 3 px) F3 raised the in-grain speckle from 0.036 to 0.047.
+* ``min_spot_radius`` (default ``centre_refine.DEFAULT_MIN_SPOT_RADIUS``, 5 px,
+  shared with the mask centroid) — below this spot radius (native px) the
+  stage is skipped and the detector's centres are kept; 0 turns it off.
 
 Uncertainty:
 
@@ -73,6 +73,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from .centre_refine import DEFAULT_MIN_SPOT_RADIUS
 
 NORMALISATION_RING_MEDIAN_DISK_P95 = "ring-median/disk-p95"
 NORMALISATION_MEAN = "mean"
@@ -205,7 +207,7 @@ class NetworkRefiner:
                  uncertainty: str = UNCERTAINTY_MIRROR, mirror_mean: bool = True,
                  sigma_per_spread: float = DEFAULT_SIGMA_PER_SPREAD,
                  max_sigma_fraction: float = DEFAULT_MAX_SIGMA_FRACTION,
-                 min_spot_radius: float = 0.0):
+                 min_spot_radius: float = DEFAULT_MIN_SPOT_RADIUS):
         if normalisation not in NORMALISATIONS:
             raise ValueError(f"unknown refiner normalisation {normalisation!r}; "
                              f"known: {NORMALISATIONS}")
@@ -410,4 +412,4 @@ def load_refiner(path, device, arch: dict | None = None, contract: dict | None =
         sigma_per_spread=float(contract.get("sigma_per_spread", DEFAULT_SIGMA_PER_SPREAD)),
         max_sigma_fraction=float(contract.get("max_sigma_fraction",
                                               DEFAULT_MAX_SIGMA_FRACTION)),
-        min_spot_radius=float(contract.get("min_spot_radius", 0.0)))
+        min_spot_radius=float(contract.get("min_spot_radius", DEFAULT_MIN_SPOT_RADIUS)))

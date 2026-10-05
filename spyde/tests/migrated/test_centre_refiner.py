@@ -168,7 +168,9 @@ class TestMaskCentroid:
         truth = disk_lattice(size, radius, rng)
         frame = uneven_disks((size, size), truth, radius, rng)
         seeds = truth + rng.uniform(-1, 1, truth.shape)
-        refined, sigmas = refine_centres([frame], [seeds], radius, MaskCentroidRefiner())
+        # the estimator itself, so the small-disk gate is off for R = 4
+        refined, sigmas = refine_centres([frame], [seeds], radius,
+                                         MaskCentroidRefiner(min_spot_radius=0))
         assert sigmas is None
 
         def rms(points):
@@ -187,6 +189,39 @@ class TestMaskCentroid:
         assert rms(refined[0]) < 0.3
         assert rms(refined[0]) < 0.4 * rms(seeds)
         assert rms(refined[0]) < 0.6 * rms(brightness_centres)
+
+    def test_small_disks_keep_the_detector_centres(self, monkeypatch):
+        """Below 5 px (the gate every refiner shares by default) the stage is
+        skipped: on SPED-Ag's 3 px disks the mask centroid scattered the peaks
+        enough to fail the CIF-referenced orientation check."""
+        from spyde.models.centre_refine import DEFAULT_MIN_SPOT_RADIUS
+
+        assert MaskCentroidRefiner().min_spot_radius == DEFAULT_MIN_SPOT_RADIUS == 5.0
+        rng = np.random.default_rng(9)
+        truth = disk_lattice(96, 3.0, rng)
+        frame = uneven_disks((96, 96), truth, 3.0, rng)
+        seeds = truth + 0.6
+        refiner = MaskCentroidRefiner()
+        called = []
+        monkeypatch.setattr(refiner, "refine", lambda *a: called.append(1))
+        kept, sigmas = refine_centres([frame], [seeds], 3.0, refiner)
+        assert not called and sigmas is None
+        np.testing.assert_allclose(kept[0], seeds, atol=1e-5)
+
+        ungated, _ = refine_centres([frame], [seeds], 3.0, MaskCentroidRefiner(min_spot_radius=0))
+        assert np.abs(ungated[0] - seeds).max() > 0.1
+        moved, _ = refine_centres([frame], [seeds], DEFAULT_MIN_SPOT_RADIUS, MaskCentroidRefiner())
+        assert np.abs(moved[0] - seeds).max() > 0.1          # at the threshold it runs
+
+    def test_the_network_refiners_share_the_gate(self, tmp_path):
+        from spyde.models import centre_network
+        from spyde.models.centre_refine import DEFAULT_MIN_SPOT_RADIUS
+
+        path = tmp_path / "stub.pt"
+        _write_stub_refiner(path)
+        assert centre_network.load_refiner(path, "cpu").min_spot_radius == DEFAULT_MIN_SPOT_RADIUS
+        assert centre_network.load_refiner(
+            path, "cpu", contract={"min_spot_radius": 0}).min_spot_radius == 0
 
     def test_a_crop_with_no_disk_is_declined(self):
         crops = np.random.default_rng(0).poisson(10.0, (2, 21, 21)).astype(np.float32)
