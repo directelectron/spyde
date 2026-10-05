@@ -176,19 +176,22 @@ test('3) scrubbing drives the real navigator — current_index advances', async 
   ctx.assertNoJsErrors()
 })
 
-// ── 4) The iMovie timeline: add a text clip on the Text lane ──────────────────
+// ── 4) The iMovie timeline: add a text clip on the Burn-in lane ───────────────
 
-test('4) add a Text overlay → a draggable clip appears on the Text timeline lane', async () => {
+test('4) add a Text burn-in → a draggable clip appears on the Burn-in timeline lane', async () => {
   const { page } = ctx
-  await page.getByTestId('movie-add-text').click()
-  // A text clip appears on the Text lane; the inspector opens to edit it.
-  await expect(page.getByTestId('movie-clip-text-0'),
-    'no text clip appeared on the timeline').toBeVisible({ timeout: 5_000 })
-  await expect(page.getByTestId('movie-insp-text'),
+  await page.getByTestId('movie-add-burnin-label').click()
+  // Static text shares the Burn-in lane with the timestamp, so find the new
+  // clip by its default text rather than by index.
+  const clip = page.locator('[data-testid^="movie-clip-signal-"]', { hasText: 'Label' }).first()
+  await expect(clip, 'no text clip appeared on the timeline').toBeVisible({ timeout: 5_000 })
+  const clipId = await clip.getAttribute('data-testid')
+  await clip.click()
+  await expect(page.getByTestId('movie-insp-sigtext'),
     'inspector did not open for the new text clip').toBeVisible({ timeout: 5_000 })
   // Edit the text in the inspector → the clip label updates.
-  await page.getByTestId('movie-insp-text').fill('Frame A')
-  await expect(page.getByTestId('movie-clip-text-0')).toContainText('Frame A', { timeout: 5_000 })
+  await page.getByTestId('movie-insp-sigtext').fill('Frame A')
+  await expect(page.getByTestId(clipId!)).toContainText('Frame A', { timeout: 5_000 })
   // A ROI clip.
   await page.getByTestId('movie-add-roi').click()
   await expect(page.locator('[data-testid^="movie-clip-roi-"]').first(),

@@ -235,6 +235,8 @@ class ActionRouterMixin:
             )
         elif action == "open_stack":
             self.open_stack(payload.get("paths") or [])
+        elif action == "load_insitu_data":
+            self.load_insitu_data(payload["path"], window_id)
         elif action == "confirm_nav_shape":
             self._confirm_nav_shape(payload)
         elif action == "playback":
@@ -551,9 +553,9 @@ class ActionRouterMixin:
     def _handle_playback(self, payload: dict) -> None:
         """Play / pause / fast-forward the movie time navigator. Commands:
         ``play`` / ``pause`` / ``toggle`` (real-time on/off) / ``fast_forward``
-        (speed cycle 2→4→8→1) / ``step`` (single frame) / ``set_speed`` /
+        (speed cycle 2→4→8→16→32→1) / ``step`` (single frame) / ``set_speed`` /
         ``set_loop``. Playback is real-time (paced from the time axis), so there is
-        no ``fps``/``step`` speed control any more — ``speed`` is a 1/2/4/8x
+        no ``fps``/``step`` speed control any more — ``speed`` is a 1/2/4/8/16/32x
         multiplier and ``loop`` wraps at the end."""
         cmd = payload.get("command", "toggle")
         pb = self.playback

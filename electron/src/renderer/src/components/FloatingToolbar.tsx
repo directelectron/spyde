@@ -369,8 +369,12 @@ export function FloatingToolbar({
         // clock runs and un-lights when playback auto-stops at the movie end.
         const pb = state.playback
         const playbackActive = a.name === 'Play' && pb.playing
-        const ffSpeed = a.name === 'Fast Forward' && pb.playing && pb.speed > 1
-          ? pb.speed : 0
+        // The "×N" badge shows whenever a speed above 1× is SELECTED, not only
+        // while the clock happens to be running: Fast Forward is a cycle, so
+        // pausing at ×8 and pressing Play must still read as ×8. Gating it on
+        // `pb.playing` made the speed vanish the moment you paused, which
+        // looked like the speed change had not been applied at all.
+        const ffSpeed = a.name === 'Fast Forward' && pb.speed > 1 ? pb.speed : 0
         const active = openName === a.name || live.has(a.name)
           || (state.subItems.get(windowId)?.get(a.name)?.length ?? 0) > 0
           || playbackActive
@@ -784,12 +788,17 @@ const styles: Record<string, React.CSSProperties> = {
     border: 'none', cursor: 'pointer', width: 30, height: 30, borderRadius: 6,
     display: 'flex', alignItems: 'center', justifyContent: 'center',
   },
-  // Small "×N" corner badge on the Fast Forward button while speed > 1.
+  // "×N" badge on the Fast Forward button while a speed above 1× is selected.
+  // Sized to stay legible at "32x" — the cycle reaches ×32, and the previous
+  // 8px corner chip was too small to read the speed off at a glance, which is
+  // the badge's entire job.
   speedBadge: {
-    position: 'absolute', bottom: -3, right: -3,
+    position: 'absolute', bottom: -5, right: -7,
     background: '#f38ba8', color: '#11111b',
-    fontSize: 8, fontWeight: 700, lineHeight: 1,
-    padding: '1px 3px', borderRadius: 6, pointerEvents: 'none',
+    fontSize: 10, fontWeight: 800, lineHeight: 1,
+    padding: '2px 4px', borderRadius: 7, pointerEvents: 'none',
+    letterSpacing: '-0.2px',
+    boxShadow: '0 0 0 1.5px #11111b',
   },
   betaBadge: {
     position: 'absolute', top: -3, right: -3,
