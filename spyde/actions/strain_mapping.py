@@ -189,6 +189,105 @@ _TRIM_SIGMA = 2.5
 _TRIM_FLOOR = 1e-6
 
 
+# The part of a centre's scatter (px) that photon counting does not see.
+WEIGHT_FLOOR_PX = 0.1
+
+
+def unit_per_px(vecs) -> float:
+    """Reciprocal units per detector pixel (geometric mean of the two signal
+    axes), the factor Find Vectors scales sigma by."""
+    try:
+        sx, sy = (float(a.scale) for a in vecs.sig_axes[:2])
+        return float(np.sqrt(abs(sx * sy))) or 1.0
+    except Exception:
+        return 1.0
+
+
+def vector_weights(rows: np.ndarray, unit_per_pixel: float = 1.0):
+    """Least-squares weight of each vector, from the confidence and positional
+    sigma Find Vectors records: ``confidence / (sigma² + floor²)``, where the
+    floor is WEIGHT_FLOOR_PX converted to reciprocal units.
+
+    The floor is there because sigma is the photon-noise limit only — on a
+    bright disk it is ~0.01 px while the centre actually scatters by tenths of a
+    pixel — so without it a few bright disks would carry the whole fit. A row
+    with no confidence or sigma (vectors from an older file, a method other
+    than the network, or columns left at zero) gets the median weight. ``None`` when no row has them, so
+    such vectors fit exactly as before."""
+    from spyde.signals.diffraction_vectors import COL_CONFIDENCE, COL_SIGMA
+
+    rows = np.asarray(rows)
+    if rows.ndim != 2 or rows.shape[1] <= COL_SIGMA or len(rows) == 0:
+        return None
+    confidence = rows[:, COL_CONFIDENCE].astype(float)
+    sigma = rows[:, COL_SIGMA].astype(float)
+    # A measured sigma is never zero; zeros mean the columns were never filled.
+    known = np.isfinite(confidence) & np.isfinite(sigma) & (sigma > 0)
+    if not known.any():
+        return None
+    weights = np.empty(len(rows))
+    floor = WEIGHT_FLOOR_PX * unit_per_pixel
+    weights[known] = confidence[known] / (sigma[known] ** 2 + floor ** 2)
+    weights[~known] = np.median(weights[known])
+    return weights
+
+
+# Robust fitting. A pixel's affine fit is iteratively reweighted: each match's
+# residual length, scaled by the square root of its weight, is divided by the
+# pixel's robust scale (1.4826 x the median) and passed through the loss. The
+# tuning constants are the usual 95 %-efficiency ones.
+ROBUST_LOSSES = ("tukey", "huber")
+TUKEY_C = 4.685
+HUBER_K = 1.345
+ROBUST_ITERATIONS = 10
+# Below this residual scale (px) a pixel is treated as fitting exactly, so
+# floating-point noise in a perfect fit is not mistaken for outliers.
+ROBUST_SCALE_FLOOR_PX = 0.01
+
+
+def _loss_weight(u: np.ndarray, loss: str) -> np.ndarray:
+    """IRLS weight for standardised residuals ``u`` (>= 0)."""
+    if loss == "tukey":
+        t = u / TUKEY_C
+        return np.where(t < 1.0, (1.0 - t * t) ** 2, 0.0)
+    if loss == "huber":
+        return np.minimum(1.0, HUBER_K / np.maximum(u, 1e-300))
+    raise ValueError(f"unknown robust loss {loss!r}; expected one of {ROBUST_LOSSES}")
+
+
+def _one_per_reflection(key: np.ndarray, weight: np.ndarray, distance: np.ndarray) -> np.ndarray:
+    """Mask keeping ONE match per ``key`` (a pixel's reference reflection): the
+    one with the smallest ``distance`` — its residual from a first fit of all
+    the pixel's matches — then the highest weight. Two vectors on one
+    reflection would otherwise both pull the fit as if they were independent.
+    Ranking by residual rather than by weight alone matters when the two are
+    equally confident: the one nearer the unstrained reference is not the
+    right one once the lattice is strained."""
+    order = np.lexsort((-weight, distance, key))
+    sorted_key = key[order]
+    first = np.ones(len(order), bool)
+    first[1:] = sorted_key[1:] != sorted_key[:-1]
+    keep = np.zeros(len(key), bool)
+    keep[order[first]] = True
+    return keep
+
+
+def _group_median(values: np.ndarray, groups: np.ndarray, n_groups: int) -> np.ndarray:
+    """``np.median(values[groups == g])`` for every group (0 for an empty one)."""
+    out = np.zeros(n_groups)
+    if len(values) == 0:
+        return out
+    order = np.lexsort((values, groups))
+    v = values[order]
+    count = np.bincount(groups, minlength=n_groups)
+    start = np.concatenate([[0], np.cumsum(count)[:-1]])
+    has = count > 0
+    low = v[start[has] + (count[has] - 1) // 2]
+    high = v[start[has] + count[has] // 2]
+    out[has] = 0.5 * (low + high)
+    return out
+
+
 def _trim_keep(r: np.ndarray, rms: float, tol: float) -> np.ndarray:
     keep = r <= max(_TRIM_SIGMA * rms, _TRIM_FLOOR)
     if np.isfinite(tol):
@@ -197,10 +296,22 @@ def _trim_keep(r: np.ndarray, rms: float, tol: float) -> np.ndarray:
 
 
 def _fit_pattern_strain_full(g_meas, g_ref, *, tol, min_matches=DEFAULT_MIN_MATCHES,
-                             trim=True):
+                             trim=True, weights=None, one_per_reflection=False,
+                             robust=None, scale_floor=0.0):
     """fit_pattern_strain + fit-quality extras:
-    ``(exx, eyy, exy, omega, coverage, residual_rms, n_matched)`` or None."""
+    ``(exx, eyy, exy, omega, coverage, residual_rms, n_matched)`` or None.
+
+    ``weights`` (one per measured vector, see :func:`vector_weights`) make the
+    affine solve a weighted least squares. ``one_per_reflection`` keeps one
+    match per reference reflection (:func:`_one_per_reflection`). ``robust``
+    (``"tukey"`` or ``"huber"``) replaces the one-pass trim with an iteratively
+    reweighted fit; ``scale_floor`` is its smallest residual scale. Matching
+    stays geometric: a vector outside ``tol`` never enters."""
     g_meas = np.asarray(g_meas, dtype=float).reshape(-1, 2)
+    if weights is not None:
+        weights = np.asarray(weights, dtype=float).reshape(-1)
+        mean = weights.mean()
+        weights = weights / mean if mean > 0 else np.ones_like(weights)
     g_ref = np.asarray(g_ref, dtype=float).reshape(-1, 2)
     if len(g_meas) < 2 or len(g_ref) < 2:
         return None
@@ -225,30 +336,67 @@ def _fit_pattern_strain_full(g_meas, g_ref, *, tol, min_matches=DEFAULT_MIN_MATC
         ref_aug = np.vstack([gr, -gr])                         # (2M, 2) Friedel
         d, idx = cKDTree(ref_aug).query(gm, distance_upper_bound=tol)
         ok = np.isfinite(d)
-        cands.append((int(ok.sum()), gm, ref_aug, idx, ok))
+        cands.append((int(ok.sum()), gm, ref_aug, idx, ok, d))
     n_raw, n_cen = cands[0][0], cands[1][0]
-    _, gm, ref_aug, idx, ok = cands[0] if n_raw > n_cen else cands[1]
+    _, gm, ref_aug, idx, ok, dist = cands[0] if n_raw > n_cen else cands[1]
     G_ref = ref_aug[idx[ok]]                                   # (K, 2)
     G_meas = gm[ok]                                            # (K, 2)
     ref_ids = src_idx[idx[ok]]
+    W = None if weights is None else weights[ok]
+    if one_per_reflection:
+        distance = dist[ok]
+        if len(G_ref) >= 3 and np.linalg.matrix_rank(G_ref - G_ref.mean(0)) == 2:
+            A = np.hstack([G_ref, np.ones((len(G_ref), 1))])
+            root = np.ones((len(G_ref), 1)) if W is None else np.sqrt(W)[:, None]
+            first, *_ = np.linalg.lstsq(A * root, G_meas * root, rcond=None)
+            distance = np.linalg.norm(G_meas - A @ first, axis=1)
+        keep = _one_per_reflection(idx[ok], np.ones(len(G_ref)) if W is None else W, distance)
+        G_ref, G_meas, ref_ids = G_ref[keep], G_meas[keep], ref_ids[keep]
+        if W is not None:
+            W = W[keep]
 
-    sol = None
-    resid = None
-    for it in range(2 if trim else 1):
-        if len(G_ref) < max(2, min_matches):
-            return None
-        if np.linalg.matrix_rank(G_ref - G_ref.mean(0)) < 2:   # collinear → ill-posed
-            return None
-        # Affine least squares: [G_ref | 1] @ M = G_meas, M = [[T^T],[t^T]] (3×2).
-        A = np.hstack([G_ref, np.ones((len(G_ref), 1))])
-        sol, *_ = np.linalg.lstsq(A, G_meas, rcond=None)
-        resid = np.linalg.norm(G_meas - A @ sol, axis=1)
-        if it == 0 and trim:
-            rms = float(np.sqrt(np.mean(resid ** 2)))
-            keep = _trim_keep(resid, rms, tol)
-            if keep.all():
+    A = np.hstack([G_ref, np.ones((len(G_ref), 1))])
+    if robust is not None:
+        base = np.ones(len(G_ref)) if W is None else W
+        w = base
+        for it in range(ROBUST_ITERATIONS + 1):
+            used = w > 0
+            if used.sum() < max(2, min_matches):
+                return None
+            if np.linalg.matrix_rank(G_ref[used] - G_ref[used].mean(0)) < 2:
+                return None
+            root = np.sqrt(w)[:, None]
+            sol, *_ = np.linalg.lstsq(A * root, G_meas * root, rcond=None)
+            if it == ROBUST_ITERATIONS:
                 break
-            G_ref, G_meas, ref_ids = G_ref[keep], G_meas[keep], ref_ids[keep]
+            z = np.linalg.norm(G_meas - A @ sol, axis=1) * np.sqrt(base)
+            scale = max(1.4826 * float(np.median(z)), scale_floor)
+            w = base * _loss_weight(z / scale, robust)
+        used = w > 0
+        G_ref, G_meas, ref_ids, A = G_ref[used], G_meas[used], ref_ids[used], A[used]
+        resid = np.linalg.norm(G_meas - A @ sol, axis=1)
+    else:
+        for it in range(2 if trim else 1):
+            if len(G_ref) < max(2, min_matches):
+                return None
+            if np.linalg.matrix_rank(G_ref - G_ref.mean(0)) < 2:   # collinear → ill-posed
+                return None
+            # Affine least squares: [G_ref | 1] @ M = G_meas, M = [[T^T],[t^T]] (3×2).
+            A = np.hstack([G_ref, np.ones((len(G_ref), 1))])
+            if W is None:
+                sol, *_ = np.linalg.lstsq(A, G_meas, rcond=None)
+            else:
+                root = np.sqrt(W)[:, None]
+                sol, *_ = np.linalg.lstsq(A * root, G_meas * root, rcond=None)
+            resid = np.linalg.norm(G_meas - A @ sol, axis=1)
+            if it == 0 and trim:
+                rms = float(np.sqrt(np.mean(resid ** 2)))
+                keep = _trim_keep(resid, rms, tol)
+                if keep.all():
+                    break
+                G_ref, G_meas, ref_ids = G_ref[keep], G_meas[keep], ref_ids[keep]
+                if W is not None:
+                    W = W[keep]
     T = sol[:2, :].T                                           # 2×2: g_meas ≈ T·g_ref + t
 
     # Report REAL-SPACE lattice strain, not reciprocal: the measured g map as
@@ -433,7 +581,9 @@ def _strain_from_T(T: np.ndarray):
 def compute_strain_field(vecs, ref_yx=None, *, ref_vectors=None,
                          tol: float | None = None,
                          min_matches: int = DEFAULT_MIN_MATCHES, trim: bool = True,
-                         ref_radius: int = 0) -> StrainField:
+                         ref_radius: int = 0, weighted: bool = True,
+                         one_per_reflection: bool = True,
+                         robust: str | None = "tukey", diagnostics: dict | None = None) -> StrainField:
     """Strain field of ``vecs`` (a ``SpyDEDiffractionVectors``) measured against a
     reference lattice — either the vectors at reference pixel ``ref_yx = (ry, rx)``
     (relative strain; ε = 0 there by construction) OR an explicit ``ref_vectors``
@@ -444,6 +594,14 @@ def compute_strain_field(vecs, ref_yx=None, *, ref_vectors=None,
     the fit-robustness knobs (see :func:`fit_pattern_strain`). ``ref_radius`` > 0
     pools the reference over a ``(2r+1)²`` neighbourhood of ``ref_yx``
     (:func:`region_reference` — noise-robust consensus; 0 = the single pixel).
+    ``weighted`` fits each pixel by weighted least squares when the vectors
+    carry a confidence and sigma (:func:`vector_weights`); vectors without
+    them fit unweighted either way. ``one_per_reflection`` lets only one vector
+    per reference reflection into a pixel's fit; ``robust`` (``"tukey"`` or
+    ``"huber"``) refits iteratively so a vector far from the lattice's
+    prediction loses its influence (in place of ``trim``). ``diagnostics``, a
+    dict, receives each match's pixel, vector row, residual, starting weight
+    and final weight from the whole-field path.
 
     Fits EVERY nav pixel in one vectorized pass (one global KDTree match + batched
     per-pixel normal-equation solve + closed-form 2×2 polar decomposition) rather
@@ -459,6 +617,10 @@ def compute_strain_field(vecs, ref_yx=None, *, ref_vectors=None,
     if tol is None:
         nn = _median_nn(g_ref)
         tol = 0.25 * nn if nn > 0 else np.inf
+    if robust is not None and robust not in ROBUST_LOSSES:
+        raise ValueError(f"unknown robust loss {robust!r}; expected one of {ROBUST_LOSSES}")
+    options = dict(min_matches=min_matches, trim=trim, one_per_reflection=one_per_reflection,
+                   robust=robust, scale_floor=ROBUST_SCALE_FLOOR_PX * unit_per_px(vecs))
 
     # Vectorized path needs the flat CSR layout with one segment per (iy, ix); a
     # 5-D dataset's innermost offsets are per (t, iy, ix), so fall back there.
@@ -466,16 +628,22 @@ def compute_strain_field(vecs, ref_yx=None, *, ref_vectors=None,
     offs = getattr(vecs, "nav_offsets", None)
     n_time = getattr(vecs, "n_time", 0)
     if (flat is None or offs is None or n_time != 0 or len(g_ref) < 2):
-        return _compute_strain_field_loop(vecs, g_ref, tol, ny, nx,
-                                          min_matches=min_matches, trim=trim)
+        return _compute_strain_field_loop(vecs, g_ref, tol, ny, nx, weighted=weighted, **options)
 
+    weights = vector_weights(flat, unit_per_px(vecs)) if weighted else None
     return _compute_strain_field_vectorized(flat, offs[-1], g_ref, tol, ny, nx,
-                                            min_matches=min_matches, trim=trim)
+                                            weights=weights, diagnostics=diagnostics, **options)
 
 
 def _compute_strain_field_loop(vecs, g_ref, tol, ny, nx,
-                               min_matches=DEFAULT_MIN_MATCHES, trim=True) -> StrainField:
+                               min_matches=DEFAULT_MIN_MATCHES, trim=True,
+                               weighted=True, one_per_reflection=True,
+                               robust="tukey", scale_floor=None) -> StrainField:
     """Per-pixel reference path (5-D / non-CSR / degenerate reference)."""
+    scale = unit_per_px(vecs)
+    if scale_floor is None:
+        scale_floor = ROBUST_SCALE_FLOOR_PX * scale
+    weighted = weighted and hasattr(vecs, "at")     # a bare kxy source has no weights
     exx = np.full((ny, nx), np.nan, dtype=np.float32)
     eyy = np.full((ny, nx), np.nan, dtype=np.float32)
     exy = np.full((ny, nx), np.nan, dtype=np.float32)
@@ -485,8 +653,11 @@ def _compute_strain_field_loop(vecs, g_ref, tol, ny, nx,
     nm = np.zeros((ny, nx), dtype=np.int32)
     for iy in range(ny):
         for ix in range(nx):
+            weights = vector_weights(vecs.at(iy, ix), scale) if weighted else None
             r = _fit_pattern_strain_full(vecs.kxy_at(iy, ix), g_ref, tol=tol,
-                                         min_matches=min_matches, trim=trim)
+                                         min_matches=min_matches, trim=trim,
+                                         weights=weights, one_per_reflection=one_per_reflection,
+                                         robust=robust, scale_floor=scale_floor)
             if r is not None:
                 (exx[iy, ix], eyy[iy, ix], exy[iy, ix], omega[iy, ix],
                  cov[iy, ix], res[iy, ix], nm[iy, ix]) = r
@@ -495,7 +666,9 @@ def _compute_strain_field_loop(vecs, g_ref, tol, ny, nx,
 
 def _compute_strain_field_vectorized(flat_buffer, x_off, g_ref, tol, ny, nx,
                                      min_matches=DEFAULT_MIN_MATCHES,
-                                     trim=True) -> StrainField:
+                                     trim=True, weights=None, one_per_reflection=True,
+                                     robust="tukey", scale_floor=0.0,
+                                     diagnostics=None) -> StrainField:
     """Whole-field strain in one pass — see :func:`compute_strain_field`.
 
     Mirrors :func:`fit_pattern_strain` exactly (incl. the min-match gate and the
@@ -543,28 +716,41 @@ def _compute_strain_field_vectorized(flat_buffer, x_off, g_ref, tol, ny, nx,
     Gr = np.vstack([ref_aug_raw[idx0[take0]], ref_aug_cen[idx1[take1]]])
     Gm = np.vstack([kxy[take0], kc[take1]])
     rid = np.concatenate([src_idx[idx0[take0]], src_idx[idx1[take1]]])
+    aug = np.concatenate([idx0[take0], idx1[take1]])               # reflection incl. sign
+    row = np.concatenate([np.nonzero(take0)[0], np.nonzero(take1)[0]])
+    wv = None
+    if weights is not None:
+        # Each pixel's weights scaled to mean 1, as the per-pixel fit does.
+        w_all = np.asarray(weights, dtype=float)[:Ntot]
+        mean = np.bincount(pix, w_all, minlength=P) / np.maximum(counts, 1)
+        w_all = np.where(mean[pix] > 0, w_all / np.where(mean > 0, mean, 1.0)[pix], 1.0)
+        wv = np.concatenate([w_all[take0], w_all[take1]])
 
     min_m = max(2, int(min_matches))
 
-    def _normal_eqs(pid, Gr, Gm):
+    def _normal_eqs(pid, Gr, Gm, wv=None):
         """Per-pixel affine normal equations for [gx,gy,1]·M = g_meas: the six
-        unique AᵀA entries + AᵀB (3×2) via scatter-add keyed by pixel."""
+        unique AᵀA entries + AᵀB (3×2) via scatter-add keyed by pixel, each
+        match scaled by its weight ``wv`` when given."""
         ax, ay = Gr[:, 0], Gr[:, 1]
+        one = np.ones_like(ax) if wv is None else wv
+        wx, wy = ax * one, ay * one
+        Gw = Gm * one[:, None]
         AtA = np.zeros((P, 3, 3))
         AtB = np.zeros((P, 3, 2))
-        np.add.at(AtA[:, 0, 0], pid, ax * ax)
-        np.add.at(AtA[:, 0, 1], pid, ax * ay)
-        np.add.at(AtA[:, 0, 2], pid, ax)
-        np.add.at(AtA[:, 1, 1], pid, ay * ay)
-        np.add.at(AtA[:, 1, 2], pid, ay)
-        np.add.at(AtA[:, 2, 2], pid, np.ones_like(ax))
+        np.add.at(AtA[:, 0, 0], pid, wx * ax)
+        np.add.at(AtA[:, 0, 1], pid, wx * ay)
+        np.add.at(AtA[:, 0, 2], pid, wx)
+        np.add.at(AtA[:, 1, 1], pid, wy * ay)
+        np.add.at(AtA[:, 1, 2], pid, wy)
+        np.add.at(AtA[:, 2, 2], pid, one)
         AtA[:, 1, 0] = AtA[:, 0, 1]
         AtA[:, 2, 0] = AtA[:, 0, 2]
         AtA[:, 2, 1] = AtA[:, 1, 2]
-        np.add.at(AtB[:, 0, :], pid, ax[:, None] * Gm)
-        np.add.at(AtB[:, 1, :], pid, ay[:, None] * Gm)
-        np.add.at(AtB[:, 2, :], pid, Gm)
-        matched = np.zeros(P, dtype=np.int64); np.add.at(matched, pid, 1)
+        np.add.at(AtB[:, 0, :], pid, ax[:, None] * Gw)
+        np.add.at(AtB[:, 1, :], pid, ay[:, None] * Gw)
+        np.add.at(AtB[:, 2, :], pid, Gw)
+        matched = np.zeros(P, dtype=np.int64); np.add.at(matched, pid[one > 0], 1)
         detAtA = np.linalg.det(AtA)
         good = (matched >= min_m) & np.isfinite(detAtA) & (np.abs(detAtA) > 1e-12)
         sol = np.zeros((P, 3, 2))
@@ -577,8 +763,42 @@ def _compute_strain_field_vectorized(flat_buffer, x_off, g_ref, tol, ny, nx,
         model = np.einsum('kj,kjl->kl', A, sol[pid])                # (K, 2)
         return np.linalg.norm(Gm - model, axis=1)
 
-    sol, good, matched = _normal_eqs(pid, Gr, Gm)
-    if trim and len(pid):
+    if one_per_reflection and len(pid):
+        distance = np.concatenate([d0[take0], d1[take1]])
+        first, fitted, _ = _normal_eqs(pid, Gr, Gm, wv)
+        enough = fitted & (np.bincount(pid, minlength=P) >= 3)
+        residual = _residuals(first, pid, Gr, Gm)
+        distance = np.where(enough[pid], residual, distance)
+        keep = _one_per_reflection(pid.astype(np.int64) * len(ref_aug_raw) + aug,
+                                   np.ones(len(pid)) if wv is None else wv, distance)
+        pid, Gr, Gm, rid, aug, row = pid[keep], Gr[keep], Gm[keep], rid[keep], aug[keep], row[keep]
+        if wv is not None:
+            wv = wv[keep]
+    base = np.ones(len(pid)) if wv is None else wv
+    final = base
+    if robust is not None:
+        # Iteratively reweighted (see _fit_pattern_strain_full); a pixel that
+        # fails at any iteration stays failed, as the per-pixel fit returns None.
+        alive = np.ones(P, bool)
+        w = base
+        for it in range(ROBUST_ITERATIONS + 1):
+            sol, good, matched = _normal_eqs(pid, Gr, Gm, w)
+            alive &= good
+            if it == ROBUST_ITERATIONS or not len(pid):
+                break
+            z = _residuals(sol, pid, Gr, Gm) * np.sqrt(base)
+            scale = np.maximum(1.4826 * _group_median(z, pid, P), scale_floor)
+            w = base * _loss_weight(z / scale[pid], robust)
+        good = alive
+        final = w
+        if diagnostics is not None:
+            diagnostics.update(pixel=pid, row=row, residual=_residuals(sol, pid, Gr, Gm),
+                               start_weight=base, final_weight=final)
+        used = w > 0
+        pid, Gr, Gm, rid = pid[used], Gr[used], Gm[used], rid[used]
+    else:
+        sol, good, matched = _normal_eqs(pid, Gr, Gm, wv)
+    if trim and robust is None and len(pid):
         # One trimming pass (same thresholds as _fit_pattern_strain_full): drop
         # matches whose residual exceeds 2.5× their pixel's RMS (abs floor) or
         # tol/2, then refit. Matches on not-yet-good pixels are left alone —
@@ -592,9 +812,15 @@ def _compute_strain_field_vectorized(flat_buffer, x_off, g_ref, tol, ny, nx,
             keep &= r <= 0.5 * tol
         keep |= ~good[pid]
         if not keep.all():
-            pid, Gr, Gm, rid = pid[keep], Gr[keep], Gm[keep], rid[keep]
-            sol, good, matched = _normal_eqs(pid, Gr, Gm)
+            pid, Gr, Gm, rid, row = pid[keep], Gr[keep], Gm[keep], rid[keep], row[keep]
+            base = final = base[keep]
+            if wv is not None:
+                wv = wv[keep]
+            sol, good, matched = _normal_eqs(pid, Gr, Gm, wv)
 
+    if diagnostics is not None and robust is None:
+        diagnostics.update(pixel=pid, row=row, residual=_residuals(sol, pid, Gr, Gm) if len(pid) else np.zeros(0),
+                           start_weight=base, final_weight=final)
     # Coverage = #distinct reference reflections matched / len(g_ref), from the
     # FINAL (post-trim) match set.
     cov = np.zeros((ny, nx), dtype=np.float32)
