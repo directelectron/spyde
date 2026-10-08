@@ -30,6 +30,14 @@ if frames it never trained on agree.
    ``noise_fraction`` (0.5) of the Friedel improvement. A missing measure skips
    its test; both missing rejects.
 
+The adapted copy corrects its scan's detections by more than a general network
+does — about 4 % of disks move half a radius or more, for real — so it carries
+its own move limit (``moved_limit``, 0.75 R) instead of the stage's 0.5 R; with
+the general limit, those disks were declined and the refined fraction fell.
+Its sigma head keeps training on the simulated disks, and its scale is then
+recalibrated so that, relative to the base network, it explains the held-out
+Friedel scatter: ``sigma_scale x (adapted fit / base fit)``.
+
 A scan with fewer than ``min_train`` (50) training or ``min_held_out`` (20)
 held-out frames indexing at least 4 reflections — sparse or amorphous data — is
 declined before any training.
@@ -79,6 +87,10 @@ class AdaptSettings:
     held_out_cap: int = 1500
     train_cap: int = 2000                    #: training frames whose crops are kept
     noise_frames: int = 300
+    #: The adapted copy's own move limit, in spot radii (the stage's is 0.5).
+    moved_limit: float = 0.75
+    #: Weight of the sigma head's likelihood on the simulated disks.
+    sigma_anchor: float = 1.0
     seed: int = 0
 
 
@@ -99,6 +111,8 @@ class AdaptReport:
     after: dict = field(default_factory=dict)
     mask_centroid: dict = field(default_factory=dict)
     refined_drop: float = float("nan")
+    #: trained_scale, friedel_scale_base, friedel_scale_adapted, recalibrated_scale
+    sigma: dict = field(default_factory=dict)
     prepare_seconds: float = 0.0
     train_seconds: float = 0.0
     total_seconds: float = 0.0
@@ -295,22 +309,65 @@ def _crop_frame(frame, seeds, half_width):
     return _Disks(crops, local, (nearest - half_width).astype(np.float64))
 
 
-def _refine_disks(refiner, disks: list, radius):
+def _refine_disks(refiner, disks: list, radius, with_sigma=False):
     """Refined frame positions per frame and the fraction of disks refined
-    (the rest keep the detection), the way the centre stage applies a refiner."""
-    out, refined, total = [], 0, 0
+    (the rest keep the detection), the way the centre stage applies a refiner;
+    with ``with_sigma``, also each frame's sigmas (NaN where declined)."""
+    out, sigmas, refined, total = [], [], 0, 0
     for item in disks:
         if len(item.local) == 0:
             out.append(np.zeros((0, 2)))
+            sigmas.append(np.zeros(0))
             continue
-        new_local, _ = refiner.refine(item.crops, item.local, radius)
+        new_local, sigma = refiner.refine(item.crops, item.local, radius)
         new_local = np.asarray(new_local, np.float64).reshape(-1, 2)
-        keep = accepted_moves(item.local, new_local, radius)
+        keep = accepted_moves(item.local, new_local, radius, refiner.max_shift_fraction)
         local = np.where(keep[:, None], new_local, item.local)
         out.append(local + item.origin)
+        sigmas.append(np.where(keep, sigma, np.nan) if sigma is not None
+                      else np.full(len(keep), np.nan))
         refined += int(keep.sum())
         total += len(keep)
+    if with_sigma:
+        return out, sigmas, refined / max(total, 1)
     return out, refined / max(total, 1)
+
+
+def _raw_sigmas(refiner, disks, radius):
+    """Positions and the head's unscaled sigma for every disk: scale 1 and no
+    sigma-based decline, so the scale can be fitted from the scan."""
+    raw = copy.copy(refiner)
+    raw.sigma_scale = 1.0
+    raw.max_sigma_fraction = float("inf")
+    positions, sigmas, _ = _refine_disks(raw, disks, radius, with_sigma=True)
+    return positions, sigmas
+
+
+def friedel_sigma_scale(positions, sigmas, index, partner, count) -> float:
+    """The factor that makes predicted sigmas explain the varying Friedel
+    scatter. Per axis, a midpoint's deviation ``v`` (frame mean and per-pair
+    median removed) has variance ``(1 - 1/n)(sigma_i² + sigma_j²)/4``; at the
+    right scale ``median(v² / predicted)`` is 0.455, the chi-square(1) median.
+    NaN with too few pairs (under 100 measurements)."""
+    per_reflection = gather(positions, index, count)
+    sigma = np.full(per_reflection.shape[:2], np.nan)
+    for n, (frame_sigma, assigned) in enumerate(zip(sigmas, index)):
+        ok = assigned >= 0
+        sigma[n, assigned[ok]] = frame_sigma[ok]
+    pairs = [(k, j) for k, j in enumerate(partner) if j > k]
+    if not pairs:
+        return float("nan")
+    midpoints = np.stack([0.5 * (per_reflection[:, k] + per_reflection[:, j]) for k, j in pairs], 1)
+    variance = np.stack([(sigma[:, k] ** 2 + sigma[:, j] ** 2) / 4 for k, j in pairs], 1)
+    have = np.isfinite(midpoints[..., 0]).sum(1, keepdims=True)
+    with _quiet():
+        deviation = midpoints - np.nanmean(midpoints, 1, keepdims=True)
+        deviation = deviation - np.nanmedian(deviation, 0, keepdims=True)
+    predicted = variance * (1 - 1 / np.maximum(have, 1))
+    usable = (have[..., None] >= 2) & np.isfinite(deviation) & (predicted[..., None] > 0)
+    with _quiet():
+        ratio = (deviation ** 2 / predicted[..., None])[usable]
+    return float(np.sqrt(np.median(ratio) / 0.4549)) if len(ratio) > 100 else float("nan")
 
 
 def _half_dose_noise(refiner, disks: list, radius, rng, frames):
@@ -406,7 +463,10 @@ def adapt_centre_refiner(chunks: Iterable, spot_radius: float, base_refiner,
         if progress is not None:
             progress(stage, done, total)
 
-    half_width = int(base_refiner.crop_half_width(radius))
+    # Crops wide enough for the adapted copy's larger move limit too.
+    wider = copy.copy(base_refiner)
+    wider.max_shift_fraction = max(base_refiner.max_shift_fraction, settings.moved_limit)
+    half_width = int(wider.crop_half_width(radius))
     height, width = frame_shape
     margin = 2 * radius
     positions, rows_all, kept = [], [], {}
@@ -589,16 +649,41 @@ def adapt_centre_refiner(chunks: Iterable, spot_radius: float, base_refiner,
                 if settings.simulation_weight > 0 and step % 2 == 0:
                     simulated, truth = _simulated_batch(adapted, 32, generator, device)
                     output = net(simulated)
-                    logits = output[0] if isinstance(output, tuple) else output
+                    logits, log_sigma = output if isinstance(output, tuple) else (output, None)
                     centre, _ = adapted._coverage_centroid(logits, iterations=1)
                     loss = loss + settings.simulation_weight * F.smooth_l1_loss(centre, truth, beta=0.2)
+                    if settings.sigma_anchor > 0 and log_sigma is not None:
+                        # keeps the sigma head calibrated as the trunk moves
+                        squared = ((centre.detach() - truth) ** 2).sum(1)
+                        loss = loss + settings.sigma_anchor * 0.1 * (
+                            squared / (2 * torch.exp(2 * log_sigma)) + 2 * log_sigma).mean()
                 optimiser.zero_grad(set_to_none=True)
                 loss.backward()
                 optimiser.step()
                 step += 1
         net.eval()
+        adapted.max_shift_fraction = settings.moved_limit
         report.steps = step
         report.train_seconds = time.perf_counter() - training_started
+
+        if getattr(adapted, "uncertainty", None) == "head":
+            trained_scale = base_refiner.sigma_scale
+            _, sigma_base = _raw_sigmas(base_refiner, held_disks, radius)
+            positions_adapted, sigma_adapted = _raw_sigmas(adapted, held_disks, radius)
+            fit_base = friedel_sigma_scale(before_positions, sigma_base, held_index,
+                                           index.partner, reflections)
+            fit_adapted = friedel_sigma_scale(positions_adapted, sigma_adapted, held_index,
+                                              index.partner, reflections)
+            if math.isfinite(fit_base * fit_adapted):
+                adapted.sigma_scale = trained_scale * fit_adapted / fit_base
+            else:
+                with _quiet():
+                    adapted.sigma_scale = trained_scale * (
+                        np.nanmedian(np.concatenate(sigma_base))
+                        / np.nanmedian(np.concatenate(sigma_adapted)))
+            report.sigma = dict(trained_scale=trained_scale, friedel_scale_base=fit_base,
+                                friedel_scale_adapted=fit_adapted,
+                                recalibrated_scale=float(adapted.sigma_scale))
 
         # 6. judge on the held-out frames
         report_progress("scoring", 1, None)

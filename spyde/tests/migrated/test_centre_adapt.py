@@ -10,6 +10,7 @@ Everything runs on the CPU in seconds.
 from __future__ import annotations
 
 import json
+import math
 
 import numpy as np
 import pytest
@@ -241,6 +242,7 @@ class TestAdaptedRegistry:
     def test_an_adapted_refiner_is_written_listed_and_loadable(self, user_folder):
         folder, registry = user_folder
         adapted = self._adapted(registry)
+        adapted.sigma_scale, adapted.max_shift_fraction = 1.5, 0.75
         entry = registry.register_adapted(adapted, "centre-fast-f5-v1", "GaN MQW", {"accepted": True},
                                           session="this")
         assert entry["parent"] == "centre-fast-f5-v1" and entry["scope"] == {"dataset": "GaN MQW"}
@@ -252,7 +254,9 @@ class TestAdaptedRegistry:
         loaded = registry.get_refiner(entry["id"], "cpu")
         for a, b in zip(loaded.net.state_dict().values(), adapted.net.state_dict().values()):
             assert torch.equal(a, b)
-        assert loaded.crop_half == adapted.crop_half and loaded.sigma_scale == adapted.sigma_scale
+        assert loaded.crop_half == adapted.crop_half
+        # the recalibrated scale and the copy's own move limit travel with it
+        assert (loaded.sigma_scale, loaded.max_shift_fraction) == (1.5, 0.75)
 
     def test_unsaved_ones_from_another_session_are_pruned(self, user_folder):
         folder, registry = user_folder
@@ -318,3 +322,96 @@ class TestAction:
             reads = [(frames.shape, rows.tolist()) for frames, rows in action._row_chunks(signal)]
         assert [shape for shape, _ in reads] == [(24, 32, 32), (24, 32, 32), (12, 32, 32)]
         assert reads[2][1] == [8] * 6 + [9] * 6
+
+
+# ── the adapted copy's own move limit and sigma calibration ────────────────────
+
+class ThresholdWithSigma(Threshold):
+    """The stand-in with a sigma head: one trainable log sigma for every disk."""
+
+    def __init__(self, start, log_sigma=-1.0):
+        super().__init__(start)
+        self.log_sigma = torch.nn.Parameter(torch.tensor(float(log_sigma)))
+
+    def forward(self, x):
+        return super().forward(x), self.log_sigma.expand(len(x))
+
+
+class TestRoundSix:
+    def test_the_refined_fraction_does_not_drop_and_the_copy_carries_its_move_limit(self, biased_scan):
+        _, adapted, report = run(biased_scan, start=0.9)
+        assert report.accepted
+        assert report.after["refined"] >= report.before["refined"]
+        assert adapted.max_shift_fraction == pytest.approx(SETTINGS.moved_limit) == 0.75
+
+    def test_a_refiners_own_move_limit_is_honoured(self):
+        from spyde.models.centre_refine import refine_centres
+
+        class Shift:
+            def __init__(self, limit=None):
+                if limit is not None:
+                    self.max_shift_fraction = limit
+
+            def crop_half_width(self, spot_radius):
+                return 16
+
+            def refine(self, crops, centres, spot_radius):
+                return centres + [0.6 * spot_radius, 0.0], None
+
+        frame = np.zeros((64, 64), np.float32)
+        detection = [np.array([[30.0, 30.0]])]
+        kept = refine_centres([frame], detection, 6.0, Shift())[0][0]
+        moved = refine_centres([frame], detection, 6.0, Shift(limit=0.75))[0][0]
+        np.testing.assert_allclose(kept, [[30.0, 30.0]])
+        np.testing.assert_allclose(moved, [[33.6, 30.0]], atol=1e-5)
+
+    def test_the_move_limit_and_sigma_scale_travel_with_the_checkpoint(self, tmp_path):
+        from spyde.models import centre_network, registry
+
+        path = tmp_path / "adapted.pt"
+        checkpoint = torch.load(registry._resolve_weights(registry._entry("centre-fast-f5-v1")),
+                                weights_only=True)
+        checkpoint.update(decline_moved_over=0.75, sigma_scale=1.7)
+        torch.save(checkpoint, path)
+        loaded = centre_network.load_refiner(path, "cpu")
+        assert (loaded.max_shift_fraction, loaded.sigma_scale) == (0.75, 1.7)
+        overridden = centre_network.load_refiner(path, "cpu", contract={"decline_moved_over": 0.6})
+        assert overridden.max_shift_fraction == 0.6
+        assert centre_network.load_refiner(
+            registry._resolve_weights(registry._entry("centre-fast-f5-v1")), "cpu"
+        ).max_shift_fraction == 0.5
+
+    def test_the_friedel_scale_fit_recovers_a_known_factor(self):
+        """Pairs whose midpoints scatter with the predicted sigma fit to 1; the
+        same scatter with sigmas predicted half as large fits to 2."""
+        from spyde.models.centre_adapt import friedel_sigma_scale
+
+        rng = np.random.default_rng(0)
+        frames, pairs = 400, 6
+        partner = np.array([[2 * k + 1, 2 * k] for k in range(pairs)]).ravel()
+        g = rng.uniform(-40, 40, (pairs, 2))
+        sigma = rng.uniform(0.1, 0.5, (frames, 2 * pairs))
+        positions, sigmas, index = [], [], []
+        for n in range(frames):
+            truth = np.concatenate([np.stack([60 + gk, 60 - gk]) for gk in g])
+            positions.append(truth + rng.normal(0, 1, truth.shape) * sigma[n][:, None])
+            sigmas.append(sigma[n])
+            index.append(np.arange(2 * pairs))
+        assert friedel_sigma_scale(positions, sigmas, index, partner, 2 * pairs) == pytest.approx(1.0, rel=0.1)
+        halved = [s / 2 for s in sigmas]
+        assert friedel_sigma_scale(positions, halved, index, partner, 2 * pairs) == pytest.approx(2.0, rel=0.1)
+
+    def test_the_sigma_scale_is_recalibrated(self, biased_scan):
+        frames, truths = biased_scan
+        base = NetworkRefiner(ThresholdWithSigma(0.9), torch.device("cpu"), crop_radius=10.0,
+                              crop_half=16, normalisation="mean", uncertainty="head", passes=1,
+                              min_spot_radius=0, max_sigma_fraction=10.0, sigma_scale=1.3)
+        adapted, report = adapt_centre_refiner(row_chunks(frames, ROWS, COLUMNS), RADIUS, base,
+                                               detector_for(frames, truths), (SIZE, SIZE), SETTINGS)
+        assert report.sigma["trained_scale"] == 1.3
+        assert math.isfinite(report.sigma["friedel_scale_base"])
+        assert math.isfinite(report.sigma["friedel_scale_adapted"])
+        expected = 1.3 * report.sigma["friedel_scale_adapted"] / report.sigma["friedel_scale_base"]
+        assert report.sigma["recalibrated_scale"] == pytest.approx(expected)
+        assert adapted is not None and adapted.sigma_scale == pytest.approx(expected)
+        assert base.sigma_scale == 1.3

@@ -411,6 +411,8 @@ def register_adapted(refiner, parent_id: str, dataset: str, report: dict,
     path = os.path.join(folder, f"{model_id}.pt")
     checkpoint = _torch.load(_resolve_weights(parent), map_location="cpu", weights_only=True)
     checkpoint["state_dict"] = {k: v.detach().cpu() for k, v in refiner.net.state_dict().items()}
+    checkpoint["sigma_scale"] = float(refiner.sigma_scale)
+    checkpoint["decline_moved_over"] = float(refiner.max_shift_fraction)
     _torch.save(checkpoint, path)
     entry = {
         "id": model_id, "kind": KIND_REFINER,

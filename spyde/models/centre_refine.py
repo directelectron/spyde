@@ -19,9 +19,12 @@ declines a disk by returning NaN for it. A refiner may also carry a
 ``min_spot_radius``: below it the stage is skipped and every detection kept.
 
 The stage keeps the detection's centre for a declined disk and for any centre
-that moves more than half a spot radius: no refiner sees enough of the frame to
-justify a larger move, and a refiner that wandered onto a neighbour is worse
-than the detection it replaced.
+that moves more than the refiner's ``max_shift_fraction`` of a spot radius —
+half a radius unless the refiner carries its own: a general refiner does not
+see enough of the frame to justify a larger move, and one that wandered onto a
+neighbour is worse than the detection it replaced. A refiner adapted to one
+scan (:mod:`spyde.models.centre_adapt`) makes real corrections of half a radius
+or more on a few percent of disks, and carries 0.75.
 
 :class:`MaskCentroidRefiner` is the classical baseline, and the bar a network
 refiner (:mod:`spyde.models.centre_network`) has to clear.
@@ -100,11 +103,13 @@ def extract_crops(frame: np.ndarray, centres: np.ndarray, half_width: int):
     return crops, local
 
 
-def accepted_moves(before: np.ndarray, after: np.ndarray, spot_radius: float) -> np.ndarray:
+def accepted_moves(before: np.ndarray, after: np.ndarray, spot_radius: float,
+                   limit: float = MAX_SHIFT_FRACTION) -> np.ndarray:
     """Which refined centres the stage takes: finite, and moved by no more than
-    ``MAX_SHIFT_FRACTION`` of the spot radius."""
+    ``limit`` (a refiner's ``max_shift_fraction``, by default
+    ``MAX_SHIFT_FRACTION``) of the spot radius."""
     shift = np.hypot(*(np.asarray(after, np.float64) - before).T)
-    return np.isfinite(after).all(1) & (shift <= MAX_SHIFT_FRACTION * float(spot_radius))
+    return np.isfinite(after).all(1) & (shift <= limit * float(spot_radius))
 
 
 def refine_centres(frames: Sequence[np.ndarray], positions: Sequence[np.ndarray],
@@ -133,7 +138,8 @@ def refine_centres(frames: Sequence[np.ndarray], positions: Sequence[np.ndarray]
         local = np.concatenate([l for _, _, l in pending])
         new_local, sigma = refiner.refine(crops, local, radius)
         new_local = np.asarray(new_local, np.float64).reshape(-1, 2)
-        accepted = accepted_moves(local, new_local, radius)
+        accepted = accepted_moves(local, new_local, radius,
+                                  getattr(refiner, "max_shift_fraction", MAX_SHIFT_FRACTION))
         if sigma is None:
             has_sigma = False
         start = 0

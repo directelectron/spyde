@@ -64,7 +64,9 @@ Uncertainty:
   error RMS was 6.0x the spread in every quintile (Spearman 0.76).
 
 A disk is declined — NaN, so the stage keeps its detected centre — when it moved
-half a spot radius or more, when its coverage is under a fifth of the expected
+``max_shift_fraction`` of a spot radius or more (0.5; a checkpoint's own
+``decline_moved_over`` wins — an adapted network corrects its scan's
+detections by more, and carries 0.75), when its coverage is under a fifth of the expected
 disk, or when its sigma is ``max_sigma_fraction`` (0.25) of the spot radius or more.
 """
 from __future__ import annotations
@@ -77,6 +79,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .centre_refine import DEFAULT_MIN_SPOT_RADIUS
+from .centre_refine import MAX_SHIFT_FRACTION as DEFAULT_MAX_SHIFT_FRACTION
 
 NORMALISATION_RING_MEDIAN_DISK_P95 = "ring-median/disk-p95"
 NORMALISATION_MEAN = "mean"
@@ -210,6 +213,7 @@ class NetworkRefiner:
                  sigma_per_spread: float = DEFAULT_SIGMA_PER_SPREAD,
                  max_sigma_fraction: float = DEFAULT_MAX_SIGMA_FRACTION,
                  sigma_scale: float = 1.0,
+                 max_shift_fraction: float = DEFAULT_MAX_SHIFT_FRACTION,
                  min_spot_radius: float = DEFAULT_MIN_SPOT_RADIUS):
         if normalisation not in NORMALISATIONS:
             raise ValueError(f"unknown refiner normalisation {normalisation!r}; "
@@ -229,6 +233,7 @@ class NetworkRefiner:
         self.sigma_per_spread = float(sigma_per_spread)
         self.max_sigma_fraction = float(max_sigma_fraction)
         self.sigma_scale = float(sigma_scale)
+        self.max_shift_fraction = float(max_shift_fraction)
         self.min_spot_radius = float(min_spot_radius)
 
     def crop_half_width(self, spot_radius: float) -> int:
@@ -236,11 +241,9 @@ class NetworkRefiner:
         # centre, which sits up to half a pixel off the crop centre and, on a
         # re-crop pass, may have moved by up to the largest accepted shift.
         # One more pixel keeps the bilinear samples inside the crop.
-        from .centre_refine import MAX_SHIFT_FRACTION
-
         reach = self.crop_half / self.crop_radius * float(spot_radius)
         if self.passes > 1:
-            reach += MAX_SHIFT_FRACTION * float(spot_radius)
+            reach += self.max_shift_fraction * float(spot_radius)
         return int(math.ceil(reach + 0.5)) + 1
 
     def _offsets(self):
@@ -363,7 +366,7 @@ class NetworkRefiner:
                     if sigma is None:
                         sigma = torch.full_like(area, float("nan"))
                     sigma[again] = moved_sigma
-            declined = ((centre - seeds).norm(dim=1) >= 0.5 * radius) \
+            declined = ((centre - seeds).norm(dim=1) >= self.max_shift_fraction * radius) \
                 | (area <= 0.2 * math.pi * self.crop_radius ** 2) \
                 | (sigma >= self.max_sigma_fraction * radius)
             centre[declined] = float("nan")
@@ -417,4 +420,6 @@ def load_refiner(path, device, arch: dict | None = None, contract: dict | None =
         max_sigma_fraction=float(contract.get("max_sigma_fraction",
                                               DEFAULT_MAX_SIGMA_FRACTION)),
         min_spot_radius=float(contract.get("min_spot_radius", DEFAULT_MIN_SPOT_RADIUS)),
-        sigma_scale=float(contract.get("sigma_scale", checkpoint.get("sigma_scale", 1.0))))
+        sigma_scale=float(contract.get("sigma_scale", checkpoint.get("sigma_scale", 1.0))),
+        max_shift_fraction=float(contract.get(
+            "decline_moved_over", checkpoint.get("decline_moved_over", DEFAULT_MAX_SHIFT_FRACTION))))
