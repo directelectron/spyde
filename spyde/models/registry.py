@@ -51,6 +51,11 @@ detector. The detector list, its default and ``get_model`` never see a
 refiner; ``available_models()["refiners"]`` and ``get_refiner`` never see a
 detector.
 
+Symmetry models (``spyde.models.symmetry_refine``) are ``"kind": "symmetry"``
+entries. Their ``arch.layout`` names a loader in ``SYMMETRY_LAYOUTS`` and their
+``input`` block is that layout's contract (what it needs per disk: positions,
+sigma, confidence, embeddings, beam, and how they are normalised).
+
 A user manifest entry may also name a local checkpoint,
 ``"source": {"type": "file", "path": "..."}``, to try a model in the app
 before it is published.
@@ -82,10 +87,16 @@ REMOTE_REGISTRY_FILE = "registry.json"
 
 KIND_DETECTOR = "detector"
 KIND_REFINER = "refiner"
+KIND_SYMMETRY = "symmetry"
+
+#: Symmetry-model layouts by name (``arch.layout`` of a ``"kind": "symmetry"``
+#: entry): ``loader(path, device, arch, contract) -> SymmetryRefiner``. A new
+#: layout registers its loader here; none ships yet.
+SYMMETRY_LAYOUTS: dict = {}
 
 _CACHE_LOCK = threading.Lock()
 _MODEL_CACHE: dict = {}          # model_id -> (model, device)
-_REFINER_CACHE: dict = {}        # (model_id, device) -> NetworkRefiner
+_REFINER_CACHE: dict = {}        # (model_id, device) -> NetworkRefiner or symmetry refiner
 _MANIFEST_CACHE: Optional[dict] = None
 
 
@@ -178,13 +189,15 @@ def _summary(entry: dict) -> dict:
 
 
 def available_models() -> dict:
-    """Compact payload for the wizard's dropdowns: ``{default, models, refiners}``,
+    """Compact payload for the wizard's dropdowns: ``{default, models, refiners,
+    symmetry}``,
     each a list of ``{id, label, version, notes}`` (arch/source omitted — the UI
     doesn't need them). ``models`` holds detectors only."""
     return {
         "default": default_model_id(),
         "models": [_summary(m) for m in list_models(KIND_DETECTOR)],
         "refiners": [_summary(m) for m in list_models(KIND_REFINER)],
+        "symmetry": [_summary(m) for m in list_models(KIND_SYMMETRY)],
     }
 
 
@@ -352,6 +365,35 @@ def get_refiner(model_id: str, device=None):
     path = _resolve_weights(entry)
     refiner = centre_network.load_refiner(path, device, arch=entry.get("arch"),
                                           contract=entry.get("input"))
+    with _CACHE_LOCK:
+        _REFINER_CACHE[key] = refiner
+    return refiner
+
+
+def get_symmetry_refiner(model_id: str, device=None):
+    """A cached symmetry refiner for a ``"kind": "symmetry"`` entry, loaded by
+    the ``SYMMETRY_LAYOUTS`` loader its ``arch.layout`` names. Raises when the
+    id is unknown, is not a symmetry model, names no known layout, or fails to
+    load; the caller (``symmetry_refine.symmetry_refiner_for``) then skips the
+    stage."""
+    import torch as _torch
+
+    from . import infer
+
+    device = _torch.device(device) if device is not None else infer._default_device()
+    key = (model_id, str(device))
+    with _CACHE_LOCK:
+        if key in _REFINER_CACHE:
+            return _REFINER_CACHE[key]
+    entry = _entry(model_id)
+    if entry is None or model_kind(entry) != KIND_SYMMETRY:
+        raise ValueError(f"{model_id!r} is not a registered symmetry model")
+    arch = entry.get("arch") or {}
+    loader = SYMMETRY_LAYOUTS.get(arch.get("layout"))
+    if loader is None:
+        raise ValueError(f"symmetry model {model_id!r} has unknown layout "
+                         f"{arch.get('layout')!r}; known: {sorted(SYMMETRY_LAYOUTS)}")
+    refiner = loader(_resolve_weights(entry), device, arch, entry.get("input") or {})
     with _CACHE_LOCK:
         _REFINER_CACHE[key] = refiner
     return refiner

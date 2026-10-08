@@ -54,6 +54,10 @@ DEFAULTS: dict = dict(
     # network's own centres; "mask-centroid" or a refiner model id re-places
     # every disk on the raw frame. Preview and batch read the same key.
     centre_refiner="decode",
+    # Neural symmetry stage (spyde.models.symmetry_refine): "off", "friedel"
+    # (the classical baseline) or a symmetry model id. Forced off for an
+    # amorphous sample, which has no Friedel pairs or lattice to use.
+    symmetry_refiner="off", sample_type="crystalline",
     # Neural stage-2 refine: drop peaks not confirmed by scan neighbours
     # (models/refine.py). BATCH-only (the preview has no neighbours) and
     # default-off until the eval benchmark says it should be on (plan Phase 3).
@@ -89,6 +93,11 @@ def _coerce(params: dict) -> dict:
     # to see). Forced here, the single choke point for wizard/toolbar/api.
     if p["method"] == "neural":
         p["sigma"] = 0.0
+    from spyde.models.symmetry_refine import SAMPLE_AMORPHOUS, SAMPLE_TYPES, SYMMETRY_OFF
+    if p["sample_type"] not in SAMPLE_TYPES:
+        p["sample_type"] = DEFAULTS["sample_type"]
+    if p["sample_type"] == SAMPLE_AMORPHOUS:
+        p["symmetry_refiner"] = SYMMETRY_OFF
     return p
 
 
@@ -119,10 +128,13 @@ def _ensure_model_local(p: dict) -> None:
         return
     from spyde import models
     from spyde.models.centre_refine import CENTRE_DECODE, CENTRE_MASK_CENTROID
+    from spyde.models.symmetry_refine import SYMMETRY_FRIEDEL, SYMMETRY_OFF
 
     model_ids = [p.get("model_id") or None]
     if p.get("centre_refiner") not in (None, "", CENTRE_DECODE, CENTRE_MASK_CENTROID):
         model_ids.append(p["centre_refiner"])
+    if p.get("symmetry_refiner") not in (None, "", SYMMETRY_OFF, SYMMETRY_FRIEDEL):
+        model_ids.append(p["symmetry_refiner"])
     for mid in model_ids:
         try:
             if not models.is_cached(mid):
@@ -971,9 +983,10 @@ def fv_tune(session, plot, payload) -> None:
         from spyde.actions.vector_overlay import tune_find_vectors_preview
         try:
             tune_find_vectors_preview(tree, prev, coerced)
-            log.info("[fv-tune] parameters APPLIED thr=%s md=%s kr=%s centre=%s",
+            log.info("[fv-tune] parameters APPLIED thr=%s md=%s kr=%s centre=%s symmetry=%s",
                      coerced.get("threshold"), coerced.get("min_distance"),
-                     coerced.get("kernel_radius"), coerced.get("centre_refiner"))
+                     coerced.get("kernel_radius"), coerced.get("centre_refiner"),
+                     coerced.get("symmetry_refiner"))
         except Exception as e:
             log.exception("[fv-tune] applying the parameters FAILED: %s", e)
 
@@ -1007,9 +1020,10 @@ def fv_models(session, plot, payload) -> None:
     """Emit the available neural models for the wizard's Model and Centre dropdowns.
 
     Payload: ``{type: "fv_models", window_id, default, models: [{id, label,
-    version, notes}], refiners: [...same]}`` — straight from the model registry
-    (bundled manifest merged with any user-installed models). ``models`` lists
-    detectors only; ``refiners`` the centre-refiner networks."""
+    version, notes}], refiners: [...same], symmetry: [...same]}`` — straight
+    from the model registry (bundled manifest merged with any user-installed
+    models). ``models`` lists detectors only; ``refiners`` the centre-refiner
+    networks; ``symmetry`` the symmetry models."""
     from spyde.models import available_models
     msg = {"type": "fv_models",
            "window_id": (payload or {}).get("window_id",

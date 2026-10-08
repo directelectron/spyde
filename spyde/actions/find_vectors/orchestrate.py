@@ -393,6 +393,9 @@ def _do_compute_vectors(
     # The neural centre stage: "decode" (none), "mask-centroid" or a refiner
     # model id (spyde.models.centre_refine.refiner_for).
     centre_refiner = str(params.get("centre_refiner") or "").strip() or None
+    # The neural symmetry stage: "off", "friedel" or a symmetry model id
+    # (spyde.models.symmetry_refine.symmetry_refiner_for).
+    symmetry_refiner = str(params.get("symmetry_refiner") or "").strip() or None
     log.debug("[do_compute_vectors] START method=%s thr=%s md=%s sigma=%s "
               "nav_dim=%s sig_shape=%s lazy=%s beamstop=%s", method, threshold,
               min_dist, sigma, nav_dim, tuple(sig_shape),
@@ -524,6 +527,7 @@ def _do_compute_vectors(
         persistence=persistence,
         spot_radius=spot_radius,
         centre_refiner=centre_refiner,
+        symmetry_refiner=symmetry_refiner,
     )
 
     # Resolve the distributed client up front — needed both to decide on GPU
