@@ -100,6 +100,13 @@ def extract_crops(frame: np.ndarray, centres: np.ndarray, half_width: int):
     return crops, local
 
 
+def accepted_moves(before: np.ndarray, after: np.ndarray, spot_radius: float) -> np.ndarray:
+    """Which refined centres the stage takes: finite, and moved by no more than
+    ``MAX_SHIFT_FRACTION`` of the spot radius."""
+    shift = np.hypot(*(np.asarray(after, np.float64) - before).T)
+    return np.isfinite(after).all(1) & (shift <= MAX_SHIFT_FRACTION * float(spot_radius))
+
+
 def refine_centres(frames: Sequence[np.ndarray], positions: Sequence[np.ndarray],
                    spot_radius: float, refiner: CentreRefiner,
                    batch_size: int = DEFAULT_BATCH):
@@ -126,8 +133,7 @@ def refine_centres(frames: Sequence[np.ndarray], positions: Sequence[np.ndarray]
         local = np.concatenate([l for _, _, l in pending])
         new_local, sigma = refiner.refine(crops, local, radius)
         new_local = np.asarray(new_local, np.float64).reshape(-1, 2)
-        shift = np.hypot(*(new_local - local).T)
-        accepted = np.isfinite(new_local).all(1) & (shift <= MAX_SHIFT_FRACTION * radius)
+        accepted = accepted_moves(local, new_local, radius)
         if sigma is None:
             has_sigma = False
         start = 0

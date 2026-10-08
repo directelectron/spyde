@@ -92,8 +92,10 @@ _MANIFEST_CACHE: Optional[dict] = None
 # ── user dir ──────────────────────────────────────────────────────────────────
 def user_models_dir() -> str:
     """``~/.spyde/models`` — where remote-downloaded weights + the user manifest
-    live (mirrors the ``~/.spyde`` settings dir used elsewhere). Created on demand."""
-    d = os.path.join(os.path.expanduser("~"), ".spyde", "models")
+    live (mirrors the ``~/.spyde`` settings dir used elsewhere), or
+    ``SPYDE_MODELS_DIR`` when set (so a test run never writes to a real
+    profile). Created on demand."""
+    d = os.environ.get("SPYDE_MODELS_DIR") or os.path.join(os.path.expanduser("~"), ".spyde", "models")
     os.makedirs(d, exist_ok=True)
     return d
 
@@ -173,8 +175,12 @@ def default_model_id() -> Optional[str]:
 
 
 def _summary(entry: dict) -> dict:
-    return {"id": entry["id"], "label": entry.get("label", entry["id"]),
-            "version": entry.get("version"), "notes": entry.get("notes")}
+    summary = {"id": entry["id"], "label": entry.get("label", entry["id"]),
+               "version": entry.get("version"), "notes": entry.get("notes")}
+    if entry.get("parent"):
+        summary.update(parent=entry["parent"], scope=entry.get("scope"),
+                       saved=bool(entry.get("saved")))
+    return summary
 
 
 def available_models() -> dict:
@@ -347,6 +353,11 @@ def get_refiner(model_id: str, device=None):
         if key in _REFINER_CACHE:
             return _REFINER_CACHE[key]
     entry = _entry(model_id)
+    if entry is None:
+        # Another process may have added it to the user manifest since this
+        # one read it — a refiner adapted in the app, used on a compute worker.
+        _invalidate_manifest()
+        entry = _entry(model_id)
     if entry is None or model_kind(entry) != KIND_REFINER:
         raise ValueError(f"{model_id!r} is not a registered centre refiner")
     path = _resolve_weights(entry)
@@ -355,6 +366,103 @@ def get_refiner(model_id: str, device=None):
     with _CACHE_LOCK:
         _REFINER_CACHE[key] = refiner
     return refiner
+
+
+# ── refiners adapted to one scan ─────────────────────────────────────────────────
+#
+# An adapted refiner (spyde.models.centre_adapt) is written to the user models
+# folder at once, with a user-manifest entry, because Find Vectors runs on
+# compute workers in other processes and they find refiners through that file.
+# Its entry carries the backend session that made it; ``saved`` makes it
+# permanent, and an unsaved one is pruned when a later session starts.
+
+ADAPTED_FOLDER = "adapted"
+
+
+def _read_user_manifest() -> dict:
+    return _load_user_manifest() or {"models": []}
+
+
+def _write_user_manifest(manifest: dict) -> None:
+    path = os.path.join(user_models_dir(), REMOTE_REGISTRY_FILE)
+    temporary = path + ".tmp"
+    with open(temporary, "w", encoding="utf-8") as handle:
+        json.dump(manifest, handle, indent=1)
+    os.replace(temporary, path)
+    _invalidate_manifest()
+
+
+def register_adapted(refiner, parent_id: str, dataset: str, report: dict,
+                     session: str, saved: bool = False) -> dict:
+    """Write an adapted refiner's checkpoint and user-manifest entry; return the
+    entry. It inherits its parent's architecture and input contract."""
+    import re
+    import time as _time
+
+    import torch as _torch
+
+    parent = _entry(parent_id)
+    if parent is None or model_kind(parent) != KIND_REFINER:
+        raise ValueError(f"{parent_id!r} is not a registered centre refiner")
+    slug = re.sub(r"[^a-z0-9]+", "-", dataset.lower()).strip("-")[:40] or "scan"
+    model_id = f"{parent_id}-adapted-{slug}-{_time.strftime('%Y%m%d%H%M%S')}"
+    folder = os.path.join(user_models_dir(), ADAPTED_FOLDER)
+    os.makedirs(folder, exist_ok=True)
+    path = os.path.join(folder, f"{model_id}.pt")
+    checkpoint = _torch.load(_resolve_weights(parent), map_location="cpu", weights_only=True)
+    checkpoint["state_dict"] = {k: v.detach().cpu() for k, v in refiner.net.state_dict().items()}
+    _torch.save(checkpoint, path)
+    entry = {
+        "id": model_id, "kind": KIND_REFINER,
+        "label": f"{parent.get('label', parent_id).replace(' (bundled)', '')} adapted to {dataset}",
+        "version": 1, "parent": parent_id, "scope": {"dataset": dataset},
+        "arch": parent.get("arch"), "input": parent.get("input"),
+        "source": {"type": "file", "path": path},
+        "report": report, "session": session, "saved": bool(saved),
+    }
+    manifest = _read_user_manifest()
+    manifest["models"] = [m for m in manifest.get("models", []) if m.get("id") != model_id] + [entry]
+    _write_user_manifest(manifest)
+    with _CACHE_LOCK:
+        _REFINER_CACHE[(model_id, str(refiner.device))] = refiner
+    return entry
+
+
+def keep_adapted(model_id: str) -> bool:
+    """Mark an adapted refiner as saved, so later sessions keep it."""
+    manifest = _read_user_manifest()
+    found = False
+    for entry in manifest.get("models", []):
+        if entry.get("id") == model_id and entry.get("parent"):
+            entry["saved"] = True
+            found = True
+    if found:
+        _write_user_manifest(manifest)
+    return found
+
+
+def prune_unsaved_adapted(session: str) -> list:
+    """Remove adapted refiners another session made and nobody saved; returns
+    their ids. Run in the backend's own process only — a compute worker must
+    never delete a file the app may be using."""
+    manifest = _load_user_manifest()
+    if not manifest:
+        return []
+    keep, removed = [], []
+    for entry in manifest.get("models", []):
+        stale = entry.get("parent") and not entry.get("saved") and entry.get("session") != session
+        if stale:
+            removed.append(entry["id"])
+            try:
+                os.remove(entry["source"]["path"])
+            except OSError:
+                pass
+        else:
+            keep.append(entry)
+    if removed:
+        manifest["models"] = keep
+        _write_user_manifest(manifest)
+    return removed
 
 
 _CPU_MODEL_CACHE: dict = {}      # model_id -> (cpu_model, cpu_device)

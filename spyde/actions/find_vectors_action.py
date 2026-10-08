@@ -1010,7 +1010,10 @@ def fv_models(session, plot, payload) -> None:
     version, notes}], refiners: [...same]}`` — straight from the model registry
     (bundled manifest merged with any user-installed models). ``models`` lists
     detectors only; ``refiners`` the centre-refiner networks."""
-    from spyde.models import available_models
+    from spyde.actions.centre_adapt_action import SESSION
+    from spyde.models import available_models, registry
+
+    registry.prune_unsaved_adapted(SESSION)
     msg = {"type": "fv_models",
            "window_id": (payload or {}).get("window_id",
                                             getattr(plot, "window_id", None))}

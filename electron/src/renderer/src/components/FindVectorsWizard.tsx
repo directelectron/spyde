@@ -15,7 +15,10 @@
  *     auto-calibrated invisibly (`fv_calibration`). Model dropdown + ↻ refresh
  *     from the registry (`fv_models`). Centre dropdown: keep the network's
  *     decode, or re-place every disk on the raw frame (mask centroid, or a
- *     refiner network the registry lists). The default method.
+ *     refiner network the registry lists). With a network picked, "Adapt"
+ *     fine-tunes a copy to this scan in the background (`fv_adapt_centre`,
+ *     cancellable) and reports before/after in a card; an accepted copy
+ *     becomes the Centre choice. The default method.
  *   • NXCORR — window-normalised cross-correlation against a flat disk
  *     (Disk Radius slider; threshold is a [-1,1] correlation score).
  *   • DoG — Difference-of-Gaussians band-pass, best for small (2-3 px) spots
@@ -45,6 +48,16 @@ const CENTRE_BUILT_IN: readonly { value: string; label: string }[] = [
   { value: 'mask-centroid', label: 'Mask centroid' },
 ]
 
+// What the backend reports while adapting a centre network and when it ends
+// (spyde.actions.centre_adapt_action).
+interface AdaptMeasures { friedel?: number | null; lattice?: number | null; noise?: number | null; refined?: number | null }
+interface AdaptState {
+  running: boolean; stage?: string; done?: number; total?: number | null
+  accepted?: boolean; declined?: string | null; cancelled?: boolean
+  before?: AdaptMeasures; after?: AdaptMeasures; seconds?: number
+  steps?: number; modelId?: string; label?: string; saved?: boolean
+}
+
 // Sensible threshold default per method (neural confidence vs NXCORR score vs DoG SNR).
 const THR_DEFAULT: Record<Method, number> = { neural: 0.3, nxcorr: 0.5, dog: 10 }
 
@@ -71,6 +84,7 @@ export function FindVectorsWizard({ caretPos, windowId, sendAction, onClose }: P
   const [models, setModels] = React.useState<readonly { value: string; label: string }[]>([])
   const [centreRefiner, setCentreRefiner] = React.useState(saved?.centreRefiner ?? 'decode')
   const [refiners, setRefiners] = React.useState<readonly { value: string; label: string }[]>([])
+  const [adapt, setAdapt] = React.useState<AdaptState | null>(null)
   const [sigma, setSigma] = React.useState(saved?.sigma ?? 0)
   const [radius, setRadius] = React.useState(saved?.radius ?? 5)
   const [sigma1, setSigma1] = React.useState(saved?.sigma1 ?? 0.8)
@@ -147,6 +161,36 @@ export function FindVectorsWizard({ caretPos, windowId, sendAction, onClose }: P
     // '' = registry default; surface it as the concrete id once known.
     if (!vals.current.modelId && typeof d.default === 'string') setModelId(d.default)
     if (d.refreshed) setStatus(`Model list refreshed — ${list.length} available.`)
+  })
+
+  // Adapt the chosen centre network to this scan: background work, progress
+  // and a before/after card; an accepted copy becomes the Centre choice.
+  const startAdapt = () => {
+    setAdapt({ running: true, stage: 'reading' })
+    sendRef.current('fv_adapt_centre', params(), windowId)
+  }
+  useWizardEvent('spyde:fv_adapt_progress', windowId, (d) => {
+    setAdapt((a) => (a && a.running ? {
+      ...a, stage: String(d.stage ?? ''), done: Number(d.done ?? 0),
+      total: typeof d.total === 'number' ? d.total : null,
+    } : a))
+  })
+  useWizardEvent('spyde:fv_adapt_result', windowId, (d) => {
+    const report = (d.report ?? {}) as Record<string, unknown>
+    setAdapt({
+      running: false, accepted: Boolean(d.accepted), cancelled: Boolean(d.cancelled),
+      declined: typeof d.declined === 'string' ? d.declined : null,
+      before: (report.before ?? {}) as AdaptMeasures, after: (report.after ?? {}) as AdaptMeasures,
+      seconds: typeof report.total_seconds === 'number' ? report.total_seconds : undefined,
+      steps: typeof report.steps === 'number' ? report.steps : undefined,
+      modelId: typeof d.model_id === 'string' ? d.model_id : undefined,
+      label: typeof d.label === 'string' ? d.label : undefined,
+    })
+    if (d.accepted && typeof d.model_id === 'string') {
+      setCentreRefiner(d.model_id)
+      vals.current = { ...vals.current, centreRefiner: d.model_id }
+      tune()
+    }
   })
 
   // "Check for new models": pull the latest registry from Hugging Face; the
@@ -232,10 +276,24 @@ export function FindVectorsWizard({ caretPos, windowId, sendAction, onClose }: P
       )}
       {isNeural && (
         <Field label="Centre">
-          <Select testid="fv-centre" value={centreRefiner}
-            options={[...CENTRE_BUILT_IN, ...refiners]} onChange={live(setCentreRefiner)} />
+          <div style={modelRowStyle}>
+            <Select testid="fv-centre" value={centreRefiner}
+              options={[...CENTRE_BUILT_IN, ...refiners]} onChange={live(setCentreRefiner)} />
+            {refiners.some((r) => r.value === centreRefiner) && !adapt?.running && (
+              <button data-testid="fv-adapt" style={adaptButtonStyle}
+                title="Fine-tune this centre network to this scan (a few minutes, in the background)"
+                onClick={startAdapt}>Adapt</button>
+            )}
+          </div>
         </Field>
       )}
+      {isNeural && adapt && <AdaptCard state={adapt}
+        onCancel={() => sendRef.current('fv_adapt_cancel', {}, windowId)}
+        onSave={() => {
+          sendRef.current('fv_adapt_save', { model_id: adapt.modelId }, windowId)
+          setAdapt({ ...adapt, saved: true })
+        }}
+        onDismiss={() => setAdapt(null)} />}
       <div style={gridStyle}>
         {!isNeural && (
           // Nav blur is a NXCORR/DoG option only (defaults off) — the neural
@@ -320,6 +378,77 @@ const refreshBtnStyle: React.CSSProperties = {
   background: 'transparent', color: 'inherit', border: '1px solid #444',
   borderRadius: 4, cursor: 'pointer',
 }
+const adaptButtonStyle: React.CSSProperties = {
+  flex: '0 0 auto', height: 22, padding: '0 8px', background: 'transparent', color: 'inherit',
+  border: '1px solid #444', borderRadius: 4, cursor: 'pointer', fontSize: 11,
+}
+const cardStyle: React.CSSProperties = {
+  border: '1px solid #3a3f4b', borderRadius: 6, padding: '6px 8px', margin: '4px 0',
+  fontSize: 11, display: 'flex', flexDirection: 'column', gap: 4,
+}
+const cardRowStyle: React.CSSProperties = {
+  display: 'grid', gridTemplateColumns: '1.3fr 1fr 1fr', columnGap: 6,
+}
+
+function formatMeasure(value: number | null | undefined, digits = 3): string {
+  return typeof value === 'number' && Number.isFinite(value) ? value.toFixed(digits) : '—'
+}
+
+// The adaptation's progress, then its outcome: accepted / not adopted /
+// declined, with the held-out measures before and after. The refined-fraction
+// change is reported only — whether a drop should reject is undecided.
+function AdaptCard({ state, onCancel, onSave, onDismiss }: {
+  state: AdaptState; onCancel: () => void; onSave: () => void; onDismiss: () => void
+}) {
+  if (state.running) {
+    const fraction = state.total ? ` ${state.done ?? 0} / ${state.total}` : ''
+    return (
+      <div data-testid="fv-adapt-card" style={cardStyle}>
+        <div>Adapting to this scan — {state.stage ?? 'starting'}{fraction}…</div>
+        <button data-testid="fv-adapt-cancel" style={adaptButtonStyle} onClick={onCancel}>Cancel</button>
+      </div>
+    )
+  }
+  const title = state.accepted ? 'Adapted — accepted'
+    : state.cancelled ? 'Adapting cancelled'
+    : state.declined ? 'Adapting declined' : 'Adapted — not adopted (kept the general network)'
+  const rows: [string, keyof AdaptMeasures, number][] = [
+    ['Friedel (px)', 'friedel', 3], ['Lattice (px)', 'lattice', 3],
+    ['Noise (px)', 'noise', 3], ['Refined', 'refined', 3],
+  ]
+  return (
+    <div data-testid="fv-adapt-card" style={cardStyle}>
+      <div data-testid="fv-adapt-title" style={{ fontWeight: 600 }}>{title}</div>
+      {state.declined && <div>{state.declined}</div>}
+      {!state.declined && !state.cancelled && (
+        <>
+          <div style={cardRowStyle}><span /><span>before</span><span>after</span></div>
+          {rows.map(([name, key, digits]) => (
+            <div key={key} style={cardRowStyle}>
+              <span>{name}</span>
+              <span>{formatMeasure(state.before?.[key], digits)}</span>
+              <span>{formatMeasure(state.after?.[key], digits)}</span>
+            </div>
+          ))}
+          <div>
+            {typeof state.seconds === 'number' ? `${state.seconds.toFixed(0)} s` : ''}
+            {typeof state.steps === 'number' ? `, ${state.steps} steps` : ''}
+            {state.accepted && state.label ? ` — now using “${state.label}”` : ''}
+          </div>
+        </>
+      )}
+      <div style={{ display: 'flex', gap: 6 }}>
+        {state.accepted && !state.saved && (
+          <button data-testid="fv-adapt-save" style={adaptButtonStyle} onClick={onSave}>
+            Save for this dataset</button>
+        )}
+        {state.saved && <span>Saved.</span>}
+        <button data-testid="fv-adapt-dismiss" style={adaptButtonStyle} onClick={onDismiss}>Dismiss</button>
+      </div>
+    </div>
+  )
+}
+
 const cellStyle: React.CSSProperties = {
   display: 'flex', flexDirection: 'column', gap: 2, minWidth: 0,
 }
