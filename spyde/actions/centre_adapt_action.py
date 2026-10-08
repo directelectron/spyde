@@ -35,7 +35,7 @@ SESSION = f"{os.getpid()}-{int(time.time())}"
 
 #: Payload keys that override :class:`~spyde.models.centre_adapt.AdaptSettings`.
 _SETTING_KEYS = ("budget_seconds", "max_steps", "primary_ratio", "other_ratio",
-                 "noise_fraction", "max_refined_drop")
+                 "max_refined_drop")
 
 
 def _settings(payload: dict):

@@ -129,8 +129,7 @@ class TestAdaptation:
         centrosymmetric about some point, so a synthetic one cannot avoid
         pairs; the index's partners are cleared instead). The lattice residual
         is then the primary measure, the only training signal, and its
-        improvement is accepted — the old rule required none and compared its
-        noise test against NaN."""
+        improvement is accepted — an earlier rule required none."""
         import spyde.models.centre_adapt as centre_adapt
 
         original = centre_adapt.scan_index
@@ -192,6 +191,40 @@ class TestAdaptation:
         json.dumps(report.to_dict())
 
 
+class TestRowScatter:
+    def test_white_noise_gives_its_own_sd(self):
+        """Second differences of white noise of SD s have SD s√6."""
+        from spyde.models.centre_adapt import row_scatter
+
+        rng = np.random.default_rng(1)
+        rows, columns = np.repeat(np.arange(20), 30), np.tile(np.arange(30), 20)
+        lattice = rng.normal(0, 0.2, (600, 5, 2)) + np.arange(5)[None, :, None]   # + static offsets
+        assert row_scatter(lattice, rows, columns) == pytest.approx(0.2, rel=0.1)
+
+    def test_a_linear_trend_along_the_row_does_not_count(self):
+        from spyde.models.centre_adapt import row_scatter
+
+        rows, columns = np.repeat(np.arange(4), 25), np.tile(np.arange(25), 4)
+        trend = (0.1 * columns)[:, None, None] * np.ones((1, 3, 2))
+        assert row_scatter(trend, rows, columns) < 1e-9
+
+    def test_unordered_frames_or_gaps_give_nan(self):
+        from spyde.models.centre_adapt import row_scatter
+
+        lattice = np.zeros((6, 2, 2))
+        assert np.isnan(row_scatter(lattice, np.full(6, -1), np.arange(6)))
+        assert np.isnan(row_scatter(lattice, np.zeros(6, int), np.array([0, 2, 4, 6, 8, 10])))
+
+    def test_held_out_rows_are_kept_whole(self, biased_scan):
+        """The scatter needs neighbours along a row: with a held-out cap of two
+        rows, exactly two whole rows are kept, and the report measures it."""
+        settings = AdaptSettings(budget_seconds=1, max_steps=1, held_out_cap=2 * COLUMNS,
+                                 min_held_out=5)
+        _, _, report = run(biased_scan, start=0.9, settings=settings)
+        assert report.held_out_frames == 2 * COLUMNS
+        assert math.isfinite(report.before["scatter"]) and math.isfinite(report.after["scatter"])
+
+
 class TestScanIndex:
     def test_reflections_pairs_and_lattice_are_found(self, biased_scan):
         frames, truths = biased_scan
@@ -208,47 +241,46 @@ class TestScanIndex:
 
 
 class TestAcceptance:
-    before = dict(friedel=1.0, lattice=1.0, noise=0.05, refined=0.99)
+    before = dict(friedel=1.0, lattice=1.0, scatter=0.05, refined=0.99)
 
     @pytest.mark.parametrize("after, expected", [
-        (dict(friedel=0.9, lattice=1.0, noise=0.05, refined=0.99), True),
-        (dict(friedel=0.99, lattice=1.0, noise=0.05, refined=0.99), False),   # gain < 2 %
-        (dict(friedel=0.9, lattice=1.05, noise=0.05, refined=0.99), False),   # lattice worse
-        (dict(friedel=0.9, lattice=1.0, noise=0.08, refined=0.99), False),    # noise added
+        (dict(friedel=0.9, lattice=1.0, scatter=0.05, refined=0.99), True),
+        (dict(friedel=0.99, lattice=1.0, scatter=0.05, refined=0.99), False),   # gain < 2 %
+        (dict(friedel=0.9, lattice=1.05, scatter=0.05, refined=0.99), False),   # lattice worse
     ])
-    def test_the_three_tests(self, after, expected):
+    def test_the_two_tests(self, after, expected):
         assert accept(self.before, after, AdaptSettings()) is expected
+
+    def test_there_is_no_separate_noise_test(self):
+        """The held-out measures are taken at the scan's real dose, so shot
+        noise is already in them. A half-dose split assumed one count per
+        electron; on a detector with ~240 counts per electron it
+        underestimated the noise ~15x, so it is gone — and the scatter, which
+        is reported, does not decide."""
+        assert not hasattr(AdaptSettings(), "noise_fraction")
+        scattered = dict(friedel=0.9, lattice=1.0, scatter=0.5, refined=0.99)
+        assert accept(self.before, scattered, AdaptSettings())
 
     def test_a_missing_other_measure_skips_its_test_and_both_missing_rejects(self):
         nan = float("nan")
         no_lattice = dict(self.before, lattice=nan)
-        assert accept(no_lattice, dict(friedel=0.9, lattice=nan, noise=0.05, refined=0.99),
+        assert accept(no_lattice, dict(friedel=0.9, lattice=nan, scatter=nan, refined=0.99),
                       AdaptSettings())
         nothing = dict(self.before, friedel=nan, lattice=nan)
         assert not accept(nothing, dict(nothing), AdaptSettings())
+        assert not accept(self.before, dict(self.before, friedel=nan), AdaptSettings())
 
     def test_without_friedel_pairs_the_lattice_is_primary(self):
-        """The old rule required no improvement at all without Friedel pairs,
-        and compared its noise test against NaN."""
+        """An earlier rule required no improvement at all without Friedel pairs."""
         nan = float("nan")
-        no_pairs = dict(friedel=nan, lattice=1.0, noise=0.05, refined=0.99)
-        better = dict(friedel=nan, lattice=0.9, noise=0.05, refined=0.99)
+        no_pairs = dict(friedel=nan, lattice=1.0, scatter=0.05, refined=0.99)
+        better = dict(friedel=nan, lattice=0.9, scatter=0.05, refined=0.99)
         assert accept(no_pairs, better, AdaptSettings())
         same = dict(better, lattice=0.99)                      # under the 2 % gain
         assert not accept(no_pairs, same, AdaptSettings())
-        noisy = dict(better, noise=0.09)                       # added 0.075 > 0.5 x 0.1
-        assert not accept(no_pairs, noisy, AdaptSettings())
-
-    def test_the_noise_test_is_nan_safe(self):
-        nan = float("nan")
-        after = dict(friedel=0.9, lattice=1.0, noise=nan, refined=0.99)
-        assert accept(self.before, after, AdaptSettings())     # unmeasured noise: skipped
-        assert accept(dict(self.before, noise=nan),
-                      dict(after, noise=0.05), AdaptSettings())
-        assert not accept(self.before, dict(after, friedel=nan), AdaptSettings())
 
     def test_the_thresholds_are_parameters(self):
-        after = dict(friedel=0.97, lattice=1.0, noise=0.05, refined=0.99)
+        after = dict(friedel=0.97, lattice=1.0, scatter=0.05, refined=0.99)
         assert accept(self.before, after, AdaptSettings())
         assert not accept(self.before, after, AdaptSettings(primary_ratio=0.95))
         worse_lattice = dict(after, lattice=1.03)
@@ -256,7 +288,7 @@ class TestAcceptance:
         assert accept(self.before, worse_lattice, AdaptSettings(other_ratio=1.05))
 
     def test_a_refined_fraction_drop_is_reported_not_enforced_by_default(self):
-        after = dict(friedel=0.9, lattice=1.0, noise=0.05, refined=0.90)
+        after = dict(friedel=0.9, lattice=1.0, scatter=0.05, refined=0.90)
         assert accept(self.before, after, AdaptSettings())
         assert not accept(self.before, after, AdaptSettings(max_refined_drop=0.02))
 

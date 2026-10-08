@@ -50,7 +50,7 @@ const CENTRE_BUILT_IN: readonly { value: string; label: string }[] = [
 
 // What the backend reports while adapting a centre network and when it ends
 // (spyde.actions.centre_adapt_action).
-interface AdaptMeasures { friedel?: number | null; lattice?: number | null; noise?: number | null; refined?: number | null }
+interface AdaptMeasures { friedel?: number | null; lattice?: number | null; scatter?: number | null; refined?: number | null }
 interface AdaptState {
   running: boolean; stage?: string; done?: number; total?: number | null
   accepted?: boolean; declined?: string | null; cancelled?: boolean
@@ -412,9 +412,13 @@ function AdaptCard({ state, onCancel, onSave, onDismiss }: {
   const title = state.accepted ? 'Adapted — accepted'
     : state.cancelled ? 'Adapting cancelled'
     : state.declined ? 'Adapting declined' : 'Adapted — not adopted (kept the general network)'
+  // Scatter is the position-to-position scatter along scan rows; it is only
+  // measured for an ordered scan, so its row is left out without it.
   const rows: [string, keyof AdaptMeasures, number][] = [
     ['Friedel (px)', 'friedel', 3], ['Lattice (px)', 'lattice', 3],
-    ['Noise (px)', 'noise', 3], ['Refined', 'refined', 3],
+    ...(typeof state.before?.scatter === 'number'
+      ? [['Scatter (px)', 'scatter', 3] as [string, keyof AdaptMeasures, number]] : []),
+    ['Refined', 'refined', 3],
   ]
   return (
     <div data-testid="fv-adapt-card" style={cardStyle}>

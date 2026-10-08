@@ -26,10 +26,15 @@ if frames it never trained on agree.
    there are no rows). The primary measure is the varying Friedel error, or the
    varying lattice residual when the scan has too few Friedel pairs to measure
    it. Accept only if, on the held-out frames, the primary falls to
-   ``primary_ratio`` (0.98) of before or less, the other measure (when there is
-   one) rises to no more than ``other_ratio`` (1.02), and the noise the
-   adaptation adds (half-dose split, in quadrature) is under ``noise_fraction``
-   (0.5) of the primary's improvement. With neither measure, reject.
+   ``primary_ratio`` (0.98) of before or less and the other measure (when there
+   is one) rises to no more than ``other_ratio`` (1.02). With neither measure,
+   reject. Both are measured at the scan's real dose, so they already include
+   shot noise; there is no separate noise test. (A half-dose split was one, but
+   it splits detector counts as if each were an electron, and on a detector
+   with ~240 counts per electron it underestimated the noise ~15x.) For an
+   ordered scan the report adds the position-to-position scatter: the robust
+   SD of second differences of each reflection's lattice residual along the
+   held-out rows, over sqrt(6).
 
 The adapted copy corrects its scan's detections by more than a general network
 does — about 4 % of disks move half a radius or more, for real — so it carries
@@ -79,7 +84,6 @@ class AdaptSettings:
     simulation_weight: float = 1.0           #: the simulated-disk anchor
     primary_ratio: float = 0.98              #: accept if the primary <= this x before
     other_ratio: float = 1.02                #: ... and the other measure <= this x before
-    noise_fraction: float = 0.5              #: ... and added noise < this x the primary's gain
     #: Reject if the refined fraction drops by more than this (fraction, e.g.
     #: 0.02). Off by default: reported, not enforced, until it is decided.
     max_refined_drop: Optional[float] = None
@@ -87,7 +91,6 @@ class AdaptSettings:
     min_held_out: int = 20
     held_out_cap: int = 1500
     train_cap: int = 2000                    #: training frames whose crops are kept
-    noise_frames: int = 300
     #: The adapted copy's own move limit, in spot radii (the stage's is 0.5).
     moved_limit: float = 0.75
     #: Weight of the sigma head's likelihood on the simulated disks.
@@ -108,7 +111,7 @@ class AdaptReport:
     train_frames: int = 0
     held_out_frames: int = 0
     steps: int = 0
-    before: dict = field(default_factory=dict)   #: friedel, lattice, noise, refined
+    before: dict = field(default_factory=dict)   #: friedel, lattice, scatter, refined
     after: dict = field(default_factory=dict)
     mask_centroid: dict = field(default_factory=dict)
     refined_drop: float = float("nan")
@@ -371,24 +374,69 @@ def friedel_sigma_scale(positions, sigmas, index, partner, count) -> float:
     return float(np.sqrt(np.median(ratio) / 0.4549)) if len(ratio) > 100 else float("nan")
 
 
-def _half_dose_noise(refiner, disks: list, radius, rng, frames):
-    """Per-axis robust scale of (position on half the counts - on the other
-    half) / 2, over up to ``frames`` frames."""
-    chosen = rng.choice(len(disks), min(frames, len(disks)), replace=False)
+def row_scatter(lattice, rows, columns) -> float:
+    """Position-to-position scatter of an ordered scan: second differences of
+    each reflection's lattice residual ``(N, K, 2)`` along scan rows, over three
+    neighbouring columns; white noise of SD s gives differences of SD s√6, so
+    the robust SD divided by √6 is s. NaN without rows or three neighbours."""
+    rows, columns = np.asarray(rows), np.asarray(columns)
+    if len(rows) == 0 or (rows < 0).any():
+        return float("nan")
     differences = []
-    for i in chosen:
-        item = disks[i]
-        if len(item.local) == 0:
-            continue
-        counts = np.rint(np.clip(item.crops, 0, None)).astype(np.int64)
-        half = rng.binomial(counts, 0.5).astype(np.float32)
-        a, _ = _refine_disks(refiner, [_Disks(half, item.local, item.origin)], radius)
-        b, _ = _refine_disks(refiner, [_Disks(counts.astype(np.float32) - half, item.local,
-                                              item.origin)], radius)
-        differences.append(a[0] - b[0])
+    for row in np.unique(rows):
+        members = np.where(rows == row)[0]
+        members = members[np.argsort(columns[members])]
+        place = columns[members]
+        consecutive = (place[1:-1] - place[:-2] == 1) & (place[2:] - place[1:-1] == 1)
+        for start in np.where(consecutive)[0]:
+            a, b, c = lattice[members[start]], lattice[members[start + 1]], lattice[members[start + 2]]
+            differences.append(a - 2 * b + c)
     if not differences:
         return float("nan")
-    return float(1.4826 * np.median(np.abs(np.concatenate(differences))) / 2)
+    values = np.stack(differences)
+    values = values[np.isfinite(values)]
+    return float(1.4826 * np.median(np.abs(values)) / np.sqrt(6)) if len(values) else float("nan")
+
+
+def _keep_reservoir(number, disks, kept, seen, cap, rng):
+    """Reservoir-sample frames into ``kept`` (at most ``cap``); ``disks()``
+    cuts the crops only for a frame that is kept."""
+    seen[0] += 1
+    if len(kept) < cap:
+        kept[number] = disks()
+        return
+    slot = int(rng.integers(0, seen[0]))
+    if slot < cap:
+        del kept[list(kept)[slot]]
+        kept[number] = disks()
+
+
+def _keep_held(number, row, disks, kept, rows, seen, cap, rng):
+    """Held-out frames: whole rows for an ordered scan (``row >= 0``), reservoir
+    sampled by row so the kept frames stay under ``cap``; single frames
+    otherwise."""
+    if row < 0:
+        _keep_reservoir(number, disks, kept, seen, cap, rng)
+        return
+    if row in rows:
+        if len(kept) < cap:
+            kept[number] = disks()
+            rows[row].append(number)
+        return
+    seen[0] += 1
+    if len(kept) < cap:
+        rows[row] = [number]
+        kept[number] = disks()
+        return
+    slot = int(rng.integers(0, seen[0]))
+    if slot < len(rows):
+        evicted = list(rows)[slot]
+        for victim in rows.pop(evicted):
+            del kept[victim]
+        rows[row] = [number]
+        kept[number] = disks()
+    else:
+        rows[row] = []                     # seen, not kept: later frames skip it
 
 
 # ── the adaptation ─────────────────────────────────────────────────────────────
@@ -470,9 +518,14 @@ def adapt_centre_refiner(chunks: Iterable, spot_radius: float, base_refiner,
     half_width = int(wider.crop_half_width(radius))
     height, width = frame_shape
     margin = 2 * radius
-    positions, rows_all, kept = [], [], {}
+    positions, rows_all, columns_all = [], [], []
+    train_kept, held_kept = {}, {}       # frame number -> its disks
+    held_rows = {}                       # held-out row -> its kept frame numbers
+    held_rows_seen, train_seen = [0], [0]
     try:
-        # 1. detect and refine, a chunk at a time; keep crops for a sample
+        # 1. detect and refine, a chunk at a time; keep crops for a sample:
+        # a reservoir of training frames, and for an ordered scan a reservoir
+        # of WHOLE held-out rows, so positions along a row stay neighbours
         frame_number = 0
         for chunk_number, (frames, rows) in enumerate(chunks):
             report_progress("reading", chunk_number, None)
@@ -482,19 +535,17 @@ def adapt_centre_refiner(chunks: Iterable, spot_radius: float, base_refiner,
                        & (s[:, 1] > margin) & (s[:, 1] < width - margin)] for s in seeds]
             refined, _ = refine_centres(list(frames), seeds, radius, base_refiner)
             for i, frame in enumerate(frames):
-                positions.append(np.asarray(refined[i], np.float64))
-                rows_all.append(-1 if rows is None else int(rows[i]))
-                # every frame is a candidate until the caps are reached; a
-                # reservoir sample keeps the kept set uniform over the scan
                 number = frame_number + i
-                if len(kept) < settings.train_cap + settings.held_out_cap:
-                    kept[number] = _crop_frame(frame, seeds[i], half_width)
+                positions.append(np.asarray(refined[i], np.float64))
+                row = -1 if rows is None else int(rows[i])
+                rows_all.append(row)
+                columns_all.append(sum(1 for r in rows_all if r == row) - 1 if row >= 0 else number)
+                disks = lambda: _crop_frame(frame, seeds[i], half_width)  # noqa: E731
+                if (row % 5 == 4) if row >= 0 else (rng.random() < 0.2):
+                    _keep_held(number, row, disks, held_kept, held_rows, held_rows_seen,
+                               settings.held_out_cap, rng)
                 else:
-                    slot = rng.integers(0, number + 1)
-                    if slot < settings.train_cap + settings.held_out_cap:
-                        victim = list(kept)[int(slot)]
-                        del kept[victim]
-                        kept[number] = _crop_frame(frame, seeds[i], half_width)
+                    _keep_reservoir(number, disks, train_kept, train_seen, settings.train_cap, rng)
             frame_number += len(frames)
         count = len(positions)
         report_progress("indexing", 0, None)
@@ -502,17 +553,11 @@ def adapt_centre_refiner(chunks: Iterable, spot_radius: float, base_refiner,
         # 2-4. the scan's own index
         index = scan_index(positions, frame_shape, radius)
         reflections = len(index.reflections)
-        rows_all = np.asarray(rows_all)
-        if (rows_all >= 0).all():
-            held_mask = rows_all % 5 == 4
-        else:
-            held_mask = rng.random(count) < 0.2
+        rows_all, columns_all = np.asarray(rows_all), np.asarray(columns_all)
         usable = np.array([(assigned >= 0).sum() >= 4 for assigned in index.index])
-        kept_numbers = np.array(sorted(kept), dtype=int)
-        held = kept_numbers[held_mask[kept_numbers] & usable[kept_numbers]]
-        train = kept_numbers[~held_mask[kept_numbers] & usable[kept_numbers]]
-        if len(held) > settings.held_out_cap:
-            held = np.sort(rng.choice(held, settings.held_out_cap, replace=False))
+        kept = {**train_kept, **held_kept}
+        held = np.array(sorted(n for n in held_kept if usable[n]), dtype=int)
+        train = np.array(sorted(n for n in train_kept if usable[n]), dtype=int)
         report = AdaptReport(
             accepted=False, frames=count, reflections=reflections,
             on_lattice=int(np.isfinite(index.hk[:, 0]).sum()), friedel_pairs=len(index.pairs),
@@ -539,6 +584,11 @@ def adapt_centre_refiner(chunks: Iterable, spot_radius: float, base_refiner,
             friedel, lattice = residuals(per_reflection, index.hk, index.partner)
             return varying(friedel), varying(lattice)
 
+        def scatter(frame_positions):
+            per_reflection = gather(frame_positions, held_index, reflections)
+            _, lattice = residuals(per_reflection, index.hk, index.partner)
+            return row_scatter(lattice, rows_all[held], columns_all[held])
+
         report_progress("scoring", 0, None)
         before_positions, refined_before = _refine_disks(base_refiner, held_disks, radius)
         friedel_before, lattice_before = score(before_positions)
@@ -547,11 +597,9 @@ def adapt_centre_refiner(chunks: Iterable, spot_radius: float, base_refiner,
             for d, m in ((d, MaskCentroidRefiner(min_spot_radius=0).refine(d.crops, d.local, radius)[0]
                           if len(d.local) else None) for d in held_disks)]
         mask_friedel, mask_lattice = score(mask_positions)
-        noise_before = _half_dose_noise(base_refiner, held_disks, radius,
-                                        np.random.default_rng(settings.seed + 1), settings.noise_frames)
         report.prepare_seconds = time.perf_counter() - started
         report.before = dict(friedel=friedel_before, lattice=lattice_before,
-                             noise=noise_before, refined=refined_before)
+                             scatter=scatter(before_positions), refined=refined_before)
         report.mask_centroid = dict(friedel=mask_friedel, lattice=mask_lattice)
 
         # 5. fine-tune a copy
@@ -690,10 +738,8 @@ def adapt_centre_refiner(chunks: Iterable, spot_radius: float, base_refiner,
         report_progress("scoring", 1, None)
         after_positions, refined_after = _refine_disks(adapted, held_disks, radius)
         friedel_after, lattice_after = score(after_positions)
-        noise_after = _half_dose_noise(adapted, held_disks, radius,
-                                       np.random.default_rng(settings.seed + 1), settings.noise_frames)
         report.after = dict(friedel=friedel_after, lattice=lattice_after,
-                            noise=noise_after, refined=refined_after)
+                            scatter=scatter(after_positions), refined=refined_after)
         report.refined_drop = refined_before - refined_after
         report.accepted = accept(report.before, report.after, settings)
         report.total_seconds = time.perf_counter() - started
@@ -713,8 +759,7 @@ def primary_measure(before: dict) -> tuple:
 
 
 def accept(before: dict, after: dict, settings: AdaptSettings) -> bool:
-    """The acceptance rule (module docstring, step 6) on the held-out measures.
-    Unmeasured noise (either side NaN) skips the noise test."""
+    """The acceptance rule (module docstring, step 6) on the held-out measures."""
     primary, other = primary_measure(before)
     primary_before, primary_after = before[primary], after[primary]
     if not math.isfinite(primary_before) or not math.isfinite(primary_after):
@@ -722,9 +767,6 @@ def accept(before: dict, after: dict, settings: AdaptSettings) -> bool:
     ok = primary_after <= settings.primary_ratio * primary_before
     if math.isfinite(before[other]):
         ok &= math.isfinite(after[other]) and after[other] <= settings.other_ratio * before[other]
-    if math.isfinite(before["noise"]) and math.isfinite(after["noise"]):
-        added = math.sqrt(max(after["noise"] ** 2 - before["noise"] ** 2, 0.0))
-        ok &= added < settings.noise_fraction * (primary_before - primary_after)
     if settings.max_refined_drop is not None:
         ok &= before["refined"] - after["refined"] <= settings.max_refined_drop
     return bool(ok)
