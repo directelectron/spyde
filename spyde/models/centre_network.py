@@ -13,6 +13,14 @@ Two network layouts load, told apart by their state-dict keys:
   predicts the log of the centre's standard deviation. About five times faster
   than R1 for the same accuracy on real GaN.
 
+A fast network with TWO input channels (P4) is a Friedel-partner refiner: the
+second channel is the window around the disk's mirror point ``2 x beam - p``,
+resampled and normalised like the first and rotated 180 degrees, so both
+channels show the same offset with the two different fills of ``g`` and
+``-g``. The channel count is read from the checkpoint's first convolution; such
+a refiner sets ``needs_partner`` and the centre stage
+(:func:`~spyde.models.centre_refine.refine_centres`) cuts the mirror windows.
+
 Checkpoint contract (``torch.load(weights_only=True)``): ``state_dict`` plus the
 scalars ``base``, ``crop_radius`` and ``crop_half`` (and for the fast layout
 ``levels``, ``depthwise``, ``sigma_head``, ``normalisation``). A registry entry
@@ -45,8 +53,10 @@ Inference options (``input`` keys):
   centre is the mean over the crop and its three mirrors. That pass runs the
   mirrors for the uncertainty anyway, so this costs nothing.
 * ``min_spot_radius`` (default ``centre_refine.DEFAULT_MIN_SPOT_RADIUS``, 5 px,
-  shared with the mask centroid) — below this spot radius (native px) the
-  stage is skipped and the detector's centres are kept; 0 turns it off.
+  shared with the mask centroid) and ``max_spot_radius`` (default none) — outside
+  this spot-radius range (native px) the stage is skipped and the incoming
+  centres are kept; a min of 0 turns the lower gate off. A checkpoint may carry
+  its own range (P4: 6-16 px, the radii it was trained on).
 
 Uncertainty:
 
@@ -167,12 +177,12 @@ class FastCentreNet(nn.Module):
     the checkpoint's state-dict keys; do not rename them."""
 
     def __init__(self, base: int = 8, levels: int = 2, depthwise: bool = False,
-                 sigma_head: bool = True):
+                 sigma_head: bool = True, channels: int = 1):
         super().__init__()
         self.levels = levels
         widths = [base * 2 ** level for level in range(levels + 1)]
         self.encoders = nn.ModuleList([
-            _fast_block(1 if level == 0 else widths[level - 1], widths[level], depthwise)
+            _fast_block(channels if level == 0 else widths[level - 1], widths[level], depthwise)
             for level in range(levels + 1)])
         self.ups = nn.ModuleList([nn.ConvTranspose2d(widths[level], widths[level - 1], 2, stride=2)
                                   for level in range(levels, 0, -1)])
@@ -210,7 +220,9 @@ class NetworkRefiner:
                  sigma_per_spread: float = DEFAULT_SIGMA_PER_SPREAD,
                  max_sigma_fraction: float = DEFAULT_MAX_SIGMA_FRACTION,
                  sigma_scale: float = 1.0,
-                 min_spot_radius: float = DEFAULT_MIN_SPOT_RADIUS):
+                 min_spot_radius: float = DEFAULT_MIN_SPOT_RADIUS,
+                 max_spot_radius: float = math.inf,
+                 needs_partner: bool = False):
         if normalisation not in NORMALISATIONS:
             raise ValueError(f"unknown refiner normalisation {normalisation!r}; "
                              f"known: {NORMALISATIONS}")
@@ -229,6 +241,9 @@ class NetworkRefiner:
         self.sigma_per_spread = float(sigma_per_spread)
         self.max_sigma_fraction = float(max_sigma_fraction)
         self.sigma_scale = float(sigma_scale)
+        self.max_spot_radius = float(max_spot_radius)
+        #: The network reads a second channel: the disk's Friedel-mirror window.
+        self.needs_partner = bool(needs_partner)
         self.min_spot_radius = float(min_spot_radius)
 
     def crop_half_width(self, spot_radius: float) -> int:
@@ -320,11 +335,18 @@ class NetworkRefiner:
                 area, log_sigma = view_area, view_log_sigma
         return torch.stack(views), area, log_sigma
 
-    def _pass(self, crop_tensor, centre, step, last):
+    def _pass(self, crop_tensor, centre, step, last, partner=None):
         """One pass at ``centre``: the new centre, coverage area and sigma
-        (native px; ``None`` until the final pass of the mirror uncertainty)."""
+        (native px; ``None`` until the final pass of the mirror uncertainty).
+        ``partner`` is ``(mirror windows, mirror point)`` for a partner network:
+        that window, sampled the same way and rotated 180 degrees, is the
+        second channel."""
         mirrored = self.uncertainty == UNCERTAINTY_MIRROR and last
         sampled = self._normalise(self._resample(crop_tensor, centre, step))
+        if partner is not None:
+            partner_crops, partner_centre = partner
+            mirror = self._normalise(self._resample(partner_crops, partner_centre, step))
+            sampled = torch.cat([sampled, mirror.flip(-1, -2)], 1)
         views, area, log_sigma = self._views(sampled, mirrored)
         offset = views.mean(0) if mirrored and self.mirror_mean else views[0]
         if self.uncertainty == UNCERTAINTY_HEAD:
@@ -336,19 +358,29 @@ class NetworkRefiner:
         return centre + offset * step, area, sigma
 
     @torch.no_grad()
-    def refine(self, crops, centres, spot_radius):
+    def refine(self, crops, centres, spot_radius, partner_crops=None, partner_centres=None):
+        """The refiner interface; a partner network also takes each disk's
+        mirror window and the mirror point in that window's pixels."""
         from spyde.device_lock import accelerator_lock
 
         count = len(crops)
         if count == 0:
             return np.zeros((0, 2)), np.zeros(0, np.float32)
+        if self.needs_partner and partner_crops is None:
+            raise ValueError("this centre network needs each disk's Friedel-mirror window")
         radius = float(spot_radius)
         step = radius / self.crop_radius
         with accelerator_lock(self.device):
-            crop_tensor = torch.as_tensor(np.asarray(crops, np.float32), device=self.device)
+            crop_tensor = _as_device_tensor(crops, self.device)
             seeds = torch.as_tensor(np.asarray(centres, np.float32), device=self.device)
+            partner = None
+            if self.needs_partner:
+                partner_tensor = _as_device_tensor(partner_crops, self.device)
+                mirror_seeds = torch.as_tensor(np.asarray(partner_centres, np.float32),
+                                               device=self.device)
+                partner = (partner_tensor, mirror_seeds)
             centre, area, sigma = self._pass(crop_tensor, seeds, step,
-                                             last=self.passes == 1)
+                                             last=self.passes == 1, partner=partner)
             for pass_index in range(1, self.passes):
                 last = pass_index == self.passes - 1
                 again = (centre - seeds).norm(dim=1) > self.recrop_over * radius
@@ -356,8 +388,11 @@ class NetworkRefiner:
                     again[:] = True      # the mirrors for sigma run on every disk
                 if not again.any():
                     break
+                # a partner window follows the mirror of the moved centre
+                moved_partner = None if partner is None else (
+                    partner_tensor[again], mirror_seeds[again] - (centre[again] - seeds[again]))
                 moved, moved_area, moved_sigma = self._pass(
-                    crop_tensor[again], centre[again], step, last)
+                    crop_tensor[again], centre[again], step, last, partner=moved_partner)
                 centre[again], area[again] = moved, moved_area
                 if moved_sigma is not None:
                     if sigma is None:
@@ -371,6 +406,23 @@ class NetworkRefiner:
             result = centre.double().cpu().numpy()
             sigma = sigma.float().cpu().numpy()
         return result, sigma
+
+
+def _as_device_tensor(crops, device):
+    """Windows as a float32 tensor on ``device``: already there when the centre
+    stage cut them on the GPU, else moved from numpy."""
+    if torch.is_tensor(crops):
+        return crops.to(device=device, dtype=torch.float32)
+    return torch.as_tensor(np.asarray(crops, np.float32), device=device)
+
+
+def input_channels(state_dict) -> int:
+    """Input channels of a fast layout, from its first convolution's weight:
+    1 for a crop alone, 2 for a crop and its Friedel-mirror window."""
+    for key in ("encoders.0.0.weight", "encoders.0.0.0.weight"):
+        if key in state_dict:
+            return int(state_dict[key].shape[1])
+    raise ValueError("no first convolution in this centre network's state dict")
 
 
 def _is_fast_layout(state_dict) -> bool:
@@ -389,9 +441,12 @@ def load_refiner(path, device, arch: dict | None = None, contract: dict | None =
     def setting(key, default):
         return arch.get(key, checkpoint.get(key, default))
 
+    channels = 1
     if _is_fast_layout(checkpoint["state_dict"]):
+        channels = input_channels(checkpoint["state_dict"])
         net = FastCentreNet(int(setting("base", 8)), int(setting("levels", 2)),
-                            bool(setting("depthwise", 0)), bool(setting("sigma_head", 1)))
+                            bool(setting("depthwise", 0)), bool(setting("sigma_head", 1)),
+                            channels=channels)
         default_normalisation = checkpoint.get("normalisation", NORMALISATION_MEAN)
         has_head = net.sigma_head is not None
     else:
@@ -416,5 +471,9 @@ def load_refiner(path, device, arch: dict | None = None, contract: dict | None =
         sigma_per_spread=float(contract.get("sigma_per_spread", DEFAULT_SIGMA_PER_SPREAD)),
         max_sigma_fraction=float(contract.get("max_sigma_fraction",
                                               DEFAULT_MAX_SIGMA_FRACTION)),
-        min_spot_radius=float(contract.get("min_spot_radius", DEFAULT_MIN_SPOT_RADIUS)),
+        min_spot_radius=float(contract.get("min_spot_radius",
+                                           checkpoint.get("min_spot_radius", DEFAULT_MIN_SPOT_RADIUS))),
+        max_spot_radius=float(contract.get("max_spot_radius",
+                                           checkpoint.get("max_spot_radius", math.inf))),
+        needs_partner=channels == 2,
         sigma_scale=float(contract.get("sigma_scale", checkpoint.get("sigma_scale", 1.0))))

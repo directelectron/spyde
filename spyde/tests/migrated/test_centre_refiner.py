@@ -257,6 +257,8 @@ STUB_ID = "centre-stub-v1"
 F3_ID = "centre-fast-f3-v1"
 F5_ID = "centre-fast-f5-v1"
 FAST_IDS = (F3_ID, F5_ID)
+P4_ID = "centre-partner-p4-v1"
+BUNDLED_REFINERS = (F3_ID, F5_ID, P4_ID)
 #: Per bundled fast refiner: its crop geometry and the checkpoint's sigma_scale.
 FAST_REFINERS = {F3_ID: dict(crop=(8.0, 13), sigma_scale=1.1276),
                  F5_ID: dict(crop=(10.0, 16), sigma_scale=0.9776)}
@@ -306,7 +308,7 @@ class TestRefinerRegistry:
         available = stub_registry.available_models()
         assert STUB_ID not in [m["id"] for m in available["models"]]
         refiners = {m["id"]: m for m in available["refiners"]}
-        assert set(refiners) == {STUB_ID, *FAST_IDS}
+        assert set(refiners) == {STUB_ID, *BUNDLED_REFINERS}
         assert refiners[STUB_ID]["label"] == "Centre stub"
         assert available["default"] != STUB_ID
         assert stub_registry.default_model_id() in [m["id"] for m in available["models"]]
@@ -318,10 +320,10 @@ class TestRefinerRegistry:
         registry._invalidate_manifest()
         try:
             available = registry.available_models()
-            assert [m["id"] for m in available["refiners"]] == list(FAST_IDS)
-            assert not set(FAST_IDS) & {m["id"] for m in available["models"]}
-            assert available["default"] not in FAST_IDS
-            assert all(registry.is_cached(model_id) for model_id in FAST_IDS)
+            assert [m["id"] for m in available["refiners"]] == list(BUNDLED_REFINERS)
+            assert not set(BUNDLED_REFINERS) & {m["id"] for m in available["models"]}
+            assert available["default"] not in BUNDLED_REFINERS
+            assert all(registry.is_cached(model_id) for model_id in BUNDLED_REFINERS)
         finally:
             registry._invalidate_manifest()
 
@@ -679,6 +681,128 @@ class TestFastRefiner:
         assert np.isnan(sigmas[0]).all()
 
 
+# ── the Friedel-partner refiner (P4): a second channel at the mirror point ─────
+
+P4_REFERENCE = Path(__file__).resolve().parents[1] / "p4_parity_reference.npz"
+
+
+def _p4_reference():
+    """The 8 real GaN frames of F5's fixture, F5's refined centres as the
+    incoming positions (the shipped cascade), and the training code's
+    ``partner_refine.refine_centres_with_partner`` output on the CPU."""
+    frames = np.load(FAST_FIXTURES["F5-gan"][1])["frames"].astype(np.float32)
+    reference = np.load(P4_REFERENCE)
+    incoming = np.split(reference["incoming"], np.cumsum(reference["counts"])[:-1])
+    return (list(frames), incoming, float(reference["radius"]), reference["centres"],
+            reference["sigma"])
+
+
+@pytest.fixture
+def p4_refiner():
+    return _load_fast(P4_ID)
+
+
+class TestPartnerRefiner:
+    def test_the_input_channels_come_from_the_first_convolution(self, tmp_path):
+        import torch
+
+        from spyde.models import centre_network, registry
+
+        for model_id, channels in ((F5_ID, 1), (P4_ID, 2)):
+            state = torch.load(registry._resolve_weights(registry._entry(model_id)),
+                               weights_only=True)["state_dict"]
+            assert centre_network.input_channels(state) == channels
+        path = tmp_path / "two_channels.pt"
+        torch.save({"state_dict": centre_network.FastCentreNet(4, 2, channels=2).state_dict(),
+                    "base": 4, "levels": 2}, path)
+        assert centre_network.load_refiner(path, "cpu").needs_partner
+        assert not _load_fast(F5_ID).needs_partner
+
+    def test_the_bundled_checkpoint_loads_with_its_radius_range(self, p4_refiner):
+        assert p4_refiner.needs_partner and p4_refiner.uncertainty == "head"
+        assert (p4_refiner.min_spot_radius, p4_refiner.max_spot_radius) == (6.0, 16.0)
+        assert (p4_refiner.crop_radius, p4_refiner.crop_half) == (10.0, 16)
+
+    def test_matches_the_training_code_on_the_cpu(self, p4_refiner):
+        """Measured: identical centres, sigma within 4e-7 px (the task's bar
+        is 0.01 px)."""
+        frames, incoming, radius, centres, sigma = _p4_reference()
+        positions, sigmas = refine_centres(frames, incoming, radius, p4_refiner)
+        np.testing.assert_allclose(np.concatenate(positions), centres, rtol=0, atol=0.01)
+        got = np.concatenate(sigmas)
+        assert (np.isnan(got) == np.isnan(sigma)).all()
+        np.testing.assert_allclose(got[np.isfinite(got)], sigma[np.isfinite(sigma)], rtol=0, atol=0.01)
+
+    @pytest.mark.parametrize("radius", [5.9, 16.1])
+    def test_disks_outside_its_radius_range_keep_their_centres(self, p4_refiner, monkeypatch, radius):
+        """Below 6 px a version trained smaller made SPED-Ag's in-grain speckle
+        worse; above 16 px it is untrained. Either way the incoming centres
+        (F5's, in the cascade) are kept without running the network."""
+        called = []
+        monkeypatch.setattr(p4_refiner, "refine", lambda *a: called.append(1))
+        frames, incoming, _, _, _ = _p4_reference()
+        positions, sigmas = refine_centres(frames, incoming, radius, p4_refiner)
+        assert not called and sigmas is None
+        for got, before in zip(positions, incoming):
+            np.testing.assert_array_equal(got, before.astype(np.float32))
+
+    def test_the_second_window_is_cut_at_the_mirror_point(self, p4_refiner, monkeypatch):
+        from spyde.models.centre_refine import frame_beams
+
+        frames, incoming, radius, _, _ = _p4_reference()
+        seen = {}
+
+        def spy(crops, centres, spot_radius, partner_crops=None, partner_centres=None):
+            seen.update(partner_crops=np.asarray(partner_crops), partner_centres=partner_centres)
+            return np.full((len(crops), 2), np.nan), None
+
+        monkeypatch.setattr(p4_refiner, "refine", spy)
+        refine_centres(frames[:1], incoming[:1], radius, p4_refiner)
+        beam = frame_beams(incoming[:1], frames[0].shape, radius)[0]
+        expected, expected_local = extract_crops(frames[0], 2 * beam - incoming[0],
+                                                 p4_refiner.crop_half_width(radius))
+        np.testing.assert_array_equal(seen["partner_crops"], expected)
+        np.testing.assert_allclose(seen["partner_centres"], expected_local)
+
+    def test_a_partner_network_refuses_to_run_without_the_mirror_window(self, p4_refiner):
+        with pytest.raises(ValueError, match="mirror window"):
+            p4_refiner.refine(np.zeros((1, 41, 41), np.float32), np.full((1, 2), 20.0), 11.0)
+
+    def test_the_beam_is_the_frames_centre_of_friedel_symmetry(self):
+        from spyde.models.centre_refine import frame_beams
+
+        rng = np.random.default_rng(3)
+        centre = np.array([250.3, 247.8])
+        g = rng.uniform(-80, 80, (6, 2))
+        # the direct beam plus six Friedel pairs about it
+        symmetric = np.concatenate([centre[None], centre + g, centre - g]) + rng.normal(0, 0.2, (13, 2))
+        sparse = symmetric[1:4]                               # under four disks
+        beams = frame_beams([symmetric, sparse, symmetric + 1.0], (507, 502), 11.0)
+        np.testing.assert_allclose(beams[0], centre, atol=0.2)
+        np.testing.assert_allclose(beams[2], centre + 1.0, atol=0.2)
+        np.testing.assert_allclose(beams[1], np.median(beams[[0, 2]], 0))   # median of the rest
+        alone = frame_beams([sparse], (507, 502), 11.0)
+        np.testing.assert_allclose(alone[0], [253.5, 251.0])                 # the frame centre
+
+    def test_windows_cut_on_a_device_equal_the_numpy_ones(self):
+        """The GPU path gathers from the frames moved to the device; on any
+        device the windows are exactly :func:`extract_crops`'s."""
+        import torch
+
+        from spyde.models.centre_refine import _extract_crops_on_device
+
+        rng = np.random.default_rng(4)
+        frames = [rng.normal(50, 20, (90, 70)).astype(np.float32) for _ in range(3)]
+        centres = np.column_stack([rng.uniform(-3, 93, 30), rng.uniform(-3, 73, 30)])
+        frame_of = rng.integers(0, 3, 30)
+        crops, local = _extract_crops_on_device(torch.as_tensor(np.stack(frames)), frame_of,
+                                                centres, 9)
+        for i in range(30):
+            expected, expected_local = extract_crops(frames[frame_of[i]], centres[i:i + 1], 9)
+            np.testing.assert_array_equal(crops[i].numpy(), expected[0])
+            np.testing.assert_allclose(local[i], expected_local[0])
+
+
 # ── the Find Vectors wiring, with a stand-in detector ──────────────────────────
 
 RADIUS = 5.0
@@ -901,6 +1025,15 @@ _DRIVER = textwrap.dedent(r"""
                     centre_difference=float(np.abs(np.concatenate(positions) - centres).max()),
                     sigma_difference=float(np.nanmax(np.abs(got - sigma))),
                     declined_match=bool((np.isnan(got) == np.isnan(sigma)).all()))
+            from test_centre_refiner import _p4_reference, P4_ID
+            frames, incoming, radius, centres, sigma = _p4_reference()
+            positions, sigmas = refine_centres(frames, incoming, radius,
+                                               registry.get_refiner(P4_ID, "cuda"))
+            got = np.concatenate(sigmas)
+            out["P4-gan"] = dict(
+                centre_difference=float(np.abs(np.concatenate(positions) - centres).max()),
+                sigma_difference=float(np.nanmax(np.abs(got - sigma))),
+                declined_match=bool((np.isnan(got) == np.isnan(sigma)).all()))
         elif mode == "accuracy":
             for choice in ("decode", "mask-centroid"):
                 errors = []
@@ -961,6 +1094,16 @@ class TestWithTheDetectorNetwork:
             assert result["declined_match"], fixture
             assert result["centre_difference"] < 1e-4, fixture
             assert result["sigma_difference"] < 5e-5, fixture
+
+    def test_the_partner_refiner_matches_the_training_code_on_cuda(self, network_results):
+        """Windows cut on the GPU; measured 3e-5 px (centres) against the CPU
+        reference."""
+        result = network_results["f3_cuda"]
+        if result.get("skipped"):
+            pytest.skip("no CUDA device")
+        assert result["P4-gan"]["declined_match"]
+        assert result["P4-gan"]["centre_difference"] < 0.01
+        assert result["P4-gan"]["sigma_difference"] < 0.01
 
     def test_the_mask_centroid_beats_the_decode_on_uneven_disks(self, network_results):
         result = network_results["accuracy"]

@@ -51,6 +51,20 @@
                 "uncertainty": "head", "max_sigma_fraction": 0.25, "min_spot_radius": 5.0},
       "sha256": "2b4d4f5c17b14db0667dbee9218c0b7e0bfe54f9051181178fc984b83bd1318a",
       "source": {"type": "bundled", "file": "centre_fast_f5.pt"}
+    },
+    {
+      "id": "centre-partner-p4-v1",
+      "kind": "refiner",
+      "label": "Friedel-partner centre network P4 (bundled)",
+      "version": 1,
+      "notes": "F5's layout reading two channels: the disk's own window and the window at its Friedel mirror point 2 x beam - p (rotated 180 degrees), so it sees both dynamical fills of g and -g. The beam is each frame's centre of Friedel symmetry, from the incoming centres. Trained on disks of 6-16 px radius; outside that range it leaves the incoming centres alone (below 6 px a version trained smaller made in-grain speckle worse).",
+      "arch": {"base": 8, "levels": 2, "depthwise": 0, "sigma_head": 1},
+      "input": {"crop_radius": 10.0, "crop_half": 16, "annulus": [0.78, 1.0],
+                "normalisation": "mean", "passes": 2, "recrop_over": 0.15,
+                "uncertainty": "head", "max_sigma_fraction": 0.25,
+                "min_spot_radius": 6.0, "max_spot_radius": 16.0},
+      "sha256": "7a8bc8a3bacb40006447d02ce300e0bc11a181a22727b1d523753f4cd8b2055a",
+      "source": {"type": "bundled", "file": "centre_partner_p4.pt"}
     }
   ]
 }
