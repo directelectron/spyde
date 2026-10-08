@@ -321,7 +321,8 @@ def _detector_params(params: dict) -> dict:
     parameter set."""
     return {key: params[key] for key in
             ("method", "kernel_radius", "threshold", "min_distance", "subpixel",
-             "model_id", "bg_sigma", "spot_radius", "centre_refiner",
+             "model_id", "bg_sigma", "spot_radius", "refine_centres",
+             "friedel_partner",
              "dog_sigma1", "dog_sigma2")
             if key in params}
 

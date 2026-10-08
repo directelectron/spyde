@@ -390,9 +390,9 @@ def _do_compute_vectors(
     # the model's own autocorrelation estimate (the wizard always sends its
     # auto-seeded Spot-size slider value).
     spot_radius = float(params.get("spot_radius") or 0.0) or None
-    # The neural centre stage: "decode" (none), "mask-centroid" or a refiner
-    # model id (spyde.models.centre_refine.refiner_for).
-    centre_refiner = str(params.get("centre_refiner") or "").strip() or None
+    # The neural centre steps (spyde.models.centre_refine).
+    refine_centres = bool(params.get("refine_centres", False))
+    friedel_partner = bool(params.get("friedel_partner", False))
     log.debug("[do_compute_vectors] START method=%s thr=%s md=%s sigma=%s "
               "nav_dim=%s sig_shape=%s lazy=%s beamstop=%s", method, threshold,
               min_dist, sigma, nav_dim, tuple(sig_shape),
@@ -523,7 +523,8 @@ def _do_compute_vectors(
         bg_sigma=bg_sigma,
         persistence=persistence,
         spot_radius=spot_radius,
-        centre_refiner=centre_refiner,
+        refine_centres=refine_centres,
+        friedel_partner=friedel_partner,
     )
 
     # Resolve the distributed client up front — needed both to decide on GPU

@@ -1,30 +1,36 @@
-"""The centre stage: re-place each detected disk on the raw frame at native resolution.
+"""The centre steps: re-place each detected disk on the raw frame at native resolution.
 
 The detector finds disks on a rescaled, locally normalised working image, so its
-centre is only as good as that image. This stage looks again at the raw counts:
-it cuts a window around every detection, hands a chunk's windows to a refiner
-as one batch, and moves each vector to the refined centre.
+centre is only as good as that image. Two steps look again at the raw counts:
 
-A refiner is any object with
+1. **Refine** (:data:`CENTRE_MODEL`, the bundled centre network F5): each disk's
+   own window, from the detector's centre.
+2. **Friedel partner** (:data:`FRIEDEL_MODEL`, P4), on top of the refined
+   centres and optional: each disk's window together with the window at its
+   Friedel mirror point ``2 x beam - p``, which shows the other dynamical fill
+   of the same reflection. It works on spots of 6-16 px radius and leaves
+   others where the refine step put them.
+
+Both are network refiners (:mod:`spyde.models.centre_network`) applied by
+:func:`refine_centres`, which cuts the windows, hands a chunk's windows to the
+network as one batch, and moves each disk to the refined centre. A refiner is
+any object with
 
     crop_half_width(spot_radius) -> int
     refine(crops, centres, spot_radius) -> (centres, sigma)
 
 ``crops`` is ``(M, S, S)`` float32 raw counts with ``S = 2 * crop_half_width + 1``,
-cut around each detection's nearest pixel; ``centres`` is ``(M, 2)`` ``[y, x]``,
-the detections in crop pixels. It returns the refined ``(M, 2)`` centres in the
-same crop pixels and an ``(M,)`` positional uncertainty in pixels, or ``None``
-for the uncertainty when it has none (the caller keeps its own). A refiner
-declines a disk by returning NaN for it. A refiner may also carry a
-``min_spot_radius``: below it the stage is skipped and every detection kept.
+cut around each centre's nearest pixel; ``centres`` is ``(M, 2)`` ``[y, x]`` in
+crop pixels. It returns the refined ``(M, 2)`` centres in the same crop pixels
+and an ``(M,)`` positional uncertainty in pixels, or ``None`` when it has none.
+A refiner declines a disk by returning NaN for it. It may carry
+``min_spot_radius`` / ``max_spot_radius``, outside which every centre is kept,
+and ``needs_partner``, which makes :func:`refine_centres` also cut each disk's
+Friedel-mirror window.
 
-The stage keeps the detection's centre for a declined disk and for any centre
-that moves more than half a spot radius: no refiner sees enough of the frame to
-justify a larger move, and a refiner that wandered onto a neighbour is worse
-than the detection it replaced.
-
-:class:`MaskCentroidRefiner` is the classical baseline, and the bar a network
-refiner (:mod:`spyde.models.centre_network`) has to clear.
+The step keeps the incoming centre for a declined disk and for any centre that
+moves more than half a spot radius: a refiner that wandered onto a neighbour is
+worse than the centre it replaced.
 """
 from __future__ import annotations
 
@@ -36,22 +42,21 @@ import numpy as np
 
 log = logging.getLogger(__name__)
 
-CENTRE_DECODE = "decode"                  # no refinement: the detector's own centre
-CENTRE_MASK_CENTROID = "mask-centroid"
+#: The refine step's network, and the Friedel-partner step's (registry ids).
+CENTRE_MODEL = "centre-fast-f5-v1"
+FRIEDEL_MODEL = "centre-partner-p4-v1"
 
-# The largest move the stage accepts, as a fraction of the spot radius.
+# The largest move a step accepts, as a fraction of the spot radius.
 MAX_SHIFT_FRACTION = 0.5
 
-# Below this spot radius (native px) every refiner keeps the detector's centres.
-# On disks this small the raw crop holds too few pixels to beat the network's
-# decode: on SPED-Ag (R ~ 3 px) refining raised the in-grain speckle from 0.036
-# to 0.047, and the mask centroid's scatter failed the CIF-referenced
-# orientation check that the decode passes. A refiner's ``min_spot_radius``
-# overrides it (0 turns the gate off).
+# Below this spot radius (native px) a refiner keeps the incoming centres unless
+# it says otherwise: on disks this small the window holds too few pixels to beat
+# the detector (on SPED-Ag, R ~ 3 px, refining raised the in-grain speckle from
+# 0.036 to 0.047).
 DEFAULT_MIN_SPOT_RADIUS = 5.0
 
-# Crops refined per batch. A chunk can hold 10^5 disks; this bounds the crop
-# stack (and a network's activations) whatever the chunk size.
+# Windows refined per batch. A chunk can hold 10^5 disks; this bounds the
+# window stack (and the network's activations) whatever the chunk size.
 DEFAULT_BATCH = 4096
 
 
@@ -257,82 +262,14 @@ def _gpu_device(refiner):
     return device if device is not None and device.type in ("cuda", "mps") else None
 
 
-class MaskCentroidRefiner:
-    """The centroid of the disk's support: every pixel above 30 % of the way from
-    the local background to the disk's plateau, with a linear ramp below that.
-
-    A brightness-weighted centroid follows the brightest part of the disk, and a
-    dynamical disk is rarely evenly lit; the support is the disk's outline, so
-    its centroid is the geometric centre however the disk is filled. The ramp
-    makes the edge pixels count fractionally, which is what gives a sub-pixel
-    answer. Per disk, iterated around the current estimate:
-
-    * background — median of the ring 1-4 px outside the spot radius;
-    * plateau — median inside the disk, away from its edge;
-    * weight — ``clip((value - background) / (0.3 * (plateau - background)), 0, 1)``
-      within 3 px of the spot radius, on the crop lightly smoothed (3 x 3 mean).
-
-    A disk with no plateau above its background is declined (NaN). Below
-    ``min_spot_radius`` the stage is skipped (see ``DEFAULT_MIN_SPOT_RADIUS``)."""
-
-    fraction = 0.3
-    iterations = 4
-
-    def __init__(self, min_spot_radius: float = DEFAULT_MIN_SPOT_RADIUS):
-        self.min_spot_radius = float(min_spot_radius)
-
-    def crop_half_width(self, spot_radius: float) -> int:
-        # The support window (radius + 3) around a centre that has moved by up
-        # to the stage's limit still fits, with the background ring around it.
-        return int(math.ceil(spot_radius)) + 5
-
-    def refine(self, crops, centres, spot_radius):
-        from scipy.ndimage import uniform_filter
-
-        crops = np.asarray(crops, np.float32)
-        count, size, _ = crops.shape
-        if count == 0:
-            return np.zeros((0, 2)), None
-        radius = float(spot_radius)
-        smoothed = uniform_filter(crops, size=(1, 3, 3), mode="nearest")
-        flat = smoothed.reshape(count, -1)
-        grid = np.arange(size, dtype=np.float64)
-        row, column = grid[None, :, None], grid[None, None, :]
-        centre_y = np.asarray(centres, np.float64)[:, 0].copy()
-        centre_x = np.asarray(centres, np.float64)[:, 1].copy()
-        plateau_radius = max(radius - 3.0, 0.5 * radius, 1.0)
-        for _ in range(self.iterations):
-            distance = np.hypot(row - centre_y[:, None, None], column - centre_x[:, None, None])
-            flat_distance = distance.reshape(count, -1)
-            background = masked_median(
-                flat, (flat_distance > radius + 1) & (flat_distance <= radius + 4))
-            plateau = masked_median(flat, flat_distance <= plateau_radius)
-            level = np.maximum(self.fraction * (plateau - background), 1e-6)
-            weight = np.clip((smoothed - background[:, None, None]) / level[:, None, None], 0, 1)
-            weight *= distance <= radius + 3
-            total = weight.sum((1, 2))
-            usable = (total > 0) & (plateau > background)
-            with np.errstate(invalid="ignore", divide="ignore"):
-                centre_y = np.where(usable, (weight * row).sum((1, 2)) / total, centre_y)
-                centre_x = np.where(usable, (weight * column).sum((1, 2)) / total, centre_x)
-        result = np.stack([centre_y, centre_x], 1)
-        result[~usable] = np.nan
-        return result, None
-
-
-def refiner_for(choice: Optional[str], device=None) -> Optional[CentreRefiner]:
-    """The refiner a Find Vectors ``centre_refiner`` value names: ``None`` for
-    the detector's own decode (empty or ``"decode"``), the mask centroid, or a
-    refiner model from the registry by id. A model that fails to load logs a
-    warning and gives ``None``, so detection still completes with the decode."""
-    if not choice or choice == CENTRE_DECODE:
-        return None
-    if choice == CENTRE_MASK_CENTROID:
-        return MaskCentroidRefiner()
+def load_step(model_id: str, device=None):
+    """The network for one of the centre steps, from the registry; ``None``
+    with a warning when it cannot load, so detection still completes with the
+    centres it has."""
     from . import registry
     try:
-        return registry.get_refiner(choice, device)
+        return registry.get_refiner(model_id, device)
     except Exception as error:
-        log.warning("[models] centre refiner %r unavailable (%s); keeping the "
-                    "detector's centres", choice, error)
+        log.warning("[models] centre network %r unavailable (%s); keeping the "
+                    "centres it would have refined", model_id, error)
         return None

@@ -1,9 +1,10 @@
 /**
- * fv_centre_refiner.spec.ts — the neural method's Centre dropdown.
+ * fv_centre_refiner.spec.ts — the neural method's centre steps.
  *
- * Find Vectors (neural) with Centre = Mask centroid on the bundled Si grains:
- * the dropdown lists the built-in choices, picking one re-runs the live preview
- * with it (backend log), and Compute runs the batch with it to completion.
+ * Find Vectors (neural) always refines each disk's centre; the "Friedel
+ * partner" checkbox, on by default, adds the step on top that also reads each
+ * disk's Friedel mirror. Unticking and re-ticking it re-runs the live preview
+ * with the switch (backend log), and Compute runs the batch with it on.
  *
  * Real Dask + bundled si-grains, matching fv_neural_calibration.spec.ts.
  */
@@ -29,31 +30,36 @@ test.afterAll(async () => {
 
 test.setTimeout(240_000)
 
-test('neural wizard: Centre = Mask centroid previews and computes', async () => {
+test('neural wizard: the Friedel-partner step is a checkbox, on by default', async () => {
   const { page, backend } = ctx
 
   const sig = sigWindow(page)
   await sig.getByTestId('subwindow-title').click()
   await sig.getByTestId('subwindow-titlebar').hover()
   await sig.getByTestId('action-btn-Find Diffraction Vectors').click()
-  await expect(page.getByTestId('find-vectors-wizard')).toBeVisible()
+  const wizard = page.getByTestId('find-vectors-wizard')
+  await expect(wizard).toBeVisible()
   await backend.waitForLog('neural calibration:', 60_000)
 
-  const centre = page.getByTestId('fv-centre')
-  await expect(centre).toBeVisible()
-  await centre.click()
-  await expect(page.getByTestId('fv-centre-opt-decode')).toBeVisible()
-  await expect(page.getByTestId('fv-centre-opt-mask-centroid')).toBeVisible()
-  // The bundled fast refiner networks are listed from the registry.
-  await expect(page.getByTestId('fv-centre-opt-centre-fast-f3-v1')).toBeVisible()
-  await expect(page.getByTestId('fv-centre-opt-centre-fast-f5-v1')).toBeVisible()
-  await page.screenshot({ path: `${SHOTS}/01-centre-dropdown.png` })
+  // One switch, and no choice of refine step.
+  const friedel = page.getByTestId('fv-friedel')
+  await expect(friedel).toBeVisible()
+  await expect(friedel).toBeChecked()
+  await expect(page.getByTestId('fv-centre')).toHaveCount(0)
+  await wizard.screenshot({ path: `${SHOTS}/01-controls.png` })
 
-  await page.getByTestId('fv-centre-opt-mask-centroid').click()
-  await expect(centre).toContainText('Mask centroid')
-  await backend.waitForLog('centre=mask-centroid', 60_000)
-  await page.screenshot({ path: `${SHOTS}/02-mask-centroid-preview.png` })
-  await sig.screenshot({ path: `${SHOTS}/02b-pattern-with-preview.png` })
+  await friedel.click()
+  await expect(friedel).not.toBeChecked()
+  await backend.waitForLog('refine=True friedel=False', 60_000)
+  await page.screenshot({ path: `${SHOTS}/02-friedel-off-preview.png` })
+
+  await friedel.click()
+  await expect(friedel).toBeChecked()
+  await backend.waitForLog('refine=True friedel=True', 60_000)
+  await page.screenshot({ path: `${SHOTS}/03-friedel-on-preview.png` })
+  await sig.screenshot({ path: `${SHOTS}/03b-pattern-with-preview.png` })
+  // Both bundled networks loaded (a step that cannot load warns and is skipped).
+  expect(backend.logBuffer.filter((line: string) => line.includes('unavailable'))).toEqual([])
 
   const before = await page.getByTestId('subwindow').count()
   await page.getByTestId('fv-compute').click()
@@ -62,13 +68,13 @@ test('neural wizard: Centre = Mask centroid previews and computes', async () => 
   }).toBeGreaterThan(before)
   // Wait for the batch: closing mid-batch wedges teardown on Windows.
   await backend.waitForLog('[fv-batch] finalized', 180_000)
-  await page.screenshot({ path: `${SHOTS}/03-vectors-window.png` })
+  await page.screenshot({ path: `${SHOTS}/04-vectors-window.png` })
 
-  // Reopening the caret restores the choice.
+  // Reopening the caret restores the switch.
   await sig.getByTestId('subwindow-title').click()
   await sig.getByTestId('subwindow-titlebar').hover()
   await sig.getByTestId('action-btn-Find Diffraction Vectors').click()
-  await expect(page.getByTestId('fv-centre')).toContainText('Mask centroid')
+  await expect(page.getByTestId('fv-friedel')).toBeChecked()
 
   ctx.assertNoJsErrors()
 })

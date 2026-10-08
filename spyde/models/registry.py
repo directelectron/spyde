@@ -40,20 +40,13 @@ Shipping a revised model (the author-side contract):
    loaded with ``torch.load(weights_only=True)``: plain state dicts + scalar
    hyperparams only, never pickled objects.
 
-Centre refiners (``spyde.models.centre_network``) are registered the same way
-with ``"kind": "refiner"`` and an ``input`` block stating their crop contract
-(``crop_radius``, ``crop_half``, ``annulus``, ``normalisation``) and inference
-options (``passes``, ``recrop_over``, ``uncertainty``, ``mirror_mean``,
-``sigma_per_spread``, ``max_sigma_fraction``, ``min_spot_radius``);
-``centre_network``'s docstring defines each. The bundled fast refiner
-(``centre-fast-f3-v1``) is a worked example. An entry without a ``kind`` is a
-detector. The detector list, its default and ``get_model`` never see a
-refiner; ``available_models()["refiners"]`` and ``get_refiner`` never see a
-detector.
-
-A user manifest entry may also name a local checkpoint,
-``"source": {"type": "file", "path": "..."}``, to try a model in the app
-before it is published.
+The centre networks (``spyde.models.centre_network``) are registered the same
+way with ``"kind": "refiner"`` and an ``input`` block for their window contract
+and inference options (``centre_network``'s docstring defines each); the two
+bundled ones are the refine step's (``centre-fast-f5-v1``) and the
+Friedel-partner step's (``centre-partner-p4-v1``). An entry without a ``kind``
+is a detector. The detector list, its default and ``get_model`` never see a
+refiner, and ``get_refiner`` never sees a detector.
 
 Users pick the new model up via Find Vectors → Model dropdown → refresh
 (``fv_refresh_models`` → ``refresh_remote_registry()``); no SpyDE release
@@ -178,13 +171,12 @@ def _summary(entry: dict) -> dict:
 
 
 def available_models() -> dict:
-    """Compact payload for the wizard's dropdowns: ``{default, models, refiners}``,
-    each a list of ``{id, label, version, notes}`` (arch/source omitted — the UI
-    doesn't need them). ``models`` holds detectors only."""
+    """Compact payload for the wizard Model dropdown: ``{default, models:[{id,label,
+    version,notes}]}`` (arch/source omitted — the UI doesn't need them),
+    detectors only."""
     return {
         "default": default_model_id(),
         "models": [_summary(m) for m in list_models(KIND_DETECTOR)],
-        "refiners": [_summary(m) for m in list_models(KIND_REFINER)],
     }
 
 
@@ -250,12 +242,6 @@ def _resolve_weights(entry: dict) -> str:
         path = _resolve_bundled(source)
     elif stype == "hf":
         path = _resolve_hf(source)
-    elif stype == "file":
-        # A checkpoint on this machine, named by path — how a model still being
-        # trained is tried in the app before it is published.
-        path = os.path.expanduser(source["path"])
-        if not os.path.exists(path):
-            raise FileNotFoundError(path)
     else:
         raise ValueError(f"unknown model source type {stype!r} for {entry.get('id')}")
     expected = entry.get("sha256") or source.get("sha256")
@@ -274,8 +260,6 @@ def is_cached(model_id: Optional[str] = None) -> bool:
     if entry is None:
         return True                      # unknown id resolves to bundled default
     source = entry.get("source", {})
-    if source.get("type") == "file":
-        return os.path.exists(os.path.expanduser(source.get("path", "")))
     if source.get("type") != "hf":
         return True
     return os.path.exists(os.path.join(user_models_dir(), source.get("file", "")))
@@ -336,7 +320,7 @@ def get_refiner(model_id: str, device=None):
     ``"kind": "refiner"`` entry, on ``device`` (default: the detector's best
     device). Raises when the id is unknown, is not a refiner, or fails to load —
     unlike ``get_model`` there is no default to fall back to, and the caller
-    (``centre_refine.refiner_for``) keeps the detector's own centres instead."""
+    (``centre_refine.load_step``) keeps the centres it has instead."""
     import torch as _torch
 
     from . import centre_network, infer

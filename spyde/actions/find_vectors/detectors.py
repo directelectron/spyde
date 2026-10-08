@@ -729,8 +729,9 @@ def _find_peaks_single_frame(frame, params, *, beamstop_mask=None,
             bg_sigma=float(params.get("bg_sigma") or 12.0),
             # Spot-size override (px radius) for the canonical rescale; 0 → auto.
             spot_radius=float(params.get("spot_radius") or 0.0) or None,
-            # Same key the batch reads, so the preview shows refined centres too.
-            centre_refiner=(params.get("centre_refiner") or None),
+            # Same keys the batch reads, so the preview shows refined centres too.
+            refine_centres=bool(params.get("refine_centres", False)),
+            friedel_partner=bool(params.get("friedel_partner", False)),
         )
     elif method == METHOD_DOG:
         out = _find_vectors_single_frame_dog(
