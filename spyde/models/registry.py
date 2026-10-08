@@ -40,6 +40,14 @@ Shipping a revised model (the author-side contract):
    loaded with ``torch.load(weights_only=True)``: plain state dicts + scalar
    hyperparams only, never pickled objects.
 
+The centre networks (``spyde.models.centre_network``) are registered the same
+way with ``"kind": "refiner"`` and an ``input`` block for their window contract
+and inference options (``centre_network``'s docstring defines each); the two
+bundled ones are the refine step's (``centre-fast-f5-v1``) and the
+Friedel-partner step's (``centre-partner-p4-v1``). An entry without a ``kind``
+is a detector. The detector list, its default and ``get_model`` never see a
+refiner, and ``get_refiner`` never sees a detector.
+
 Users pick the new model up via Find Vectors → Model dropdown → refresh
 (``fv_refresh_models`` → ``refresh_remote_registry()``); no SpyDE release
 needed. To make a proven model the offline/first-run default for a SpyDE
@@ -65,8 +73,12 @@ log = logging.getLogger(__name__)
 HF_REPO = "cssfrancis/spyde-spotunet"
 REMOTE_REGISTRY_FILE = "registry.json"
 
+KIND_DETECTOR = "detector"
+KIND_REFINER = "refiner"
+
 _CACHE_LOCK = threading.Lock()
 _MODEL_CACHE: dict = {}          # model_id -> (model, device)
+_REFINER_CACHE: dict = {}        # (model_id, device) -> NetworkRefiner
 _MANIFEST_CACHE: Optional[dict] = None
 
 
@@ -117,9 +129,15 @@ def _merge_manifests(*manifests: Optional[dict]) -> dict:
             default = man["default"]
     # Keep a stable, bundled-first order for the UI.
     models = list(by_id.values())
-    if default not in by_id and models:
-        default = models[0]["id"]
+    detectors = [m for m in models if model_kind(m) == KIND_DETECTOR]
+    if (default not in by_id or model_kind(by_id[default]) != KIND_DETECTOR) and detectors:
+        default = detectors[0]["id"]
     return {"default": default, "models": models}
+
+
+def model_kind(entry: dict) -> str:
+    """``"detector"`` or ``"refiner"``; an entry that predates kinds is a detector."""
+    return entry.get("kind") or KIND_DETECTOR
 
 
 def _manifest(force: bool = False) -> dict:
@@ -136,31 +154,35 @@ def _invalidate_manifest():
 
 
 # ── public manifest API (for the UI) ────────────────────────────────────────────
-def list_models() -> list[dict]:
-    """Full merged model entries (id/label/arch/source/version/notes)."""
-    return list(_manifest().get("models", []))
+def list_models(kind: Optional[str] = KIND_DETECTOR) -> list[dict]:
+    """Full merged model entries (id/label/arch/source/version/notes) of one
+    ``kind``; ``kind=None`` lists every entry."""
+    return [m for m in _manifest().get("models", [])
+            if kind is None or model_kind(m) == kind]
 
 
 def default_model_id() -> Optional[str]:
     return _manifest().get("default")
 
 
+def _summary(entry: dict) -> dict:
+    return {"id": entry["id"], "label": entry.get("label", entry["id"]),
+            "version": entry.get("version"), "notes": entry.get("notes")}
+
+
 def available_models() -> dict:
     """Compact payload for the wizard Model dropdown: ``{default, models:[{id,label,
-    version,notes}]}`` (arch/source omitted — the UI doesn't need them)."""
+    version,notes}]}`` (arch/source omitted — the UI doesn't need them),
+    detectors only."""
     return {
         "default": default_model_id(),
-        "models": [
-            {"id": m["id"], "label": m.get("label", m["id"]),
-             "version": m.get("version"), "notes": m.get("notes")}
-            for m in list_models()
-        ],
+        "models": [_summary(m) for m in list_models(KIND_DETECTOR)],
     }
 
 
 def _entry(model_id: Optional[str]) -> Optional[dict]:
     mid = model_id or default_model_id()
-    for m in list_models():
+    for m in list_models(kind=None):
         if m["id"] == mid:
             return m
     return None
@@ -273,8 +295,8 @@ def get_model(model_id: Optional[str] = None):
             return _MODEL_CACHE[mid]
 
     entry = _entry(mid)
-    if entry is None:
-        log.warning("[models] unknown model_id %r; using default", mid)
+    if entry is None or model_kind(entry) != KIND_DETECTOR:
+        log.warning("[models] %r is not a detector model; using default", mid)
         return get_model(None) if mid is not None else _raise_no_models()
 
     try:
@@ -291,6 +313,32 @@ def get_model(model_id: Optional[str] = None):
     with _CACHE_LOCK:
         _MODEL_CACHE[mid] = result
     return result
+
+
+def get_refiner(model_id: str, device=None):
+    """A cached :class:`~spyde.models.centre_network.NetworkRefiner` for a
+    ``"kind": "refiner"`` entry, on ``device`` (default: the detector's best
+    device). Raises when the id is unknown, is not a refiner, or fails to load —
+    unlike ``get_model`` there is no default to fall back to, and the caller
+    (``centre_refine.load_step``) keeps the centres it has instead."""
+    import torch as _torch
+
+    from . import centre_network, infer
+
+    device = _torch.device(device) if device is not None else infer._default_device()
+    key = (model_id, str(device))
+    with _CACHE_LOCK:
+        if key in _REFINER_CACHE:
+            return _REFINER_CACHE[key]
+    entry = _entry(model_id)
+    if entry is None or model_kind(entry) != KIND_REFINER:
+        raise ValueError(f"{model_id!r} is not a registered centre refiner")
+    path = _resolve_weights(entry)
+    refiner = centre_network.load_refiner(path, device, arch=entry.get("arch"),
+                                          contract=entry.get("input"))
+    with _CACHE_LOCK:
+        _REFINER_CACHE[key] = refiner
+    return refiner
 
 
 _CPU_MODEL_CACHE: dict = {}      # model_id -> (cpu_model, cpu_device)

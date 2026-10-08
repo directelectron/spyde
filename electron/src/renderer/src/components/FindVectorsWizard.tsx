@@ -13,7 +13,9 @@
  *     canonical rescale + NMS + marker radius) and Threshold (model confidence,
  *     ~0.3). Nav blur is never applied for neural; the high-pass (bg σ) is
  *     auto-calibrated invisibly (`fv_calibration`). Model dropdown + ↻ refresh
- *     from the registry (`fv_models`). The default method.
+ *     from the registry (`fv_models`). Every disk's centre is refined on the
+ *     raw frame; the "Friedel partner" checkbox adds the step that also reads
+ *     each disk's Friedel mirror (spyde.models.centre_refine). The default method.
  *   • NXCORR — window-normalised cross-correlation against a flat disk
  *     (Disk Radius slider; threshold is a [-1,1] correlation score).
  *   • DoG — Difference-of-Gaussians band-pass, best for small (2-3 px) spots
@@ -47,6 +49,7 @@ interface FvSaved {
   sigma1: number; sigma2: number; bgSigma: number
   threshold: number; minDist: number; subpixel: boolean; beamstop: boolean
   beamstopDilate: number; showTransform: boolean; persistence: boolean
+  friedelPartner: boolean
 }
 const _fvStore = new Map<number, FvSaved>()
 
@@ -72,19 +75,20 @@ export function FindVectorsWizard({ caretPos, windowId, sendAction, onClose }: P
   const [beamstopDilate, setBeamstopDilate] = React.useState(saved?.beamstopDilate ?? 5)
   const [showTransform, setShowTransform] = React.useState(saved?.showTransform ?? false)
   const [persistence, setPersistence] = React.useState(saved?.persistence ?? false)
+  const [friedelPartner, setFriedelPartner] = React.useState(saved?.friedelPartner ?? true)
   const [status, setStatus] = React.useState('Tune the parameters — peaks preview under the crosshair.')
 
   React.useEffect(() => {
     _fvStore.set(windowId, {
       method, modelId, sigma, radius, sigma1, sigma2, bgSigma, threshold, minDist, subpixel,
-      beamstop, beamstopDilate, showTransform, persistence,
+      beamstop, beamstopDilate, showTransform, persistence, friedelPartner,
     })
   }, [windowId, method, modelId, sigma, radius, sigma1, sigma2, bgSigma, threshold, minDist,
-      subpixel, beamstop, beamstopDilate, showTransform, persistence])
+      subpixel, beamstop, beamstopDilate, showTransform, persistence, friedelPartner])
 
   // Live refs so the debounced tune always sends the latest of EVERY control.
-  const vals = React.useRef({ method, modelId, sigma, radius, sigma1, sigma2, bgSigma, threshold, minDist, subpixel, beamstop, beamstopDilate, showTransform, persistence })
-  vals.current = { method, modelId, sigma, radius, sigma1, sigma2, bgSigma, threshold, minDist, subpixel, beamstop, beamstopDilate, showTransform, persistence }
+  const vals = React.useRef({ method, modelId, sigma, radius, sigma1, sigma2, bgSigma, threshold, minDist, subpixel, beamstop, beamstopDilate, showTransform, persistence, friedelPartner })
+  vals.current = { method, modelId, sigma, radius, sigma1, sigma2, bgSigma, threshold, minDist, subpixel, beamstop, beamstopDilate, showTransform, persistence, friedelPartner }
   const params = () => {
     const v = vals.current
     const neural = v.method === 'neural'
@@ -103,6 +107,8 @@ export function FindVectorsWizard({ caretPos, windowId, sendAction, onClose }: P
       beamstop_dilate: v.beamstopDilate,
       show_transform: v.showTransform,
       persistence: v.persistence,
+      refine_centres: neural,
+      friedel_partner: neural && v.friedelPartner,
     }
   }
 
@@ -282,6 +288,10 @@ export function FindVectorsWizard({ caretPos, windowId, sendAction, onClose }: P
           // the live preview has no neighbours so it only affects Compute.
           <Check testid="fv-persistence" checked={persistence} onChange={live(setPersistence)}
             label="Neighbor refine" />
+        )}
+        {isNeural && (
+          <Check testid="fv-friedel" checked={friedelPartner} onChange={live(setFriedelPartner)}
+            label="Friedel partner" />
         )}
       </div>
       <button data-testid="fv-compute" style={S.primary} onClick={compute}>Compute</button>

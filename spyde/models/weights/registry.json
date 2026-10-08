@@ -25,6 +25,32 @@
       "notes": "Earlier edge-trained detector. Kept as a fallback.",
       "arch": {"base": 16, "in_ch": 1, "levels": 2},
       "source": {"type": "bundled", "file": "spotunet_base16.pt"}
+    },
+    {
+      "id": "centre-fast-f5-v1",
+      "kind": "refiner",
+      "label": "Centre network F5 (bundled; the refine step)",
+      "version": 1,
+      "notes": "The refine step. Segments each disk in a 33 px window of the raw frame (spot radius -> 10 window px) and takes the coverage centroid; re-crops disks the first pass moved by more than 0.15 R; its sigma head is calibrated per checkpoint (sigma_scale 0.98). On real GaN it lowers the Friedel error of the detector's centres from 1.13 to 0.84 px. Skipped below a 5 px spot radius.",
+      "arch": {"base": 8, "levels": 2, "depthwise": 0, "sigma_head": 1},
+      "input": {"crop_radius": 10.0, "crop_half": 16, "annulus": [0.78, 1.0],
+                "passes": 2, "recrop_over": 0.15, "max_sigma_fraction": 0.25,
+                "min_spot_radius": 5.0},
+      "sha256": "2b4d4f5c17b14db0667dbee9218c0b7e0bfe54f9051181178fc984b83bd1318a",
+      "source": {"type": "bundled", "file": "centre_fast_f5.pt"}
+    },
+    {
+      "id": "centre-partner-p4-v1",
+      "kind": "refiner",
+      "label": "Friedel-partner network P4 (bundled; the step on top of F5)",
+      "version": 1,
+      "notes": "The refine step's layout reading two channels: the disk's own window and the window at its Friedel mirror point 2 x beam - p (rotated 180 degrees), so it sees both dynamical fills of g and -g. The beam is each frame's centre of Friedel symmetry, from the incoming centres. Trained on disks of 6-16 px radius; outside that range it leaves the incoming centres alone (below 6 px a version trained smaller made in-grain speckle worse).",
+      "arch": {"base": 8, "levels": 2, "depthwise": 0, "sigma_head": 1},
+      "input": {"crop_radius": 10.0, "crop_half": 16, "annulus": [0.78, 1.0],
+                "passes": 2, "recrop_over": 0.15, "max_sigma_fraction": 0.25,
+                "min_spot_radius": 6.0, "max_spot_radius": 16.0},
+      "sha256": "7a8bc8a3bacb40006447d02ce300e0bc11a181a22727b1d523753f4cd8b2055a",
+      "source": {"type": "bundled", "file": "centre_partner_p4.pt"}
     }
   ]
 }
