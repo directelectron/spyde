@@ -23,12 +23,13 @@ if frames it never trained on agree.
    simulated-disk anchor and a weak pull toward the mask centroid. Eight frames
    per step, under a wall-clock budget.
 6. Hold out every fifth scan row (a random 20 %, capped at 1500 frames, when
-   there are no rows). Accept only if, on the held-out frames, the varying
-   Friedel error falls to ``friedel_ratio`` (0.98) of before or less, the
-   varying lattice residual rises to no more than ``lattice_ratio`` (1.02), and
-   the noise the adaptation adds (half-dose split, in quadrature) is under
-   ``noise_fraction`` (0.5) of the Friedel improvement. A missing measure skips
-   its test; both missing rejects.
+   there are no rows). The primary measure is the varying Friedel error, or the
+   varying lattice residual when the scan has too few Friedel pairs to measure
+   it. Accept only if, on the held-out frames, the primary falls to
+   ``primary_ratio`` (0.98) of before or less, the other measure (when there is
+   one) rises to no more than ``other_ratio`` (1.02), and the noise the
+   adaptation adds (half-dose split, in quadrature) is under ``noise_fraction``
+   (0.5) of the primary's improvement. With neither measure, reject.
 
 The adapted copy corrects its scan's detections by more than a general network
 does — about 4 % of disks move half a radius or more, for real — so it carries
@@ -76,9 +77,9 @@ class AdaptSettings:
     learning_rate: float = 2e-4
     prior_weight: float = 0.05               #: pull toward the mask centroid
     simulation_weight: float = 1.0           #: the simulated-disk anchor
-    friedel_ratio: float = 0.98              #: accept if Friedel <= this x before
-    lattice_ratio: float = 1.02              #: ... and lattice <= this x before
-    noise_fraction: float = 0.5              #: ... and added noise < this x Friedel gain
+    primary_ratio: float = 0.98              #: accept if the primary <= this x before
+    other_ratio: float = 1.02                #: ... and the other measure <= this x before
+    noise_fraction: float = 0.5              #: ... and added noise < this x the primary's gain
     #: Reject if the refined fraction drops by more than this (fraction, e.g.
     #: 0.02). Off by default: reported, not enforced, until it is decided.
     max_refined_drop: Optional[float] = None
@@ -703,21 +704,27 @@ def adapt_centre_refiner(chunks: Iterable, spot_radius: float, base_refiner,
         return None, report
 
 
+def primary_measure(before: dict) -> tuple:
+    """``(primary, other)`` measure names: Friedel when the scan measured it,
+    the lattice residual otherwise."""
+    if math.isfinite(before["friedel"]):
+        return "friedel", "lattice"
+    return "lattice", "friedel"
+
+
 def accept(before: dict, after: dict, settings: AdaptSettings) -> bool:
-    """The acceptance rule (module docstring, step 6) on the held-out measures."""
-    friedel_before, friedel_after = before["friedel"], after["friedel"]
-    lattice_before, lattice_after = before["lattice"], after["lattice"]
-    if not math.isfinite(friedel_before) and not math.isfinite(lattice_before):
+    """The acceptance rule (module docstring, step 6) on the held-out measures.
+    Unmeasured noise (either side NaN) skips the noise test."""
+    primary, other = primary_measure(before)
+    primary_before, primary_after = before[primary], after[primary]
+    if not math.isfinite(primary_before) or not math.isfinite(primary_after):
         return False
-    ok = True
-    if math.isfinite(friedel_before):
-        ok &= friedel_after <= settings.friedel_ratio * friedel_before
-    if math.isfinite(lattice_before):
-        ok &= lattice_after <= settings.lattice_ratio * lattice_before
-    gain = friedel_before - friedel_after if math.isfinite(friedel_before) else 0.0
-    added = math.sqrt(max(after["noise"] ** 2 - before["noise"] ** 2, 0.0)) \
-        if math.isfinite(after["noise"]) and math.isfinite(before["noise"]) else 0.0
-    ok &= added < settings.noise_fraction * gain if math.isfinite(friedel_before) else True
+    ok = primary_after <= settings.primary_ratio * primary_before
+    if math.isfinite(before[other]):
+        ok &= math.isfinite(after[other]) and after[other] <= settings.other_ratio * before[other]
+    if math.isfinite(before["noise"]) and math.isfinite(after["noise"]):
+        added = math.sqrt(max(after["noise"] ** 2 - before["noise"] ** 2, 0.0))
+        ok &= added < settings.noise_fraction * (primary_before - primary_after)
     if settings.max_refined_drop is not None:
         ok &= before["refined"] - after["refined"] <= settings.max_refined_drop
     return bool(ok)

@@ -124,10 +124,32 @@ class TestAdaptation:
         assert float(base.net.threshold) == pytest.approx(0.9)          # the base is untouched
         assert 0 < report.steps <= SETTINGS.max_steps
 
+    def test_without_friedel_pairs_it_is_judged_on_the_lattice(self, biased_scan, monkeypatch):
+        """A scan whose index finds no Friedel partners (any lattice subset is
+        centrosymmetric about some point, so a synthetic one cannot avoid
+        pairs; the index's partners are cleared instead). The lattice residual
+        is then the primary measure, the only training signal, and its
+        improvement is accepted — the old rule required none and compared its
+        noise test against NaN."""
+        import spyde.models.centre_adapt as centre_adapt
+
+        original = centre_adapt.scan_index
+
+        def without_pairs(*args, **kwargs):
+            index = original(*args, **kwargs)
+            index.partner[:] = -1
+            return index
+
+        monkeypatch.setattr(centre_adapt, "scan_index", without_pairs)
+        _, adapted, report = run(biased_scan, start=0.9)
+        assert report.friedel_pairs == 0 and math.isnan(report.before["friedel"])
+        assert report.after["lattice"] <= SETTINGS.primary_ratio * report.before["lattice"]
+        assert report.accepted and adapted is not None
+
     def test_a_scan_with_nothing_to_fix_is_rejected(self, even_scan):
         _, adapted, report = run(even_scan, start=0.3)
         assert not report.accepted and adapted is None and report.declined is None
-        assert report.after["friedel"] > SETTINGS.friedel_ratio * report.before["friedel"]
+        assert report.after["friedel"] > SETTINGS.primary_ratio * report.before["friedel"]
 
     def test_a_sparse_scan_is_declined_before_training(self):
         frames, truths = make_scan(ROWS, COLUMNS, uneven=True, extent=0)   # one disk a frame
@@ -197,7 +219,7 @@ class TestAcceptance:
     def test_the_three_tests(self, after, expected):
         assert accept(self.before, after, AdaptSettings()) is expected
 
-    def test_a_missing_measure_skips_its_test_and_both_missing_rejects(self):
+    def test_a_missing_other_measure_skips_its_test_and_both_missing_rejects(self):
         nan = float("nan")
         no_lattice = dict(self.before, lattice=nan)
         assert accept(no_lattice, dict(friedel=0.9, lattice=nan, noise=0.05, refined=0.99),
@@ -205,10 +227,33 @@ class TestAcceptance:
         nothing = dict(self.before, friedel=nan, lattice=nan)
         assert not accept(nothing, dict(nothing), AdaptSettings())
 
+    def test_without_friedel_pairs_the_lattice_is_primary(self):
+        """The old rule required no improvement at all without Friedel pairs,
+        and compared its noise test against NaN."""
+        nan = float("nan")
+        no_pairs = dict(friedel=nan, lattice=1.0, noise=0.05, refined=0.99)
+        better = dict(friedel=nan, lattice=0.9, noise=0.05, refined=0.99)
+        assert accept(no_pairs, better, AdaptSettings())
+        same = dict(better, lattice=0.99)                      # under the 2 % gain
+        assert not accept(no_pairs, same, AdaptSettings())
+        noisy = dict(better, noise=0.09)                       # added 0.075 > 0.5 x 0.1
+        assert not accept(no_pairs, noisy, AdaptSettings())
+
+    def test_the_noise_test_is_nan_safe(self):
+        nan = float("nan")
+        after = dict(friedel=0.9, lattice=1.0, noise=nan, refined=0.99)
+        assert accept(self.before, after, AdaptSettings())     # unmeasured noise: skipped
+        assert accept(dict(self.before, noise=nan),
+                      dict(after, noise=0.05), AdaptSettings())
+        assert not accept(self.before, dict(after, friedel=nan), AdaptSettings())
+
     def test_the_thresholds_are_parameters(self):
         after = dict(friedel=0.97, lattice=1.0, noise=0.05, refined=0.99)
         assert accept(self.before, after, AdaptSettings())
-        assert not accept(self.before, after, AdaptSettings(friedel_ratio=0.95))
+        assert not accept(self.before, after, AdaptSettings(primary_ratio=0.95))
+        worse_lattice = dict(after, lattice=1.03)
+        assert not accept(self.before, worse_lattice, AdaptSettings())
+        assert accept(self.before, worse_lattice, AdaptSettings(other_ratio=1.05))
 
     def test_a_refined_fraction_drop_is_reported_not_enforced_by_default(self):
         after = dict(friedel=0.9, lattice=1.0, noise=0.05, refined=0.90)
