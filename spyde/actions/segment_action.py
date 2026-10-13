@@ -277,7 +277,7 @@ class SegmentWizard(WizardController):
             if self._closed or not self.still(generation):
                 return
             if self.classifier is classifier:
-                self.src_plot.set_overlay_mask(mask, color=MASK_COLOUR, alpha=MASK_ALPHA)
+                self.src_plot._set_overlay_mask(mask, color=MASK_COLOUR, alpha=MASK_ALPHA)
             if self._preview_again:
                 self._preview_again = False
                 self.preview()
@@ -290,7 +290,7 @@ class SegmentWizard(WizardController):
 
     def clear_preview(self) -> None:
         try:
-            self.src_plot.set_overlay_mask(None)
+            self.src_plot._set_overlay_mask(None)
         except Exception as exc:
             log.debug("[seg] clearing the mask failed: %s", exc)
 

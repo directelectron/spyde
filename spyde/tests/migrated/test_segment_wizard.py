@@ -45,6 +45,14 @@ def _navigator_plot(session):
     return next((p for p in session._plots if p.is_navigator), None)
 
 
+def _shipped_mask(plot):
+    """The particle mask as the renderer receives it -- the bytes in the
+    figure's state, not the array handed to the plot. Empty when none is drawn."""
+    import base64
+    encoded = plot._plot2d._state.get("overlay_mask_b64", "")
+    return np.frombuffer(base64.b64decode(encoded), np.uint8) > 0
+
+
 def _of_type(messages, kind):
     return [m for m in messages if isinstance(m, dict) and m.get("type") == kind]
 
@@ -118,11 +126,11 @@ class TestOpenAndClose:
     def test_close_removes_the_brush_and_the_mask(self, window):
         session, plot, tree = _movie(window)
         wizard = _open(session, plot)
-        cleared = []
-        plot.set_overlay_mask = lambda mask, **kw: cleared.append(mask)
+        plot._set_overlay_mask(np.ones(wizard.source.shape, bool))
+        assert _shipped_mask(plot).any()
         sa.seg_close(session, plot, {})
         assert wizard._closed and wizard._brush is None
-        assert tree._seg_wizard is None and cleared == [None]
+        assert tree._seg_wizard is None and not _shipped_mask(plot).any()
 
     def test_open_close_open_leaves_one_controller(self, window):
         session, plot, tree = _movie(window)
@@ -158,12 +166,12 @@ class TestPaintTrainPreview:
         truth = ground_truth(tree.root)
         wizard = _open(session, plot)
         _paint_movie(wizard, truth)
-        masks = []
-        plot.set_overlay_mask = lambda mask, **kw: masks.append(mask)
         sa.seg_train(session, plot, {})
-        assert wait_until(lambda: wizard.classifier is not None and masks, timeout=60)
+        assert wait_until(lambda: wizard.classifier is not None
+                          and _shipped_mask(plot).any(), timeout=60)
         first = wizard.classifier
-        assert masks[-1].shape == (96, 112) and 0 < masks[-1].mean() < 0.3
+        mask = _shipped_mask(plot)
+        assert mask.size == 96 * 112 and 0 < mask.mean() < 0.3
         assert _of_type(window["messages"], "seg_state")[-1]["trained"]
         _stroke(wizard, [[70, 60], [70, 64]], BACKGROUND)
         assert wait_until(lambda: wizard.classifier is not first, timeout=60)
@@ -175,6 +183,27 @@ class TestPaintTrainPreview:
         sa.seg_clear(session, plot, {})
         assert len(wizard.labels) == 0 and wizard.classifier is None
         assert wizard._brush.n_strokes == 0
+
+    def test_the_mask_draws_on_a_tiled_frame(self, window):
+        """A large frame is displayed as a tile overview, so the renderer takes
+        the mask on the overview grid while the wizard hands over the native
+        frame's. The mask must still ship, reduced to that grid."""
+
+        class _EveryPixel:
+            def foreground(self, field):
+                return np.ones(field.shape), np.zeros(field.shape)
+
+        session = window["window"]
+        session._load_test_data_particles({"frames": 2, "size": [2048, 2048]})
+        assert wait_until(lambda: _signal_plot(session) is not None)
+        plot = _signal_plot(session)
+        wizard = _open(session, plot)
+        state = plot._plot2d._state
+        assert wait_until(lambda: state.get("base_width")), "the frame was not tiled"
+        wizard.classifier = _EveryPixel()
+        wizard.preview()
+        assert wait_until(lambda: _shipped_mask(plot).any(), timeout=30)
+        assert _shipped_mask(plot).size == state["base_height"] * state["base_width"]
 
 
 @pytest.mark.usefixtures("_capture_module_emit")
