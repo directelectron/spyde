@@ -122,12 +122,83 @@ def capture_from_plot(plot, *, color: str | None = None) -> "TraceSpec | None":
                      x=x, y=y)
 
 
-def from_metadata(signal, key: str):  # pragma: no cover - documented seam only
-    """SEAM (NOT IMPLEMENTED): build a TraceSpec from per-frame values baked into
-    a movie's ``original_metadata`` (e.g. a temperature/pressure column from the
-    DE-MRC reader). The movie time base would be the trace's own x; this is the
-    obvious growth point for CSV import too. Kept as a stub so the source can be
-    added without reshaping :class:`TraceSpec`."""
-    raise NotImplementedError(
-        "trace-from-original_metadata is a post-v1 seam; only 1-D plot capture "
-        "is implemented (see capture_from_plot).")
+def from_insitu_channel(tree, channel: str, *, color: str | None = None):
+    """Capture a :class:`TraceSpec` from a movie's ATTACHED instrument channel.
+
+    This is the second trace source (``capture_from_plot`` is the first): a
+    per-frame column that :mod:`spyde.insitu` already aligned and resampled
+    onto this movie's frame times, sitting on the tree as ``insitu_channels``.
+    It needs no 1-D plot window to exist — an electrochemistry potential lives
+    on the tree from the moment the movie opens, so it can be burnt into the
+    frame directly.
+
+    The x base is the movie's OWN time axis in seconds (index × scale), not the
+    instrument clock: an overlay is resampled against ``movie_times`` at render
+    time, and the instrument clock has a lag offset that would shift every
+    value by that lag. The values are already per-frame, so this is an identity
+    resample — but going through the same path keeps one code path for both
+    sources.
+
+    Frames outside the instrument record are NaN in ``insitu_channels`` and
+    stay NaN here; :func:`~spyde.actions.movie_export.pipeline._draw_text_overlays`
+    paints a dash for those rather than a made-up number.
+
+    Returns None when the tree has no such channel.
+    """
+    channels = getattr(tree, "insitu_channels", None) or {}
+    values = channels.get(channel)
+    if values is None:
+        log.debug("traces: no in-situ channel %r on this tree", channel)
+        return None
+    y = np.asarray(values, dtype=float)
+    if y.size == 0:
+        return None
+    try:
+        ax = tree.root.axes_manager.navigation_axes[0]
+        scale, offset = float(ax.scale), float(ax.offset)
+    except Exception:
+        scale, offset = 1.0, 0.0
+    x = np.arange(y.size, dtype=float) * scale + offset
+
+    label, units = _split_channel_name(channel)
+    return TraceSpec(id=new_trace_id(), label=label,
+                     color=str(color or _TRACE_COLORS[0]), units=units, x=x, y=y)
+
+
+def _split_channel_name(channel: str) -> tuple[str, str]:
+    """``"Ewe/V"`` → ``("Ewe", "V")``; ``"<I>/mA"`` → ``("I", "mA")``.
+
+    EC-Lab names a column ``quantity/unit`` and brackets an averaged one, which
+    reads badly burnt into a frame ("<I>/mA = 0.0002"). Split it so the overlay
+    can render "I = 0.0002 mA" like every other trace.
+    """
+    name, _, unit = str(channel).rpartition("/")
+    if not name:
+        name, unit = str(channel), ""
+    return name.strip().strip("<>") or str(channel), unit.strip()
+
+
+def insitu_channel_options(tree) -> list[dict]:
+    """The instrument channels on *tree* worth offering as an overlay.
+
+    Flags and bookkeeping columns (``mode``, ``error``, ``counter inc.``) are
+    excluded — they are booleans that read as "0"/"1" burnt into a frame. The
+    result is renderer-facing: ``[{"channel", "label", "units"}]``.
+    """
+    channels = getattr(tree, "insitu_channels", None) or {}
+    out: list[dict] = []
+    for name in channels:
+        if name == "time/s" or name in _SKIP_CHANNELS:
+            continue
+        values = np.asarray(channels[name], dtype=float)
+        if values.size == 0 or not np.isfinite(values).any():
+            continue
+        label, units = _split_channel_name(name)
+        out.append({"channel": name, "label": label, "units": units})
+    return out
+
+
+# Per-frame columns that carry no meaning as a burnt-in number.
+_SKIP_CHANNELS = frozenset({
+    "mode", "error", "ox/red", "control changes", "Ns changes", "counter inc.",
+})

@@ -318,7 +318,7 @@ export interface PlaybackStateMessage extends MsgBase {
   type: 'playback_state'
   /** True while the movie clock is running. */
   playing: boolean
-  /** Current speed multiplier (1/2/4/8) — drives the Fast Forward "×N" badge. */
+  /** Current speed multiplier (1/2/4/8/16/32) — drives the Fast Forward "×N" badge. */
   speed?: number
   loop?: boolean
 }
@@ -579,6 +579,14 @@ export interface ReportCell {
  *  at render time; `fmt` is a Python-style format string over {label,value,units}. */
 export interface MovieTextOverlay {
   source?: Record<string, unknown>   // a SignalRef dict (opaque to the renderer)
+  /** An attached instrument channel (spyde/insitu), e.g. "Ewe/V". */
+  insitu_channel?: string
+  /** A built-in value needing no source: "time" is the elapsed-time burn-in,
+   *  which is an ordinary overlay so it gets the same widget, timeline clip
+   *  and inspector controls as any other. */
+  builtin?: 'time' | 'label'
+  /** Literal string for a builtin:'label' overlay. */
+  text?: string
   label?: string
   units?: string
   fmt?: string
@@ -641,6 +649,8 @@ export interface MovieParams {
   cmap?: string
   clim?: [number, number] | null
   timestamp?: boolean
+  /** Burnt-in timestamp colour ("#rrggbb"); white when unset. */
+  timestamp_color?: string
   scalebar?: boolean
   axes?: boolean                        // draw calibrated axis ticks (default true)
   t_start?: number
@@ -677,6 +687,26 @@ export interface MovieStateMessage extends MsgBase {
   signal_window_id: number | null     // the MDI window holding the signal figure
   nav_fig_id: string | null           // the 1-D navigator figure (shown beside, opt)
   current_index: number               // the navigator's current time index
+  /** Instrument channels aligned to this movie (electrochemistry potential /
+   *  current, holder temperature…). Already per-frame on the tree, so the
+   *  editor offers each as a one-click burn-in overlay; empty when none is
+   *  attached. See spyde/insitu and movie_add_insitu_overlay. */
+  insitu_channels?: InsituChannelOption[]
+  /** Everything addable as burnt-in text: static label, clock, channels. */
+  burnin_sources?: BurninSource[]
+}
+
+/** One attached instrument channel offered as a burn-in overlay. */
+export interface BurninSource {
+  source: string   // "label" | "time" | an instrument channel key
+  label: string
+  units: string
+}
+
+export interface InsituChannelOption {
+  channel: string        // the backend key, e.g. "Ewe/V"
+  label: string          // display name, e.g. "Ewe"
+  units: string          // e.g. "V"
 }
 
 /** Export finished (spyde:movie_done). */

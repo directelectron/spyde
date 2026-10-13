@@ -548,10 +548,12 @@ test.describe('Group B · movie editor (#6/#13)', () => {
       .toBeLessThan(mdiBefore)
 
     // Add a text overlay INSIDE the editor.
-    await page.getByTestId('movie-add-text').click()
-    await expect(page.getByTestId('movie-clip-text-0'),
+    await page.getByTestId('movie-add-burnin-label').click()
+    const textClip = page.locator('[data-testid^="movie-clip-signal-"]', { hasText: 'Label' }).first()
+    await expect(textClip,
       'no text overlay clip appeared in the editor').toBeVisible({ timeout: 8_000 })
-    await page.getByTestId('movie-insp-text').fill('OVERLAY-A')
+    await textClip.click()
+    await page.getByTestId('movie-insp-sigtext').fill('OVERLAY-A')
     await page.waitForTimeout(1500)
     await page.screenshot({ path: join(SHOTS, '21-movie-editor-overlay.png') })
 
@@ -660,7 +662,7 @@ test.describe('Group B · movie editor (#6/#13)', () => {
     const reopened = await page.getByTestId('movie-editor').isVisible().catch(() => false)
     console.log('[laundry #13] editor reopened =', reopened)
     if (reopened) {
-      await expect(page.getByTestId('movie-clip-text-0'),
+      await expect(page.locator('[data-testid^="movie-clip-signal-"]', { hasText: 'OVERLAY-A' }).first(),
         'text overlay did not persist across editor reopen').toBeVisible({ timeout: 8_000 })
       await page.screenshot({ path: join(SHOTS, '25-movie-overlay-restored.png') })
     } else {

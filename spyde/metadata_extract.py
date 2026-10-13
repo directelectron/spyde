@@ -278,6 +278,12 @@ def build_metadata_dict(signal_tree: "BaseSignalTree") -> dict[str, dict[str, st
     # numbers instead of "--". We require a recognised time UNIT (not just a
     # "time"-ish name) and convert it to seconds — deriving from an unconvertible
     # unit (or a bare uncalibrated name) would show a wrong fps, worse than "--".
+    #
+    # The key stays authoritative on purpose. When a DE movie's per-frame
+    # timestamps disagree with it (a summed movie's key holds the CAMERA rate,
+    # not the saved-frame rate), the loader corrects the KEY at load time
+    # (`_session_files._apply_frame_timestamps`) rather than this precedence —
+    # fixing the recorded value beats teaching every reader of it to distrust it.
     try:
         movie = subsections.get("Movie / In-Situ")
         if movie is not None:

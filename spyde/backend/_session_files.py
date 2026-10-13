@@ -214,6 +214,79 @@ class FileLoaderMixin:
             name=f"load-{name}",
         ).start()
 
+    # Instrument-record extensions the File ▸ Load In-Situ Data… picker offers.
+    # `.txt` is here because EC-Lab's ASCII export is routinely saved that way;
+    # the reader dispatches on the file's own magic, not on the extension.
+    INSITU_EXTS = (".mpr", ".mpt", ".txt", ".mps")
+
+    def load_insitu_data(self, path: str, window_id: int | None = None) -> None:
+        """Attach an explicitly chosen instrument record to a movie tree.
+
+        Targets the tree owning *window_id* when the renderer supplies one
+        (the user's focused window), else the most recent tree that has a
+        frame time base. Attaching needs per-frame timestamps, so a tree
+        without them is reported rather than silently skipped — that is the
+        single most likely reason for this to do nothing.
+        """
+        if not os.path.isfile(path):
+            emit_error(f"File not found: {path}")
+            return
+        if _path_ext(path) == ".mps":
+            self._describe_mps(path)
+            return
+        tree = self._insitu_target_tree(window_id)
+        if tree is None:
+            emit_error("Open an in-situ movie first, then load its instrument data.")
+            return
+        try:
+            from spyde.insitu.attach import attach_ec_file
+            result = attach_ec_file(tree, path)
+        except Exception as e:
+            emit_error(f"Failed to load {os.path.basename(path)}: {e}")
+            return
+        if result:
+            log.info("insitu: %s", result.describe())
+            emit_status(result.describe())
+        else:
+            log.info("insitu: could not attach %s — %s",
+                     os.path.basename(path), result.reason)
+            emit_error(f"Could not attach {os.path.basename(path)} — {result.reason}")
+
+    def _insitu_target_tree(self, window_id: int | None):
+        """The tree an attach should land on: the focused window's, else the
+        most recently opened one that has a per-frame time base."""
+        if window_id is not None:
+            plot = self._plot_by_window_id(window_id)
+            tree = getattr(getattr(plot, "plot_state", None), "signal_tree", None)
+            if tree is None:
+                tree = getattr(plot, "signal_tree", None)
+            if tree is not None:
+                return tree
+        from spyde.insitu.attach import movie_clock_for
+        for tree in reversed(self.signal_trees):
+            try:
+                if movie_clock_for(tree) is not None:
+                    return tree
+            except Exception as e:
+                log.debug("probing tree for a frame time base failed: %s", e)
+        return self.signal_trees[-1] if self.signal_trees else None
+
+    def _describe_mps(self, path: str) -> None:
+        """An ``.mps`` is the recipe, not the data — say so, and say what it
+        planned, so picking one is a useful mistake rather than a silent one."""
+        try:
+            from spyde.insitu.eclab import read_mps
+            settings = read_mps(path)
+        except Exception as e:
+            emit_error(f"Failed to read {os.path.basename(path)}: {e}")
+            return
+        names = [t.get("name", "?") for t in settings.get("techniques", [])]
+        emit_status(
+            f"{os.path.basename(path)} is an EC-Lab settings file (no samples). "
+            f"It runs {len(names)} technique(s): {', '.join(names) or 'none'}. "
+            "Load the matching .mpr for the data."
+        )
+
     def _open_if_dense_vectors(self, sig, path: str) -> bool:
         """If *sig* is a saved dense-vectors carrier, reconstruct the vectors and
         open a Find-Vectors result tree. Returns True if it handled the file."""
@@ -457,6 +530,8 @@ class FileLoaderMixin:
                 return
             for sig in signal:
                 self._maybe_set_insitu_signal_type(sig)
+                clock = self._apply_frame_timestamps(sig, path)
+                self._apply_de_pixel_size(sig, path, clock)
                 # A saved multi-angle acquisition opens as its whole tree, not
                 # as a bare 5-D array: the sums are reductions over its own
                 # leading axis and the angles are in its metadata, so
@@ -464,13 +539,201 @@ class FileLoaderMixin:
                 # the members or the offsets.
                 if self._maybe_rebuild_multiangle(sig, path) is not None:
                     continue
-                self._add_signal(sig, source_path=path,
-                                 navigator_override=_reader_navigator(sig))
+                tree = self._add_signal(sig, source_path=path,
+                                        navigator_override=_reader_navigator(sig))
+                self._maybe_attach_insitu(tree, path, clock)
             self._add_recent(path)
             ipc.emit({"type": "recent_files", "paths": self._recent_files[:20]})
         except Exception as e:
             ipc.emit({"type": "loading", "busy": False, "text": ""})
             emit_error(f"Failed to load {os.path.basename(path)}: {e}")
+
+    @staticmethod
+    def _apply_frame_timestamps(sig: BaseSignal, path: str):
+        """Calibrate a movie's time axis from its REAL per-frame timestamps.
+
+        A Direct Electron acquisition writes ``*_movie_timestamps.csv`` beside
+        the movie with one row per saved frame. That file is ground truth, and
+        the reader's calibration is not: RosettaSciIO derives the period as
+        ``1 / (fps * Autosave Movie Sum Count)`` when a summed movie's saved
+        period is ``sum_count / fps`` — wrong by ``sum_count**2``, so a
+        routine 2-frame sum lands the axis 4× too fast. Everything downstream
+        inherits that: playback wall-clock pacing, the movie exporter's time
+        base, the metadata panel's FPS.
+
+        The axis stays UNIFORM (scale = the median measured period) rather
+        than becoming a per-frame non-uniform axis, because the 1-D selector
+        resolves a widget position to an index with ``(x - offset) / scale``
+        — a non-uniform axis would break navigation for a jitter that is
+        microseconds wide in practice. The exact times are kept on the
+        returned clock (and on the tree) for anything that needs them, and a
+        real gap is reported rather than smoothed over.
+
+        Returns the :class:`~spyde.insitu.de_movie.MovieClock` when it applied,
+        else None. Best-effort throughout — a movie with no sidecar, or one
+        whose sidecar disagrees with the data, loads exactly as before.
+        """
+        try:
+            from spyde.insitu.de_movie import read_movie_clock
+        except Exception as e:  # pragma: no cover - import guard
+            log.debug("insitu timestamps unavailable: %s", e)
+            return None
+        try:
+            if not FileLoaderMixin._is_movie_time_axis(sig):
+                return None
+            clock = read_movie_clock(path)
+            if clock.n_frames < 2 or clock.frame_period <= 0:
+                return None
+            nav = sig.axes_manager.navigation_axes[0]
+            n_nav = int(sig.axes_manager.navigation_shape[0])
+            if clock.n_frames != n_nav:
+                # One info file per acquisition but one movie per autosave
+                # session, so a stale/foreign sidecar is a real possibility.
+                # The measured period is still right (it is a property of the
+                # camera, not of which frames landed in this file), so take it
+                # and refuse only the per-frame mapping.
+                log.warning(
+                    "insitu: %s lists %d frames but the movie has %d — using "
+                    "its frame period, not its per-frame times",
+                    os.path.basename(clock.timestamps_path or path),
+                    clock.n_frames, n_nav,
+                )
+                nav.scale = clock.frame_period
+                nav.units = "s"
+                return None
+            before = float(nav.scale)
+            nav.scale = clock.frame_period
+            nav.units = "s"
+            if not str(getattr(nav, "name", "") or "").strip():
+                nav.name = "time"
+            # Correct the recorded fps too, not just the axis. The reader takes
+            # `frames_per_second` straight from the DE info file, where it is
+            # the CAMERA's rate — with `Autosave Movie Sum Count = N` the SAVED
+            # frames arrive N times slower. Leaving it means the metadata panel
+            # (which prefers the explicit key — see metadata_extract) reports
+            # 61 fps beside a 32.76 ms/frame axis: two answers to one question.
+            # Fix the value at the source rather than teaching every reader of
+            # it to distrust it.
+            try:
+                # Rounded: the metadata chip renders the stored number
+                # verbatim, and "30.525030441931396 fps" is noise. The AXIS
+                # keeps the full-precision period; this is the display value.
+                sig.metadata.set_item(
+                    "Acquisition_instrument.TEM.frames_per_second",
+                    round(1.0 / clock.frame_period, 4),
+                )
+            except Exception as e:
+                log.debug("stamping corrected fps failed: %s", e)
+            dropped = clock.dropped_frames()
+            if dropped.size:
+                log.info("insitu: %d frame gap(s) in %s", dropped.size,
+                         os.path.basename(clock.timestamps_path or path))
+            if abs(before - clock.frame_period) > 1e-9:
+                msg = (
+                    f"Frame timing from {os.path.basename(clock.timestamps_path)}: "
+                    f"{clock.frame_period * 1e3:.3f} ms/frame "
+                    f"({1 / clock.frame_period:.2f} fps)"
+                )
+                # Logged as well as emitted: emit_status is the PLOTAPP line
+                # protocol, consumed by the Electron main process, so it never
+                # reaches stderr where the e2e harness can see it.
+                log.info("insitu: %s (reader said %.5f ms)", msg, before * 1e3)
+                emit_status(msg)
+            return clock
+        except Exception as e:
+            log.debug("applying frame timestamps failed: %s", e)
+            return None
+
+    @staticmethod
+    def _apply_de_pixel_size(sig: BaseSignal, path: str, clock=None) -> bool:
+        """Calibrate a DE frame's SIGNAL axes from its ``*_info.txt``.
+
+        Companion to :meth:`_apply_frame_timestamps` — same principle, the
+        other axis. RosettaSciIO decides imaging-vs-diffraction with
+        ``camera_length != -1``, but an imaging exposure records ``0``, so a
+        plain TEM image is calibrated as diffraction: ``nm^-1`` units and the
+        unset ``-1`` diffraction pixel size, while the correct specimen pixel
+        size sits in the same file (see
+        :func:`spyde.insitu.de_movie.spatial_calibration`).
+
+        Applied only when the info file gives a positive scale, and only to a
+        2-D signal. Returns True when it changed anything.
+        """
+        try:
+            from spyde.insitu.de_movie import (
+                find_movie_sidecars, read_info, spatial_calibration,
+            )
+        except Exception as e:  # pragma: no cover - import guard
+            log.debug("insitu pixel size unavailable: %s", e)
+            return False
+        try:
+            if sig.axes_manager.signal_dimension != 2:
+                return False
+            info = getattr(clock, "info", None)
+            info_path = getattr(clock, "info_path", None)
+            if not info:
+                _ts, info_path = find_movie_sidecars(path)
+                if not info_path:
+                    return False
+                info = read_info(info_path)
+            calibration = spatial_calibration(info)
+            if calibration is None:
+                return False
+            scale_y, scale_x, units = calibration
+            axes = sig.axes_manager.signal_axes
+            # HyperSpy orders signal_axes x-first.
+            before = (float(axes[0].scale), str(axes[0].units or ""))
+            if (abs(before[0] - scale_x) < 1e-12 and before[1] == units):
+                return False
+            axes[0].scale, axes[0].units = scale_x, units
+            axes[1].scale, axes[1].units = scale_y, units
+            # The reader also NAMED them for the branch it took: an image
+            # mis-read as diffraction comes out as "kx"/"ky". Rename to match
+            # the space the units now say they are in, but only when they
+            # carry the reader's own default — never clobber a user's name.
+            wanted = ("x", "y") if units == "nm" else ("kx", "ky")
+            unwanted = ("kx", "ky") if units == "nm" else ("x", "y")
+            for axis, name, stale in zip(axes, wanted, unwanted):
+                if str(getattr(axis, "name", "") or "").strip().lower() == stale:
+                    axis.name = name
+            log.info(
+                "insitu: frame pixel size from %s: %.6g %s/px (reader said "
+                "%.6g %s)", os.path.basename(info_path or path), scale_x, units,
+                before[0], before[1] or "-",
+            )
+            emit_status(
+                f"Pixel size from {os.path.basename(info_path or path)}: "
+                f"{scale_x:.5g} {units}/px"
+            )
+            return True
+        except Exception as e:
+            log.debug("applying DE pixel size failed: %s", e)
+            return False
+
+    def _maybe_attach_insitu(self, tree, path: str, clock=None) -> None:
+        """Look beside a freshly-opened movie for instrument data to attach.
+
+        Auto-discovery is silent unless it finds a record whose duration
+        actually matches the movie's — see
+        :func:`spyde.insitu.attach.discover_and_attach`. Best-effort: a folder
+        of unrelated records, an unreadable file or a missing sidecar all just
+        mean the movie opens as it always did.
+        """
+        if tree is None:
+            return
+        try:
+            from spyde.insitu.attach import discover_and_attach
+            if clock is not None:
+                tree.insitu_clock = clock
+            result = discover_and_attach(tree, path)
+        except Exception as e:
+            log.debug("in-situ auto-discovery failed: %s", e)
+            return
+        if result:
+            log.info("insitu: %s", result.describe())
+            emit_status(result.describe())
+        else:
+            log.info("insitu: nothing attached — %s", result.reason)
 
     @staticmethod
     def _is_self_describing(path: str) -> bool:

@@ -60,6 +60,9 @@ contextBridge.exposeInMainWorld('electron', {
   /** Open a .zspy/.zarr DIRECTORY store (folder picker → load). */
   openZarrFolder: (): Promise<void> => ipcRenderer.invoke('spyde:open-zarr-folder'),
 
+  /** Pick an in-situ instrument record (.mpr/.mpt/.txt/.mps) and attach it. */
+  loadInsituData: (): Promise<void> => ipcRenderer.invoke('spyde:load-insitu-data'),
+
   /** Quit the app (custom title-bar menu replaces native File→Quit). */
   quit: (): Promise<void> => ipcRenderer.invoke('spyde:quit'),
 

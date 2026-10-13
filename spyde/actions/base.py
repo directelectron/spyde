@@ -99,7 +99,7 @@ def play_pause(toolbar: "ActionContext", toggled=None, *args, **kwargs):
 
 
 def fast_forward(toolbar: "ActionContext", toggled=None, *args, **kwargs):
-    """Fast-forward = speed multiplier. Cycles 2x → 4x → 8x → back to 1x. Pressed
+    """Fast-forward = speed multiplier. Cycles 2x → 4x → 8x → 16x → 32x → back to 1x. Pressed
     while stopped, starts playback at 2x; while playing, bumps the speed one notch
     (staying at 1x after 8x)."""
     session = _session_of(toolbar)

@@ -27,7 +27,7 @@ frame rate. There is no fixed sleep-per-frame, so playback never accumulates dri
 
 Fast-forward = speed multiplier
 -------------------------------
-``fast_forward()`` cycles the speed 1×→2×→4×→8×→1× (starting playback at 2× if
+``fast_forward()`` cycles the speed 1×→2×→4×→8×→16×→32×→1× (starting playback at 2× if
 stopped). ``play()`` is a plain toggle at 1× (or the current speed). Both step the
 same selector via ``translate_pixels`` + ``delayed_update_data(force=True)`` — the
 same path a manual drag uses — so no new frame-read machinery is introduced. At the
@@ -46,8 +46,12 @@ import time
 
 logger = logging.getLogger(__name__)
 
-# Speed multipliers cycled by Fast Forward.
-SPEED_CYCLE = (1, 2, 4, 8)
+# Speed multipliers cycled by Fast Forward. Reaches ×32 because an in-situ
+# movie is often thousands of frames of slow change — a 7914-frame acquisition
+# is 4.3 minutes at ×1 and still 32 s at ×8. The clock is wall-clock-paced with
+# a frame-skip (see `_tick`), so a high multiplier drops frames rather than
+# demanding an impossible paint rate; ×32 costs no more per second than ×1.
+SPEED_CYCLE = (1, 2, 4, 8, 16, 32)
 
 # Legacy fallback frame rate when the time axis carries no usable scale.
 DEFAULT_FPS = 10.0
@@ -87,10 +91,11 @@ class MoviePlaybackController:
 
     State machine (all guarded by ``self._lock``):
       • ``_playing``  — a clock thread is running.
-      • ``speed``     — current multiplier (1/2/4/8); the "×N" the UI shows.
+      • ``speed``     — current multiplier (1/2/4/8/16/32); the "×N" the UI shows.
       • ``loop``      — wrap to the start at the end instead of stopping.
     ``play()`` is a plain toggle at the current (or requested) speed;
-    ``fast_forward()`` starts at 2× if stopped, else bumps 1→2→4→8→1 while playing.
+    ``fast_forward()`` starts at 2× if stopped, else bumps 1→2→4→8→16→32→1 while
+    playing.
     """
 
     def __init__(self, session) -> None:
@@ -268,7 +273,7 @@ class MoviePlaybackController:
         """Fast-forward = speed multiplier cycle.
 
         Stopped  → start playing at 2×.
-        Playing  → bump the speed 1→2→4→8→1 (stays playing at 1× after 8×).
+        Playing  → bump the speed 1→2→4→8→16→32→1 (back to 1× after 32×).
         Returns True when playback is running afterwards."""
         if loop is not None:
             self.loop = bool(loop)
