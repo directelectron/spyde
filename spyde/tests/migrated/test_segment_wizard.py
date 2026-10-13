@@ -126,6 +126,11 @@ class TestOpenAndClose:
     def test_close_removes_the_brush_and_the_mask(self, window):
         session, plot, tree = _movie(window)
         wizard = _open(session, plot)
+        state = plot._plot2d._state
+        # A mask that does not match the displayed frame is dropped, so wait
+        # for the frame before drawing one.
+        assert wait_until(lambda: (state.get("image_height"), state.get("image_width"))
+                          == wizard.source.shape)
         plot._set_overlay_mask(np.ones(wizard.source.shape, bool))
         assert _shipped_mask(plot).any()
         sa.seg_close(session, plot, {})
