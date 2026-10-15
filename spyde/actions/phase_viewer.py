@@ -14,7 +14,12 @@ The three panes share one crystal orientation:
   (a ``"world"`` patch), so it stays put while a drag turns the crystal;
 * **unit cell** — the atoms and edges of the cell, turning with it;
 * **detector** — what the screen records at that orientation, with the
-  kinematic spots on it in TEM mode.
+  kinematic spots on it on a TEM.
+
+The 3-D panes are drawn in the DETECTOR frame, looking straight at the
+screen with its own "up", so the front of the sphere reads like the screen
+does whatever the detector's angles are; the crystal's orientation is kept
+in the sample frame and carried into the detector frame for display.
 
 Dragging either 3-D pane turns the crystal in both and repaints the
 detector. The master pattern is either the kinematic bands
@@ -23,8 +28,9 @@ dictionary uses) or a full dynamical simulation from de_ebsd when it is
 installed; both are sampled at the same directions, so switching changes
 the intensities and never the geometry.
 
-The set-up's numbers are read from, and written back to, the signal's
-metadata (:mod:`spyde.ebsd.microscope`), so the indexing wizards see them too.
+Which microscope is read off the signal, not chosen. The set-up's numbers
+are read from, and written back to, the signal's metadata
+(:mod:`spyde.ebsd.microscope`), so the indexing wizards see them too.
 """
 from __future__ import annotations
 
@@ -54,6 +60,9 @@ FIGURE_SIZE = (744, 248)
 FULL_NPX = 150
 FULL_DMIN = 0.1
 
+#: Looks along the detector frame's +z, with its +y up and +x to the right.
+CAMERA = dict(azimuth=0.0, elevation=90.0)
+
 DETECTOR_COLOUR = "#f38ba8"
 SPOT_COLOUR = "#f9e2af"
 
@@ -63,12 +72,12 @@ def full_simulation_available() -> bool:
     return importlib.util.find_spec("de_ebsd") is not None
 
 
-def preview_shape(signal, mode: str) -> tuple[int, int]:
+def preview_shape(signal, microscope: str) -> tuple[int, int]:
     """``(rows, cols)`` of the detector preview: in SEM the signal's frame
     shape scaled to :data:`PREVIEW_PIXELS` on its longer side, so the aspect
     (which the pattern centre is measured against) is right; in TEM square."""
     rows = cols = PREVIEW_PIXELS
-    if mode == "SEM":
+    if microscope == "SEM":
         try:
             axes = signal.axes_manager.signal_axes
             if len(axes) == 2:
@@ -105,8 +114,8 @@ class PhaseViewer:
         self.master = "bands"                   # or "full"
         self.full_state = "none"                # computing | ready | error
         self.full_note = ""
-        self.show_spots = setup.mode == "TEM"
-        self.rotation = np.eye(3)
+        self.show_spots = setup.microscope == "TEM"
+        self.rotation = np.eye(3)               # crystal → sample
         self._textures: dict = {}               # ("bands", kV) | ("full", key) → image
         self._reflectors: dict = {}             # kV → Reflectors
         self._full_patterns: dict = {}          # (kV, tilt) → de_ebsd MasterPattern
@@ -161,27 +170,30 @@ class PhaseViewer:
     def _geometry(self) -> None:
         from spyde.ebsd.microscope import detector_rays, detector_to_sample
 
-        self.shape = preview_shape(self.tree.root, self.setup.mode)
+        self.shape = preview_shape(self.tree.root, self.setup.microscope)
         rays = detector_rays(self.setup, self.shape)
         self._to_sample = detector_to_sample(self.setup)
-        self._rays_sample = rays.reshape(-1, 3) @ self._to_sample.T
-        corners = np.array([rays[0, 0], rays[0, -1], rays[-1, -1], rays[-1, 0]])
-        self._corners = corners @ self._to_sample.T
+        self._rays = rays.reshape(-1, 3)
+        self._corners = np.array([rays[0, 0], rays[0, -1], rays[-1, -1], rays[-1, 0]])
         # The screen's gnomonic extent, for placing spots in pixels.
         gnomonic = rays[..., :2] / rays[..., 2:]
         self._extent = (float(gnomonic[0, 0, 0]), float(gnomonic[0, -1, 0]),
                         float(gnomonic[-1, 0, 1]), float(gnomonic[0, 0, 1]))
 
+    def displayed(self) -> np.ndarray:
+        """The crystal's rotation in the detector frame the panes are drawn in."""
+        return self._to_sample.T @ self.rotation
+
     def pattern(self) -> np.ndarray:
         """What the detector records at the current orientation.
 
-        :attr:`rotation` carries crystal directions into the sample frame,
-        so a ray ``r`` came from crystal direction ``rotationᵀ r`` — as rows,
-        ``r @ rotation``.
+        :meth:`displayed` carries crystal directions into the detector frame,
+        so a ray ``r`` came from crystal direction ``displayedᵀ r`` — as rows,
+        ``r @ displayed``.
         """
         from spyde.ebsd.bands import band_intensity
 
-        crystal_rays = self._rays_sample @ self.rotation
+        crystal_rays = self._rays @ self.displayed()
         if self.master == "full" and self._full_key() in self._full_patterns:
             import torch
             image = self._full_patterns[self._full_key()].sample(
@@ -195,7 +207,7 @@ class PhaseViewer:
         from spyde.ebsd.bands import wavelength
         from spyde.ebsd.spots import spot_pixels
 
-        if not (self.show_spots and self.setup.mode == "TEM"):
+        if not (self.show_spots and self.setup.microscope == "TEM"):
             return np.empty((0, 2)), np.empty(0)
         pixels, weights = spot_pixels(
             self._spot_reflections, self.rotation, self._to_sample,
@@ -206,21 +218,20 @@ class PhaseViewer:
     def build_figure(self, texture: np.ndarray) -> None:
         import anyplotlib as apl
         from spyde.ebsd.bands import sphere_directions
-        from spyde.ebsd.microscope import camera_angles
         from spyde.ebsd.unit_cell import ELEMENT_COLOURS, unit_cell
 
-        azimuth, elevation = camera_angles(self.setup)
         self.figure, (sphere_axes, cell_axes, detector_axes) = apl.subplots(
             1, 3, figsize=FIGURE_SIZE)
 
         mesh = sphere_directions(*SPHERE_MESH)
         self.sphere = sphere_axes.plot_surface(
             mesh[..., 0], mesh[..., 1], mesh[..., 2], bounds=((-1, 1),) * 3,
-            azimuth=azimuth, elevation=elevation, zoom=1.3)
+            zoom=1.3, **CAMERA)
         self.sphere.set_axis_off()
         self.sphere.set_title("Master pattern")
         self.sphere.set_texture(_grey_rgb(texture), shade=True, cull_backfaces=True)
         self.sphere.set_drag_mode("rotate")
+        self.sphere.set_rotation(self.displayed())
         self._footprint = self.sphere.add_patch(
             self._corners, frame="world", facecolor=DETECTOR_COLOUR, alpha=0.12,
             linewidth=2, name="detector")
@@ -232,10 +243,11 @@ class PhaseViewer:
             positions[:, 0], positions[:, 1], positions[:, 2],
             colors=[ELEMENT_COLOURS.get(e, "#9e9e9e") for e in elements],
             point_size=6, bounds=tuple((c - reach, c + reach) for c in centre),
-            azimuth=azimuth, elevation=elevation)
+            **CAMERA)
         self.cell.set_axis_off()
         self.cell.set_title("Unit cell")
         self.cell.set_drag_mode("rotate")
+        self.cell.set_rotation(self.displayed())
         for number, edge in enumerate(edges):
             self.cell.add_patch(edge, closed=False, geodesic=False,
                                 edgecolor="#a6adc8", alpha=0, linewidth=1,
@@ -273,22 +285,20 @@ class PhaseViewer:
     def _on_turn(self, event, source) -> None:
         if self._closed or getattr(event, "rotation", None) is None:
             return
-        self.rotation = source.rotation
+        self.rotation = self._to_sample @ source.rotation
         other = self.cell if source is self.sphere else self.sphere
         try:
-            other.set_rotation(self.rotation)
+            other.set_rotation(source.rotation)
             self._paint_detector()
         except Exception as e:
             log.debug("repainting after a turn failed: %s", e)
 
     def _apply_geometry(self) -> None:
-        """Re-aim everything after a set-up change that moves the detector."""
-        from spyde.ebsd.microscope import camera_angles
-
+        """Redraw after a set-up change. The crystal stays put in the sample
+        frame, so moving the detector turns it as the detector sees it."""
         self._geometry()
-        azimuth, elevation = camera_angles(self.setup)
-        self.sphere.set_view(azimuth=azimuth, elevation=elevation)
-        self.cell.set_view(azimuth=azimuth, elevation=elevation)
+        self.sphere.set_rotation(self.displayed())
+        self.cell.set_rotation(self.displayed())
         self._footprint.set(points=self._corners)
         self._paint_detector()
 
@@ -314,20 +324,10 @@ class PhaseViewer:
                       on_error=lambda e: emit_error(f"Could not redraw the master pattern: {e}"))
 
     # ── set-up changes ───────────────────────────────────────────────────────
-    def set_mode(self, mode: str) -> None:
-        from spyde.ebsd.microscope import read_setup
-
-        self.setup = read_setup(self.tree.root, mode, fallback=_pc_fallback(self.tree.root))
-        self.show_spots = mode == "TEM"
-        if mode == "TEM" and self.master == "full":
-            self.master = "bands"
-        self._apply_geometry()
-        self._refresh_texture()
-
     def set_field(self, key: str, value: float) -> None:
         from spyde.ebsd.microscope import write_field
 
-        write_field(self.tree.root, self.setup.mode, key, value)
+        write_field(self.tree.root, self.setup.microscope, key, value)
         old_key = self._texture_key()
         self.setup.values[key] = float(value)
         self.setup.sources[key] = "metadata"
@@ -342,7 +342,7 @@ class PhaseViewer:
             self.master = "bands"
             self._refresh_texture()
             return
-        if not full_simulation_available() or self.setup.mode != "SEM":
+        if not full_simulation_available() or self.setup.microscope != "SEM":
             return
         if self._full_key() in self._full_patterns:
             self.master, self.full_state = "full", "ready"
@@ -411,17 +411,17 @@ class PhaseViewer:
             "title": phase_label(self.phase),
             "subtitle": "{} · a {:.3f} Å".format(
                 self.structure.space_group.short_name, float(lattice.a)),
-            "mode": self.setup.mode,
+            "microscope": self.setup.microscope,
             "fields": [{"key": f.key, "label": f.label, "unit": f.unit,
                         "value": self.setup.values[f.key], "step": f.step,
                         "source": self.setup.sources[f.key]}
                        for f in self.setup.fields],
             "master": self.master,
             "full": {"available": full_simulation_available(),
-                     "applies": self.setup.mode == "SEM",
+                     "applies": self.setup.microscope == "SEM",
                      "state": self.full_state, "note": self.full_note},
             "spots": self.show_spots,
-            "spots_apply": self.setup.mode == "TEM",
+            "spots_apply": self.setup.microscope == "TEM",
         })
 
     def close(self) -> None:
@@ -476,7 +476,7 @@ def show_phase(session, plot, payload) -> None:
     if existing is not None and existing.phase.get("cif_path") == phase["cif_path"]:
         existing.show()
         return
-    setup = read_setup(tree.root, payload.get("mode"), fallback=_pc_fallback(tree.root))
+    setup = read_setup(tree.root, fallback=_pc_fallback(tree.root))
     emit_status(f"Simulating {phase_label(phase)}…")
 
     def work():
@@ -505,16 +505,14 @@ def show_phase(session, plot, payload) -> None:
 def phase_setup_set(session, plot, payload) -> None:
     """Change one thing about a phase viewer's set-up.
 
-    *payload* carries ``phase`` and exactly one of ``mode`` (SEM | TEM),
-    ``field`` + ``value``, ``master`` (bands | full) or ``spots`` (bool).
+    *payload* carries ``phase`` and exactly one of ``field`` + ``value``,
+    ``master`` (bands | full) or ``spots`` (bool).
     """
     _tree, _phase, viewer = _viewer_for(session, plot, payload)
     if viewer is None:
         return
     try:
-        if "mode" in payload:
-            viewer.set_mode(str(payload["mode"]))
-        elif "field" in payload:
+        if "field" in payload:
             viewer.set_field(str(payload["field"]), float(payload["value"]))
         elif "master" in payload:
             viewer.set_master(str(payload["master"]))

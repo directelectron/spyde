@@ -19,7 +19,6 @@ const FIGURE_W = 744
 const FIGURE_H = 248
 
 export type PhaseSetupChange =
-  | { mode: 'SEM' | 'TEM' }
   | { field: string, value: number }
   | { master: 'bands' | 'full' }
   | { spots: boolean }
@@ -67,22 +66,10 @@ function SetupForm({ setup, phaseId, onChange }: {
     : !full.applies ? 'A backscatter master pattern: SEM only'
       : full.state === 'computing' ? 'Simulating — about a second on a GPU'
         : full.state === 'error' ? full.note : ''
+  const [geometryOpen, setGeometryOpen] = React.useState(false)
+  const guesses = setup.fields.filter(field => field.source === 'default').length
   return (
     <div style={S.form}>
-      <div style={S.row}>
-        <span style={S.label}>Microscope</span>
-        <Segmented testid={`phase-mode-${phaseId}`} value={setup.mode}
-          options={[['SEM', 'SEM'], ['TEM', 'TEM']]}
-          onPick={(mode) => onChange({ mode: mode as 'SEM' | 'TEM' })} />
-      </div>
-
-      <div style={S.fields}>
-        {setup.fields.map(field => (
-          <FieldInput key={`${setup.mode}-${field.key}`} field={field} phaseId={phaseId}
-            onCommit={(value) => onChange({ field: field.key, value })} />
-        ))}
-      </div>
-
       <div style={S.row}>
         <span style={S.label}>Master pattern</span>
         <Segmented testid={`phase-master-${phaseId}`} value={setup.master}
@@ -92,17 +79,51 @@ function SetupForm({ setup, phaseId, onChange }: {
         {fullHint && <span style={S.muted} data-testid={`phase-full-note-${phaseId}`}>{fullHint}</span>}
       </div>
 
-      <label style={{ ...S.row, opacity: setup.spots_apply ? 1 : 0.5 }}
-        title={setup.spots_apply ? undefined
-          : 'Spots form in transmission; an EBSD screen sees only the bands'}>
-        <input type="checkbox" checked={setup.spots && setup.spots_apply}
-          disabled={!setup.spots_apply} style={S.check}
-          onChange={(e) => onChange({ spots: e.currentTarget.checked })}
-          data-testid={`phase-spots-${phaseId}`} />
-        <span style={S.label}>Diffraction spots on the detector</span>
-      </label>
+      {/* Spots form in transmission; an EBSD screen sees only the bands. */}
+      {setup.spots_apply && (
+        <label style={S.row}>
+          <input type="checkbox" checked={setup.spots} style={S.check}
+            onChange={(e) => onChange({ spots: e.currentTarget.checked })}
+            data-testid={`phase-spots-${phaseId}`} />
+          <span style={S.label}>Diffraction spots on the detector</span>
+        </label>
+      )}
+
+      {/* The geometry is only needed to match real data, so it stays folded
+          away; its summary line says what it is set to. */}
+      <button style={S.disclosure} aria-expanded={geometryOpen}
+        onClick={() => setGeometryOpen(open => !open)}
+        data-testid={`phase-geometry-${phaseId}`}>
+        <span>{geometryOpen ? '▾' : '▸'} {setup.microscope} geometry</span>
+        <span style={S.summary}>{summarise(setup)}</span>
+        {guesses > 0 && (
+          <span style={SOURCE_TONE.default}
+            title="Not in the metadata — defaults; check them before matching data">
+            {guesses} default{guesses > 1 ? 's' : ''}
+          </span>
+        )}
+      </button>
+      {geometryOpen && (
+        <div style={S.fields}>
+          {setup.fields.map(field => (
+            <FieldInput key={field.key} field={field} phaseId={phaseId}
+              onCommit={(value) => onChange({ field: field.key, value })} />
+          ))}
+        </div>
+      )}
     </div>
   )
+}
+
+/** One line saying what the geometry is set to, for the folded header. */
+function summarise(setup: PhaseSetupMessage): string {
+  const v = Object.fromEntries(setup.fields.map(f => [f.key, f.value]))
+  const n = (x: number, digits = 0) => x.toFixed(digits)
+  if (setup.microscope === 'SEM') {
+    return `${n(v.beam_energy, 1)} kV · tilt ${n(v.sample_tilt, 1)}° · `
+      + `PC ${n(v.pc_x, 3)} ${n(v.pc_y, 3)} ${n(v.pc_z, 3)}`
+  }
+  return `${n(v.beam_energy)} kV · ${n(v.camera_length)} mm`
 }
 
 function FieldInput({ field, phaseId, onCommit }: {
@@ -207,4 +228,10 @@ const S: Record<string, React.CSSProperties> = {
     padding: '3px 10px', fontWeight: 700, cursor: 'pointer',
   },
   check: { accentColor: '#89b4fa', width: 14, height: 14, margin: 0 },
+  disclosure: {
+    display: 'flex', alignItems: 'center', gap: 10, background: 'none', border: 'none',
+    borderTop: '1px solid #313244', padding: '6px 0 0', color: '#a6adc8', fontSize: 10,
+    cursor: 'pointer', textAlign: 'left',
+  },
+  summary: { color: '#6c7086', fontFamily: 'ui-monospace, Consolas, monospace', flex: 1 },
 }

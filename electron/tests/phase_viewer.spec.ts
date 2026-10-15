@@ -1,9 +1,10 @@
 /**
  * phase_viewer.spec.ts — clicking a phase's structure in the Composition dock
  * pops its viewer out beside the sidebar: [master pattern] [unit cell]
- * [detector], and under them the SEM/TEM set-up, the master-pattern choice
- * and the spots option. It is part of the phase, not a window; several open
- * phases stack.
+ * [detector], the master-pattern choice, and the microscope geometry folded
+ * away under them. Which microscope is read off the signal — an EBSD scan is
+ * SEM, a diffraction dataset TEM (with spots). It is part of the phase, not a
+ * window; several open phases stack.
  *
  * Runs on the bundled synthetic EBSD scan, whose geometry (pattern centre,
  * detector shape) the viewer reads, with the bundled Ag structure.
@@ -69,7 +70,9 @@ test('clicking a phase pops out its viewer beside the sidebar', async () => {
   await page.getByTestId('composition-structure-0').click()
   await expect(card(0).locator('iframe')).toBeVisible({ timeout: 60_000 })
   await expect(card(0)).toContainText('Fm-3m')
-  await expect(card(0).getByTestId(/phase-mode-.*-SEM$/)).toHaveAttribute('aria-checked', 'true')
+  await expect(card(0).getByTestId(/phase-geometry-/)).toContainText('SEM geometry')
+  await expect(card(0).getByTestId(/phase-field-/)).toHaveCount(0)   // folded away
+  await expect(card(0).getByTestId(/phase-spots-/)).toHaveCount(0)   // EBSD: no spots
   await page.waitForTimeout(1500)             // the texture decodes asynchronously
   expect(await windowCount()).toBe(windows)   // part of the phase, not a window
   await shot('01-popout')
@@ -88,7 +91,9 @@ test('dragging the sphere turns the crystal and repaints the detector', async ()
   expect((await region(0, 2)).equals(before)).toBe(false)
 })
 
-test('editing a set-up field moves the detector', async () => {
+test('opening the geometry and editing a field moves the detector', async () => {
+  await card(0).getByTestId(/phase-geometry-/).click()
+  await expect(card(0).getByTestId(/phase-field-.*-twist$/)).toBeVisible()
   const before = await region(0, 2)
   const field = card(0).getByTestId(/phase-field-.*-pc_y$/)
   await field.fill('0.3')
@@ -111,15 +116,6 @@ test('the full simulation replaces the kinematic bands', async () => {
   expect((await region(0, 0)).equals(before)).toBe(false)
 })
 
-test('TEM mode shows the diffraction spots', async () => {
-  await card(0).getByTestId(/phase-mode-.*-TEM$/).click()
-  await expect(card(0).getByTestId(/phase-mode-.*-TEM$/)).toHaveAttribute('aria-checked', 'true')
-  await expect(card(0).getByTestId(/phase-field-.*-camera_length$/)).toBeVisible()
-  await expect(card(0).getByTestId(/phase-spots-/)).toBeChecked()
-  await page.waitForTimeout(1500)
-  await shot('04-tem-spots')
-})
-
 test('a second phase stacks under the first', async () => {
   await page.getByTestId('composition-edit').click()
   await page.getByTestId('ptable-add-phase').click()
@@ -135,4 +131,24 @@ test('a second phase stacks under the first', async () => {
 
   await card(0).getByRole('button', { name: 'Close phase viewer' }).click()
   await expect(page.getByTestId('phase-popout').locator('section')).toHaveCount(1)
+})
+
+test('a diffraction dataset is simulated as TEM, with spots', async () => {
+  await backendAction(page, 'load_test_data_si_grains')
+  await page.waitForFunction(
+    () => document.querySelectorAll('[data-testid="subwindow"]').length >= 4,
+    { timeout: 120_000 })
+  const navigators = page.getByTestId('subwindow')
+    .filter({ has: page.getByTestId('window-breadcrumb').filter({ hasText: /^N-/ }) })
+  await navigators.last().getByTestId('subwindow-titlebar').click()
+  await page.getByTestId('composition-edit').click()
+  await page.getByTestId('phase-0-cif').click()
+  await expect(page.getByTestId('phase-0-structure')).toContainText('Silver__0011135')
+  await page.getByTestId('ptable-done').click()
+  await page.getByTestId('composition-structure-0').click()
+  const tem = page.getByTestId('phase-popout').locator('section').last()
+  await expect(tem.getByTestId(/phase-geometry-/)).toContainText('TEM geometry', { timeout: 60_000 })
+  await expect(tem.getByTestId(/phase-spots-/)).toBeChecked()
+  await page.waitForTimeout(1500)
+  await shot('06-tem-spots')
 })

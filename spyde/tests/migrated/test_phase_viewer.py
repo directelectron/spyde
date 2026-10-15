@@ -67,10 +67,10 @@ def _open(monkeypatch, tree, phase_id="ag"):
     return tree._phase_viewers[phase_id]
 
 
-def _setup(mode="SEM", **values):
-    fields = microscope.FIELDS[mode]
+def _setup(kind="SEM", **values):
+    fields = microscope.FIELDS[kind]
     merged = {f.key: f.default for f in fields} | values
-    return microscope.Setup(mode, merged, {k: "default" for k in merged})
+    return microscope.Setup(kind, merged, {k: "default" for k in merged})
 
 
 class TestOneBandProfile:
@@ -101,18 +101,36 @@ class TestOneBandProfile:
 
 
 class TestSetup:
+    def test_the_microscope_is_read_off_the_signal(self):
+        assert microscope.microscope_of(_sem_tree().root) == "SEM"
+        assert microscope.microscope_of(
+            hs.signals.Signal2D(np.zeros((8, 8)))) == "TEM"
+
     def test_values_come_from_metadata_and_say_so(self):
-        tree = _sem_tree(beam_energy=15.0)
-        setup = microscope.read_setup(tree.root, "SEM")
-        assert setup["beam_energy"] == 15.0
+        setup = microscope.read_setup(_sem_tree(beam_energy=15.0).root)
+        assert setup.microscope == "SEM" and setup["beam_energy"] == 15.0
         assert setup.sources["beam_energy"] == "metadata"
-        assert setup.sources["sample_tilt"] == "default"
+        assert setup.sources["azimuthal"] == "default"
+
+    def test_a_recorded_detector_supplies_the_angles(self):
+        """A kikuchipy EBSD signal carries its detector: its angles and PC
+        count as recorded with the data."""
+        class Detector:
+            sample_tilt, tilt, azimuthal, twist = 68.0, 3.0, 1.5, 0.5
+            pc_average = np.array([0.45, 0.6, 0.58])
+
+        signal = _sem_tree().root
+        signal.detector = Detector()
+        setup = microscope.read_setup(signal)
+        assert (setup["sample_tilt"], setup["detector_tilt"], setup["azimuthal"],
+                setup["twist"], setup["pc_y"]) == (68.0, 3.0, 1.5, 0.5, 0.6)
+        assert setup.sources["twist"] == "data"
 
     def test_writing_a_field_records_it(self):
         tree = _sem_tree()
-        microscope.write_field(tree.root, "SEM", "sample_tilt", 65.0)
+        microscope.write_field(tree.root, "SEM", "twist", 1.25)
         assert tree.root.metadata.get_item(
-            "Acquisition_instrument.SEM.Stage.tilt_alpha") == 65.0
+            "Acquisition_instrument.SEM.Detector.EBSD.twist") == 1.25
 
     def test_the_sample_normal_sits_above_the_pattern_centre(self):
         to_sample = microscope.detector_to_sample(_setup("SEM"))
@@ -120,13 +138,22 @@ class TestSetup:
         assert normal_on_screen[1] > 0.3            # up, by sin(20°)
         np.testing.assert_allclose(np.degrees(np.arccos(normal_on_screen[2])), 20)
 
-    def test_the_camera_looks_from_the_detector(self):
-        azimuth, elevation = microscope.camera_angles(_setup("SEM"))
-        assert azimuth == pytest.approx(0) and elevation == pytest.approx(70)
+    def test_the_tilts_are_kikuchipys(self):
+        """The four SEM angles follow kikuchipy, the reference for EBSD
+        geometry, exactly."""
+        kp = pytest.importorskip("kikuchipy")
+        rng = np.random.default_rng(2)
+        for angles in rng.uniform([0, -30, -30, -30], [90, 30, 30, 30], (50, 4)):
+            detector = kp.detectors.EBSDDetector(
+                (60, 60), pc=(0.5, 0.5, 0.5), sample_tilt=angles[0],
+                tilt=angles[1], azimuthal=angles[2], twist=angles[3])
+            np.testing.assert_allclose(
+                microscope._sample_to_detector(*angles),
+                detector.sample_to_detector.to_matrix()[0], atol=1e-12)
 
 
 class TestPreviewParity:
-    @pytest.mark.parametrize("sample_tilt", [90.0, 70.0])
+    @pytest.mark.parametrize("sample_tilt", [90.0, 70.0, 55.0])
     @pytest.mark.parametrize("euler", [(0.0, 0.0, 0.0), (0.4, 0.9, 1.3)])
     def test_preview_matches_simulate_patterns(self, monkeypatch, messages,
                                                sample_tilt, euler):
@@ -173,7 +200,7 @@ class TestViewer:
         assert "window_id" not in figure
         setup = next(m for m in messages if m.get("type") == "phase_setup")
         fields = {f["key"]: f for f in setup["fields"]}
-        assert setup["mode"] == "SEM" and fields["beam_energy"]["value"] == 15.0
+        assert setup["microscope"] == "SEM" and fields["beam_energy"]["value"] == 15.0
         assert fields["beam_energy"]["source"] == "metadata"
 
     def test_turning_one_pane_turns_the_other(self, monkeypatch, messages):
@@ -200,14 +227,28 @@ class TestViewer:
             "Acquisition_instrument.SEM.Detector.EBSD.pc_y") == 0.3
         assert not np.array_equal(before, viewer.detector.data)
 
-    def test_tem_mode_shows_spots(self, monkeypatch, messages):
-        viewer = _open(monkeypatch, _sem_tree())
-        pv.phase_setup_set(_Session(), None, {"phase": "ag", "mode": "TEM"})
-        assert viewer.setup.mode == "TEM" and viewer.show_spots
+    def test_a_tem_signal_shows_spots(self, monkeypatch, messages):
+        signal = hs.signals.Signal2D(np.zeros((2, 2, 64, 64), np.float32))
+        tree = _Tree(signal)
+        comp.write_phases(tree, [AG])
+        viewer = _open(monkeypatch, tree)
+        assert viewer.setup.microscope == "TEM" and viewer.show_spots
         pixels, _ = viewer.spots()
         assert len(pixels) > 5
         setup = [m for m in messages if m.get("type") == "phase_setup"][-1]
         assert setup["spots_apply"] and not setup["full"]["applies"]
+
+    def test_moving_the_detector_keeps_the_crystal_in_the_sample(
+            self, monkeypatch, messages):
+        """A geometry edit changes how the detector sees the crystal, not the
+        crystal's orientation in the sample."""
+        viewer = _open(monkeypatch, _sem_tree())
+        viewer.rotation = euler_to_matrix(0.4, 0.9, 1.3).T
+        held = viewer.rotation.copy()
+        pv.phase_setup_set(_Session(), None, {"phase": "ag", "field": "sample_tilt",
+                                              "value": 60.0})
+        np.testing.assert_allclose(viewer.rotation, held)
+        np.testing.assert_allclose(viewer.sphere.rotation, viewer.displayed())
 
     def test_full_simulation_is_refused_without_de_ebsd(self, monkeypatch, messages):
         monkeypatch.setattr(pv, "full_simulation_available", lambda: False)

@@ -194,7 +194,7 @@ export interface PhaseSetupMessage extends MsgBase {
   phase_id: string
   title: string
   subtitle: string
-  mode: 'SEM' | 'TEM'
+  microscope: 'SEM' | 'TEM'
   fields: PhaseSetupField[]
   master: 'bands' | 'full'
   full: { available: boolean, applies: boolean, state: string, note: string }
