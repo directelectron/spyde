@@ -258,6 +258,10 @@ interface State extends ShellState {
   // kept OUT of the MDI `windows`/`figures` state so they never open an MDI
   // subwindow. `host:"report"` figure messages route here.
   reportFigures: Map<string, SpyDEFigure>
+  // A phase's viewer (its band sphere and detector preview), keyed by PHASE
+  // id and shown inside the Composition dock — part of the phase's setup, so
+  // it never opens a window. `host:"phase"` figure messages route here.
+  phaseFigures: Map<string, SpyDEFigure>
   // The authoritative report document (mirrored from `report_state`), or null
   // before any report is opened/created.
   report: ReportDocState | null
@@ -339,6 +343,7 @@ type Action =
   | { type: 'CONSOLE_PREVIEW_RESULT'; preview: ConsolePreviewResult }
   | { type: 'REPORT_STATE'; report: ReportDocState }
   | { type: 'REPORT_FIGURE'; cellId: string; figure: SpyDEFigure }
+  | { type: 'PHASE_FIGURE'; phaseId: string; figure: SpyDEFigure }
 
 function spydeReducer(state: State, action: Action): State {
   switch (action.type) {
@@ -629,6 +634,12 @@ function spydeReducer(state: State, action: Action): State {
       return { ...state, reportFigures }
     }
 
+    case 'PHASE_FIGURE': {
+      const phaseFigures = new Map(state.phaseFigures)
+      phaseFigures.set(action.phaseId, action.figure)
+      return { ...state, phaseFigures }
+    }
+
     case 'SIGNAL_TREE': {
       const signalTrees = new Map(state.signalTrees)
       signalTrees.set(action.windowId, action.tree)
@@ -730,6 +741,7 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
     windows: new Map(),
     figures: new Map(),
     reportFigures: new Map(),
+    phaseFigures: new Map(),
     report: null,
     metadata: new Map(),
     metadataEditable: new Map(),
@@ -1019,6 +1031,20 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
                 windowId: msg.window_id,
                 filePath: fileUrl,
                 title: msg.title || 'Figure',
+                isNavigator: false,
+              },
+            })
+            break
+          }
+          if (msg.host === 'phase' && msg.phase_id) {
+            dispatch({
+              type: 'PHASE_FIGURE',
+              phaseId: msg.phase_id,
+              figure: {
+                figId: msg.fig_id,
+                windowId: -1,
+                filePath: fileUrl,
+                title: msg.title || 'Phase',
                 isNavigator: false,
               },
             })

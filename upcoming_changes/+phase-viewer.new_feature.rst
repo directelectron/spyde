@@ -1,0 +1,1 @@
+Clicking a phase's structure in the Composition dock now expands the phase to show its Kikuchi band sphere, with the detector's outline on it, beside the pattern the detector would record; drag the sphere to turn the crystal and the pattern follows.

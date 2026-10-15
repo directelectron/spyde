@@ -253,6 +253,21 @@ def euler_to_matrix(phi1, Phi, phi2) -> np.ndarray:
     return m
 
 
+def matrix_to_euler(matrix) -> np.ndarray:
+    """Bunge ZXZ Euler angles (radians, each in [0, 2π)) of one matrix — the
+    inverse of :func:`euler_to_matrix`. At Φ = 0 only φ1 + φ2 is defined, and
+    it is all given to φ1."""
+    m = np.asarray(matrix, float)
+    Phi = np.arccos(np.clip(m[2, 2], -1.0, 1.0))
+    if abs(np.sin(Phi)) > 1e-8:
+        phi1 = np.arctan2(m[2, 0], -m[2, 1])
+        phi2 = np.arctan2(m[0, 2], m[1, 2])
+    else:
+        phi1 = np.arctan2(m[0, 1], m[0, 0])
+        phi2 = 0.0
+    return np.mod(np.array([phi1, Phi, phi2]), 2 * np.pi)
+
+
 def normals_to_sample(normals, rot):
     """Plane normals from the CRYSTAL frame into the SAMPLE frame.
 
@@ -271,6 +286,55 @@ def normals_to_sample(normals, rot):
     (phi1 + 90). Transposed, that is exactly reversed.
     """
     return np.asarray(normals) @ np.asarray(rot)
+
+
+def band_intensity(directions, reflectors: Reflectors, *, normals=None,
+                   block: int = 65536) -> np.ndarray:
+    """Kinematic band intensity seen along unit *directions* ``(N, 3)``.
+
+    THE band profile: a Gaussian in ``r·n`` of half-width ``w`` per reflector,
+    weighted by its intensity. Every picture of the bands — a detector
+    pattern, the whole sphere of directions — is this function sampled at
+    different directions, so they cannot disagree.
+
+    *normals* are the plane normals in the same frame as *directions*; by
+    default the reflectors' own (crystal-frame) normals. Evaluated in blocks
+    of *block* directions so the ``(directions × reflectors)`` table stays
+    small for a whole-sphere texture.
+    """
+    normals = reflectors.normals if normals is None else np.asarray(normals)
+    directions = np.asarray(directions, float).reshape(-1, 3)
+    out = np.empty(len(directions), np.float32)
+    for start in range(0, len(directions), block):
+        d = directions[start:start + block] @ normals.T
+        band = np.exp(-0.5 * (d / reflectors.widths) ** 2) * reflectors.weights
+        out[start:start + block] = band.sum(1)
+    return out
+
+
+def sphere_directions(rows: int, cols: int) -> np.ndarray:
+    """Unit directions on a longitude × latitude grid → ``(rows, cols, 3)``.
+
+    Columns run longitude 0 → 2π and rows latitude +90° → −90°, the layout a
+    sphere's texture is mapped with, so an image sampled here wraps onto a
+    sphere built from the same grid with no remapping.
+    """
+    longitude = np.linspace(0.0, 2 * np.pi, int(cols))
+    latitude = np.linspace(np.pi / 2, -np.pi / 2, int(rows))
+    lon, lat = np.meshgrid(longitude, latitude)
+    return np.stack([np.cos(lat) * np.cos(lon), np.cos(lat) * np.sin(lon),
+                     np.sin(lat)], axis=-1)
+
+
+def band_sphere(reflectors: Reflectors, shape=(512, 1024)) -> np.ndarray:
+    """The kinematic master pattern: band intensity over every crystal
+    direction, as a ``shape`` longitude × latitude image (float32).
+
+    The detector pattern for any orientation is a window onto this sphere,
+    computed from the same :func:`band_intensity`.
+    """
+    directions = sphere_directions(*shape)
+    return band_intensity(directions, reflectors).reshape(shape)
 
 
 def simulate_patterns(euler, reflectors: Reflectors | None = None,
@@ -299,9 +363,7 @@ def simulate_patterns(euler, reflectors: Reflectors | None = None,
     out = np.empty((len(euler), dy, dx), np.float32)
     for i in range(len(euler)):
         n_rot = normals_to_sample(refl.normals, rot[i])
-        d = flat_r @ n_rot.T
-        band = np.exp(-0.5 * (d / refl.widths) ** 2) * refl.weights
-        out[i] = band.sum(1).reshape(dy, dx).astype(np.float32)
+        out[i] = band_intensity(flat_r, refl, normals=n_rot).reshape(dy, dx)
     if background:
         gy, gx = np.mgrid[0:dy, 0:dx].astype(np.float32)
         out = out / max(out.max(), 1e-9) + (

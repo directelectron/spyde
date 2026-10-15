@@ -7,10 +7,16 @@
  * ("Zr, Nb") it would say one compound of both — which is why a sample is a
  * list of phases and not an element list. EELS and EDS fit every element of
  * every phase; the indexing wizards use each phase's structure.
+ *
+ * Clicking a phase's structure expands the phase to show its viewer — the
+ * band sphere and the pattern it makes on the detector. That is part of the
+ * phase's setup, not a dataset, so it is shown here rather than in a window.
  */
 import React from 'react'
 import type { Composition } from '../kernel/SpyDEContext'
+import { useSpyDE } from '../kernel/SpyDEContext'
 import { PeriodicTable, structureName, structureTone } from './PeriodicTable'
+import { SeamlessFigureFrame } from './ReportFigureCell'
 
 interface Props {
   activeId: number | null
@@ -20,7 +26,15 @@ interface Props {
 
 export function CompositionPanel({ activeId, composition, sendAction }: Props) {
   const [editing, setEditing] = React.useState(false)
+  const [expanded, setExpanded] = React.useState<string | null>(null)
+  const { state, iframeRefs, replayState } = useSpyDE()
   const phases = composition?.phases ?? []
+
+  const toggleViewer = (phaseId: string) => {
+    if (expanded === phaseId) { setExpanded(null); return }
+    setExpanded(phaseId)
+    if (activeId != null) sendAction('show_phase', { phase: phaseId }, activeId)
+  }
 
   return (
     <div style={S.section} data-testid="composition-section">
@@ -39,7 +53,8 @@ export function CompositionPanel({ activeId, composition, sendAction }: Props) {
       </div>
 
       {phases.map((phase, index) => (
-        <div key={phase.id} style={S.phaseRow} data-testid={`composition-phase-${index}`}>
+        <React.Fragment key={phase.id}>
+        <div style={S.phaseRow} data-testid={`composition-phase-${index}`}>
           {index > 0 && <span style={S.ampersand}>&amp;</span>}
           <div style={S.chips}>
             {phase.elements.length === 0
@@ -59,18 +74,47 @@ export function CompositionPanel({ activeId, composition, sendAction }: Props) {
               })}
           </div>
           {phase.cifPath && (
-            <span style={{ ...S.structure, ...structureTone(phase) }} title={phase.cifPath}
+            <button style={{ ...S.structure, ...structureTone(phase) }}
+              title={`${phase.cifPath}\nClick to show this phase's Kikuchi bands`}
+              aria-expanded={expanded === phase.id}
+              disabled={activeId == null}
+              onClick={() => toggleViewer(phase.id)}
               data-testid={`composition-structure-${index}`}>
-              {structureName(phase)}
-            </span>
+              {expanded === phase.id ? '▾ ' : '▸ '}{structureName(phase)}
+            </button>
           )}
         </div>
+        {expanded === phase.id && phase.cifPath && (
+          <PhaseViewer figure={state.phaseFigures.get(phase.id)}
+            iframeRefs={iframeRefs} replayState={replayState} index={index} />
+        )}
+        </React.Fragment>
       ))}
 
       {editing && activeId != null && (
         <PeriodicTable windowId={activeId} phases={phases} sendAction={sendAction}
           onClose={() => setEditing(false)} />
       )}
+    </div>
+  )
+}
+
+/** A phase's band sphere and detector preview, under its row. */
+function PhaseViewer({ figure, iframeRefs, replayState, index }: {
+  figure?: { figId: string, filePath: string | null, title: string }
+  iframeRefs: React.MutableRefObject<Map<string, HTMLIFrameElement>>
+  replayState: (figId: string, target?: HTMLIFrameElement) => void
+  index: number
+}) {
+  return (
+    <div style={S.viewer} data-testid={`composition-viewer-${index}`}>
+      <div style={S.viewerFrame}>
+        {figure
+          ? <SeamlessFigureFrame figId={figure.figId} filePath={figure.filePath}
+              title={figure.title} iframeRefs={iframeRefs} replayState={replayState} />
+          : <span style={S.empty}>Simulating bands…</span>}
+      </div>
+      <span style={S.hint}>Drag the sphere to turn the crystal; the outline is the detector.</span>
     </div>
   )
 }
@@ -101,5 +145,17 @@ const S: Record<string, React.CSSProperties> = {
   },
   symbol: { fontSize: 11, fontWeight: 700, color: '#cdd6f4' },
   percent: { fontSize: 9, color: '#a6adc8' },
-  structure: { flex: 1, textAlign: 'right', fontSize: 9 },
+  viewer: { display: 'flex', flexDirection: 'column', gap: 2, marginTop: 4 },
+  // Matches phase_viewer.FIGURE_SIZE: a figure that is not a window is never
+  // resized, so its host is exactly its size. The frame fills it absolutely.
+  viewerFrame: {
+    position: 'relative', width: 276, height: 150, display: 'flex',
+    alignItems: 'center', justifyContent: 'center',
+  },
+  hint: { fontSize: 9, color: '#6c7086' },
+  structure: {
+    flex: 1, textAlign: 'right', fontSize: 9, background: 'none', border: 'none',
+    padding: 0, cursor: 'pointer', textDecoration: 'underline dotted',
+    textUnderlineOffset: 2,
+  },
 }

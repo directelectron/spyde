@@ -92,10 +92,14 @@ export interface FigureMessage extends MsgBase {
   view_kind?: string
   strain_components?: string[]
   /** When present + === "report", this figure belongs to a report figure cell
-   *  (routed to `reportFigures`, keyed by `cell_id`) — NOT the MDI windows. */
+   *  (routed to `reportFigures`, keyed by `cell_id`); === "phase", to a phase
+   *  in the Composition dock (routed to `phaseFigures`, keyed by `phase_id`).
+   *  Neither opens an MDI window. */
   host?: string
   /** The report cell id owning this figure (only set when host === "report"). */
   cell_id?: string
+  /** The phase owning this figure (only set when host === "phase"). */
+  phase_id?: string
 }
 
 export interface ToolbarConfigMessage extends MsgBase {
