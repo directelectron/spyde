@@ -10,7 +10,8 @@ several patterns at different orientations can.
 
 The steps, all on de_ebsd:
 
-1. remove each pattern's background (the smooth backscatter gradient);
+1. remove the detector's fixed intensity profile (the mean of the patterns)
+   and each pattern's own background (the smooth backscatter gradient);
 2. seed an orientation per pattern by dictionary indexing against the
    phase's dynamical master pattern (a 3° grid over its fundamental zone);
 3. fit the shared centre, refining the orientations alongside.
@@ -41,11 +42,15 @@ SEED_STEP_DEG = 3.0
 #: the seeding dictionary's cost grows with every pixel.
 MAX_SIDE = 160
 #: The mean per-tile correlation below which a solved centre is not trusted.
-#: Patterns too small or noisy to pin the centre still "improve" the fit by
-#: wandering off along the noise: kikuchipy's 60×60 nickel scan reaches 0.08
-#: while moving 0.05 away from its recorded centre. Clean synthetic patterns
-#: reach 0.8.
+#: kikuchipy's real Ni calibration patterns (nine, 480×480) solve to within
+#: 0.002 of kikuchipy's own refined centre from starts up to 0.05 off, at a
+#: fit of 0.35–0.46. A failed solve "improves" the fit by wandering off along
+#: the noise and stops near 0.08: those patterns with bad seeds, or
+#: kikuchipy's 60×60 nickel scan, which moves 0.05 from its recorded centre.
 MIN_FIT = 0.2
+#: Fewer patterns than this do not average their bands away, so no static
+#: background is estimated from them.
+MIN_PATTERNS_FOR_STATIC = 9
 
 
 @dataclass
@@ -100,6 +105,22 @@ def _bin(frame: np.ndarray) -> np.ndarray:
     return frame[:rows, :cols].reshape(rows // factor, factor, cols // factor, factor).mean((1, 3))
 
 
+def static_background(patterns) -> np.ndarray | None:
+    """The detector's fixed intensity profile, as the mean of *patterns*.
+
+    Patterns at different orientations average their bands away, leaving the
+    profile every frame shares. Without it the seeds go wrong: on kikuchipy's
+    real Ni calibration patterns, dictionary seeds were right for 5 of 9
+    patterns at the true centre (0 of 9 from 0.03 off) with only the
+    per-pattern background removed, and 9 of 9 (8 of 9) with this subtracted
+    too — as good as the background recorded with the scan. Too few patterns
+    still carry their own bands, so then there is none.
+    """
+    if len(patterns) < MIN_PATTERNS_FOR_STATIC:
+        return None
+    return np.asarray(patterns, np.float32).mean(0)
+
+
 def solve_pattern_centre(patterns, master, setup, point_group, *,
                          device=None, positions=()) -> Calibration:
     """Fit the pattern centre shared by *patterns* ``(N, rows, cols)``.
@@ -122,7 +143,8 @@ def solve_pattern_centre(patterns, master, setup, point_group, *,
         azimuthal=setup["azimuthal"], twist=setup["twist"])
     device = device or master.data.device
     master = master.to(device)
-    clean = remove_background(patterns, dynamic=True, device=device)
+    clean = remove_background(patterns, static_bg=static_background(patterns),
+                              dynamic=True, device=device)
     seeds, _quality = DictionaryIndexer(master, detector, point_group=point_group,
                                         resolution=SEED_STEP_DEG,
                                         device=device).index(clean)

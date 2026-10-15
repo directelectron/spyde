@@ -329,3 +329,12 @@ class TestCalibrationInputs:
         signal = hs.signals.Signal2D(np.ones((2, 480, 640), np.float32))
         patterns = read_patterns(signal, [(0,), (1,)])
         assert patterns.shape == (2, 120, 160) and max(patterns.shape[1:]) <= MAX_SIDE
+
+    def test_the_static_background_is_what_the_patterns_share(self):
+        from spyde.ebsd.calibrate import MIN_PATTERNS_FOR_STATIC, static_background
+
+        profile = np.linspace(1, 2, 16, dtype=np.float32)[None, :] * np.ones((16, 1), np.float32)
+        bands = np.random.default_rng(0).normal(0, 0.1, (64, 16, 16)).astype(np.float32)
+        background = static_background(profile + bands)
+        assert np.abs(background - profile).max() < 0.1
+        assert static_background((profile + bands)[:MIN_PATTERNS_FOR_STATIC - 1]) is None
