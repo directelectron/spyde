@@ -104,12 +104,25 @@ function SetupForm({ setup, phaseId, onChange }: {
         )}
       </button>
       {geometryOpen && (
-        <div style={S.fields}>
-          {setup.fields.map(field => (
-            <FieldInput key={field.key} field={field} phaseId={phaseId}
-              onCommit={(value) => onChange({ field: field.key, value })} />
-          ))}
-        </div>
+        <>
+          <div style={S.fields}>
+            {setup.fields.filter(field => !isPc(field)).map(field => (
+              <FieldInput key={field.key} field={field} phaseId={phaseId}
+                onCommit={(value) => onChange({ field: field.key, value })} />
+            ))}
+          </div>
+          {/* The pattern centre is one point; its three coordinates read as one row. */}
+          {setup.fields.some(isPc) && (
+            <div style={S.pcRow} data-testid={`phase-pc-${phaseId}`}>
+              <span style={S.pcLabel}>Pattern centre</span>
+              {setup.fields.filter(isPc).map(field => (
+                <FieldInput key={field.key} field={field} phaseId={phaseId}
+                  label={field.key.slice(3)}
+                  onCommit={(value) => onChange({ field: field.key, value })} />
+              ))}
+            </div>
+          )}
+        </>
       )}
     </div>
   )
@@ -126,8 +139,11 @@ function summarise(setup: PhaseSetupMessage): string {
   return `${n(v.beam_energy)} kV · ${n(v.camera_length)} mm`
 }
 
-function FieldInput({ field, phaseId, onCommit }: {
-  field: PhaseSetupField, phaseId: string, onCommit: (value: number) => void
+const isPc = (field: PhaseSetupField) => field.key.startsWith('pc_')
+
+function FieldInput({ field, phaseId, onCommit, label }: {
+  field: PhaseSetupField, phaseId: string, onCommit: (value: number) => void,
+  label?: string
 }) {
   const [text, setText] = React.useState(format(field.value))
   React.useEffect(() => { setText(format(field.value)) }, [field.value])
@@ -138,7 +154,7 @@ function FieldInput({ field, phaseId, onCommit }: {
   }
   return (
     <label style={S.field} title={SOURCE_TITLE[field.source]}>
-      <span style={S.fieldLabel}>{field.label}</span>
+      <span style={label ? S.pcAxis : S.fieldLabel}>{label ?? field.label}</span>
       <span style={S.fieldValue}>
         <input type="number" value={text} step={field.step} style={S.input}
           onChange={(e) => setText(e.currentTarget.value)}
@@ -208,6 +224,12 @@ const S: Record<string, React.CSSProperties> = {
     display: 'grid', gridTemplateColumns: 'repeat(3, minmax(0, 1fr))', gap: '4px 12px',
   },
   field: { display: 'flex', alignItems: 'center', gap: 6, minWidth: 0 },
+  pcRow: {
+    display: 'grid', gridTemplateColumns: 'auto repeat(3, minmax(0, 1fr))',
+    alignItems: 'center', gap: '4px 12px',
+  },
+  pcLabel: { fontSize: 10, color: '#a6adc8', whiteSpace: 'nowrap' },
+  pcAxis: { fontSize: 10, color: '#a6adc8' },
   fieldLabel: { fontSize: 10, color: '#a6adc8', flex: 1, whiteSpace: 'nowrap' },
   fieldValue: { display: 'flex', alignItems: 'center', gap: 3 },
   input: {
