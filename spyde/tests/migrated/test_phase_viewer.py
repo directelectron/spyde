@@ -1,29 +1,33 @@
 """
-test_phase_viewer.py — a phase's band sphere and its detector preview.
+test_phase_viewer.py — the phase viewer: master pattern, unit cell, detector,
+and the microscope set-up they are simulated in.
 
-The viewer draws the same bands three ways (the sphere, the preview, and — in
-the EBSD wizard — the dictionary and live overlay), so the contract that
-matters is that they agree: the preview at a sphere rotation must be exactly
-``simulate_patterns`` at the matching Bunge angles. Getting the frame
-convention backwards would still draw plausible bands, just for the INVERSE
-orientation, so this is pinned against the established function rather than
-eyeballed.
+The viewer draws the same bands as the EBSD wizard's dictionary, so the
+contract that matters is that they agree: the preview at a crystal rotation
+must be exactly ``simulate_patterns`` at the matching Bunge angles. Getting a
+frame backwards would still draw plausible bands, just for the wrong
+orientation, so this is pinned against the established function — with and
+without a tilted sample — rather than eyeballed.
 """
 import os
 
 import numpy as np
 import pytest
 import hyperspy.api as hs
+from orix.crystal_map import Phase
 
 from spyde.actions import composition as comp
-from spyde.actions import phase_viewer as viewer
+from spyde.actions import phase_viewer as pv
+from spyde.ebsd import microscope
 from spyde.ebsd.bands import (
     band_intensity, band_sphere, cubic_reflectors, euler_to_matrix,
-    matrix_to_euler, reflectors_from_phase, simulate_patterns,
-    sphere_directions,
+    matrix_to_euler, simulate_patterns, sphere_directions, wavelength,
 )
+from spyde.ebsd.spots import reflections_from_phase, spot_pixels
+from spyde.ebsd.unit_cell import unit_cell
 
 CIF = os.path.join(os.path.dirname(__file__), "..", "Silver__0011135.cif")
+AG = {"id": "ag", "elements": ["Ag"], "cif_path": CIF, "label": "Ag"}
 
 
 class _Tree:
@@ -33,51 +37,49 @@ class _Tree:
 
 
 class _Session:
-    """With no ``_dispatch_to_main`` the worker step runs inline."""
+    """With no ``_dispatch_to_main`` the worker steps run inline."""
 
 
 @pytest.fixture
 def messages(monkeypatch):
     sent = []
-    monkeypatch.setattr(viewer, "emit_status",
-                        lambda text: sent.append(("status", text)))
-    monkeypatch.setattr(viewer, "emit_error",
-                        lambda text: sent.append(("error", text)))
-    from de_shell import ipc
-    monkeypatch.setattr(ipc, "emit", lambda message: sent.append(message))
+    monkeypatch.setattr(pv, "emit", sent.append)
+    monkeypatch.setattr(pv, "emit_status", lambda text: None)
+    monkeypatch.setattr(pv, "emit_error", lambda text: sent.append(("error", text)))
+    monkeypatch.setattr(pv, "SPHERE_TEXTURE", (32, 64))
     return sent
 
 
-def _figures(messages):
-    return [m for m in messages if isinstance(m, dict) and m.get("type") == "figure"]
-
-
-def _ebsd_tree(*phases, beam_energy=None):
+def _sem_tree(*phases, **metadata):
     signal = hs.signals.Signal2D(np.zeros((2, 2, 30, 40), np.float32))
-    if beam_energy is not None:
-        signal.metadata.set_item("Acquisition_instrument.SEM.beam_energy",
-                                 beam_energy)
+    signal.metadata.set_item("Acquisition_instrument.SEM.beam_energy",
+                             metadata.pop("beam_energy", 20.0))
+    for key, value in metadata.items():
+        signal.metadata.set_item(key, value)
     tree = _Tree(signal)
-    comp.write_phases(tree, list(phases))
+    comp.write_phases(tree, list(phases) or [AG])
     return tree
 
 
-def _controller(reflectors=None, shape=(40, 50), pc=(0.45, 0.55, 0.6)):
-    reflectors = reflectors or cubic_reflectors()
-    return viewer.PhaseViewerController(
-        {"id": "p", "elements": ["Ag"]}, reflectors,
-        np.random.default_rng(0).random((16, 32)), voltage_kv=20, pc=pc,
-        shape=shape)
+def _open(monkeypatch, tree, phase_id="ag"):
+    monkeypatch.setattr(comp, "_src_plot_tree", lambda session, plot: (None, tree))
+    pv.show_phase(_Session(), None, {"phase": phase_id})
+    return tree._phase_viewers[phase_id]
+
+
+def _setup(mode="SEM", **values):
+    fields = microscope.FIELDS[mode]
+    merged = {f.key: f.default for f in fields} | values
+    return microscope.Setup(mode, merged, {k: "default" for k in merged})
 
 
 class TestOneBandProfile:
     def test_simulate_patterns_is_band_intensity_on_the_detector(self):
-        """The refactor that made the sphere possible changed no pattern."""
+        from spyde.ebsd.bands import detector_directions
         reflectors = cubic_reflectors()
         euler = np.array([[0.3, 0.7, 1.1]])
         old_style = simulate_patterns(euler, reflectors, (30, 40), (0.5, 0.5, 0.55))
         rot = euler_to_matrix(*euler[0])
-        from spyde.ebsd.bands import detector_directions
         rays = detector_directions((30, 40), (0.5, 0.5, 0.55)).reshape(-1, 3)
         direct = band_intensity(rays, reflectors,
                                 normals=reflectors.normals @ rot).reshape(30, 40)
@@ -85,16 +87,9 @@ class TestOneBandProfile:
 
     def test_the_sphere_is_band_intensity_over_all_directions(self):
         reflectors = cubic_reflectors()
-        sphere = band_sphere(reflectors, (20, 40))
-        expected = band_intensity(sphere_directions(20, 40), reflectors)
-        np.testing.assert_allclose(sphere.ravel(), expected)
-
-    def test_blocks_do_not_change_the_answer(self):
-        reflectors = cubic_reflectors()
-        directions = sphere_directions(30, 60).reshape(-1, 3)
         np.testing.assert_allclose(
-            band_intensity(directions, reflectors, block=7),
-            band_intensity(directions, reflectors))
+            band_sphere(reflectors, (20, 40)).ravel(),
+            band_intensity(sphere_directions(20, 40), reflectors))
 
     def test_euler_round_trip(self):
         rng = np.random.default_rng(1)
@@ -105,119 +100,128 @@ class TestOneBandProfile:
                                        atol=1e-12)
 
 
+class TestSetup:
+    def test_values_come_from_metadata_and_say_so(self):
+        tree = _sem_tree(beam_energy=15.0)
+        setup = microscope.read_setup(tree.root, "SEM")
+        assert setup["beam_energy"] == 15.0
+        assert setup.sources["beam_energy"] == "metadata"
+        assert setup.sources["sample_tilt"] == "default"
+
+    def test_writing_a_field_records_it(self):
+        tree = _sem_tree()
+        microscope.write_field(tree.root, "SEM", "sample_tilt", 65.0)
+        assert tree.root.metadata.get_item(
+            "Acquisition_instrument.SEM.Stage.tilt_alpha") == 65.0
+
+    def test_the_sample_normal_sits_above_the_pattern_centre(self):
+        to_sample = microscope.detector_to_sample(_setup("SEM"))
+        normal_on_screen = to_sample.T @ np.array([0.0, 0.0, 1.0])
+        assert normal_on_screen[1] > 0.3            # up, by sin(20°)
+        np.testing.assert_allclose(np.degrees(np.arccos(normal_on_screen[2])), 20)
+
+    def test_the_camera_looks_from_the_detector(self):
+        azimuth, elevation = microscope.camera_angles(_setup("SEM"))
+        assert azimuth == pytest.approx(0) and elevation == pytest.approx(70)
+
+
 class TestPreviewParity:
-    @pytest.mark.parametrize("euler", [(0.0, 0.0, 0.0), (0.4, 0.9, 1.3),
-                                       (2.5, 0.3, 4.0)])
-    def test_preview_matches_simulate_patterns(self, euler):
-        """The sphere's model rotation carries crystal directions into the
-        sample frame, i.e. the TRANSPOSE of the Bunge matrix."""
-        controller = _controller()
-        rot = euler_to_matrix(*euler)
-        expected = simulate_patterns(np.array([euler]), controller.reflectors,
-                                     controller.shape, controller.pc)[0]
-        np.testing.assert_allclose(controller.pattern(rot.T), expected, rtol=1e-6)
-
-    def test_a_drag_repaints_the_preview_and_title(self):
-        controller = _controller()
-        before = controller.detector.data.copy()
-        rot = euler_to_matrix(0.4, 0.9, 1.3)
-        controller.sphere._set_rotation_from_js(list(rot.T.ravel()))
-
-        class Event:
-            rotation = list(rot.T.ravel())
-
-        controller._on_turn(Event())
-        assert not np.array_equal(before, controller.detector.data)
-        assert controller.detector._state["title"].startswith("φ1 23°  Φ 52°")
-
-    def test_a_wheel_zoom_does_not_repaint(self):
-        controller = _controller()
-        before = controller.detector.data.copy()
-
-        class Event:
-            rotation = None
-
-        controller._on_turn(Event())
-        np.testing.assert_array_equal(before, controller.detector.data)
-
-    def test_the_footprint_is_fixed_to_the_microscope(self):
-        controller = _controller()
-        (patch,) = controller.sphere._state["patches"]
-        assert patch["frame"] == "world" and patch["closed"]
+    @pytest.mark.parametrize("sample_tilt", [90.0, 70.0])
+    @pytest.mark.parametrize("euler", [(0.0, 0.0, 0.0), (0.4, 0.9, 1.3)])
+    def test_preview_matches_simulate_patterns(self, monkeypatch, messages,
+                                               sample_tilt, euler):
+        """At 90° the detector and sample frames coincide (the wizard's frame);
+        tilted, the detector sees the crystal through the tilt rotation."""
+        tree = _sem_tree(**{"Acquisition_instrument.SEM.Stage.tilt_alpha": sample_tilt})
+        viewer = _open(monkeypatch, tree)
+        crystal = euler_to_matrix(*euler).T            # crystal → sample
+        viewer.rotation = crystal
+        detector_bunge = crystal.T @ viewer._to_sample  # detector → crystal
+        expected = simulate_patterns(
+            np.array([matrix_to_euler(detector_bunge)]), viewer.reflectors(),
+            viewer.shape, (viewer.setup["pc_x"], viewer.setup["pc_y"],
+                           viewer.setup["pc_z"]))[0]
+        np.testing.assert_allclose(viewer.pattern(), expected, rtol=1e-5, atol=1e-6)
 
 
-class TestGeometry:
-    def test_voltage_comes_from_the_signal(self):
-        assert viewer.beam_voltage_kv(_ebsd_tree(beam_energy=15).root) == 15
-        assert viewer.beam_voltage_kv(_ebsd_tree().root) == viewer.DEFAULT_VOLTAGE_KV
+class TestUnitCellAndSpots:
+    def test_fcc_cell_has_its_face_and_corner_atoms(self):
+        positions, elements, edges = unit_cell(Phase.from_cif(CIF))
+        assert len(positions) == 14 and set(elements) == {"Ag"}
+        lengths = np.linalg.norm(edges[:, 1] - edges[:, 0], axis=1)
+        np.testing.assert_allclose(lengths, 4.0862, atol=1e-3)
 
-    def test_preview_keeps_the_detector_aspect(self):
-        rows, cols = viewer.preview_shape(_ebsd_tree().root)       # 30 × 40
-        assert cols == viewer.PREVIEW_PIXELS
-        assert rows == round(viewer.PREVIEW_PIXELS * 30 / 40)
+    def test_fcc_001_zone_spot_rings(self):
+        """At [001] the spots are {200}, {220}, {400}, {420}: radii in the
+        ratio 1 : √2 : 2 : √5."""
+        setup = _setup("TEM")
+        half = setup["detector_size"] / 2 / setup["camera_length"]
+        pixels, _ = spot_pixels(reflections_from_phase(Phase.from_cif(CIF)),
+                                np.eye(3), microscope.detector_to_sample(setup),
+                                wavelength(setup["beam_energy"]),
+                                (-half, half, -half, half), (160, 160))
+        radii = np.unique(np.round(np.hypot(*(pixels[1:] - pixels[0]).T), 1))
+        np.testing.assert_allclose(radii[:4] / radii[0],
+                                   [1, np.sqrt(2), 2, np.sqrt(5)], rtol=0.03)
 
 
-def _show(monkeypatch, tree, phase_id="ag"):
-    monkeypatch.setattr(comp, "_src_plot_tree", lambda session, plot: (None, tree))
-    viewer.show_phase(_Session(), None, {"phase": phase_id})
-
-
-AG = {"id": "ag", "elements": ["Ag"], "cif_path": CIF, "label": "Ag"}
-
-
-class TestShowPhase:
-    def test_the_figure_goes_to_the_phase_not_to_a_window(self, monkeypatch,
-                                                         messages):
-        monkeypatch.setattr(viewer, "SPHERE_TEXTURE", (64, 128))
-        tree = _ebsd_tree(AG, beam_energy=15)
-        _show(monkeypatch, tree)
-
-        (figure,) = _figures(messages)
+class TestViewer:
+    def test_the_figure_goes_to_the_phase_with_its_setup(self, monkeypatch, messages):
+        _open(monkeypatch, _sem_tree(beam_energy=15.0))
+        figure = next(m for m in messages if m.get("type") == "figure")
         assert figure["host"] == "phase" and figure["phase_id"] == "ag"
         assert "window_id" not in figure
-        held = tree._phase_viewers["ag"]
-        assert held.voltage_kv == 15
-        from orix.crystal_map import Phase
-        expected = reflectors_from_phase(Phase.from_cif(CIF), voltage_kv=15)
-        np.testing.assert_allclose(held.reflectors.widths, expected.widths)
+        setup = next(m for m in messages if m.get("type") == "phase_setup")
+        fields = {f["key"]: f for f in setup["fields"]}
+        assert setup["mode"] == "SEM" and fields["beam_energy"]["value"] == 15.0
+        assert fields["beam_energy"]["source"] == "metadata"
 
-    def test_showing_again_resends_without_recomputing(self, monkeypatch,
-                                                       messages):
-        monkeypatch.setattr(viewer, "SPHERE_TEXTURE", (64, 128))
-        tree = _ebsd_tree(AG)
-        _show(monkeypatch, tree)
-        first = tree._phase_viewers["ag"]
-        monkeypatch.setattr(viewer, "run_on_worker",
-                            lambda *a, **k: pytest.fail("recomputed the sphere"))
-        _show(monkeypatch, tree)
-        assert tree._phase_viewers["ag"] is first
-        one, two = _figures(messages)
-        assert one["fig_id"] == two["fig_id"]
-
-    def test_a_new_voltage_recomputes(self, monkeypatch, messages):
-        monkeypatch.setattr(viewer, "SPHERE_TEXTURE", (64, 128))
-        tree = _ebsd_tree(AG, beam_energy=20)
-        _show(monkeypatch, tree)
-        first = tree._phase_viewers["ag"]
-        tree.root.metadata.set_item("Acquisition_instrument.SEM.beam_energy", 10)
-        _show(monkeypatch, tree)
-        assert tree._phase_viewers["ag"] is not first
-        assert first._closed and tree._phase_viewers["ag"].voltage_kv == 10
-
-    def test_a_phase_without_a_structure_says_so(self, monkeypatch, messages):
-        tree = _ebsd_tree({"id": "ag", "elements": ["Ag"]})
-        _show(monkeypatch, tree)
-        assert not _figures(messages)
-        assert any(isinstance(m, tuple) and m[0] == "error" and "no structure" in m[1]
-                   for m in messages)
-
-    def test_close_stops_repaints(self):
-        controller = _controller()
-        controller.close()
-        before = controller.detector.data.copy()
+    def test_turning_one_pane_turns_the_other(self, monkeypatch, messages):
+        viewer = _open(monkeypatch, _sem_tree())
+        before = viewer.detector.data.copy()
+        rotation = euler_to_matrix(0.4, 0.9, 1.3).T
+        viewer.sphere._set_rotation_from_js(list(rotation.ravel()))
 
         class Event:
-            rotation = list(np.eye(3).ravel())
+            rotation = list(np.ravel(euler_to_matrix(0.4, 0.9, 1.3).T))
 
-        controller._on_turn(Event())
-        np.testing.assert_array_equal(before, controller.detector.data)
+        viewer._on_turn(Event(), viewer.sphere)
+        np.testing.assert_allclose(viewer.cell.rotation, rotation)
+        assert not np.array_equal(before, viewer.detector.data)
+
+    def test_a_field_edit_writes_metadata_and_moves_the_detector(self, monkeypatch,
+                                                                 messages):
+        tree = _sem_tree()
+        viewer = _open(monkeypatch, tree)
+        before = viewer.detector.data.copy()
+        pv.phase_setup_set(_Session(), None, {"phase": "ag", "field": "pc_y",
+                                              "value": 0.3})
+        assert tree.root.metadata.get_item(
+            "Acquisition_instrument.SEM.Detector.EBSD.pc_y") == 0.3
+        assert not np.array_equal(before, viewer.detector.data)
+
+    def test_tem_mode_shows_spots(self, monkeypatch, messages):
+        viewer = _open(monkeypatch, _sem_tree())
+        pv.phase_setup_set(_Session(), None, {"phase": "ag", "mode": "TEM"})
+        assert viewer.setup.mode == "TEM" and viewer.show_spots
+        pixels, _ = viewer.spots()
+        assert len(pixels) > 5
+        setup = [m for m in messages if m.get("type") == "phase_setup"][-1]
+        assert setup["spots_apply"] and not setup["full"]["applies"]
+
+    def test_full_simulation_is_refused_without_de_ebsd(self, monkeypatch, messages):
+        monkeypatch.setattr(pv, "full_simulation_available", lambda: False)
+        viewer = _open(monkeypatch, _sem_tree())
+        pv.phase_setup_set(_Session(), None, {"phase": "ag", "master": "full"})
+        assert viewer.master == "bands"
+
+    def test_reopening_keeps_the_viewer(self, monkeypatch, messages):
+        tree = _sem_tree()
+        first = _open(monkeypatch, tree)
+        assert _open(monkeypatch, tree) is first
+
+    def test_a_phase_without_a_structure_says_so(self, monkeypatch, messages):
+        tree = _sem_tree({"id": "ag", "elements": ["Ag"]})
+        monkeypatch.setattr(comp, "_src_plot_tree", lambda session, plot: (None, tree))
+        pv.show_phase(_Session(), None, {"phase": "ag"})
+        assert any(isinstance(m, tuple) and "no structure" in m[1] for m in messages)

@@ -177,6 +177,31 @@ export interface CompositionMessage extends MsgBase {
   elements?: string[]
 }
 
+/** One editable number of a phase viewer's microscope set-up. */
+export interface PhaseSetupField {
+  key: string
+  label: string
+  unit: string
+  value: number
+  step: number
+  /** "metadata" read from the signal, "data" stamped on it, "default" a guess. */
+  source: 'metadata' | 'data' | 'default'
+}
+
+/** A phase viewer's set-up: everything its form shows (phase_viewer.py). */
+export interface PhaseSetupMessage extends MsgBase {
+  type: 'phase_setup'
+  phase_id: string
+  title: string
+  subtitle: string
+  mode: 'SEM' | 'TEM'
+  fields: PhaseSetupField[]
+  master: 'bands' | 'full'
+  full: { available: boolean, applies: boolean, state: string, note: string }
+  spots: boolean
+  spots_apply: boolean
+}
+
 export interface MetadataMessage extends MsgBase {
   type: 'metadata'
   window_ids?: number[]
@@ -1142,6 +1167,7 @@ export type PlotAppMessage =
   | StateUpdateMessage
   | StateUpdateBinaryMessage
   | CompositionMessage
+  | PhaseSetupMessage
   | MetadataMessage
   | AxesInfoMessage
   | OffsetPickMessage

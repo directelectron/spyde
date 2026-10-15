@@ -8,15 +8,16 @@
  * list of phases and not an element list. EELS and EDS fit every element of
  * every phase; the indexing wizards use each phase's structure.
  *
- * Clicking a phase's structure expands the phase to show its viewer — the
- * band sphere and the pattern it makes on the detector. That is part of the
- * phase's setup, not a dataset, so it is shown here rather than in a window.
+ * Clicking a phase's structure pops its viewer out beside the sidebar — the
+ * master pattern, unit cell and detector, and the set-up they are simulated
+ * in. That is part of the phase's set-up, not a dataset, so it never becomes
+ * a window. Several open phases stack.
  */
 import React from 'react'
 import type { Composition } from '../kernel/SpyDEContext'
 import { useSpyDE } from '../kernel/SpyDEContext'
 import { PeriodicTable, structureName, structureTone } from './PeriodicTable'
-import { SeamlessFigureFrame } from './ReportFigureCell'
+import { PhaseViewerCard, type PhaseSetupChange } from './PhaseViewerCard'
 
 interface Props {
   activeId: number | null
@@ -26,18 +27,27 @@ interface Props {
 
 export function CompositionPanel({ activeId, composition, sendAction }: Props) {
   const [editing, setEditing] = React.useState(false)
-  const [expanded, setExpanded] = React.useState<string | null>(null)
+  const [open, setOpen] = React.useState<string[]>([])
   const { state, iframeRefs, replayState } = useSpyDE()
   const phases = composition?.phases ?? []
+  const sectionRef = React.useRef<HTMLDivElement | null>(null)
+
+  // A phase that left the sample takes its viewer with it.
+  React.useEffect(() => {
+    setOpen(ids => ids.filter(id => phases.some(phase => phase.id === id)))
+  }, [phases])
 
   const toggleViewer = (phaseId: string) => {
-    if (expanded === phaseId) { setExpanded(null); return }
-    setExpanded(phaseId)
+    if (open.includes(phaseId)) { setOpen(ids => ids.filter(id => id !== phaseId)); return }
+    setOpen(ids => [...ids, phaseId])
     if (activeId != null) sendAction('show_phase', { phase: phaseId }, activeId)
+  }
+  const change = (phaseId: string, update: PhaseSetupChange) => {
+    if (activeId != null) sendAction('phase_setup_set', { phase: phaseId, ...update }, activeId)
   }
 
   return (
-    <div style={S.section} data-testid="composition-section">
+    <div ref={sectionRef} style={S.section} data-testid="composition-section">
       <div style={S.head}>
         <span style={S.label}>Composition</span>
         {/* The empty state rides ON the header row rather than costing a line of
@@ -53,8 +63,7 @@ export function CompositionPanel({ activeId, composition, sendAction }: Props) {
       </div>
 
       {phases.map((phase, index) => (
-        <React.Fragment key={phase.id}>
-        <div style={S.phaseRow} data-testid={`composition-phase-${index}`}>
+        <div key={phase.id} style={S.phaseRow} data-testid={`composition-phase-${index}`}>
           {index > 0 && <span style={S.ampersand}>&amp;</span>}
           <div style={S.chips}>
             {phase.elements.length === 0
@@ -75,21 +84,29 @@ export function CompositionPanel({ activeId, composition, sendAction }: Props) {
           </div>
           {phase.cifPath && (
             <button style={{ ...S.structure, ...structureTone(phase) }}
-              title={`${phase.cifPath}\nClick to show this phase's Kikuchi bands`}
-              aria-expanded={expanded === phase.id}
+              title={`${phase.cifPath}\nClick to view this phase and its simulation set-up`}
+              aria-pressed={open.includes(phase.id)}
               disabled={activeId == null}
               onClick={() => toggleViewer(phase.id)}
               data-testid={`composition-structure-${index}`}>
-              {expanded === phase.id ? '▾ ' : '▸ '}{structureName(phase)}
+              {structureName(phase)} {open.includes(phase.id) ? '◂' : '▸'}
             </button>
           )}
         </div>
-        {expanded === phase.id && phase.cifPath && (
-          <PhaseViewer figure={state.phaseFigures.get(phase.id)}
-            iframeRefs={iframeRefs} replayState={replayState} index={index} />
-        )}
-        </React.Fragment>
       ))}
+
+      {open.length > 0 && (
+        <PopOut anchor={sectionRef}>
+          {open.map(phaseId => (
+            <PhaseViewerCard key={phaseId} phaseId={phaseId}
+              setup={state.phaseSetups.get(phaseId)}
+              figure={state.phaseFigures.get(phaseId)}
+              iframeRefs={iframeRefs} replayState={replayState}
+              onChange={(update) => change(phaseId, update)}
+              onClose={() => setOpen(ids => ids.filter(id => id !== phaseId))} />
+          ))}
+        </PopOut>
+      )}
 
       {editing && activeId != null && (
         <PeriodicTable windowId={activeId} phases={phases} sendAction={sendAction}
@@ -99,22 +116,28 @@ export function CompositionPanel({ activeId, composition, sendAction }: Props) {
   )
 }
 
-/** A phase's band sphere and detector preview, under its row. */
-function PhaseViewer({ figure, iframeRefs, replayState, index }: {
-  figure?: { figId: string, filePath: string | null, title: string }
-  iframeRefs: React.MutableRefObject<Map<string, HTMLIFrameElement>>
-  replayState: (figId: string, target?: HTMLIFrameElement) => void
-  index: number
+/** A column pinned just left of the sidebar, starting level with *anchor*
+ *  and scrolling when its cards outgrow the window. */
+function PopOut({ anchor, children }: {
+  anchor: React.RefObject<HTMLDivElement | null>, children: React.ReactNode
 }) {
+  const [place, setPlace] = React.useState({ right: 316, top: 56 })
+  React.useLayoutEffect(() => {
+    const measure = () => {
+      const rect = anchor.current?.getBoundingClientRect()
+      if (!rect) return
+      setPlace({ right: window.innerWidth - rect.left + 8,
+                 top: Math.max(48, Math.min(rect.top, window.innerHeight - 320)) })
+    }
+    measure()
+    window.addEventListener('resize', measure)
+    return () => window.removeEventListener('resize', measure)
+  }, [anchor])
   return (
-    <div style={S.viewer} data-testid={`composition-viewer-${index}`}>
-      <div style={S.viewerFrame}>
-        {figure
-          ? <SeamlessFigureFrame figId={figure.figId} filePath={figure.filePath}
-              title={figure.title} iframeRefs={iframeRefs} replayState={replayState} />
-          : <span style={S.empty}>Simulating bands…</span>}
-      </div>
-      <span style={S.hint}>Drag the sphere to turn the crystal; the outline is the detector.</span>
+    <div style={{ ...S.popOut, right: place.right, top: place.top,
+                  maxHeight: `calc(100vh - ${place.top + 40}px)` }}
+      data-testid="phase-popout">
+      {children}
     </div>
   )
 }
@@ -145,17 +168,13 @@ const S: Record<string, React.CSSProperties> = {
   },
   symbol: { fontSize: 11, fontWeight: 700, color: '#cdd6f4' },
   percent: { fontSize: 9, color: '#a6adc8' },
-  viewer: { display: 'flex', flexDirection: 'column', gap: 2, marginTop: 4 },
-  // Matches phase_viewer.FIGURE_SIZE: a figure that is not a window is never
-  // resized, so its host is exactly its size. The frame fills it absolutely.
-  viewerFrame: {
-    position: 'relative', width: 276, height: 150, display: 'flex',
-    alignItems: 'center', justifyContent: 'center',
-  },
-  hint: { fontSize: 9, color: '#6c7086' },
   structure: {
     flex: 1, textAlign: 'right', fontSize: 9, background: 'none', border: 'none',
     padding: 0, cursor: 'pointer', textDecoration: 'underline dotted',
     textUnderlineOffset: 2,
+  },
+  popOut: {
+    position: 'fixed', zIndex: 40, display: 'flex', flexDirection: 'column', gap: 8,
+    overflowY: 'auto', overflowX: 'hidden',
   },
 }
