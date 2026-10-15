@@ -22,6 +22,7 @@ export type PhaseSetupChange =
   | { field: string, value: number }
   | { master: 'bands' | 'full' }
   | { spots: boolean }
+  | { solve_pc: true }
 
 interface Props {
   phaseId: string
@@ -120,7 +121,19 @@ function SetupForm({ setup, phaseId, onChange }: {
                   label={field.key.slice(3)}
                   onCommit={(value) => onChange({ field: field.key, value })} />
               ))}
+              {setup.solve?.available && (
+                <button style={S.solve} disabled={setup.solve.state === 'solving'}
+                  onClick={() => onChange({ solve_pc: true })}
+                  title="Fit the pattern centre to patterns read across the scan"
+                  data-testid={`phase-solve-pc-${phaseId}`}>
+                  {setup.solve.state === 'solving' ? 'Solving…' : 'Solve from data'}
+                </button>
+              )}
             </div>
+          )}
+          {setup.solve?.note && (
+            <span style={setup.solve.state === 'error' ? S.solveWarn : S.muted}
+              data-testid={`phase-solve-note-${phaseId}`}>{setup.solve.note}</span>
           )}
         </>
       )}
@@ -225,9 +238,14 @@ const S: Record<string, React.CSSProperties> = {
   },
   field: { display: 'flex', alignItems: 'center', gap: 6, minWidth: 0 },
   pcRow: {
-    display: 'grid', gridTemplateColumns: 'auto repeat(3, minmax(0, 1fr))',
+    display: 'grid', gridTemplateColumns: 'auto repeat(3, minmax(0, 1fr)) auto',
     alignItems: 'center', gap: '4px 12px',
   },
+  solve: {
+    background: '#1e1e2e', color: '#89b4fa', border: '1px solid #313244', borderRadius: 4,
+    fontSize: 10, padding: '3px 8px', cursor: 'pointer', whiteSpace: 'nowrap',
+  },
+  solveWarn: { fontSize: 10, color: '#f9e2af' },
   pcLabel: { fontSize: 10, color: '#a6adc8', whiteSpace: 'nowrap' },
   pcAxis: { fontSize: 10, color: '#a6adc8' },
   fieldLabel: { fontSize: 10, color: '#a6adc8', flex: 1, whiteSpace: 'nowrap' },

@@ -198,6 +198,8 @@ export interface PhaseSetupMessage extends MsgBase {
   fields: PhaseSetupField[]
   master: 'bands' | 'full'
   full: { available: boolean, applies: boolean, state: string, note: string }
+  /** Solving the pattern centre from the scan's own patterns (SEM only). */
+  solve?: { available: boolean, state: 'none' | 'solving' | 'done' | 'error', note: string }
   spots: boolean
   spots_apply: boolean
 }

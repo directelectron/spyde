@@ -116,6 +116,21 @@ test('the full simulation replaces the kinematic bands', async () => {
   expect((await region(0, 0)).equals(before)).toBe(false)
 })
 
+test('solving the pattern centre from the scan reports its fit', async () => {
+  const solve = card(0).getByTestId(/phase-solve-pc-/)
+  if (!await solve.count()) test.skip(true, 'de_ebsd is not installed here')
+  test.setTimeout(240_000)
+  await solve.click()
+  await expect(solve).toHaveText('Solving…')
+  // The answer depends on how well the phase matches the data; either way
+  // the note says what the fit was and whether the centre was written.
+  await expect(card(0).getByTestId(/phase-solve-note-/))
+    .toContainText(/patterns · fit/, { timeout: 200_000 })
+  await expect(solve).toHaveText('Solve from data')
+  await page.waitForTimeout(800)
+  await shot('04-solved')
+})
+
 test('a second phase stacks under the first', async () => {
   await page.getByTestId('composition-edit').click()
   await page.getByTestId('ptable-add-phase').click()

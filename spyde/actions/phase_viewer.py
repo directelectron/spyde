@@ -30,7 +30,9 @@ the intensities and never the geometry.
 
 Which microscope is read off the signal, not chosen. The set-up's numbers
 are read from, and written back to, the signal's metadata
-(:mod:`spyde.ebsd.microscope`), so the indexing wizards see them too.
+(:mod:`spyde.ebsd.microscope`), so the indexing wizards see them too. On an
+EBSD scan the pattern centre can instead be solved from the scan's own
+patterns (:mod:`spyde.ebsd.calibrate`).
 """
 from __future__ import annotations
 
@@ -114,6 +116,8 @@ class PhaseViewer:
         self.master = "bands"                   # or "full"
         self.full_state = "none"                # computing | ready | error
         self.full_note = ""
+        self.solve_state = "none"               # solving | done | error
+        self.solve_note = ""
         self.show_spots = setup.microscope == "TEM"
         self.rotation = np.eye(3)               # crystal → sample
         self._textures: dict = {}               # ("bands", kV) | ("full", key) → image
@@ -354,30 +358,32 @@ class PhaseViewer:
         self.show_spots = bool(show)
         self._paint_detector()
 
+    def _simulate_full(self, key):
+        """The dynamical master pattern at *key* (kV, sample tilt), on the CPU.
+        Slow: run off the main thread."""
+        import de_ebsd
+        from spyde.device_lock import accelerator_lock
+
+        device = _device()
+        crystal = de_ebsd.Crystal.from_cif(self.phase["cif_path"])
+        microscope = de_ebsd.Microscope(energy=key[0] * 1e3, sample_tilt=key[1])
+        simulator = de_ebsd.MasterPatternSimulator(
+            crystal, microscope, npx=FULL_NPX, dmin=FULL_DMIN, backend="bloch_prism")
+        with accelerator_lock(device):
+            return simulator.compute(device=device).to("cpu")
+
     def _compute_full(self) -> None:
         key = self._full_key()
-        cif = self.phase["cif_path"]
         self.full_state, self.full_note = "computing", "Simulating…"
         self.emit_setup()
 
         def work():
-            import de_ebsd
-            import torch
-            from spyde.device_lock import accelerator_lock
-
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            crystal = de_ebsd.Crystal.from_cif(cif)
-            microscope = de_ebsd.Microscope(energy=key[0] * 1e3, sample_tilt=key[1])
-            simulator = de_ebsd.MasterPatternSimulator(
-                crystal, microscope, npx=FULL_NPX, dmin=FULL_DMIN,
-                backend="bloch_prism")
-            with accelerator_lock(device):
-                return simulator.compute(device=device)
+            return self._simulate_full(key)
 
         def done(pattern):
             if self._closed:
                 return
-            self._full_patterns[key] = pattern.to("cpu")
+            self._full_patterns[key] = pattern
             self.full_state, self.full_note = "ready", ""
             if self._full_key() == key:
                 self.master = "full"
@@ -389,6 +395,71 @@ class PhaseViewer:
             self.emit_setup()
 
         run_on_worker(self.session, work, name="phase-viewer-full",
+                      on_done=done, on_error=failed)
+
+    # ── pattern centre from the data ─────────────────────────────────────────
+    def can_solve(self) -> bool:
+        """An SEM scan with several patterns, and de_ebsd to fit them."""
+        axes = self.tree.root.axes_manager
+        return (self.setup.microscope == "SEM" and full_simulation_available()
+                and axes.signal_dimension == 2 and axes.navigation_dimension >= 1)
+
+    def solve_pattern_centre(self) -> None:
+        """Fit the pattern centre to patterns read across the scan, and write
+        it to the metadata when the fit is good enough to trust.
+
+        The crystal is turned to the centre pattern's orientation, so the
+        detector preview shows what that pattern should look like.
+        """
+        from spyde.ebsd.calibrate import (MIN_FIT, calibration_positions,
+                                          read_patterns, solve_pattern_centre)
+
+        if not self.can_solve() or self.solve_state == "solving":
+            return
+        key = self._full_key()
+        setup = self.setup
+        signal = self.tree.root
+        self.solve_state, self.solve_note = "solving", "Solving from the scan's patterns…"
+        self.emit_setup()
+
+        def work():
+            from spyde.device_lock import accelerator_lock
+
+            master = self._full_patterns.get(key) or self._simulate_full(key)
+            positions = calibration_positions(signal.axes_manager.navigation_shape)
+            patterns = read_patterns(signal, positions)
+            device = _device()
+            with accelerator_lock(device):
+                calibration = solve_pattern_centre(
+                    patterns, master, setup, self.structure.point_group,
+                    device=device, positions=positions)
+            return master, calibration
+
+        def done(result):
+            master, calibration = result
+            if self._closed:
+                return
+            self._full_patterns[key] = master
+            summary = "{} patterns · fit {:.2f} (from {:.2f})".format(
+                len(calibration.positions), calibration.fit, calibration.fit_before)
+            if not calibration.trusted:
+                self.solve_state = "error"
+                self.solve_note = (f"{summary} — below {MIN_FIT}, so the centre "
+                                   "was left as it was")
+                self.emit_setup()
+                return
+            for axis, value in zip(("pc_x", "pc_y", "pc_z"), calibration.pc):
+                self.set_field(axis, value)
+            self.rotation = calibration.rotations[0]
+            self._apply_geometry()
+            self.solve_state, self.solve_note = "done", f"Solved from {summary}"
+            self.emit_setup()
+
+        def failed(error):
+            self.solve_state, self.solve_note = "error", f"Could not solve: {error}"
+            self.emit_setup()
+
+        run_on_worker(self.session, work, name="phase-viewer-solve-pc",
                       on_done=done, on_error=failed)
 
     # ── messages ─────────────────────────────────────────────────────────────
@@ -420,12 +491,20 @@ class PhaseViewer:
             "full": {"available": full_simulation_available(),
                      "applies": self.setup.microscope == "SEM",
                      "state": self.full_state, "note": self.full_note},
+            "solve": {"available": self.can_solve(), "state": self.solve_state,
+                      "note": self.solve_note},
             "spots": self.show_spots,
             "spots_apply": self.setup.microscope == "TEM",
         })
 
     def close(self) -> None:
         self._closed = True
+
+
+def _device() -> str:
+    import torch
+
+    return "cuda" if torch.cuda.is_available() else "cpu"
 
 
 def _pc_fallback(signal) -> dict:
@@ -506,7 +585,8 @@ def phase_setup_set(session, plot, payload) -> None:
     """Change one thing about a phase viewer's set-up.
 
     *payload* carries ``phase`` and exactly one of ``field`` + ``value``,
-    ``master`` (bands | full) or ``spots`` (bool).
+    ``master`` (bands | full), ``spots`` (bool) or ``solve_pc`` (solve the
+    pattern centre from the scan).
     """
     _tree, _phase, viewer = _viewer_for(session, plot, payload)
     if viewer is None:
@@ -518,6 +598,8 @@ def phase_setup_set(session, plot, payload) -> None:
             viewer.set_master(str(payload["master"]))
         elif "spots" in payload:
             viewer.set_spots(bool(payload["spots"]))
+        elif payload.get("solve_pc"):
+            viewer.solve_pattern_centre()
     except Exception as e:
         log.exception("phase set-up change failed")
         emit_error(f"Could not apply that change: {e}")

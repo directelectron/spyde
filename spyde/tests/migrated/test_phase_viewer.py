@@ -266,3 +266,66 @@ class TestViewer:
         monkeypatch.setattr(comp, "_src_plot_tree", lambda session, plot: (None, tree))
         pv.show_phase(_Session(), None, {"phase": "ag"})
         assert any(isinstance(m, tuple) and "no structure" in m[1] for m in messages)
+
+
+class TestSolvePatternCentre:
+    """The button's wiring. The fit itself is de_ebsd's and needs a GPU-sized
+    simulation, so here it is replaced by a known answer."""
+
+    def _solving(self, monkeypatch, fit):
+        from spyde.ebsd import calibrate
+
+        monkeypatch.setattr(pv, "full_simulation_available", lambda: True)
+        viewer = _open(monkeypatch, _sem_tree())
+        monkeypatch.setattr(viewer, "_simulate_full", lambda key: "master")
+        turned = euler_to_matrix(0.4, 0.9, 1.3).T
+
+        def solve(patterns, master, setup, point_group, *, device, positions):
+            assert master == "master" and patterns.shape == (len(positions), 30, 40)
+            return calibrate.Calibration(pc=(0.41, 0.22, 0.6), rotations=turned[None],
+                                         fit=fit, fit_before=0.1, positions=positions)
+
+        monkeypatch.setattr(calibrate, "solve_pattern_centre", solve)
+        pv.phase_setup_set(_Session(), None, {"phase": "ag", "solve_pc": True})
+        return viewer, turned
+
+    def test_a_trusted_fit_writes_the_centre_and_turns_the_crystal(
+            self, monkeypatch, messages):
+        viewer, turned = self._solving(monkeypatch, fit=0.8)
+        assert (viewer.setup["pc_x"], viewer.setup["pc_y"], viewer.setup["pc_z"]) == (0.41, 0.22, 0.6)
+        assert viewer.tree.root.metadata.get_item(
+            "Acquisition_instrument.SEM.Detector.EBSD.pc_z") == 0.6
+        np.testing.assert_allclose(viewer.rotation, turned)
+        setup = [m for m in messages if isinstance(m, dict) and m.get("type") == "phase_setup"][-1]
+        assert setup["solve"]["state"] == "done" and "4 patterns" in setup["solve"]["note"]
+
+    def test_a_weak_fit_leaves_the_centre_alone(self, monkeypatch, messages):
+        viewer, _ = self._solving(monkeypatch, fit=0.08)
+        assert viewer.solve_state == "error" and "left as it was" in viewer.solve_note
+        assert viewer.setup["pc_x"] != 0.41
+        assert viewer.tree.root.metadata.get_item(
+            "Acquisition_instrument.SEM.Detector.EBSD.pc_x") is None
+
+    def test_offered_only_on_an_sem_scan(self, monkeypatch, messages):
+        monkeypatch.setattr(pv, "full_simulation_available", lambda: True)
+        assert _open(monkeypatch, _sem_tree()).can_solve()
+        tem = _Tree(hs.signals.Signal2D(np.zeros((2, 2, 32, 32), np.float32)))
+        comp.write_phases(tem, [AG])
+        assert not _open(monkeypatch, tem).can_solve()
+
+
+class TestCalibrationInputs:
+    def test_positions_spread_over_the_scan_centre_first(self):
+        from spyde.ebsd.calibrate import calibration_positions
+
+        positions = calibration_positions((40, 30))
+        assert len(positions) == 25 and positions[0] == (20, 14)   # the grid point nearest (20, 15)
+        assert {p[0] for p in positions} == {0, 10, 20, 29, 39}
+        assert calibration_positions((3,)) == [(1,), (0,), (2,)]
+
+    def test_large_patterns_are_binned_to_the_same_screen(self):
+        from spyde.ebsd.calibrate import MAX_SIDE, read_patterns
+
+        signal = hs.signals.Signal2D(np.ones((2, 480, 640), np.float32))
+        patterns = read_patterns(signal, [(0,), (1,)])
+        assert patterns.shape == (2, 120, 160) and max(patterns.shape[1:]) <= MAX_SIDE
