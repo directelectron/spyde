@@ -322,6 +322,7 @@ class TestCalibrationInputs:
         assert len(positions) == 25 and positions[0] == (20, 14)   # the grid point nearest (20, 15)
         assert {p[0] for p in positions} == {0, 10, 20, 29, 39}
         assert calibration_positions((3,)) == [(1,), (0,), (2,)]
+        assert len(calibration_positions((100,))) == 25   # a line scan reads as many as a map
 
     def test_large_patterns_are_binned_to_the_same_screen(self):
         from spyde.ebsd.calibrate import MAX_SIDE, read_patterns

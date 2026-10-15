@@ -74,7 +74,9 @@ def calibration_positions(nav_shape, grid: int = CALIBRATION_GRID) -> list[tuple
     """
     if not nav_shape:
         return [()]
-    axes = [np.unique(np.linspace(0, n - 1, min(grid, n)).round().astype(int))
+    # a line scan gets as many patterns as a map, enough for a static background
+    per_axis = grid if len(nav_shape) > 1 else grid * grid
+    axes = [np.unique(np.linspace(0, n - 1, min(per_axis, n)).round().astype(int))
             for n in nav_shape]
     positions = [tuple(int(v) for v in combo)
                  for combo in np.array(np.meshgrid(*axes, indexing="ij")).reshape(len(axes), -1).T]
