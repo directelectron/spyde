@@ -211,6 +211,24 @@ class TestReflectors:
         assert (r.widths > 0).all() and r.widths.max() < 0.1
         assert np.allclose(np.linalg.norm(r.normals, axis=1), 1.0)
 
+    def test_fcc_keeps_its_200_and_220_bands(self):
+        """(100), (200) and (400) lie along one line, and for fcc the extinct
+        (100) is listed first. Deduplicating by line alone kept it and dropped
+        the real {200} and {220} bands, so [001] — a 4-fold zone axis — sat on
+        no band at all. Extinct reflections go first; higher orders stay."""
+        import os
+        from orix.crystal_map import Phase
+        from spyde.ebsd.bands import reflectors_from_phase
+
+        cif = os.path.join(os.path.dirname(__file__), "..", "Silver__0011135.cif")
+        r = reflectors_from_phase(Phase.from_cif(cif), voltage_kv=20.0)
+        families = {tuple(sorted(np.abs(h))) for h in r.hkl}
+        assert {(1, 1, 1), (0, 0, 2), (0, 2, 2)} <= families
+        assert (0, 0, 1) not in families and (0, 1, 1) not in families
+        assert (r.weights > 0).all()
+        z = np.array([0.0, 0.0, 1.0])
+        assert np.sum(np.abs(r.normals @ z) < r.widths) >= 6, "[001] is on no band"
+
     def test_a_structureless_phase_falls_back(self):
         """A bare Phase(space_group=…) has no atoms, so no structure factors —
         the wizard must still work, with the generic cubic band set."""

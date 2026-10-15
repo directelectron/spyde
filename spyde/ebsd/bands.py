@@ -93,15 +93,23 @@ class Reflectors:
                           None if self.hkl is None else self.hkl[keep])
 
 
-def _dedupe_friedel(normals: np.ndarray, tol: float = 1e-6) -> np.ndarray:
-    """Indices of one normal per ``±n`` pair, keeping the first occurrence."""
+def _dedupe_friedel(normals: np.ndarray, dspacing: np.ndarray | None = None,
+                    tol: float = 1e-6) -> np.ndarray:
+    """Indices of one reflector per Friedel pair ``±g``, keeping the first.
+
+    A pair shares its d-spacing as well as its line. Reflections along the
+    same line at a DIFFERENT d — (200) and (400) — are different bands (the
+    higher order is twice as wide) and are both kept.
+    """
+    dspacing = (np.ones(len(normals)) if dspacing is None
+                else np.asarray(dspacing, float))
     keep: list[int] = []
-    kept: list[np.ndarray] = []
     for i, v in enumerate(normals):
-        if any(abs(abs(float(v @ k)) - 1.0) < tol for k in kept):
+        if any(abs(abs(float(v @ normals[k])) - 1.0) < tol
+               and abs(dspacing[i] - dspacing[k]) <= tol * dspacing[k]
+               for k in keep):
             continue
         keep.append(i)
-        kept.append(v)
     return np.asarray(keep, int)
 
 
@@ -187,15 +195,20 @@ def reflectors_from_phase(phase, *, min_dspacing: float = 0.7,
         log.debug("phase %s has no usable structure factors — using the "
                   "generic cubic band set", getattr(phase, "name", phase))
         return cubic_reflectors()
+    # Extinct reflections draw no band, and they must go BEFORE the Friedel
+    # dedupe: (100), (200) and (400) lie along one line, and for fcc the
+    # extinct (100) comes first — dropping the real {200} and {220} bands
+    # and leaving [001] on no band at all.
+    finite &= factor > 1e-6 * float(factor[finite].max())
     normals, factor, d, hkl = normals[finite], factor[finite], d[finite], hkl[finite]
 
-    keep = _dedupe_friedel(normals)
+    keep = _dedupe_friedel(normals, d)
     normals, factor, d, hkl = normals[keep], factor[keep], d[keep], hkl[keep]
 
     lam = wavelength(voltage_kv)
     widths = np.clip(lam / (2.0 * d), 1e-4, 0.25)
     weights = factor / max(float(factor.max()), 1e-12)
-    refl = Reflectors(normals, weights, widths, hkl.astype(int))
+    refl = Reflectors(normals, weights, widths, np.rint(hkl).astype(int))
     return refl.brightest(max_bands)
 
 
