@@ -10,6 +10,8 @@ orientation, so this is pinned against the established function — with and
 without a tilted sample — rather than eyeballed.
 """
 import os
+import sys
+import types
 
 import numpy as np
 import pytest
@@ -341,3 +343,53 @@ class TestCalibrationInputs:
         background = static_background(profile + bands)
         assert np.abs(background - profile).max() < 0.1
         assert static_background((profile + bands)[:MIN_PATTERNS_FOR_STATIC - 1]) is None
+
+
+class TestPatternCentreSearch:
+    """The grid search that brings the centre within the fit's reach."""
+
+    @staticmethod
+    def _peak(centre, width=0.06):
+        def score(pc):
+            return float(np.exp(-np.sum((np.asarray(pc) - centre) ** 2) / (2 * width**2)))
+        return score
+
+    def test_a_centre_far_from_the_start_is_found_to_a_quarter_step(self):
+        from spyde.ebsd.calibrate import SEARCH_REFINE_STEPS, grid_search
+
+        for centre in ((0.42, 0.213, 0.499), (0.5, 0.3, 0.6), (0.47, 0.71, 0.83)):
+            best = grid_search(self._peak(np.array(centre)), start_x=0.5)[0]
+            assert np.abs(np.subtract(best, centre)).max() <= SEARCH_REFINE_STEPS[-1], centre
+
+    def test_each_centre_is_scored_once(self):
+        from spyde.ebsd.calibrate import grid_search
+
+        seen = []
+        score = self._peak(np.array((0.5, 0.3, 0.6)))
+        grid_search(lambda pc: seen.append(pc) or score(pc), start_x=0.5)
+        assert len(seen) == len(set(seen))
+
+    def test_the_best_fit_of_the_candidates_is_kept(self, monkeypatch):
+        from spyde.ebsd import calibrate
+
+        fits = {}
+
+        def solve(patterns, master, setup, point_group, *, device=None, positions=()):
+            pc = (setup["pc_x"], setup["pc_y"], setup["pc_z"])
+            fits[pc] = fit = 0.4 if pc[1] < 0.35 else 0.1
+            return calibrate.Calibration(pc=pc, rotations=np.eye(3)[None], fit=fit,
+                                         fit_before=0.0, positions=list(positions))
+
+        monkeypatch.setattr(calibrate, "solve_pattern_centre", solve)
+        monkeypatch.setattr(calibrate, "grid_search",
+                            lambda score, start_x: [(0.5, 0.5, 0.55), (0.5, 0.3, 0.6)])
+        monkeypatch.setitem(sys.modules, "de_ebsd", types.ModuleType("de_ebsd"))
+        index = types.ModuleType("de_ebsd.index")
+        index.DictionaryIndexer = None
+        index.remove_background = lambda patterns, **kw: patterns
+        monkeypatch.setitem(sys.modules, "de_ebsd.index", index)
+        master = types.SimpleNamespace(data=types.SimpleNamespace(device="cpu"), to=lambda device: master)
+        setup = {"pc_x": 0.5, "pc_y": 0.5, "pc_z": 0.55, "sample_tilt": 70.0,
+                 "detector_tilt": 0.0, "azimuthal": 0.0, "twist": 0.0}
+        found = calibrate.search_pattern_centre(np.zeros((9, 8, 8), np.float32), master, setup, None)
+        assert found.pc == (0.5, 0.3, 0.6) and found.fit == 0.4 and len(fits) == 2

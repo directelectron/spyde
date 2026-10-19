@@ -52,6 +52,29 @@ MIN_FIT = 0.2
 #: background is estimated from them.
 MIN_PATTERNS_FOR_STATIC = 9
 
+# ── The search, for a centre not known to within the fit's reach ──
+#: The fit above only polishes: it moves the centre a few hundredths at most,
+#: so from the usual defaults (0.5, 0.5, 0.55) it cannot reach a real centre
+#: like kikuchipy's Ni scan's (0.42, 0.21, 0.50) or de-twin's (0.5, 0.3, 0.6),
+#: and stops at a fit of about 0.1. The search first scores candidate centres
+#: on a grid, by how far each pattern's best dictionary match stands above
+#: that pattern's other matches (in standard deviations). The raw best
+#: correlation is NOT that score: it rises steadily with the screen distance
+#: (a far screen sees a smoother, easier-to-match pattern) and peaks at the
+#: edge of any grid. Measured on both scans, the grid's best cell is within
+#: 0.05 of the centre, and the fit from it lands within 0.0001 (Ni) and 0.004
+#: (de-twin) of it.
+SEARCH_PC_Y = np.round(np.arange(0.1, 0.91, 0.1), 3)
+SEARCH_PC_Z = np.round(np.arange(0.4, 1.01, 0.1), 3)
+#: Finer grids around the best candidates, each half the last step.
+SEARCH_REFINE_STEPS = (0.05, 0.025)
+#: Candidates carried from one grid to the next, and finally fitted.
+SEARCH_KEPT = 2
+#: The scoring dictionary: coarse and matched binned, since it only has to
+#: rank centres a grid step apart.
+SEARCH_STEP_DEG = 5.0
+SEARCH_BINNING = 2
+
 
 @dataclass
 class Calibration:
@@ -138,11 +161,8 @@ def solve_pattern_centre(patterns, master, setup, point_group, *,
                                remove_background)
 
     patterns = np.asarray(patterns, np.float32)
-    detector = de_ebsd.EBSDDetector(
-        shape=tuple(patterns.shape[-2:]),
-        pc=(setup["pc_x"], setup["pc_y"], setup["pc_z"]),
-        sample_tilt=setup["sample_tilt"], tilt=setup["detector_tilt"],
-        azimuthal=setup["azimuthal"], twist=setup["twist"])
+    detector = _detector(setup, (setup["pc_x"], setup["pc_y"], setup["pc_z"]),
+                         patterns.shape[-2:])
     device = device or master.data.device
     master = master.to(device)
     clean = remove_background(patterns, static_bg=static_background(patterns),
@@ -159,3 +179,80 @@ def solve_pattern_centre(patterns, master, setup, point_group, *,
     return Calibration(pc=pc, rotations=np.transpose(bunge, (0, 2, 1)),
                        fit=float(info["ncc"]), fit_before=float(info["ncc_seed"]),
                        positions=list(positions))
+
+
+def _detector(setup, pc, shape):
+    import de_ebsd
+
+    return de_ebsd.EBSDDetector(
+        shape=tuple(shape), pc=tuple(float(v) for v in pc),
+        sample_tilt=setup["sample_tilt"], tilt=setup["detector_tilt"],
+        azimuthal=setup["azimuthal"], twist=setup["twist"])
+
+
+def grid_search(score, start_x: float, *, kept: int = SEARCH_KEPT) -> list[tuple]:
+    """The *kept* best centres by *score* ``(pc) -> float``: the coarse
+    (pcy, pcz) grid at *start_x*, then finer grids in all three around the
+    best so far. Each centre is scored once."""
+    scores: dict[tuple, float] = {}
+
+    def ranked(candidates):
+        for pc in candidates:
+            if pc not in scores:
+                scores[pc] = float(score(pc))
+        return sorted(set(candidates), key=scores.__getitem__, reverse=True)[:kept]
+
+    best = ranked([(round(float(start_x), 4), float(y), float(z))
+                   for y in SEARCH_PC_Y for z in SEARCH_PC_Z])
+    for step in SEARCH_REFINE_STEPS:
+        offsets = (-step, 0.0, step)
+        best = ranked([tuple(round(c + d, 4) for c, d in zip(centre, (dx, dy, dz)))
+                       for centre in best
+                       for dx in offsets for dy in offsets for dz in offsets])
+    return best
+
+
+def search_pattern_centre(patterns, master, setup, point_group, *, device=None,
+                          positions=(), progress=None) -> Calibration:
+    """:func:`solve_pattern_centre` from wherever the centre is: a
+    :func:`grid_search` for the candidates, then the fit from each, the best
+    fit kept. *setup*'s centre gives only the grid's pcx. Minutes, not
+    seconds — about 190 dictionaries are scored; *progress* ``(done, total)``
+    is called after each."""
+    import de_ebsd  # noqa: F401  (fail early, before the slow part)
+    from de_ebsd.index import DictionaryIndexer, remove_background
+
+    patterns = np.asarray(patterns, np.float32)
+    device = device or master.data.device
+    master = master.to(device)
+    clean = remove_background(patterns, static_bg=static_background(patterns),
+                              dynamic=True, device=device)
+    expected = (len(SEARCH_PC_Y) * len(SEARCH_PC_Z)
+                + len(SEARCH_REFINE_STEPS) * SEARCH_KEPT * 27 + SEARCH_KEPT)
+    done = 0
+
+    def tick():
+        nonlocal done
+        done += 1
+        if progress is not None:
+            progress(min(done, expected), expected)
+
+    def contrast(pc):
+        indexer = DictionaryIndexer(master, _detector(setup, pc, patterns.shape[-2:]),
+                                    point_group=point_group, resolution=SEARCH_STEP_DEG,
+                                    device=device, match_binning=SEARCH_BINNING)
+        _, _, scores = indexer.index(clean, return_scores=True)
+        lead = (scores.max(1).values - scores.mean(1)) / scores.std(1)
+        tick()
+        return float(lead.mean())
+
+    candidates = grid_search(contrast, setup["pc_x"])
+    log.info("pattern centre search: candidates %s", candidates)
+    fits = []
+    for pc in candidates:
+        start = dict(setup) if isinstance(setup, dict) else dict(setup.values)
+        start.update(zip(("pc_x", "pc_y", "pc_z"), pc))
+        fits.append(solve_pattern_centre(patterns, master, start, point_group,
+                                         device=device, positions=positions))
+        tick()
+    return max(fits, key=lambda calibration: calibration.fit)
