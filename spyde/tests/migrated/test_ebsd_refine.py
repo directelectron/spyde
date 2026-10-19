@@ -73,14 +73,31 @@ class TestEulerToMatrix:
 
 
 class TestBandSimulator:
-    def test_matches_the_numpy_generator(self):
+    @pytest.mark.parametrize("geometry", [
+        {}, {"sample_tilt": 62.0, "detector_tilt": 7.0, "azimuthal": 4.0,
+             "twist": -3.0}], ids=["default-70", "all-angles"])
+    def test_matches_the_numpy_generator(self, geometry):
         """The differentiable simulator and the data generator must render the
-        SAME pattern — otherwise refinement is fitting a different forward
-        model than the one that made the data."""
+        SAME pattern, at the same detector angles — otherwise refinement is
+        fitting a different forward model than the one that made the data."""
         eul = np.array([[0.3, 0.7, 1.1], [1.5, 0.4, 0.2]])
-        want = simulate_patterns(eul, detector=(24, 24)).reshape(2, -1)
-        got = BandSimulator((24, 24))(torch.as_tensor(eul, dtype=torch.float32))
+        want = simulate_patterns(eul, detector=(24, 24),
+                                 **geometry).reshape(2, -1)
+        got = BandSimulator((24, 24), **geometry)(
+            torch.as_tensor(eul, dtype=torch.float32))
         np.testing.assert_allclose(got.numpy(), want, rtol=1e-4, atol=1e-4)
+
+    def test_the_dictionary_is_simulate_patterns(self):
+        """The dictionary indexing matches against, and the patterns the
+        overlay's lines are pinned to, are one function at one geometry."""
+        from spyde.ebsd.indexing import simulate_dictionary
+        geometry = {"sample_tilt": 62.0, "detector_tilt": 7.0,
+                    "azimuthal": 4.0, "twist": -3.0}
+        eul = np.array([[0.3, 0.7, 1.1], [1.5, 0.4, 0.2], [4.0, 2.0, 0.5]])
+        want = simulate_patterns(eul, detector=(20, 28), **geometry)
+        got = simulate_dictionary(eul, (20, 28), device="cpu", chunk=2,
+                                  **geometry)
+        np.testing.assert_allclose(got, want, rtol=1e-4, atol=1e-4)
 
     def test_is_differentiable_wrt_orientation(self):
         eul = torch.tensor([[0.3, 0.7, 1.1]], requires_grad=True)

@@ -80,7 +80,9 @@ class TestOneBandProfile:
         euler = np.array([[0.3, 0.7, 1.1]])
         old_style = simulate_patterns(euler, reflectors, (30, 40), (0.5, 0.5, 0.55))
         rot = euler_to_matrix(*euler[0])
-        rays = detector_directions((30, 40), (0.5, 0.5, 0.55)).reshape(-1, 3)
+        # rays into the sample frame: the default 70° sample tilt
+        rays = detector_directions((30, 40), (0.5, 0.5, 0.55)).reshape(-1, 3) \
+            @ microscope._sample_to_detector(70.0, 0.0, 0.0, 0.0)
         direct = band_intensity(rays, reflectors,
                                 normals=reflectors.normals @ rot).reshape(30, 40)
         np.testing.assert_allclose(old_style[0], direct, rtol=1e-6)
@@ -157,17 +159,17 @@ class TestPreviewParity:
     @pytest.mark.parametrize("euler", [(0.0, 0.0, 0.0), (0.4, 0.9, 1.3)])
     def test_preview_matches_simulate_patterns(self, monkeypatch, messages,
                                                sample_tilt, euler):
-        """At 90° the detector and sample frames coincide (the wizard's frame);
-        tilted, the detector sees the crystal through the tilt rotation."""
+        """The viewer's detector pane is the EBSD wizard's simulation at the
+        same orientation and the same set-up — one geometry, not two."""
         tree = _sem_tree(**{"Acquisition_instrument.SEM.Stage.tilt_alpha": sample_tilt})
         viewer = _open(monkeypatch, tree)
-        crystal = euler_to_matrix(*euler).T            # crystal → sample
-        viewer.rotation = crystal
-        detector_bunge = crystal.T @ viewer._to_sample  # detector → crystal
+        viewer.rotation = euler_to_matrix(*euler).T     # crystal → sample
         expected = simulate_patterns(
-            np.array([matrix_to_euler(detector_bunge)]), viewer.reflectors(),
-            viewer.shape, (viewer.setup["pc_x"], viewer.setup["pc_y"],
-                           viewer.setup["pc_z"]))[0]
+            np.array([euler]), viewer.reflectors(), viewer.shape,
+            (viewer.setup["pc_x"], viewer.setup["pc_y"], viewer.setup["pc_z"]),
+            sample_tilt=viewer.setup["sample_tilt"],
+            detector_tilt=viewer.setup["detector_tilt"],
+            azimuthal=viewer.setup["azimuthal"], twist=viewer.setup["twist"])[0]
         np.testing.assert_allclose(viewer.pattern(), expected, rtol=1e-5, atol=1e-6)
 
 

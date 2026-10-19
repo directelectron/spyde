@@ -19,7 +19,9 @@ SAMPLE frame. :func:`detector_to_sample` turns one into the other:
   four of its angles: sample tilt, detector tilt, azimuthal and twist
   (:func:`_sample_to_detector`, a port of kikuchipy's own, pinned against it
   in ``test_phase_viewer``). ``spyde.ebsd.bands`` uses the same detector
-  frame (``test_ebsd_bands_kikuchipy_parity``).
+  frame and this same rotation (:func:`spyde.ebsd.bands.sample_to_detector`),
+  so the EBSD wizard's dictionary and this viewer show one geometry
+  (``test_ebsd_bands_kikuchipy_parity``, ``test_phase_viewer``).
 * **TEM** — the screen is normal to the beam, so only the stage tilts turn
   the sample relative to it: α about x, then β about y.
 """

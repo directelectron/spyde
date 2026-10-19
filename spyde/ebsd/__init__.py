@@ -23,6 +23,7 @@ from spyde.ebsd.bands import (
     cubic_reflectors,
     detector_directions,
     reflectors_from_phase,
+    sample_to_detector,
     simulate_patterns,
     zone_axis_points,
 )
@@ -50,4 +51,4 @@ __all__ = ["dictionary_index", "sample_orientations", "simulate_dictionary",
            "merge_phases",
            "Reflectors", "cubic_reflectors", "reflectors_from_phase",
            "band_lines", "zone_axis_points", "detector_directions",
-           "simulate_patterns"]
+           "simulate_patterns", "sample_to_detector"]

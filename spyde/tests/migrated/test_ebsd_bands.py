@@ -264,7 +264,7 @@ class TestGeometryBasics:
         assert np.allclose(np.linalg.norm(r, axis=-1), 1.0)
 
     def test_detector_y_is_flipped(self):
-        """Detector row 0 is the TOP, which is +y in the sample frame. Getting
+        """Detector row 0 is the TOP, which is +y in the detector frame. Getting
         this backwards mirrors every pattern and is invisible in a symmetric
         one — which is why the synthetic data is deliberately asymmetric."""
         r = detector_directions(DET, PC)
@@ -277,3 +277,70 @@ class TestGeometryBasics:
     def test_reflectors_dataclass_broadcasts_scalars(self):
         r = Reflectors(np.eye(3), 1.0, 0.05)
         assert r.weights.shape == (3,) and r.widths.shape == (3,)
+
+
+#: The default 70° EBSD set-up, and one with every angle away from zero.
+GEOMETRIES = [
+    pytest.param({}, id="default-70"),
+    pytest.param({"sample_tilt": 62.0, "detector_tilt": 7.0, "azimuthal": 4.0,
+                  "twist": -3.0}, id="all-angles"),
+]
+ORIENTATIONS = np.deg2rad([[33.3, 30.0, 15.0], [120.0, 50.0, 70.0],
+                           [250.0, 80.0, 10.0], [10.0, 140.0, 300.0]])
+
+
+class TestLinesAndPatternsShareTheGeometry:
+    """The drawn lines and the simulated patterns are two separate pieces of
+    code (a closed-form line and a per-pixel dot product) that must place the
+    detector identically for every orientation and every set of angles —
+    otherwise the overlay sits beside the bands the dictionary matched."""
+
+    @pytest.mark.parametrize("geometry", GEOMETRIES)
+    @pytest.mark.parametrize("euler", ORIENTATIONS, ids=lambda e: str(
+        np.round(np.rad2deg(e)).astype(int).tolist()))
+    def test_every_line_is_on_its_band(self, euler, geometry):
+        """One band at a time, so a neighbouring band cannot pull the peak:
+        every pixel at the top of a band's simulated profile lies on the line
+        drawn for it."""
+        reflectors = cubic_reflectors()
+        worst, compared = 0.0, 0
+        for k in range(len(reflectors)):
+            band = Reflectors(reflectors.normals[k:k + 1], [1.0], [0.01])
+            segs, _ = band_lines(euler, band, DET, PC, **geometry)
+            rows, cols = np.nonzero(
+                simulate_patterns(euler, band, DET, PC, **geometry)[0] > 0.9)
+            assert bool(len(segs)) == bool(len(rows)), (
+                "a band was drawn that the pattern does not show, or the "
+                "other way round")
+            if not len(segs):
+                continue
+            compared += 1
+            (x0, y0), (x1, y1) = segs[0]
+            normal = np.array([y0 - y1, x1 - x0])
+            normal /= np.linalg.norm(normal)
+            offset = (np.column_stack([cols, rows]) - [x0, y0]) @ normal
+            worst = max(worst, float(np.abs(offset).max()))
+        assert compared > 3, "no bands crossed the detector"
+        assert worst < 1.0, f"a band line is {worst:.2f} px off its band"
+
+    @pytest.mark.parametrize("geometry", GEOMETRIES)
+    def test_zone_axes_fall_where_the_lines_cross(self, geometry):
+        segs, _ = band_lines(EULER, detector=DET, pc=PC, **geometry)
+        za = zone_axis_points(EULER, detector=DET, pc=PC, **geometry)
+        assert len(za) >= 1
+        for p in za:
+            d = []
+            for (x0, y0), (x1, y1) in segs:
+                v = np.array([x1 - x0, y1 - y0], float)
+                n = np.array([-v[1], v[0]]) / max(np.linalg.norm(v), 1e-12)
+                d.append(abs(float((p - np.array([x0, y0])) @ n)))
+            assert sorted(d)[1] < 1.0, f"zone axis {p} lies on fewer than 2 bands"
+
+    def test_the_tilt_moves_the_bands(self):
+        """Lines drawn without the sample tilt miss a tilted pattern's bands,
+        so the test above cannot pass on a geometry that ignores the angles."""
+        pattern = simulate_patterns(EULER, detector=DET, pc=PC)[0]
+        segs, _ = band_lines(EULER, detector=DET, pc=PC, sample_tilt=90.0,
+                             twist=90.0)
+        profile, offs = _perpendicular_profile(pattern, segs)
+        assert np.abs(offs[profile.argmax(axis=1)]).max() > 1.0
