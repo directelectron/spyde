@@ -374,7 +374,8 @@ class TestPatternCentreSearch:
 
         fits = {}
 
-        def solve(patterns, master, setup, point_group, *, device=None, positions=()):
+        def solve(patterns, master, setup, point_group, *, device=None, positions=(),
+                  orientations=None):
             pc = (setup["pc_x"], setup["pc_y"], setup["pc_z"])
             fits[pc] = fit = 0.4 if pc[1] < 0.35 else 0.1
             return calibrate.Calibration(pc=pc, rotations=np.eye(3)[None], fit=fit,
@@ -383,9 +384,10 @@ class TestPatternCentreSearch:
         monkeypatch.setattr(calibrate, "solve_pattern_centre", solve)
         monkeypatch.setattr(calibrate, "grid_search",
                             lambda score, start_x: [(0.5, 0.5, 0.55), (0.5, 0.3, 0.6)])
+        monkeypatch.setattr(calibrate, "_lead_scorer", lambda *args: lambda pc: 0.0)
+        monkeypatch.setattr(calibrate, "seed_orientations", lambda point_group: None)
         monkeypatch.setitem(sys.modules, "de_ebsd", types.ModuleType("de_ebsd"))
         index = types.ModuleType("de_ebsd.index")
-        index.DictionaryIndexer = None
         index.remove_background = lambda patterns, **kw: patterns
         monkeypatch.setitem(sys.modules, "de_ebsd.index", index)
         master = types.SimpleNamespace(data=types.SimpleNamespace(device="cpu"), to=lambda device: master)

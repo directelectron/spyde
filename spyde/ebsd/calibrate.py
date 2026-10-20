@@ -71,9 +71,15 @@ SEARCH_REFINE_STEPS = (0.05, 0.025)
 #: Candidates carried from one grid to the next, and finally fitted.
 SEARCH_KEPT = 2
 #: The scoring dictionary: coarse and matched binned, since it only has to
-#: rank centres a grid step apart.
+#: rank centres a grid step apart. Its orientations are sampled once for the
+#: whole search: sampling the fundamental zone is 0.8 s on the CPU, eight
+#: times the projection of a centre's dictionary, and it was being redone for
+#: each of ~160 centres.
 SEARCH_STEP_DEG = 5.0
 SEARCH_BINNING = 2
+#: Orientations projected at a time, which bounds the device memory a
+#: dictionary takes while it is simulated.
+SEARCH_CHUNK = 4096
 
 
 @dataclass
@@ -147,18 +153,19 @@ def static_background(patterns) -> np.ndarray | None:
 
 
 def solve_pattern_centre(patterns, master, setup, point_group, *,
-                         device=None, positions=()) -> Calibration:
+                         device=None, positions=(), orientations=None) -> Calibration:
     """Fit the pattern centre shared by *patterns* ``(N, rows, cols)``.
 
     *master* is a de_ebsd ``MasterPattern`` of the phase at the scan's beam
     energy; *setup* the SEM :class:`~spyde.ebsd.microscope.Setup`, whose
     angles are held and whose centre is the starting guess. *point_group* is
-    the phase's (orix), which bounds the seeding dictionary.
+    the phase's (orix), which bounds the seeding dictionary; *orientations*
+    are that dictionary's (:func:`seed_orientations`), passed in when several
+    starts are fitted, since sampling them is most of a seed's cost.
     """
     import torch
     import de_ebsd
-    from de_ebsd.index import (DictionaryIndexer, determine_pattern_center,
-                               remove_background)
+    from de_ebsd.index import determine_pattern_center, remove_background
 
     patterns = np.asarray(patterns, np.float32)
     detector = _detector(setup, (setup["pc_x"], setup["pc_y"], setup["pc_z"]),
@@ -167,9 +174,9 @@ def solve_pattern_centre(patterns, master, setup, point_group, *,
     master = master.to(device)
     clean = remove_background(patterns, static_bg=static_background(patterns),
                               dynamic=True, device=device)
-    seeds, _quality = DictionaryIndexer(master, detector, point_group=point_group,
-                                        resolution=SEED_STEP_DEG,
-                                        device=device).index(clean)
+    if orientations is None:
+        orientations = seed_orientations(point_group)
+    seeds = _best_matches(clean, master, detector, orientations, device)
     pc, rotations, info = determine_pattern_center(
         clean, master, detector, seeds, return_orientations=True, device=device)
     pc = tuple(float(v) for v in torch.as_tensor(pc).detach().cpu().numpy().reshape(3))
@@ -216,17 +223,18 @@ def search_pattern_centre(patterns, master, setup, point_group, *, device=None,
                           positions=(), progress=None) -> Calibration:
     """:func:`solve_pattern_centre` from wherever the centre is: a
     :func:`grid_search` for the candidates, then the fit from each, the best
-    fit kept. *setup*'s centre gives only the grid's pcx. Minutes, not
-    seconds — about 190 dictionaries are scored; *progress* ``(done, total)``
-    is called after each."""
+    fit kept. *setup*'s centre gives only the grid's pcx. About 25 s: some
+    160 centres are scored; *progress* ``(done, total)`` is called after each,
+    and after each fit."""
     import de_ebsd  # noqa: F401  (fail early, before the slow part)
-    from de_ebsd.index import DictionaryIndexer, remove_background
+    from de_ebsd.index import remove_background
 
     patterns = np.asarray(patterns, np.float32)
     device = device or master.data.device
     master = master.to(device)
     clean = remove_background(patterns, static_bg=static_background(patterns),
                               dynamic=True, device=device)
+    score = _lead_scorer(clean, master, setup, point_group, device)
     expected = (len(SEARCH_PC_Y) * len(SEARCH_PC_Z)
                 + len(SEARCH_REFINE_STEPS) * SEARCH_KEPT * 27 + SEARCH_KEPT)
     done = 0
@@ -238,21 +246,91 @@ def search_pattern_centre(patterns, master, setup, point_group, *, device=None,
             progress(min(done, expected), expected)
 
     def contrast(pc):
-        indexer = DictionaryIndexer(master, _detector(setup, pc, patterns.shape[-2:]),
-                                    point_group=point_group, resolution=SEARCH_STEP_DEG,
-                                    device=device, match_binning=SEARCH_BINNING)
-        _, _, scores = indexer.index(clean, return_scores=True)
-        lead = (scores.max(1).values - scores.mean(1)) / scores.std(1)
+        lead = score(pc)
         tick()
-        return float(lead.mean())
+        return lead
 
     candidates = grid_search(contrast, setup["pc_x"])
     log.info("pattern centre search: candidates %s", candidates)
+    # Every candidate is fitted: the best-scored is not always the best fit.
+    orientations = seed_orientations(point_group)
     fits = []
     for pc in candidates:
         start = dict(setup) if isinstance(setup, dict) else dict(setup.values)
         start.update(zip(("pc_x", "pc_y", "pc_z"), pc))
-        fits.append(solve_pattern_centre(patterns, master, start, point_group,
-                                         device=device, positions=positions))
+        fits.append(solve_pattern_centre(patterns, master, start, point_group, device=device,
+                                         positions=positions, orientations=orientations))
         tick()
     return max(fits, key=lambda calibration: calibration.fit)
+
+
+def _normalized_rows(x):
+    x = x - x.mean(-1, keepdim=True)
+    return x / x.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+
+
+def _lead_scorer(patterns, master, setup, point_group, device):
+    """The search's score of a centre, ``(pc) -> float``: how far each of
+    *patterns*' best match in the centre's dictionary stands above its other
+    matches, in standard deviations, averaged over the patterns. The
+    dictionary is de_ebsd's ``DictionaryIndexer``'s, binned by
+    `SEARCH_BINNING`, with the orientations and the binned patterns made once
+    for every centre scored."""
+    import torch
+    import torch.nn.functional as F
+    from orix.sampling import get_sample_fundamental
+
+    rotations = get_sample_fundamental(resolution=SEARCH_STEP_DEG, point_group=point_group)
+    quaternions = torch.as_tensor(np.asarray(rotations.data), dtype=torch.float32)
+    binned = torch.as_tensor(patterns).to(device=device, dtype=torch.float32)
+    binned = F.avg_pool2d(binned[:, None], SEARCH_BINNING)[:, 0]
+    shape = tuple(binned.shape[-2:])
+    binned = _normalized_rows(binned.reshape(len(binned), -1))
+
+    def score(pc) -> float:
+        detector = _detector(setup, pc, shape)
+        with torch.no_grad():
+            parts = []
+            for start in range(0, len(quaternions), SEARCH_CHUNK):
+                simulated = master.project(detector, quaternions[start:start + SEARCH_CHUNK],
+                                           rescale=False)
+                simulated = _normalized_rows(simulated.reshape(len(simulated), -1).float())
+                parts.append(binned @ simulated.T)
+            scores = torch.cat(parts, dim=1)
+            lead = (scores.max(1).values - scores.mean(1)) / scores.std(1)
+        return float(lead.mean())
+
+    return score
+
+
+def seed_orientations(point_group):
+    """The seeding dictionary's orientations, `SEED_STEP_DEG` apart over
+    *point_group*'s fundamental zone, as ``(N, 4)`` quaternions."""
+    from orix.sampling import get_sample_fundamental
+
+    rotations = get_sample_fundamental(resolution=SEED_STEP_DEG, point_group=point_group)
+    return np.asarray(rotations.data, np.float32)
+
+
+def _best_matches(patterns, master, detector, orientations, device):
+    """Each of *patterns*' best match among *orientations* projected from
+    *master* onto *detector*: de_ebsd's ``DictionaryIndexer.index``, with the
+    orientations given rather than sampled again."""
+    import torch
+    from orix.quaternion import Rotation
+
+    quaternions = torch.as_tensor(orientations)
+    flat = torch.as_tensor(patterns).to(device=device, dtype=torch.float32)
+    flat = _normalized_rows(flat.reshape(len(flat), -1))
+    best = torch.full((len(flat),), -torch.inf, device=flat.device)
+    at = torch.zeros(len(flat), dtype=torch.long, device=flat.device)
+    with torch.no_grad():
+        for start in range(0, len(quaternions), SEARCH_CHUNK):
+            simulated = master.project(detector, quaternions[start:start + SEARCH_CHUNK],
+                                       rescale=False)
+            simulated = _normalized_rows(simulated.reshape(len(simulated), -1).float())
+            score, index = (flat @ simulated.T).max(1)
+            better = score > best
+            best = torch.where(better, score, best)
+            at = torch.where(better, index + start, at)
+    return Rotation(orientations[at.cpu().numpy()])
