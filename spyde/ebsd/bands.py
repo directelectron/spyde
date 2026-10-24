@@ -26,6 +26,17 @@ perpendicular to a plane normal ``n``. That gives two things:
   pattern's band edges are diffuse anyway. This is also what kikuchipy's
   geometrical simulation draws.
 
+**Two frames.** Detector pixels give directions in the DETECTOR frame
+(:func:`detector_directions`); an orientation rotates plane normals into the
+SAMPLE frame (:func:`normals_to_sample`). The two differ by the microscope's
+geometry — in EBSD the sample is tilted ~70° towards the screen — so every
+comparison of a ray with a normal goes through :func:`sample_to_detector`,
+with the four angles of kikuchipy's ``EBSDDetector`` (sample tilt, detector
+tilt, azimuthal, twist; the defaults are a standard 70° EBSD set-up). Dotting
+a detector-frame ray with a sample-frame normal tilts every band by the
+missing ~20°, and the dictionary, the drawn lines and a solved pattern centre
+all inherit it while still agreeing with one another.
+
 Nothing here needs torch or the ``ebsd`` extra — it is numpy and, only for
 :func:`reflectors_from_phase`, diffsims (which SpyDE already depends on).
 """
@@ -37,6 +48,12 @@ from dataclasses import dataclass
 import numpy as np
 
 log = logging.getLogger(__name__)
+
+#: The EBSD geometry assumed when a caller gives none, in degrees: the sample
+#: tilted 70° towards an upright screen — the SEM defaults of
+#: :data:`spyde.ebsd.microscope.FIELDS`.
+SAMPLE_TILT = 70.0
+DETECTOR_TILT = 0.0
 
 # Electron wavelength in Å at an accelerating voltage in kV (relativistic).
 _H, _M0, _E, _C = 6.62607015e-34, 9.1093837015e-31, 1.602176634e-19, 299792458.0
@@ -93,15 +110,23 @@ class Reflectors:
                           None if self.hkl is None else self.hkl[keep])
 
 
-def _dedupe_friedel(normals: np.ndarray, tol: float = 1e-6) -> np.ndarray:
-    """Indices of one normal per ``±n`` pair, keeping the first occurrence."""
+def _dedupe_friedel(normals: np.ndarray, dspacing: np.ndarray | None = None,
+                    tol: float = 1e-6) -> np.ndarray:
+    """Indices of one reflector per Friedel pair ``±g``, keeping the first.
+
+    A pair shares its d-spacing as well as its line. Reflections along the
+    same line at a DIFFERENT d — (200) and (400) — are different bands (the
+    higher order is twice as wide) and are both kept.
+    """
+    dspacing = (np.ones(len(normals)) if dspacing is None
+                else np.asarray(dspacing, float))
     keep: list[int] = []
-    kept: list[np.ndarray] = []
     for i, v in enumerate(normals):
-        if any(abs(abs(float(v @ k)) - 1.0) < tol for k in kept):
+        if any(abs(abs(float(v @ normals[k])) - 1.0) < tol
+               and abs(dspacing[i] - dspacing[k]) <= tol * dspacing[k]
+               for k in keep):
             continue
         keep.append(i)
-        kept.append(v)
     return np.asarray(keep, int)
 
 
@@ -187,15 +212,20 @@ def reflectors_from_phase(phase, *, min_dspacing: float = 0.7,
         log.debug("phase %s has no usable structure factors — using the "
                   "generic cubic band set", getattr(phase, "name", phase))
         return cubic_reflectors()
+    # Extinct reflections draw no band, and they must go BEFORE the Friedel
+    # dedupe: (100), (200) and (400) lie along one line, and for fcc the
+    # extinct (100) comes first — dropping the real {200} and {220} bands
+    # and leaving [001] on no band at all.
+    finite &= factor > 1e-6 * float(factor[finite].max())
     normals, factor, d, hkl = normals[finite], factor[finite], d[finite], hkl[finite]
 
-    keep = _dedupe_friedel(normals)
+    keep = _dedupe_friedel(normals, d)
     normals, factor, d, hkl = normals[keep], factor[keep], d[keep], hkl[keep]
 
     lam = wavelength(voltage_kv)
     widths = np.clip(lam / (2.0 * d), 1e-4, 0.25)
     weights = factor / max(float(factor.max()), 1e-12)
-    refl = Reflectors(normals, weights, widths, hkl.astype(int))
+    refl = Reflectors(normals, weights, widths, np.rint(hkl).astype(int))
     return refl.brightest(max_bands)
 
 
@@ -234,6 +264,33 @@ def detector_directions(detector=(60, 60), pc=(0.5, 0.5, 0.55)) -> np.ndarray:
     return r / np.linalg.norm(r, axis=-1, keepdims=True)
 
 
+def sample_to_detector(sample_tilt: float = SAMPLE_TILT,
+                       detector_tilt: float = DETECTOR_TILT,
+                       azimuthal: float = 0.0, twist: float = 0.0) -> np.ndarray:
+    """The rotation ``M`` taking SAMPLE-frame components to DETECTOR-frame
+    ones, ``v_detector = M @ v_sample``: kikuchipy's matrix
+    (:func:`spyde.ebsd.microscope._sample_to_detector`), angles in degrees.
+
+    For row vectors that is ``v_sample @ M.T`` one way and
+    ``v_detector @ M`` the other.
+    """
+    from spyde.ebsd.microscope import _sample_to_detector
+
+    return _sample_to_detector(float(sample_tilt), float(detector_tilt),
+                               float(azimuthal), float(twist))
+
+
+def sample_directions(detector=(60, 60), pc=(0.5, 0.5, 0.55), *,
+                      sample_tilt: float = SAMPLE_TILT,
+                      detector_tilt: float = DETECTOR_TILT,
+                      azimuthal: float = 0.0, twist: float = 0.0) -> np.ndarray:
+    """:func:`detector_directions` expressed in the SAMPLE frame,
+    ``(dy, dx, 3)`` — the rays that sample-frame plane normals are dotted
+    with."""
+    rotation = sample_to_detector(sample_tilt, detector_tilt, azimuthal, twist)
+    return detector_directions(detector, pc) @ rotation
+
+
 def euler_to_matrix(phi1, Phi, phi2) -> np.ndarray:
     """Bunge ZXZ Euler angles -> rotation matrices, batched over the leading
     axes. Returns ``(..., 3, 3)``."""
@@ -251,6 +308,21 @@ def euler_to_matrix(phi1, Phi, phi2) -> np.ndarray:
     m[..., 2, 1] = -c1 * s
     m[..., 2, 2] = c
     return m
+
+
+def matrix_to_euler(matrix) -> np.ndarray:
+    """Bunge ZXZ Euler angles (radians, each in [0, 2π)) of one matrix — the
+    inverse of :func:`euler_to_matrix`. At Φ = 0 only φ1 + φ2 is defined, and
+    it is all given to φ1."""
+    m = np.asarray(matrix, float)
+    Phi = np.arccos(np.clip(m[2, 2], -1.0, 1.0))
+    if abs(np.sin(Phi)) > 1e-8:
+        phi1 = np.arctan2(m[2, 0], -m[2, 1])
+        phi2 = np.arctan2(m[0, 2], m[1, 2])
+    else:
+        phi1 = np.arctan2(m[0, 1], m[0, 0])
+        phi2 = 0.0
+    return np.mod(np.array([phi1, Phi, phi2]), 2 * np.pi)
 
 
 def normals_to_sample(normals, rot):
@@ -273,9 +345,74 @@ def normals_to_sample(normals, rot):
     return np.asarray(normals) @ np.asarray(rot)
 
 
+def normals_to_detector(normals, rot, *, sample_tilt: float = SAMPLE_TILT,
+                        detector_tilt: float = DETECTOR_TILT,
+                        azimuthal: float = 0.0, twist: float = 0.0):
+    """Plane normals from the CRYSTAL frame into the DETECTOR frame: the
+    sample frame (:func:`normals_to_sample`) carried on through
+    :func:`sample_to_detector`. Their dot product with a
+    :func:`detector_directions` ray is the same number as the sample-frame
+    one :func:`simulate_patterns` renders, which is what keeps the drawn lines
+    on the simulated bands."""
+    rotation = sample_to_detector(sample_tilt, detector_tilt, azimuthal, twist)
+    return normals_to_sample(normals, rot) @ rotation.T
+
+
+def band_intensity(directions, reflectors: Reflectors, *, normals=None,
+                   block: int = 65536) -> np.ndarray:
+    """Kinematic band intensity seen along unit *directions* ``(N, 3)``.
+
+    THE band profile: a Gaussian in ``r·n`` of half-width ``w`` per reflector,
+    weighted by its intensity. Every picture of the bands — a detector
+    pattern, the whole sphere of directions — is this function sampled at
+    different directions, so they cannot disagree.
+
+    *normals* are the plane normals in the same frame as *directions*; by
+    default the reflectors' own (crystal-frame) normals. Evaluated in blocks
+    of *block* directions so the ``(directions × reflectors)`` table stays
+    small for a whole-sphere texture.
+    """
+    normals = reflectors.normals if normals is None else np.asarray(normals)
+    directions = np.asarray(directions, float).reshape(-1, 3)
+    out = np.empty(len(directions), np.float32)
+    for start in range(0, len(directions), block):
+        d = directions[start:start + block] @ normals.T
+        band = np.exp(-0.5 * (d / reflectors.widths) ** 2) * reflectors.weights
+        out[start:start + block] = band.sum(1)
+    return out
+
+
+def sphere_directions(rows: int, cols: int) -> np.ndarray:
+    """Unit directions on a longitude × latitude grid → ``(rows, cols, 3)``.
+
+    Columns run longitude 0 → 2π and rows latitude +90° → −90°, the layout a
+    sphere's texture is mapped with, so an image sampled here wraps onto a
+    sphere built from the same grid with no remapping.
+    """
+    longitude = np.linspace(0.0, 2 * np.pi, int(cols))
+    latitude = np.linspace(np.pi / 2, -np.pi / 2, int(rows))
+    lon, lat = np.meshgrid(longitude, latitude)
+    return np.stack([np.cos(lat) * np.cos(lon), np.cos(lat) * np.sin(lon),
+                     np.sin(lat)], axis=-1)
+
+
+def band_sphere(reflectors: Reflectors, shape=(512, 1024)) -> np.ndarray:
+    """The kinematic master pattern: band intensity over every crystal
+    direction, as a ``shape`` longitude × latitude image (float32).
+
+    The detector pattern for any orientation is a window onto this sphere,
+    computed from the same :func:`band_intensity`.
+    """
+    directions = sphere_directions(*shape)
+    return band_intensity(directions, reflectors).reshape(shape)
+
+
 def simulate_patterns(euler, reflectors: Reflectors | None = None,
                       detector=(60, 60), pc=(0.5, 0.5, 0.55), *,
-                      background: bool = False) -> np.ndarray:
+                      background: bool = False,
+                      sample_tilt: float = SAMPLE_TILT,
+                      detector_tilt: float = DETECTOR_TILT,
+                      azimuthal: float = 0.0, twist: float = 0.0) -> np.ndarray:
     """Kikuchi patterns for a list of orientations -> ``(N, dy, dx)`` float32.
 
     *euler* is ``(N, 3)`` Bunge angles in radians. Pure numpy and looped over
@@ -288,20 +425,23 @@ def simulate_patterns(euler, reflectors: Reflectors | None = None,
     normalised cross-correlation, which is invariant to the smooth gradient a
     real detector adds — and the experimental side has background removal
     applied before matching anyway (:mod:`spyde.ebsd.preprocess`).
+
+    *euler* rotates the crystal into the SAMPLE frame; the four angles place
+    the detector relative to the sample (:func:`sample_to_detector`).
     """
     refl = reflectors if reflectors is not None else cubic_reflectors()
     euler = np.atleast_2d(np.asarray(euler, float))
     rot = euler_to_matrix(euler[:, 0], euler[:, 1], euler[:, 2])    # (N, 3, 3)
-    r = detector_directions(detector, pc)
+    r = sample_directions(detector, pc, sample_tilt=sample_tilt,
+                          detector_tilt=detector_tilt, azimuthal=azimuthal,
+                          twist=twist)
     dy, dx = r.shape[:2]
     flat_r = r.reshape(-1, 3)
 
     out = np.empty((len(euler), dy, dx), np.float32)
     for i in range(len(euler)):
         n_rot = normals_to_sample(refl.normals, rot[i])
-        d = flat_r @ n_rot.T
-        band = np.exp(-0.5 * (d / refl.widths) ** 2) * refl.weights
-        out[i] = band.sum(1).reshape(dy, dx).astype(np.float32)
+        out[i] = band_intensity(flat_r, refl, normals=n_rot).reshape(dy, dx)
     if background:
         gy, gx = np.mgrid[0:dy, 0:dx].astype(np.float32)
         out = out / max(out.max(), 1e-9) + (
@@ -363,7 +503,10 @@ def _clip_line_to_box(a: np.ndarray, b: np.ndarray, c: np.ndarray,
 
 def band_lines(euler, reflectors: Reflectors | None = None,
                detector=(60, 60), pc=(0.5, 0.5, 0.55), *,
-               max_bands: int | None = None):
+               max_bands: int | None = None,
+               sample_tilt: float = SAMPLE_TILT,
+               detector_tilt: float = DETECTOR_TILT,
+               azimuthal: float = 0.0, twist: float = 0.0):
     """Band CENTRE lines for one orientation -> ``(M, 2, 2)`` detector pixels.
 
     Returns ``(segments, weights)`` where each segment is
@@ -374,24 +517,28 @@ def band_lines(euler, reflectors: Reflectors | None = None,
     can style by band strength.
 
     Only bands that actually cross the detector are returned, so ``M <= N``.
+    The geometry and its angles are :func:`simulate_patterns`'.
     """
     refl = reflectors if reflectors is not None else cubic_reflectors()
     if max_bands is not None:
         refl = refl.brightest(max_bands)
     euler = np.asarray(euler, float).reshape(3)
     rot = euler_to_matrix(*euler)                            # (3, 3)
-    n_rot = normals_to_sample(refl.normals, rot)             # (N, 3) sample frame
+    n_rot = normals_to_detector(refl.normals, rot, sample_tilt=sample_tilt,
+                                detector_tilt=detector_tilt,
+                                azimuthal=azimuthal, twist=twist)
 
     dy, dx = int(detector[0]), int(detector[1])
     pcx, pcy, L = float(pc[0]), float(pc[1]), float(pc[2])
     aspect = dx / dy
     nx, ny, nz = n_rot[:, 0], n_rot[:, 1], n_rot[:, 2]
 
-    # r·n = 0 with r = (aspect*(u/dx - pcx), (pcy - v/dy), L) — the same square
-    # -pixel gnomonic frame detector_directions builds — and u, v the continuous
-    # pixel coordinates. Linear in (u, v): the band centre IS a straight line.
-    # Note aspect/dx == 1/dy, i.e. BOTH in-plane axes are measured in fractions
-    # of the detector height. See detector_directions for why.
+    # r·n = 0 in the detector frame, with r = (aspect*(u/dx - pcx),
+    # (pcy - v/dy), L) — the same square-pixel gnomonic frame
+    # detector_directions builds — and u, v the continuous pixel coordinates.
+    # Linear in (u, v): the band centre IS a straight line. Note aspect/dx ==
+    # 1/dy, i.e. BOTH in-plane axes are measured in fractions of the detector
+    # height. See detector_directions for why.
     a = nx / dy
     b = -ny / dy
     c = L * nz - aspect * pcx * nx + pcy * ny
@@ -404,7 +551,10 @@ def band_lines(euler, reflectors: Reflectors | None = None,
 
 def zone_axis_points(euler, reflectors: Reflectors | None = None,
                      detector=(60, 60), pc=(0.5, 0.5, 0.55), *,
-                     max_axes: int = 12, min_bands: int = 3):
+                     max_axes: int = 12, min_bands: int = 3,
+                     sample_tilt: float = SAMPLE_TILT,
+                     detector_tilt: float = DETECTOR_TILT,
+                     azimuthal: float = 0.0, twist: float = 0.0):
     """Where band lines meet — the zone axes -> ``(M, 2)`` detector pixels.
 
     A zone axis is a crystal direction several planes share, and on a real
@@ -412,12 +562,15 @@ def zone_axis_points(euler, reflectors: Reflectors | None = None,
     the most useful thing to draw after the bands themselves. Found from the
     band set rather than from a separate direction list: any pair of normals
     defines their zone axis ``n_i x n_j``, and the axes worth drawing are the
-    ones many pairs agree on.
+    ones many pairs agree on. Worked in the detector frame, where an axis's
+    ``z`` says whether it points at the screen.
     """
     refl = reflectors if reflectors is not None else cubic_reflectors()
     euler = np.asarray(euler, float).reshape(3)
     rot = euler_to_matrix(*euler)
-    n_rot = normals_to_sample(refl.normals, rot)
+    n_rot = normals_to_detector(refl.normals, rot, sample_tilt=sample_tilt,
+                                detector_tilt=detector_tilt,
+                                azimuthal=azimuthal, twist=twist)
     n = len(n_rot)
     if n < 2:
         return np.zeros((0, 2), np.float32)

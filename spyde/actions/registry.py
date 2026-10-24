@@ -106,6 +106,8 @@ _SPYDE_STAGED_HANDLERS: dict[str, str] = {
     "set_phase_structure": "spyde.actions.composition.set_phase_structure",
     "cod_search":          "spyde.actions.composition.cod_search",
     "cod_pick":            "spyde.actions.composition.cod_pick",
+    "show_phase":          "spyde.actions.phase_viewer.show_phase",
+    "phase_setup_set":     "spyde.actions.phase_viewer.phase_setup_set",
     "czb_run":             "spyde.actions.center_zero_beam.czb_run",
     "czb_open":            "spyde.actions.center_zero_beam.czb_open",
     "czb_pick":            "spyde.actions.center_zero_beam.czb_pick",

@@ -1,0 +1,1 @@
+Fixed the EBSD wizard simulating its dictionary and drawing its band overlay for an untilted detector: both now use the scan's sample and detector tilt (70° by default), so the bands line up with real patterns at every orientation rather than only some.

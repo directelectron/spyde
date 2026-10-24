@@ -1,0 +1,1 @@
+Fixed fcc and bcc phases loaded from a CIF losing their {200} and {220} Kikuchi bands in the EBSD wizard's dictionary and band overlay: an extinct reflection along the same line was kept in their place.

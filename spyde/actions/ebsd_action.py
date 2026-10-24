@@ -137,7 +137,7 @@ class EbsdWizard(WizardController):
 
     def __init__(self, session, tree, *, phase, reflectors, indexer, euler,
                  detector, pc, background, background_sigma, static_ref,
-                 voltage, overlay=None):
+                 voltage, geometry=None, overlay=None):
         super().__init__(session, tree)
         self.phase = phase
         self.reflectors = reflectors
@@ -145,6 +145,9 @@ class EbsdWizard(WizardController):
         self.euler = euler                # (D, 3) the dictionary's orientations
         self.detector = detector
         self.pc = pc
+        # The detector's angles relative to the sample, as keyword arguments
+        # of the spyde.ebsd simulators (_resolve_geometry).
+        self.geometry = dict(geometry or _resolve_geometry(None))
         self.background = background
         self.background_sigma = float(background_sigma)
         self.static_ref = static_ref
@@ -245,6 +248,32 @@ def _resolve_pc(signal, payload) -> tuple[float, float, float]:
         if payload.get(key) is not None:
             base[i] = float(payload[key])
     return tuple(base)
+
+
+def _resolve_geometry(signal) -> dict:
+    """The detector's orientation relative to the sample, in degrees, as the
+    keyword arguments every ``spyde.ebsd`` simulator takes.
+
+    Read from the microscope set-up the phase viewer edits
+    (:func:`spyde.ebsd.microscope.read_setup`: metadata, then the detector
+    recorded with the scan, then the EBSD defaults), so the dictionary, the
+    drawn bands and the viewer all see the same geometry.
+    """
+    from spyde.ebsd.bands import DETECTOR_TILT, SAMPLE_TILT
+    from spyde.ebsd.microscope import read_setup
+
+    geometry = {"sample_tilt": SAMPLE_TILT, "detector_tilt": DETECTOR_TILT,
+                "azimuthal": 0.0, "twist": 0.0}
+    if signal is None:
+        return geometry
+    try:
+        setup = read_setup(signal)
+    except Exception as e:
+        log.debug("no microscope set-up on the scan (%s); EBSD defaults", e)
+        return geometry
+    if setup.microscope != "SEM":
+        return geometry
+    return {key: float(setup[key]) for key in geometry}
 
 
 def _nav_shape(signal) -> tuple[int, int]:
@@ -367,6 +396,7 @@ def ebsd_build_dictionary(session, plot, payload) -> None:
     n_bands = int(payload.get("n_bands", DEFAULTS["n_bands"]))
     zone_axes = bool(payload.get("show_zone_axes", DEFAULTS["show_zone_axes"]))
     pc = _resolve_pc(root, payload)
+    geometry = _resolve_geometry(root)
     detector = _detector_shape(root)
     window_id = getattr(src, "window_id", None) or payload.get("window_id")
 
@@ -412,7 +442,7 @@ def ebsd_build_dictionary(session, plot, payload) -> None:
             dic = simulate_dictionary(euler, detector, pc,
                                       reflectors=reflectors,
                                       background_sigma=sim_sigma,
-                                      progress=_progress)
+                                      progress=_progress, **geometry)
             if dic is None:
                 return
             indexer = SinglePatternIndexer(dic, euler)
@@ -438,13 +468,13 @@ def ebsd_build_dictionary(session, plot, payload) -> None:
                 session, tree, phase=phase, reflectors=reflectors,
                 indexer=indexer, euler=euler, detector=detector, pc=pc,
                 background=background, background_sigma=bg_sigma,
-                static_ref=static_ref, voltage=voltage,
+                static_ref=static_ref, voltage=voltage, geometry=geometry,
             )
             from spyde.actions.ebsd_overlay import attach_ebsd_band_overlay
             wiz.overlay = attach_ebsd_band_overlay(
                 root, indexer, reflectors, tree,
-                detector=detector, pc=pc, correct=wiz.correct,
-                n_bands=n_bands, show_zone_axes=zone_axes,
+                detector=detector, pc=pc, geometry=geometry,
+                correct=wiz.correct, n_bands=n_bands, show_zone_axes=zone_axes,
                 on_match=lambda e, s: _emit_match(window_id, e, s),
             )
             # Published only once it is COMPLETE: `tree._ebsd_wizard` is what
@@ -580,7 +610,7 @@ def _index_chunk(block, wiz, keep, refine, steps, dict_euler):
             ref = refine_orientations(
                 corrected, eul, detector=wiz.detector, pc=wiz.pc,
                 reflectors=wiz.reflectors, background_sigma=wiz.sim_sigma,
-                steps=steps)
+                steps=steps, **wiz.geometry)
         eul = ref.euler_map((by, bx))
         sc = ref.score.reshape(by, bx)
 
@@ -846,6 +876,7 @@ def _orientation_map(euler, score, wiz, src):
         nav_axes=list(src.axes_manager.navigation_axes),
         params={"action": "EBSD Indexing", "pc": list(wiz.pc),
                 "detector": list(wiz.detector),
+                **{key: float(value) for key, value in wiz.geometry.items()},
                 "voltage_kv": wiz.voltage,
                 "n_dictionary": int(len(wiz.euler)),
                 "background": wiz.background},

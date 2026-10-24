@@ -139,6 +139,19 @@ class TestBuildDictionary:
         # which reads as broken indexing.
         assert np.allclose(wiz.pc, ebsd_session["truth"]["pc"])
 
+    def test_simulates_at_the_recorded_sample_tilt(self, ebsd_session):
+        """The dictionary and the drawn bands take the detector's angles from
+        the scan's microscope set-up — the one the phase viewer edits — and
+        the EBSD defaults when it records none."""
+        plot = _signal_plot(ebsd_session["session"])
+        plot.signal_tree.root.metadata.set_item(
+            "Acquisition_instrument.SEM.Stage.tilt_alpha", 65.0)
+        _s, _p, _tree, wiz = _build(ebsd_session)
+        want = {"sample_tilt": 65.0, "detector_tilt": 0.0, "azimuthal": 0.0,
+                "twist": 0.0}
+        assert wiz.geometry == want
+        assert overlay_static(wiz.overlay)["geometry"] == want
+
         # And it announces itself to the caret.
         msgs = [m for m in ebsd_session["messages"]
                 if m.get("type") == "ebsd_dictionary_ready"]

@@ -1,0 +1,1 @@
+Solving a scan's EBSD pattern center from its own patterns now takes about 25 s, down from minutes, because the candidate orientations are sampled once and reused across the search.
