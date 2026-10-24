@@ -363,6 +363,16 @@ def show_tree_node(plot, tree, new_signal) -> None:
             session._reemit_signal_tree(plot)
         except Exception as e:
             log.debug("re-emitting signal tree after transform failed: %s", e)
+    # The dock's axes table and dataset summary describe the displayed node,
+    # so they are stale the moment it changes.
+    for emit_name in ("_emit_axes", "_emit_metadata"):
+        emit_for_tree = getattr(session, emit_name, None)
+        if emit_for_tree is None:
+            continue
+        try:
+            emit_for_tree(tree)
+        except Exception as e:
+            log.debug("%s after node switch failed: %s", emit_name, e)
 
 
 def paint_signal_plots(tree, data, *, levels: tuple[float, float] | None = None) -> int:

@@ -1,0 +1,1 @@
+With a binned or cropped node selected, Plot Control showed the original dataset's size and axis calibration; it now describes the selected node, and an axis edited there is applied consistently to every node of the dataset.

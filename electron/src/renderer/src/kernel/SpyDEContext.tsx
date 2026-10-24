@@ -37,6 +37,9 @@ export interface ParamSpec {
   step?: number
   extensions?: string[]         // for type 'file' (e.g. ['.cif'])
   tab?: string                  // optional caret tab this param belongs to
+  // Optional field group: the caret draws a "|" where consecutive fields
+  // change group (Rebin's scan fields | its diffraction fields).
+  group?: string
   // Show this row only when another param currently equals `value`.
   display_condition?: { parameter: string; value: unknown }
 }

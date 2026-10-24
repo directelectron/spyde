@@ -46,13 +46,15 @@ def _clean(value) -> str:
 
 
 def build_axes_list(signal_tree: "BaseSignalTree") -> list[dict]:
-    """Return the root signal's axes as plain dicts for the sidebar table.
+    """Return the displayed node's axes as plain dicts for the sidebar table.
 
+    The displayed node, not the root: a binned or cropped node has its own
+    sizes, scales and offsets, and the dock describes what is on screen.
     One row per axis (navigation + signal), in array order. ``scale``/``offset``
     are ``None`` for non-uniform/functional axes (rendered read-only). The
     ``index`` is the stable handle the renderer sends back in ``set_axis``.
     """
-    am = signal_tree.root.axes_manager
+    am = _displayed_signal(signal_tree).axes_manager
     rows: list[dict] = []
     for i, ax in enumerate(am._axes):
         scale = getattr(ax, "scale", None)

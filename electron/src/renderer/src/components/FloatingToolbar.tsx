@@ -569,13 +569,16 @@ function ParamPopout({ action, caretPos, below, onRun, onClose }: {
         </div>
       )}
       <div style={styles.paramWrap}>
-        {params.map(([key, spec]) => (
-          rowVisible(spec, values) && (
-            <div key={key} style={styles.cell} data-testid={`param-row-${key}`}>
+        {params.filter(([, spec]) => rowVisible(spec, values)).map(([key, spec], position, shown) => (
+          <React.Fragment key={key}>
+            {position > 0 && spec.group !== shown[position - 1][1].group && (
+              <span data-testid="param-separator" style={styles.paramSeparator}>|</span>
+            )}
+            <div style={styles.cell} data-testid={`param-row-${key}`}>
               <label style={styles.cellLabel}>{spec.name || key}</label>
               <ParamControl paramKey={key} spec={spec} value={values[key]} onChange={(v) => set(key, v)} />
             </div>
-          )
+          </React.Fragment>
         ))}
       </div>
       <button data-testid="action-run" style={{ ...styles.runBtn, alignSelf: 'flex-start' }}
@@ -854,6 +857,9 @@ const styles: Record<string, React.CSSProperties> = {
     alignItems: 'flex-end', gap: 8, rowGap: 8, maxWidth: 440, marginBottom: 6,
   },
   cell: { display: 'flex', flexDirection: 'column', gap: 2, alignItems: 'flex-start' },
+  // Sits on the inputs' baseline (paramWrap aligns to flex-end), between two
+  // groups of fields.
+  paramSeparator: { color: '#585b70', fontSize: 16, lineHeight: '22px', padding: '0 2px' },
   cellLabel: { fontSize: 9, color: '#a6adc8', whiteSpace: 'nowrap' },
   control: {
     background: '#11111b', color: '#cdd6f4', border: '1px solid #313244',

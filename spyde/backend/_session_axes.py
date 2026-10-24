@@ -124,9 +124,17 @@ class AxesEditorMixin:
         self._emit_axes(tree)
 
     def _set_axis(self, plot, payload: dict) -> None:
-        """Edit one axis property of the active window's root signal and
-        recalibrate every plot in its tree. Writes back to the real
-        axes_manager so the change is reflected in the dataset."""
+        """Edit one axis property of the displayed node and recalibrate every
+        plot in its tree. Writes back to the real axes_manager so the change is
+        reflected in the dataset.
+
+        ``index`` names a row of the axes table, which describes the DISPLAYED
+        node (see ``build_axes_list``). The same change then reaches the
+        matching axis of every other node of the tree (``_matching_axes``): a
+        scale as a ratio and an offset as a shift, which is what keeps a binned
+        or cropped node's calibration consistent with its root's. The navigator
+        finds such a node's position through that calibration, so an edit made
+        on one node alone would point the crosshair at the wrong frames."""
         if plot is None:
             return
         tree = getattr(plot, "signal_tree", None)
@@ -137,11 +145,14 @@ class AxesEditorMixin:
         value = payload.get("value")
         if index is None or field not in ("name", "units", "scale", "offset"):
             return
+        from spyde.metadata_extract import _displayed_signal
         try:
-            axes = tree.root.axes_manager._axes
+            signal = _displayed_signal(tree)
+            axes = signal.axes_manager._axes
             if not (0 <= int(index) < len(axes)):
                 return
             ax = axes[int(index)]
+            others = _matching_axes(tree, signal, ax)
             if field == "scale":
                 try:
                     new_scale = float(value)
@@ -154,22 +165,30 @@ class AxesEditorMixin:
                 # So the (0,0) point (e.g. the crosshair-marked centre) does not
                 # drift when the user recalibrates the pixel size.
                 old_scale = float(ax.scale)
-                old_offset = float(ax.offset)
-                ax.scale = new_scale
-                if old_scale != 0.0:
-                    ax.offset = old_offset * (new_scale / old_scale)
+                if old_scale == 0.0:
+                    ax.scale = new_scale
+                else:
+                    ratio = new_scale / old_scale
+                    for each in [ax, *others]:
+                        each.offset = float(each.offset) * ratio
+                        each.scale = float(each.scale) * ratio
+                    ax.scale = new_scale
             elif field == "offset":
                 try:
-                    ax.offset = float(value)
+                    shift = float(value) - float(ax.offset)
                 except (TypeError, ValueError):
                     return  # ignore non-numeric input mid-typing
+                for each in [ax, *others]:
+                    each.offset = float(each.offset) + shift
+                ax.offset = float(value)
             else:
                 # A units edit RELABELS and leaves the scale alone — deliberately,
                 # and not the same operation as the dock's Detector-units control,
                 # which converts. Both are needed: "show me this in nm⁻¹" converts,
                 # while "this axis says 1/nm but the numbers are Å⁻¹" is a repair
                 # that must NOT touch them. Only the cell can do the second.
-                setattr(ax, field, str(value))
+                for each in [ax, *others]:
+                    setattr(each, field, str(value))
         except Exception as e:
             log.warning("set_axis failed: %s", e)
             return
@@ -434,3 +453,41 @@ class AxesEditorMixin:
         # do NOT mutate the offset at toggle-on: the crosshair already starts at
         # the existing origin, so the offset is unchanged until the user drags.
         self._emit_axes(tree)
+
+
+def _matching_axes(tree, signal, axis) -> list:
+    """The axis of every OTHER node of ``tree`` that is the same axis as
+    ``axis`` of ``signal``, binned, cropped or not.
+
+    Matched by position among the navigation or signal axes, counted from the
+    fastest, and by the name and units it has before the edit. Position alone
+    is not enough: a node whose detector axes were replaced (an azimuthal
+    integration's radius and angle) has axes in the same places that are not
+    the detector's, and a detector scale must not rescale them. Counting from
+    the fastest keeps a multi-angle stack's summed node aligned with its
+    root, which lost its slowest navigation axis.
+    """
+    def group(axes_manager, navigate):
+        return list(axes_manager.navigation_axes if navigate
+                    else axes_manager.signal_axes)
+
+    navigate = bool(axis.navigate)
+    position = next(index for index, each in enumerate(
+        group(signal.axes_manager, navigate)) if each is axis)
+    name, units = axis.name, axis.units
+    matches = []
+    for node in tree.walk():
+        other_signal = node.signal
+        if other_signal is signal:
+            continue
+        try:
+            others = group(other_signal.axes_manager, navigate)
+        except Exception:
+            continue
+        if position >= len(others):
+            continue
+        other = others[position]
+        if (other.name == name and other.units == units
+                and getattr(other, "is_uniform", False)):
+            matches.append(other)
+    return matches
