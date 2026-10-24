@@ -1,0 +1,44 @@
+# Barium titanate, tetragonal P4mm: COD entry 1507756, trimmed to the cell,
+# symmetry and atom sites. Crystallography Open Database,
+# https://www.crystallography.net/cod/1507756.html (see _journal_paper_doi).
+data_1507756
+_journal_paper_doi               10.4236/jmp.2011.211175
+_chemical_formula_sum            'Ba O3 Ti'
+_space_group_IT_number           99
+_symmetry_Int_Tables_number      99
+_symmetry_space_group_name_Hall  'P 4 -2'
+_symmetry_space_group_name_H-M   'P 4 m m'
+_cell_angle_alpha                90.000
+_cell_angle_beta                 90.000
+_cell_angle_gamma                90.000
+_cell_formula_units_Z            1
+_cell_length_a                   3.9999
+_cell_length_b                   3.9999
+_cell_length_c                   4.0170
+_cell_volume                     64.269
+_cod_database_code               1507756
+loop_
+_symmetry_equiv_pos_site_id
+_symmetry_equiv_pos_as_xyz
+1 x,y,z
+2 -y,x,z
+3 -x,-y,z
+4 y,-x,z
+5 -x,y,z
+6 x,-y,z
+7 -y,-x,z
+8 y,x,z
+loop_
+_atom_site_label
+_atom_site_type_symbol
+_atom_site_fract_x
+_atom_site_fract_y
+_atom_site_fract_z
+_atom_site_occupancy
+_atom_site_symmetry_multiplicity
+_atom_site_Wyckoff_symbol
+_atom_site_calc_flag
+ba Ba 0.0000 0.0000 0.0000 1.000 1 a d
+ti Ti 0.5000 0.5000 0.4820 1.000 1 b d
+o O 0.5000 0.5000 0.0160 1.000 1 b d
+o O 0.5000 0.0000 0.5150 1.000 2 c d

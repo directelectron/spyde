@@ -98,8 +98,8 @@ def _load_phases(session, tree, panel) -> None:
     paths = [p.get("cif_path") for p in read_phases(tree) if p.get("cif_path")]
 
     def _read():
-        from orix.crystal_map import Phase
-        return [Phase.from_cif(path) for path in paths]
+        from spyde.crystal_phase import phase_from_cif
+        return [phase_from_cif(path) for path in paths]
 
     if getattr(session, "_dispatch_to_main", None) is None:
         try:

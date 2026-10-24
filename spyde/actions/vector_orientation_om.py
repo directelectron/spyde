@@ -244,12 +244,11 @@ def vom_generate_library(session, plot, payload) -> None:
 
     def _work():
         try:
-            from orix.crystal_map import Phase
-
+            from spyde.crystal_phase import phase_from_cif
             from spyde.reciprocal_units import axis_unit_factor
             root = tree.root
             vecs = tree.diffraction_vectors
-            phases = [Phase.from_cif(p) for p in cif_paths]
+            phases = [phase_from_cif(p) for p in cif_paths]
             recip_r = _reciprocal_radius(root)
             # No diffsims library: the matcher samples zone axes from the
             # crystal itself and leaves the in-plane angle to an FFT, so a
@@ -268,9 +267,6 @@ def vom_generate_library(session, plot, payload) -> None:
                     old.remove()
                 except Exception as e:
                     log.debug("removing prior VOM wizard failed: %s", e)
-            overlay = None
-            fitter = None
-            n_orientations = 0
             wid = getattr(src, "window_id", None)
             # The IPF window shows the phases' triangles filling in while the
             # plans build — see ipf_panel.
@@ -280,6 +276,9 @@ def vom_generate_library(session, plot, payload) -> None:
             panel.set_phases(phases)
             panel.show()
             panel.start_filling()
+            # A plan that fails to build fails Generate: the preview, the heat
+            # map and Run all need it, and a "ready" library without one reads
+            # as 0 orientations with nothing to say why.
             try:
                 # The live preview is the quantem correlation matcher: it
                 # returns a continuous orientation rather than the nearest
@@ -300,23 +299,18 @@ def vom_generate_library(session, plot, payload) -> None:
                     angle_step_in_plane_deg=float(in_plane))
                 overlay = attach_quantem_orientation_overlay(
                     vecs, fitter, tree, on_fit=lambda fit: _emit_vom_fit(wid, fit))
-                n_orientations = sum(int(m.zone_axes.shape[0])
-                                     for m in fitter._maps)
-            except Exception as e:
-                import logging
-                logging.getLogger(__name__).debug("vom overlay attach failed: %s", e)
             finally:
                 panel.stop_filling()
+            n_orientations = sum(int(m.zone_axes.shape[0]) for m in fitter._maps)
+            note = _coarsened_step_note(fitter, phases, float(resolution))
 
             # The correlation surface the matcher picks its answer off, one
             # triangle per phase. A single best number cannot say whether the
             # position was confident, ambiguous between variants, or the wrong
             # phase entirely; this can, and it costs one correlation per move.
-            refine_ipf = None
-            if fitter is not None:
-                from spyde.actions.vector_refine_ipf import open_refine_ipf
-                refine_ipf = open_refine_ipf(session, root, fitter, phases,
-                                             vecs, tree, fit_overlay=overlay)
+            from spyde.actions.vector_refine_ipf import open_refine_ipf
+            refine_ipf = open_refine_ipf(session, root, fitter, phases,
+                                         vecs, tree, fit_overlay=overlay)
 
             wiz = VomWizard(
                 session, tree, phases=phases, overlay=overlay,
@@ -337,11 +331,12 @@ def vom_generate_library(session, plot, payload) -> None:
             # Run's job; the crosshair preview is what refining looks at.
             emit_status(f"Vector Orientation: ready ({n_orientations} "
                         f"orientations, {phase_names}) — move the crosshair "
-                        f"to refine, or Compute Maps")
+                        f"to refine, or Compute Maps"
+                        + (f". {note}" if note else ""))
             emit({"type": "vom_library_ready",
                   "window_id": getattr(src, "window_id", None),
                   "ok": True, "n_templates": n_orientations,
-                  "phases": [str(p.name) for p in phases]})
+                  "phases": [str(p.name) for p in phases], "note": note})
         except Exception as e:
             emit_error(f"Generate Library failed: {e}")
             log.exception("Generate Library failed")
@@ -350,6 +345,18 @@ def vom_generate_library(session, plot, payload) -> None:
 
     from spyde.actions.lifecycle import run_on_worker
     run_on_worker(session, _work, name="vom-generate-library")
+
+
+def _coarsened_step_note(fitter, phases, requested_step: float) -> str | None:
+    """What to tell the user when a phase's plan was built coarser than the
+    requested zone-axis step because the finer one would not fit in memory."""
+    raised = [f"{phase.name} at {orientation_map.zone_step_deg:g}°"
+              for phase, orientation_map in zip(phases, fitter._maps)
+              if orientation_map.zone_step_deg > requested_step]
+    if not raised:
+        return None
+    return (f"A {requested_step:g}° zone-axis step does not fit in memory, so "
+            f"the library was built with {', '.join(raised)}")
 
 
 def _ipf_title(src, title: str) -> str:

@@ -1,0 +1,56 @@
+# Barium titanate, hexagonal P63/mmc: COD entry 2009488, trimmed to the cell,
+# symmetry and atom sites. Crystallography Open Database,
+# https://www.crystallography.net/cod/2009488.html (see _journal_paper_doi).
+data_2009488
+_journal_paper_doi               10.1107/S0108270193008637
+_chemical_formula_sum            'Ba O3 Ti'
+_space_group_IT_number           194
+_symmetry_cell_setting           hexagonal
+_symmetry_space_group_name_Hall  '-P 6c 2c'
+_symmetry_space_group_name_H-M   'P 63/m m c'
+_cell_angle_alpha                90
+_cell_angle_beta                 90
+_cell_angle_gamma                120
+_cell_formula_units_Z            6
+_cell_length_a                   5.7238(7)
+_cell_length_b                   5.7238(7)
+_cell_length_c                   13.9649(7)
+_cell_volume                     396.22(7)
+_cod_database_code               2009488
+loop_
+_symmetry_equiv_pos_as_xyz
++x,+y,+z
+-y,+x-y,+z
+-x+y,-x,+z
+-x,-y,1/2+z
++y,-x+y,1/2+z
++x-y,+x,1/2+z
++y,+x,-z
++x-y,-y,-z
+-x,-x+y,-z
+-y,-x,1/2-z
+-x+y,+y,1/2-z
++x,+x-y,1/2-z
+-x,-y,-z
++y,-x+y,-z
++x-y,+x,-z
++x,+y,1/2-z
+-y,+x-y,1/2-z
+-x+y,-x,1/2-z
+-y,-x,+z
+-x+y,+y,+z
++x,+x-y,+z
++y,+x,1/2+z
++x-y,-y,1/2+z
+-x,-x+y,1/2+z
+loop_
+_atom_site_label
+_atom_site_fract_x
+_atom_site_fract_y
+_atom_site_fract_z
+Ba(1) 0 0 0.25
+Ba(2) 0.333333333333333 0.666666666666667 0.09671(5)
+Ti(1) 0 0 0
+Ti(2) 0.333333333333333 0.666666666666667 0.84633(14)
+O(1) 0.5185(6) 0.0370 0.25
+O(2) 0.8349(6) 0.6698 0.0802(2)

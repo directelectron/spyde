@@ -1,0 +1,1 @@
+Orientation-mapping libraries built from hexagonal, trigonal and monoclinic CIFs (barium titanate, GaN, ZnO, sapphire and Ti from COD among them) now use the atom positions in the file, so they keep their space group, and a library too large for the free memory is built at a coarser zone-axis step and says so, where it used to report 0 orientations.

@@ -328,7 +328,8 @@ def _phase_for(payload, signal):
     from orix.crystal_map import Phase
     cif = payload.get("cif_path") or ""
     if cif:
-        return Phase.from_cif(cif)
+        from spyde.crystal_phase import phase_from_cif
+        return phase_from_cif(cif)
     sg = int(payload.get("space_group") or DEFAULTS["space_group"])
     return Phase(name="phase", space_group=sg)
 

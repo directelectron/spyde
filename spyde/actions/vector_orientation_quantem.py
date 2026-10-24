@@ -953,6 +953,73 @@ def orientation_map_class(refine_device: str = "cpu", refine_chunk: int = 2048,
     return _GpuRefine
 
 
+#: Bytes the plan build holds per (zone axis, reflection) pair while it
+#: simulates the library. Measured on BaTiO3 polymorphs and silver (peak
+#: working set less the interpreter's): 330-410; the larger is used so the
+#: estimate errs towards a coarser step rather than a failed build.
+PLAN_BYTES_PER_ZONE_REFLECTION = 410
+#: Share of the memory free at build time that a plan may use. The rest is the
+#: app's: the scan, its vectors, the other phases' plans.
+PLAN_MEMORY_SHARE = 0.5
+#: No plan is built coarser than this. Past it a zone axis is so far from its
+#: neighbours that a pattern between them matches neither.
+COARSEST_ZONE_STEP_DEG = 8.0
+
+
+def plan_zone_count(crystal, angle_step_zone_axis_deg: float) -> int:
+    """How many zone axes the plan samples: the same two branches as the
+    matcher's ``build_plan``, without building anything."""
+    from spyde.external.quantem.diffraction.orientation import sample_zone_axes
+
+    wedge = crystal.zone_axis_wedge()
+    if wedge is None:
+        return int(np.ceil(2 * np.pi / np.deg2rad(angle_step_zone_axis_deg) ** 2))
+    return int(sample_zone_axes(wedge, angle_step_zone_axis_deg)[0].shape[0])
+
+
+def plan_bytes(crystal, angle_step_zone_axis_deg: float) -> int:
+    """Peak memory of building the plan, estimated. ``crystal.g_vec`` must
+    already be computed.
+
+    Two terms dominate, and the first is why a low-symmetry phase fails: the
+    neighbour search holds a float64 table of every zone's symmetry images in
+    both hemispheres against every zone, which grows with the SQUARE of the
+    zone count. Orthorhombic BaTiO3 at 1° samples ~20 600 zones,
+    ~14 GB for that table alone. The second is the simulation, one row per
+    reflection for every zone.
+    """
+    zones = plan_zone_count(crystal, angle_step_zone_axis_deg)
+    images = 2 * int(crystal.sym_quats_matching.shape[0]) * zones
+    reflections = int(crystal.g_vec.shape[0])
+    return 8 * images * zones + PLAN_BYTES_PER_ZONE_REFLECTION * zones * reflections
+
+
+def plan_memory_budget() -> int:
+    """Bytes a plan build may use now."""
+    import psutil
+    return int(psutil.virtual_memory().available * PLAN_MEMORY_SHARE)
+
+
+def affordable_zone_step(crystal, angle_step_zone_axis_deg: float,
+                         budget_bytes: int) -> float:
+    """The finest zone-axis step, no finer than the one asked for, whose plan
+    fits in *budget_bytes*. Raises ``MemoryError`` with a message for the user
+    when not even :data:`COARSEST_ZONE_STEP_DEG` fits."""
+    step = float(angle_step_zone_axis_deg)
+    while plan_bytes(crystal, step) > budget_bytes:
+        if step >= COARSEST_ZONE_STEP_DEG:
+            raise MemoryError(
+                f"not enough memory for a {crystal.name} library: even at a "
+                f"{COARSEST_ZONE_STEP_DEG:g}° zone-axis step it "
+                f"needs ~{plan_bytes(crystal, step) / 1e9:.1f} GB and "
+                f"{budget_bytes / 1e9:.1f} GB can be spared. Lower the "
+                f"reciprocal radius or free some memory.")
+        # Memory goes as the fourth power of the step, so 10 % per try trims
+        # about a third and lands close to the finest step that fits.
+        step = min(COARSEST_ZONE_STEP_DEG, max(step + 0.01, round(step * 1.1, 2)))
+    return step
+
+
 def build_orientation_map(peaks: PeaksAdapter, crystal, energy_ev: float,
                           k_max: float, angle_step_zone_axis_deg: float = 1.0,
                           angle_step_in_plane_deg: float = 5.0,
@@ -964,14 +1031,24 @@ def build_orientation_map(peaks: PeaksAdapter, crystal, energy_ev: float,
     ``k_max`` is the outer reciprocal radius in Å⁻¹, i.e. the same quantity our
     own library build calls ``reciprocal_radius`` / ``r_max``. Reflections
     beyond it cannot be measured, so generating them only costs plan size.
+
+    A plan that would not fit in memory is built at the finest coarser
+    zone-axis step that does (:func:`affordable_zone_step`); the step used is
+    the map's ``zone_step_deg``, so a caller can tell the user.
     """
     install_zone_angle_cache()
     if crystal.g_vec is None:
         crystal.calculate_structure_factors(k_max=k_max)
+    step = affordable_zone_step(crystal, angle_step_zone_axis_deg,
+                                plan_memory_budget())
+    if step > angle_step_zone_axis_deg:
+        log.warning("%s: zone-axis step raised from %g to %g degrees so the "
+                    "plan fits in memory", crystal.name,
+                    angle_step_zone_axis_deg, step)
     map_class = orientation_map_class(refine_device, refine_chunk, refine_dtype)
     orientation_map = map_class.from_vectors(peaks, crystal, energy_ev=energy_ev)
     orientation_map.build_plan(
-        angle_step_zone_axis_deg=angle_step_zone_axis_deg,
+        angle_step_zone_axis_deg=step,
         angle_step_in_plane_deg=angle_step_in_plane_deg,
         device=device, verbose=verbose, **plan_kwargs)
     return orientation_map

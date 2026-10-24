@@ -1,0 +1,38 @@
+# Barium titanate, orthorhombic Amm2: COD entry 9014492, trimmed to the cell,
+# symmetry and atom sites. Crystallography Open Database,
+# https://www.crystallography.net/cod/9014492.html (see _journal_paper_doi).
+data_9014492
+_journal_paper_doi               10.1021/j100112a043
+_chemical_formula_sum            'Ba O3 Ti'
+_space_group_IT_number           38
+_symmetry_space_group_name_Hall  'A 2 -2'
+_symmetry_space_group_name_H-M   'A m m 2'
+_cell_angle_alpha                90
+_cell_angle_beta                 90
+_cell_angle_gamma                90
+_cell_length_a                   3.9828
+_cell_length_b                   5.6745
+_cell_length_c                   5.6946
+_cell_formula_units_Z            2
+_cell_volume                     128.700
+_cod_database_code               9014492
+loop_
+_space_group_symop_operation_xyz
+x,y,z
+x,1/2+y,1/2+z
+x,-y,z
+x,1/2-y,1/2+z
+-x,y,z
+-x,1/2+y,1/2+z
+-x,-y,z
+-x,1/2-y,1/2+z
+loop_
+_atom_site_label
+_atom_site_fract_x
+_atom_site_fract_y
+_atom_site_fract_z
+_atom_site_U_iso_or_equiv
+Ba 0.00000 0.00000 0.00000 0.00090
+Ti 0.50000 0.00000 0.51700 0.00260
+O1 0.00000 0.00000 0.48900 0.00480
+O2 0.50000 0.25610 0.24843 0.00250

@@ -64,8 +64,8 @@ def orientation_mapping(ctx, action_name: str = "Orientation Mapping",
 
     def _work():
         try:
-            from orix.crystal_map import Phase
-            phase = Phase.from_cif(cif_path)
+            from spyde.crystal_phase import phase_from_cif
+            phase = phase_from_cif(cif_path)
             run_orientation(session, src, src_tree, [phase], sim_params,
                             match_params, src_dp_plot=src_dp_plot)
         except Exception as e:
@@ -327,13 +327,13 @@ def om_generate_library(session, plot, payload) -> None:
 
     def _work():
         try:
-            from orix.crystal_map import Phase
+            from spyde.crystal_phase import phase_from_cif
             from spyde.actions.orientation_compute import (
                 generate_library_from_phases, build_matching_cache, template_tables,
             )
             from spyde.actions.vector_overlay import attach_orientation_overlay
             src_root = _current_signal(src) or tree.root
-            phases = [Phase.from_cif(p) for p in cif_paths]
+            phases = [phase_from_cif(p) for p in cif_paths]
             recip_r = _reciprocal_radius(src_root)
             # The IPF window shows the phases' triangles filling in while the
             # library builds — see ipf_panel.

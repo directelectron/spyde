@@ -83,8 +83,10 @@ export function VectorOrientationWizard({ caretPos, windowId, sendAction, onClos
   // The library builds off-thread; its reply is what ends "Generating library…".
   useWizardEvent('spyde:vom_library_ready', windowId, (detail) => {
     if (detail.ok) {
+      // A note says the library was built coarser than asked, to fit in memory.
       setStatus(`Library ready (${Number(detail.n_templates ?? 0).toLocaleString()} templates) — `
-        + 'move the crosshair to refine, or Compute Maps.')
+        + 'move the crosshair to refine, or Compute Maps.'
+        + (detail.note ? ` ${String(detail.note)}.` : ''))
     } else {
       setLibReady(false)
       setTab('Library')

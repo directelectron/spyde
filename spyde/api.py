@@ -72,7 +72,8 @@ def _as_phases(phases) -> list:
     ``[Phase]``."""
     from orix.crystal_map import Phase
     if isinstance(phases, (str,)) or hasattr(phases, "__fspath__"):
-        return [Phase.from_cif(str(phases))]
+        from spyde.crystal_phase import phase_from_cif
+        return [phase_from_cif(phases)]
     if isinstance(phases, Phase):
         return [phases]
     out = []

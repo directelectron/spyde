@@ -856,8 +856,8 @@ def strain_set_method(session, plot, payload) -> None:
         if not cif_path:
             return                                  # CIF chosen but no file yet
         try:
-            from orix.crystal_map import Phase
-            ctrl.set_cif_reference(Phase.from_cif(cif_path))
+            from spyde.crystal_phase import phase_from_cif
+            ctrl.set_cif_reference(phase_from_cif(cif_path))
         except Exception as e:
             from de_shell.ipc import emit_error
             emit_error(f"Strain CIF reference failed: {e}")

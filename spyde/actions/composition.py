@@ -304,8 +304,8 @@ def elements_from_cif(path) -> list[str]:
     elements from it, which is the state it was in anyway.
     """
     try:
-        from orix.crystal_map import Phase
-        phase = Phase.from_cif(str(path))
+        from spyde.crystal_phase import phase_from_cif
+        phase = phase_from_cif(path)
         symbols: list[str] = []
         for atom in phase.structure:
             symbol = str(getattr(atom, "element", "") or "").strip()
