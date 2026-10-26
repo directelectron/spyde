@@ -35,6 +35,7 @@ import numpy as np
 
 from spyde.device_lock import DEVICE_LOCK, accelerator_lock, is_mps, mps_sync
 from spyde.ebsd._device import default_device
+from spyde.ebsd.bands import DETECTOR_TILT, SAMPLE_TILT
 
 log = logging.getLogger(__name__)
 
@@ -90,6 +91,9 @@ class BandSimulator:
     THE SAME reflectors, so the lines it draws are the centres of the bands
     this simulator rendered.
 
+    The four angles place the detector relative to the sample, as in
+    :func:`spyde.ebsd.bands.sample_to_detector`.
+
     Stands in for a master-pattern lookup (#69). The optimiser does not care
     which it is: anything mapping ``(P, 3)`` Euler angles to ``(P, K)`` patterns
     differentiably will do.
@@ -97,13 +101,18 @@ class BandSimulator:
 
     def __init__(self, detector=(60, 60), pc=(0.5, 0.5, 0.55), *,
                  reflectors=None, background_sigma=None, device="cpu",
-                 dtype=None):
+                 dtype=None, sample_tilt=SAMPLE_TILT,
+                 detector_tilt=DETECTOR_TILT, azimuthal=0.0, twist=0.0):
         import torch
-        from spyde.ebsd.bands import cubic_reflectors, detector_directions
+        from spyde.ebsd.bands import cubic_reflectors, sample_directions
 
         dtype = dtype or torch.float32
         refl = reflectors if reflectors is not None else cubic_reflectors()
-        r = detector_directions(detector, pc).reshape(-1, 3)
+        # The rays are carried into the sample frame once here, rather than
+        # every orientation's normals into the detector frame per call.
+        r = sample_directions(detector, pc, sample_tilt=sample_tilt,
+                              detector_tilt=detector_tilt,
+                              azimuthal=azimuthal, twist=twist).reshape(-1, 3)
         self.reflectors = refl
         # Under the lock like every other device submission (device_lock.py):
         # these uploads are Metal blits, and BOTH simulate_dictionary and
@@ -171,6 +180,8 @@ def _ncc(a, b, eps=1e-12):
 def refine_orientations(patterns, euler_start, *, simulator=None,
                         detector=None, pc=(0.5, 0.5, 0.55), reflectors=None,
                         background_sigma=None, device=None,
+                        sample_tilt=SAMPLE_TILT, detector_tilt=DETECTOR_TILT,
+                        azimuthal=0.0, twist=0.0,
                         steps: int = 120, lr: float = 0.01, chunk=None,
                         on_yield: Callable[[], None] | None = None,
                         yield_every: int = 12,
@@ -187,7 +198,8 @@ def refine_orientations(patterns, euler_start, *, simulator=None,
         Starting orientations, normally ``IndexingResult.orientations(...)``.
     simulator : callable, optional
         ``(P, 3) -> (P, K)``, differentiable. Defaults to :class:`BandSimulator`
-        on *detector*.
+        on *detector*, placed by the four angles (degrees; see
+        :func:`spyde.ebsd.bands.sample_to_detector`).
     background_sigma : float, optional
         High-pass the SIMULATED patterns the same way the experimental ones
         were corrected. Pass it whenever *patterns* has been through
@@ -225,7 +237,9 @@ def refine_orientations(patterns, euler_start, *, simulator=None,
             detector = tuple(exp.shape[-2:])
         simulator = BandSimulator(detector, pc, reflectors=reflectors,
                                   background_sigma=background_sigma,
-                                  device=device)
+                                  device=device, sample_tilt=sample_tilt,
+                                  detector_tilt=detector_tilt,
+                                  azimuthal=azimuthal, twist=twist)
 
     P = len(E)
     chunk = int(chunk) if chunk else P

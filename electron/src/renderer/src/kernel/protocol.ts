@@ -92,10 +92,14 @@ export interface FigureMessage extends MsgBase {
   view_kind?: string
   strain_components?: string[]
   /** When present + === "report", this figure belongs to a report figure cell
-   *  (routed to `reportFigures`, keyed by `cell_id`) — NOT the MDI windows. */
+   *  (routed to `reportFigures`, keyed by `cell_id`); === "phase", to a phase
+   *  in the Composition dock (routed to `phaseFigures`, keyed by `phase_id`).
+   *  Neither opens an MDI window. */
   host?: string
   /** The report cell id owning this figure (only set when host === "report"). */
   cell_id?: string
+  /** The phase owning this figure (only set when host === "phase"). */
+  phase_id?: string
 }
 
 export interface ToolbarConfigMessage extends MsgBase {
@@ -171,6 +175,33 @@ export interface CompositionMessage extends MsgBase {
   phases?: PhaseRecord[]
   /** The union of the phases' elements. */
   elements?: string[]
+}
+
+/** One editable number of a phase viewer's microscope set-up. */
+export interface PhaseSetupField {
+  key: string
+  label: string
+  unit: string
+  value: number
+  step: number
+  /** "metadata" read from the signal, "data" stamped on it, "default" a guess. */
+  source: 'metadata' | 'data' | 'default'
+}
+
+/** A phase viewer's set-up: everything its form shows (phase_viewer.py). */
+export interface PhaseSetupMessage extends MsgBase {
+  type: 'phase_setup'
+  phase_id: string
+  title: string
+  subtitle: string
+  microscope: 'SEM' | 'TEM'
+  fields: PhaseSetupField[]
+  master: 'bands' | 'full'
+  full: { available: boolean, applies: boolean, state: string, note: string }
+  /** Solving the pattern centre from the scan's own patterns (SEM only). */
+  solve?: { available: boolean, state: 'none' | 'solving' | 'done' | 'error', note: string }
+  spots: boolean
+  spots_apply: boolean
 }
 
 export interface MetadataMessage extends MsgBase {
@@ -1138,6 +1169,7 @@ export type PlotAppMessage =
   | StateUpdateMessage
   | StateUpdateBinaryMessage
   | CompositionMessage
+  | PhaseSetupMessage
   | MetadataMessage
   | AxesInfoMessage
   | OffsetPickMessage
