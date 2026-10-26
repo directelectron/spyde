@@ -18,13 +18,13 @@ Download
      (.github/scripts/update-download-links.mjs) — edit the markers, not the table. -->
 <!-- spyde:download-table:start -->
 
-**[⬇ Download SpyDE v0.6.0-rc.3](https://github.com/directelectron/spyde/releases/tag/v0.6.0-rc.3)** — pick your platform:
+**[⬇ Download SpyDE v0.6.0](https://github.com/directelectron/spyde/releases/tag/v0.6.0)** — pick your platform:
 
 | Platform | Download |
 |----------|----------|
-| **Windows** | [SpyDE-Setup-0.6.0-rc.3.exe](https://github.com/directelectron/spyde/releases/download/v0.6.0-rc.3/SpyDE-Setup-0.6.0-rc.3.exe) |
-| **macOS** (Apple Silicon) | [SpyDE-0.6.0-rc.3-arm64-mac.zip](https://github.com/directelectron/spyde/releases/download/v0.6.0-rc.3/SpyDE-0.6.0-rc.3-arm64-mac.zip) |
-| **Linux** | [SpyDE-0.6.0-rc.3.AppImage](https://github.com/directelectron/spyde/releases/download/v0.6.0-rc.3/SpyDE-0.6.0-rc.3.AppImage) |
+| **Windows** | [SpyDE-Setup-0.6.0.exe](https://github.com/directelectron/spyde/releases/download/v0.6.0/SpyDE-Setup-0.6.0.exe) |
+| **macOS** (Apple Silicon) | [SpyDE-0.6.0-arm64-mac.zip](https://github.com/directelectron/spyde/releases/download/v0.6.0/SpyDE-0.6.0-arm64-mac.zip) |
+| **Linux** | [SpyDE-0.6.0.AppImage](https://github.com/directelectron/spyde/releases/download/v0.6.0/SpyDE-0.6.0.AppImage) |
 
 All releases: <https://github.com/directelectron/spyde/releases>
 
