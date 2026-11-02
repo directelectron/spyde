@@ -47,6 +47,15 @@ def _com(frame):
     return (xx * frame).sum() / tot, (yy * frame).sum() / tot   # (col, row)
 
 
+def _assert_origin_on_beam(centered, source):
+    """The centered node's detector axes read (0, 0) on the pixel the beam was
+    moved to (size / 2), and the source node keeps its own calibration."""
+    for axis, source_axis in zip(centered.axes_manager.signal_axes,
+                                 source.axes_manager.signal_axes):
+        assert axis.offset == -axis.scale * axis.size / 2, axis.offset
+        assert source_axis.offset == 0.0
+
+
 class TestCenterZeroBeam:
     def test_auto_centers_beam(self):
         from spyde.actions.center_zero_beam import czb_run
@@ -69,6 +78,7 @@ class TestCenterZeroBeam:
             # The tree records the step.
             node = session.signal_trees[0].get_node(before)
             assert any("Centered" in k for k in node.children)
+            _assert_origin_on_beam(centered, before)
         finally:
             close_session(session)
 
@@ -284,6 +294,7 @@ class TestCenterZeroBeam:
             assert abs(cx - 16) < 2 and abs(cy - 16) < 2, (cx, cy)
             # Crosshair is cleared after applying.
             assert getattr(tree, "_czb_cross", None) is None
+            _assert_origin_on_beam(centered, before)
         finally:
             close_session(session)
 

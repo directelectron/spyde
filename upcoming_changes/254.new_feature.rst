@@ -1,0 +1,1 @@
+Find Diffraction Vectors now centers its result on the zero beam and makes the beam the origin ("Center on zero beam", on by default), and says so in the status bar when it leaves the vectors alone because no vector stands out as the beam, as behind a beam stop.

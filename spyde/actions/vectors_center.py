@@ -15,7 +15,6 @@ after the fact on the peaks — the same shift, without touching a frame.
 from __future__ import annotations
 
 import copy
-import dataclasses
 import logging
 
 import numpy as np
@@ -27,26 +26,83 @@ from spyde.signals.diffraction_vectors import (
 log = logging.getLogger(__name__)
 
 
+def _brightest_per_position(position, intensity, n_positions):
+    """For rows tagged with a flat scan *position*, the row index of the
+    brightest row at each position (-1 where a position has no rows)."""
+    order = np.lexsort((-intensity, position))
+    starts = np.searchsorted(position[order], np.arange(n_positions))
+    counts = np.bincount(position, minlength=n_positions)
+    return np.where(counts > 0, order[np.minimum(starts, len(order) - 1)], -1)
+
+
+def _rows_in_box(vecs, center_xy, half_width):
+    """``(position, inside)`` for every vector: its flat scan position
+    (``iy * nx + ix``) and whether it lies in the box."""
+    rows = np.asarray(vecs.flat_buffer)
+    nx = int(vecs.nav_shape[1])
+    position = (rows[:, COL_NAV_Y].astype(np.int64) * nx
+                + rows[:, COL_NAV_X].astype(np.int64))
+    half = float(half_width)
+    inside = ((np.abs(rows[:, COL_KX] - float(center_xy[0])) <= half)
+              & (np.abs(rows[:, COL_KY] - float(center_xy[1])) <= half))
+    return position, inside
+
+
+def _beam_rows(vecs, center_xy, half_width):
+    """Per scan position, the row index of the brightest vector inside the
+    box, or -1 where the box holds none."""
+    n_positions = int(np.prod(vecs.nav_shape))
+    position, inside = _rows_in_box(vecs, center_xy, half_width)
+    candidates = np.flatnonzero(inside)
+    best = np.full(n_positions, -1)
+    if candidates.size:
+        intensity = np.asarray(vecs.flat_buffer)[candidates, COL_INTENSITY]
+        first = _brightest_per_position(position[candidates], intensity, n_positions)
+        best[first >= 0] = candidates[first[first >= 0]]
+    return best
+
+
 def beam_per_position(vecs, centre_xy, half_width) -> np.ndarray:
     """``(ny, nx, 2)`` — the brightest vector inside the box at each scan
     position, in the vectors' own units; NaN where the box holds none."""
     ny, nx = vecs.nav_shape
-    beam = np.full((ny, nx, 2), np.nan)
-    cx, cy = float(centre_xy[0]), float(centre_xy[1])
-    half = float(half_width)
-    for iy in range(ny):
-        for ix in range(nx):
-            rows = np.asarray(vecs.at(iy, ix))
-            if rows.shape[0] == 0:
-                continue
-            inside = ((np.abs(rows[:, COL_KX] - cx) <= half)
-                      & (np.abs(rows[:, COL_KY] - cy) <= half))
-            if not inside.any():
-                continue
-            candidates = rows[inside]
-            best = candidates[np.argmax(candidates[:, COL_INTENSITY])]
-            beam[iy, ix] = (best[COL_KX], best[COL_KY])
-    return beam
+    best = _beam_rows(vecs, centre_xy, half_width)
+    beam = np.full((ny * nx, 2), np.nan)
+    found = best >= 0
+    beam[found] = np.asarray(vecs.flat_buffer)[best[found]][:, [COL_KX, COL_KY]]
+    return beam.reshape(ny, nx, 2)
+
+
+def beam_contrast(vecs, center_xy, half_width) -> float:
+    """How much brighter the beam candidate is than the brightest vector of
+    any other disk in the same pattern: the median over the scan of their
+    intensity ratio.
+
+    A Bragg spot has a Friedel partner of nearly equal intensity, so when a
+    beam stop hides the beam and a spot is taken for it the ratio sits at ~1
+    (measured 1.00–1.11 on si_grains, sped_ag and mgo_nanocrystals with the
+    beam masked), while a visible beam stands well clear (6.7–16 on the same
+    scans). Vectors within one disk radius of the candidate are the same disk
+    found again, not another spot, and are left out. NaN when no position has
+    both a candidate and another disk."""
+    n_positions = int(np.prod(vecs.nav_shape))
+    rows = np.asarray(vecs.flat_buffer)
+    if rows.shape[0] == 0:
+        return float("nan")
+    best = _beam_rows(vecs, center_xy, half_width)
+    position, _ = _rows_in_box(vecs, center_xy, half_width)
+    intensity = rows[:, COL_INTENSITY]
+    beam_row = best[position]
+    beam_k = rows[np.maximum(beam_row, 0)][:, [COL_KX, COL_KY]]
+    distance = np.hypot(*(rows[:, [COL_KX, COL_KY]] - beam_k).T)
+    disk_radius = float(getattr(vecs, "kernel_radius_data", 0.0) or 0.0)
+    elsewhere = (beam_row >= 0) & (distance > disk_radius)
+    other_max = np.zeros(n_positions)
+    np.maximum.at(other_max, position[elsewhere], intensity[elsewhere])
+    usable = (best >= 0) & (other_max > 0)
+    if not usable.any():
+        return float("nan")
+    return float(np.median(intensity[best[usable]] / other_max[usable]))
 
 
 def fit_plane(values: np.ndarray) -> np.ndarray:
@@ -109,9 +165,60 @@ def shifted_vectors(vecs, shift):
     return out
 
 
+def with_origin_at(vecs, origin_xy, sig_axes):
+    """A copy of *vecs* whose coordinate frame puts *origin_xy* at (0, 0),
+    with *sig_axes* (the vectors' signal-axis records) re-offset to match.
+
+    Every vector and both axis offsets move by the same amount, so each vector
+    stays on the same detector pixel; only the numbers change. Strain and
+    orientation read a vector's coordinates as its scattering vector, which is
+    only true once the zero beam is the origin."""
+    from spyde.signals.ragged_store import _AxisLite
+
+    shift = np.broadcast_to(-np.asarray(origin_xy, float), tuple(vecs.nav_shape) + (2,))
+    out = shifted_vectors(vecs, shift)
+    out.sig_axes = [
+        _AxisLite(scale=float(axis.scale),
+                  offset=float(axis.offset) - float(origin),
+                  size=int(axis.size),
+                  units=str(getattr(axis, "units", "") or ""),
+                  name=str(getattr(axis, "name", "") or ""))
+        for axis, origin in zip(sig_axes, origin_xy)
+    ]
+    return out
+
+
 def center_vectors(vecs, centre_xy, half_width, plane: bool = True,
                    corner_fraction: float | None = None):
     """Centre a vectors object. Returns ``(centred, shift, beam)``."""
     shift, beam = centring_shifts(vecs, centre_xy, half_width, plane=plane,
                                   corner_fraction=corner_fraction)
     return shifted_vectors(vecs, shift), shift, beam
+
+
+def detector_center(sig_axes):
+    """The middle of the detector in the axes' own units."""
+    return tuple(float(axis.offset) + int(axis.size) / 2.0 * float(axis.scale)
+                 for axis in sig_axes[:2])
+
+
+def center_on_beam(vecs, sig_axes, half_width_px: int = 0, plane: bool = True,
+                   corner_fraction: float | None = None):
+    """Center *vecs* on the zero beam and make the beam the origin.
+
+    The beam is searched for in a box of half-width *half_width_px* pixels
+    around the middle of the detector (0 searches the whole pattern);
+    *corner_fraction* fits the plane through the scan corners alone (see
+    ``centring_shifts``).
+    Returns ``(centered, shift, found)`` — *found* is how many scan positions
+    had a vector in the box; with none, *centered* is None."""
+    center = detector_center(sig_axes)
+    scale = abs(float(sig_axes[0].scale))
+    half = (half_width_px if half_width_px > 0
+            else max(int(sig_axes[0].size), int(sig_axes[1].size))) * scale
+    centered, shift, beam = center_vectors(vecs, center, half, plane=plane,
+                                          corner_fraction=corner_fraction)
+    found = int(np.isfinite(beam[..., 0]).sum())
+    if found == 0:
+        return None, shift, 0
+    return with_origin_at(centered, center, sig_axes), shift, found
