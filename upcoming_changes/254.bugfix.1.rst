@@ -1,0 +1,1 @@
+The neural Find Diffraction Vectors method no longer reports one disk two or three times when refining moves two of its detections onto the same center, which inflated vector counts and anything summed over vectors.
