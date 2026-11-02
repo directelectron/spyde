@@ -268,18 +268,14 @@ def _run_on_vectors(session, src, tree, signal, vectors, half_width_px: int,
     ``constant_shift`` (the Manual tab's ``centre − picked``, in the axes'
     units) skips the search and moves every vector by it.
     """
-    from spyde.actions.vectors_center import center_vectors, shifted_vectors
+    from spyde.actions.vectors_center import (
+        center_on_beam, detector_center, shifted_vectors, with_origin_at,
+    )
 
     # The vectors are in the units they were found in, which the window's
     # axes may since have been converted from (a 1/nm scan reads in Å⁻¹), so
     # the box is placed on the vectors' own axis records when they carry any.
     sig_ax = list(getattr(vectors, "sig_axes", None) or signal.axes_manager.signal_axes)
-    scale_x, scale_y = float(sig_ax[0].scale), float(sig_ax[1].scale)
-    centre = (float(sig_ax[0].offset) + int(sig_ax[0].size) / 2.0 * scale_x,
-              float(sig_ax[1].offset) + int(sig_ax[1].size) / 2.0 * scale_y)
-    # A full-frame box (half-width 0) searches the whole pattern.
-    half = (half_width_px if half_width_px > 0
-            else max(int(sig_ax[0].size), int(sig_ax[1].size))) * abs(scale_x)
     emit_status("Centering zero beam on the vectors…")
 
     def _work():
@@ -287,14 +283,14 @@ def _run_on_vectors(session, src, tree, signal, vectors, half_width_px: int,
             ny, nx = vectors.nav_shape
             if constant_shift is not None:
                 shift = np.tile(np.asarray(constant_shift, float), (ny, nx, 1))
-                centred = shifted_vectors(vectors, shift)
+                centred = with_origin_at(shifted_vectors(vectors, shift),
+                                         detector_center(sig_ax), sig_ax)
                 found = None
             else:
-                centred, shift, beam = center_vectors(
-                    vectors, centre, half, plane=plane,
+                centred, shift, found = center_on_beam(
+                    vectors, sig_ax, half_width_px, plane=plane,
                     corner_fraction=corner_fraction)
-                found = int(np.isfinite(beam[..., 0]).sum())
-                if found == 0:
+                if centred is None:
                     emit_error("Center Zero Beam: no vector inside the box at "
                                "any position — widen the box")
                     return
@@ -312,9 +308,10 @@ def _run_on_vectors(session, src, tree, signal, vectors, half_width_px: int,
                          "mean_shift": [float(v) for v in np.nanmean(shift, axis=(0, 1))]})
                 except Exception as e:
                     log.debug("stamping the vectors centring params failed: %s", e)
+            from spyde.drawing.plots.plot import _clean_units
             mean = np.nanmean(shift, axis=(0, 1))
             emit_status(f"Zero beam centered on the vectors (mean shift "
-                        f"{mean[0]:+.3g}, {mean[1]:+.3g} {sig_ax[0].units}"
+                        f"{mean[0]:+.3g}, {mean[1]:+.3g} {_clean_units(sig_ax[0].units)}"
                         + (f", beam found at {found}/{ny * nx} positions)"
                            if found is not None else ")"))
             emit({"type": "czb_done", "window_id": getattr(src, "window_id", None),
@@ -337,6 +334,17 @@ def _shift_signal(signal, shifts: np.ndarray):
         axis.scale, axis.offset = source_axis.scale, source_axis.offset
         axis.units, axis.name = source_axis.units, source_axis.name
     return out
+
+
+def _put_origin_on_beam(signal) -> None:
+    """Offset the signal axes so the centered beam reads (0, 0).
+
+    The patterns are shifted so the beam lands on pixel ``size / 2`` — the
+    center ``get_direct_beam_position`` measures from — and strain and
+    orientation read calibrated coordinates as scattering vectors, which
+    holds only when that pixel is the origin."""
+    for axis in signal.axes_manager.signal_axes:
+        axis.offset = -float(axis.scale) * (int(axis.size) / 2.0)
 
 
 def _display(src, tree, new_signal) -> None:
@@ -434,6 +442,7 @@ def czb_run(session, plot, payload) -> None:
             if new is None:
                 emit_error("Center Zero Beam: centering failed")
                 return
+            _put_origin_on_beam(new)
             _display(src, tree, new)
             # Mark where the beam was found (mean over the scan): shift
             # convention is (centre − beam), so beam = centre − shift.
@@ -571,6 +580,7 @@ def czb_pick(session, plot, payload) -> None:
             if new is None:
                 emit_error("Center Zero Beam: centering failed")
                 return
+            _put_origin_on_beam(new)
             _display(src, tree, new)
             _czb_manual_stop_obj(tree)
             _czb_show_found(src, tree, signal, (float(cx), float(cy)))

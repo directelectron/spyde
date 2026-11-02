@@ -60,7 +60,19 @@ DEFAULTS: dict = dict(
     # default-off until the eval benchmark says it should be on (plan Phase 3).
     persistence=False,
     beamstop_auto=False, beamstop_dilate=5, show_transform=False,
+    # Move the result so the zero beam is the origin (see _auto_center).
+    center_beam=True,
 )
+
+# The automatic centering searches the middle half of the detector for the
+# beam: wide enough for any descan drift, narrow enough that a bright artefact
+# at the detector edge cannot win.
+_AUTO_CENTER_HALF_WIDTH = 0.25
+# ... and centers only when the candidate is clearly brighter than every other
+# vector (see vectors_center.beam_contrast): a hidden beam measures ~1.0–1.1.
+# Precession data, where the beam is only slightly the brightest (~1.3 on
+# zrnb_precipitate), falls below this too and is left for Center Zero Beam.
+_AUTO_CENTER_MIN_CONTRAST = 1.5
 
 # Per-method threshold default applied when the user switches method without
 # having explicitly set a threshold for it.
@@ -319,7 +331,19 @@ def _start_batch(session, plot, src_tree, p: dict, *, overlay_visible: bool = Tr
                 if not stopped_flag[0]:
                     emit_error("Find Vectors: compute returned no result")
                 return
-            _finalize(new_tree, vecs)
+            result, centering_note = _auto_center(src, vecs, p)
+            if result is not vecs:
+                for axis, record in zip(new_tree.root.axes_manager.signal_axes,
+                                        result.sig_axes):
+                    axis.offset = float(record.offset)
+            _finalize(new_tree, result)
+            if result is not vecs:
+                # The axes table went out when the window opened, before the
+                # offsets moved.
+                session._emit_axes(new_tree)
+            if centering_note:
+                log.info("[fv-batch] %s", centering_note)
+                emit_status(centering_note)
             log.info("[fv-batch] finalized in %.1fs total", _time.monotonic() - t0)
             _overlay_on_source(src_tree, vecs, visible=overlay_visible,
                                signal=src)
@@ -470,6 +494,59 @@ def build_vectors_result_tree(session, vecs, title: str = "Diffraction Vectors")
     )
     _finalize(tree, vecs)
     return tree
+
+
+def _auto_center(signal, vecs, p: dict):
+    """``(vectors, note)`` for the result window: the vectors centered on the
+    zero beam with the beam as the origin when ``center_beam`` is set, else
+    *vecs* unchanged; *note* says what happened, for the status bar once the
+    "Found N vectors" line has gone out.
+
+    Strain and orientation read a vector's coordinates as its scattering
+    vector, so they want the beam at (0, 0). The beam is the brightest vector
+    near the middle of each pattern; a beam stop hides it, and the brightest
+    vector there is a Bragg spot, so centering is skipped when the user asked
+    to mask a stop or the candidate is not clearly brighter than the rest.
+    (The frame-based beam-stop detector is not used: it reads ordinary dark
+    background as a stop on sped_ag, zrnb_precipitate and mgo_nanocrystals.)
+    The source pattern's overlay keeps the uncentered *vecs*, which are in the
+    source's own frame."""
+    if not p.get("center_beam", False):
+        return vecs, None
+    if vecs.n_time > 0:
+        return vecs, ("Vectors left uncentered: centering a time series is not "
+                      "supported yet")
+    if p.get("beamstop_auto", False):
+        return vecs, ("Vectors left uncentered: the beam stop hides the zero beam "
+                      "— use Center Zero Beam to place it by hand")
+
+    from spyde.actions.vectors_center import (
+        beam_contrast, center_on_beam, detector_center,
+    )
+    sig_axes = list(getattr(vecs, "sig_axes", None) or signal.axes_manager.signal_axes)
+    half_width_px = int(max(int(axis.size) for axis in sig_axes[:2])
+                        * _AUTO_CENTER_HALF_WIDTH)
+    try:
+        contrast = beam_contrast(vecs, detector_center(sig_axes),
+                                 half_width_px * abs(float(sig_axes[0].scale)))
+        if not contrast >= _AUTO_CENTER_MIN_CONTRAST:
+            return vecs, ("Vectors left uncentered: no vector stands out as the "
+                          "zero beam (a beam stop?) — use Center Zero Beam to "
+                          "place it by hand")
+        centered, shift, found = center_on_beam(vecs, sig_axes, half_width_px)
+    except Exception as e:
+        log.exception("centering the found vectors failed")
+        return vecs, f"Vectors left uncentered: {e}"
+    if centered is None:
+        return vecs, ("Vectors left uncentered: no vector near the middle of the "
+                      "pattern to take as the zero beam")
+    from spyde.drawing.plots.plot import _clean_units
+    mean = np.nanmean(shift, axis=(0, 1))
+    ny, nx = vecs.nav_shape
+    units = _clean_units(getattr(sig_axes[0], "units", ""))
+    return centered, (f"Zero beam centered (mean shift {mean[0]:+.3g}, "
+                     f"{mean[1]:+.3g} {units}, beam found at {found}/{ny * nx} "
+                     f"positions)")
 
 
 def _finalize(tree, vecs) -> None:

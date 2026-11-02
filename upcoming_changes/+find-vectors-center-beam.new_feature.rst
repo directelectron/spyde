@@ -1,0 +1,1 @@
+Find Diffraction Vectors now centers its result on the zero beam and makes the beam the origin, so the vectors are ready for strain and orientation mapping without a separate Center Zero Beam step. It is on by default ("Center on zero beam") and stands aside when the beam is not clearly the brightest spot, as behind a beam stop, saying so in the status bar.
