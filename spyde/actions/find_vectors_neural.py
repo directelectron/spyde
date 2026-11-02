@@ -179,6 +179,30 @@ def _refined(frames, preds, spot_radius, refine=False, friedel=False, device=Non
     return refined, sigmas
 
 
+def _kept_apart(pred: np.ndarray, sigma, min_distance: float):
+    """One frame's ``(N, 4)`` detections with none closer than *min_distance*
+    pixels, and their *sigma* to match: where two are, the more confident one
+    stays.
+
+    The detector spaces its detections by *min_distance* before their centres
+    are placed, and both the sub-pixel placement and the centre steps then
+    move them. Two detections of one disk end up on its centre together, and
+    the disk is counted twice or three times (measured on si_grains at a
+    background scale of 4 px: 616 pairs under 1 px apart in 788 vectors)."""
+    if len(pred) < 2 or min_distance <= 0:
+        return pred, sigma
+    offsets = pred[:, None, :2] - pred[None, :, :2]
+    distance = np.hypot(offsets[..., 0], offsets[..., 1])
+    np.fill_diagonal(distance, np.inf)
+    if distance.min() >= min_distance:
+        return pred, sigma
+    keep = np.ones(len(pred), dtype=bool)
+    for index in np.argsort(-pred[:, 2], kind="stable"):
+        if keep[index]:
+            keep[distance[index] < min_distance] = False
+    return pred[keep], (None if sigma is None else sigma[keep])
+
+
 def _heatmap_response(frame_shape, peaks_yx, threshold) -> np.ndarray:
     """A sparse confidence map for the "show transform" preview toggle: the model's
     per-peak score painted at each detected pixel. (The full dense heatmap isn't
@@ -239,6 +263,7 @@ def _find_vectors_single_frame_neural(
     counts_radius = _counts_radius(f, spot_radius)
     (pred,), (refined_sigma,) = _refined([f], [pred], counts_radius, refine_centres,
                                          friedel_partner, device)
+    pred, refined_sigma = _kept_apart(pred, refined_sigma, min_distance)
 
     raw_response = _heatmap_response(f.shape, pred, threshold)
     corr_map = raw_response  # already thresholded (only kept peaks are painted)
@@ -444,6 +469,10 @@ def _neural_block(b4d, threshold, min_dist, subpixel, beamstop_mask, model_id,
                      for i, p in enumerate(raw)]
             preds, refined_sigmas = _refined(flat, preds, counts_radius,
                                              refine_centres, friedel_partner, device)
+            kept = [_kept_apart(pred, sigma, min_dist)
+                    for pred, sigma in zip(preds, refined_sigmas)]
+            preds = [pred for pred, _ in kept]
+            refined_sigmas = [sigma for _, sigma in kept]
             peaks_list = [_neural_peaks(flat[i], p, counts_radius, refined_sigmas[i])
                           for i, p in enumerate(preds)]
     except Exception as _e:
