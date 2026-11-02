@@ -829,3 +829,68 @@ class TestWithTheDetectorNetwork:
             tolerance = 0.01 if case.startswith("P4") else 1e-4
             assert result["centre_difference"] < tolerance, case
             assert result["sigma_difference"] < max(tolerance, 5e-5), case
+
+
+class TestOneDiskOneVector:
+    """The detector spaces its detections before their centres are placed; the
+    placement and the centre steps then move them, and two detections of one
+    disk used to land on its centre together. The spacing is enforced again
+    after the last move, keeping the more confident detection."""
+
+    def test_two_detections_on_one_spot_keep_the_more_confident(self):
+        from spyde.actions.find_vectors_neural import _kept_apart
+        pred = np.array([[10.0, 10.0, 0.5, 1.5],
+                         [10.2, 10.1, 0.9, 1.5],
+                         [30.0, 30.0, 0.7, 1.5]], np.float32)
+        sigma = np.array([0.1, 0.2, 0.3], np.float32)
+        kept, kept_sigma = _kept_apart(pred, sigma, 3)
+        np.testing.assert_array_equal(kept, pred[[1, 2]])
+        np.testing.assert_array_equal(kept_sigma, sigma[[1, 2]])
+
+    def test_detections_far_enough_apart_are_untouched(self):
+        from spyde.actions.find_vectors_neural import _kept_apart
+        pred = np.array([[10.0, 10.0, 0.5, 1.5], [10.0, 13.0, 0.9, 1.5]], np.float32)
+        kept, kept_sigma = _kept_apart(pred, None, 3)
+        assert kept is pred and kept_sigma is None
+
+    def test_a_suppressed_detection_does_not_suppress_its_own_neighbors(self):
+        """A–B and B–C are too close, A–C are not: B goes, A and C stay."""
+        from spyde.actions.find_vectors_neural import _kept_apart
+        pred = np.array([[10.0, 10.0, 0.9, 1.5],
+                         [10.0, 12.0, 0.5, 1.5],
+                         [10.0, 14.0, 0.8, 1.5]], np.float32)
+        kept, _ = _kept_apart(pred, None, 3)
+        np.testing.assert_array_equal(kept, pred[[0, 2]])
+
+    @pytest.mark.parametrize("batched", [True, False])
+    def test_each_disk_is_one_vector_in_the_batch_and_the_preview(self, standin_detector,
+                                                                  monkeypatch, batched):
+        import spyde.actions.find_vectors_neural as neural
+        import spyde.actions.find_vectors_torch as find_vectors_torch
+        from spyde import models
+
+        stack, truth = _scan(np.random.default_rng(13))
+        _register(standin_detector, stack, truth)
+        once, once_batch = models.detect, models.detect_batch
+
+        def twice(rows):
+            again = rows.copy()
+            again[:, 1] += 0.4
+            again[:, 2] = 0.5
+            return np.concatenate([again, rows])
+
+        monkeypatch.setattr(models, "detect", lambda *a, **k: twice(once(*a, **k)))
+        monkeypatch.setattr(models, "detect_batch",
+                            lambda *a, **k: [twice(rows) for rows in once_batch(*a, **k)])
+        monkeypatch.setattr(find_vectors_torch, "torch_gpu_device",
+                            (lambda: "fake-gpu") if batched else (lambda: None))
+        block = neural._neural_block(stack.reshape(2, 2, *stack.shape[1:]), 0.3, 3, True, None,
+                                     None, spot_radius=RADIUS)
+        for index, frame in enumerate(stack):
+            row = block[index // 2, index % 2]
+            row = row[np.isfinite(row[:, 0])]
+            preview = _preview(frame)
+            for peaks in (row, preview):
+                assert len(peaks) == len(truth[index])
+                np.testing.assert_allclose(np.sort(peaks[:, :2], axis=0),
+                                           np.sort(truth[index] + 0.8, axis=0), atol=1e-5)
