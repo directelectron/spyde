@@ -336,14 +336,13 @@ def _start_batch(session, plot, src_tree, p: dict, *, overlay_visible: bool = Tr
                 for axis, record in zip(new_tree.root.axes_manager.signal_axes,
                                         result.sig_axes):
                     axis.offset = float(record.offset)
-            _finalize(new_tree, result)
+            if centering_note:
+                log.info("[fv-batch] %s", centering_note)
+            _finalize(new_tree, result, note=centering_note)
             if result is not vecs:
                 # The axes table went out when the window opened, before the
                 # offsets moved.
                 session._emit_axes(new_tree)
-            if centering_note:
-                log.info("[fv-batch] %s", centering_note)
-                emit_status(centering_note)
             log.info("[fv-batch] finalized in %.1fs total", _time.monotonic() - t0)
             _overlay_on_source(src_tree, vecs, visible=overlay_visible,
                                signal=src)
@@ -549,9 +548,10 @@ def _auto_center(signal, vecs, p: dict):
                      f"positions)")
 
 
-def _finalize(tree, vecs) -> None:
+def _finalize(tree, vecs, note: str | None = None) -> None:
     """Attach the vectors, fill the count-map navigator, wire the render-on-demand
-    display, and unlock the vector toolbar actions.
+    display, and unlock the vector toolbar actions. *note* is appended to the
+    "Found N diffraction vectors" status line, which callers wait on.
 
     The result window's frames are produced on every navigator move by
     ``vecs.render_frame`` (an O(1) slice of the vector buffer; see
@@ -654,7 +654,7 @@ def _finalize(tree, vecs) -> None:
     _overlay_on_result(tree, vecs)
 
     total = int(len(vecs.flat_buffer))   # total over ALL slices, not one slice
-    emit_status(f"Found {total} diffraction vectors")
+    emit_status(f"Found {total} diffraction vectors" + (f". {note}" if note else ""))
 
 
 def _split_nav_index(index):

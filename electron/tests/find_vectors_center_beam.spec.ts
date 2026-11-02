@@ -69,7 +69,9 @@ test('the found vectors come back with the zero beam at the origin', async () =>
   }).toBeGreaterThan(before)
   await ctx.backend.waitForLog('[fv-batch] finalized', 120_000)
   await ctx.backend.waitForLog('[fv-batch] Zero beam centered', 30_000)
-  await expect(page.getByTestId('status-text')).toContainText('Zero beam centered')
+  // One line, so anything waiting on the vector count still sees it.
+  await expect(page.getByTestId('status-text'))
+    .toContainText(/Found \d+ diffraction vectors\. Zero beam centered/)
   await page.screenshot({ path: `${SHOTS}/04-status-zero-beam-centered.png` })
 
   // The result window's detector axes put the beam back at the origin: half
