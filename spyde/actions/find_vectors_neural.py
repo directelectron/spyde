@@ -449,6 +449,12 @@ def _neural_block(b4d, threshold, min_dist, subpixel, beamstop_mask, model_id,
     except Exception as _e:
         log.warning("[find_vectors] torch neural GPU path failed (%s); CPU per-frame", _e)
         peaks_list = None
+        # The failure is often running out of device memory, and the CPU path
+        # below needs none: hand the cached blocks back so other processes
+        # sharing the card (other workers, a camera server) can have them.
+        if getattr(device, "type", None) == "cuda":
+            import torch
+            torch.cuda.empty_cache()
 
     if peaks_list is None:
         peaks_list = [

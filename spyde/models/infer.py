@@ -441,6 +441,10 @@ def detect_batch(model, frames, device, thresh: float = 0.3,
     Memory: the padded stack is run through the U-Net in fixed sub-batches of
     ``SPYDE_NEURAL_BATCH`` frames (default 64), NOT as one (N,1,H,W) tensor — a
     single pass over a full nav chunk (1000+ frames) held ~16 GB of activations.
+    The sub-batches reuse each other's device memory: nothing here hands it back
+    to the driver, because every sub-batch would then allocate it afresh. The
+    post-batch trim (``dask_stats.trim_cluster_memory``) releases it once the
+    whole Find Vectors run is done.
     The scale/NMS-window/bg_sigma are resolved ONCE from ``frames[0]`` (below,
     outside the sub-batch loop) so results are bit-identical to a single pass;
     only the forward+decode is chunked.
@@ -503,8 +507,6 @@ def detect_batch(model, frames, device, thresh: float = 0.3,
         for f in range(chunk.shape[0]):
             per_frame.append(_frame_rows(res_np[b == f], frames.shape[1:], factor, with_width))
         del outputs, res
-        if cur_device.type == "cuda":
-            torch.cuda.empty_cache()
 
     return per_frame
 
