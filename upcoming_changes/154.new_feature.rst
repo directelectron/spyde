@@ -1,0 +1,1 @@
+Added Segment: paint a few strokes on an image, a movie frame or a 4-D scan's navigator, train a pixel classifier on them, and label every frame into measured regions (a new result tree with the count per frame as its navigator).
