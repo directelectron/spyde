@@ -495,7 +495,6 @@ def detect_batch(model, frames, device, thresh: float = 0.3,
     mask_radius = _mask_radius(work_diam)
 
     K = _neural_sub_batch_size()
-    per_frame: list = []
     # ``device`` / ``model`` may flip to CPU mid-call if an MPS op raises a
     # catchable RuntimeError (fix 2): re-move the model to CPU ONCE, retry the
     # failing sub-batch on CPU, and stay on CPU for the remaining sub-batches so
@@ -503,6 +502,9 @@ def detect_batch(model, frames, device, thresh: float = 0.3,
     # to the coarser ``_neural_block`` catch (which drops to a slow per-frame CPU
     # loop for the whole chunk). ``cur_*`` is the live model/device the loop uses.
     cur_model, cur_device = model, device
+    # Each sub-batch's decoded rows stay where they were computed and come back
+    # to the host together, in one copy, once the loop is done.
+    found = []
     for i0 in range(0, N, K):
         chunk = stack_t[i0:i0 + K]
         # If even the CPU retry inside _forward_with_cpu_retry fails, the error
@@ -514,13 +516,19 @@ def detect_batch(model, frames, device, thresh: float = 0.3,
                                    radius=radius,
                                    mask_logits=outputs[2] if len(outputs) > 2 else None,
                                    mask_radius=mask_radius)
-        b = res[:, 0].long().cpu().numpy() if len(res) else np.zeros(0, np.int64)
-        res_np = res.cpu().numpy()
-        for f in range(chunk.shape[0]):
-            per_frame.append(_frame_rows(res_np[b == f], frames.shape[1:], factor, with_width))
+        res[:, 0] += i0      # frame index within the sub-batch -> within the stack
+        found.append(res)
         del outputs, res
 
-    return per_frame
+    if len({part.device for part in found}) == 1:
+        rows = torch.cat(found).cpu().numpy()
+    else:                    # the loop moved to the CPU part way through
+        rows = np.concatenate([part.cpu().numpy() for part in found])
+    frame_of = rows[:, 0].astype(np.int64)
+    # Stable, so each frame's rows stay in the order the decode gave them.
+    rows = rows[np.argsort(frame_of, kind="stable")]
+    per_frame_rows = np.split(rows, np.cumsum(np.bincount(frame_of, minlength=N))[:-1])
+    return [_frame_rows(r, frames.shape[1:], factor, with_width) for r in per_frame_rows]
 
 
 @torch.no_grad()
