@@ -30,6 +30,11 @@ Input contract, all relative to the spot radius ``R`` in native pixels:
   crop_half`` (default 0.78-1.0), divide by ``|mean inside crop_radius -
   background|`` (at least 1e-3), clamp to [-4, 8].
 
+The grid can also be read from the frames themselves
+(:meth:`NetworkRefiner.refine_in_frames`, :func:`sample_frames`) rather than
+from windows cut around each disk first: the same samples, without cutting and
+moving a window's worth of pixels per disk to resample a few hundred of them.
+
 Inference: a second pass re-crops at the refined centre for the disks the first
 moved by more than ``recrop_over x R`` (0.15). Sigma is ``exp(log_sigma) x
 sigma_scale x R / crop_radius``; it ranks centres well, but its absolute scale
@@ -208,14 +213,37 @@ class NetworkRefiner:
             partner_crops, partner_centre = partner
             mirror = self._normalise(self._resample(partner_crops, partner_centre, step))
             sampled = torch.cat([sampled, mirror.flip(-1, -2)], 1)
+        return self._infer(sampled, centre, step)
+
+    def _infer(self, sampled, centre, step):
+        """The network on normalised samples taken at ``centre``. Its outputs
+        are taken in float32, whatever precision it ran in."""
         logits, log_sigmas = [], []
         for start in range(0, len(sampled), FORWARD_BATCH):
             output, log_sigma = self.net(sampled[start:start + FORWARD_BATCH])
-            logits.append(output)
-            log_sigmas.append(log_sigma)
+            logits.append(output.float())
+            log_sigmas.append(log_sigma.float())
         offset, area = self._coverage_centroid(torch.cat(logits))
         sigma = torch.exp(torch.cat(log_sigmas)) * step * self.sigma_scale
         return centre + offset * step, area, sigma
+
+    def _passes(self, run, seeds, radius):
+        """The passes and the decline rule: ``run(select, centre)`` is one pass
+        over the windows *select* picks (``None``: all of them) at *centre*.
+        Returns the centres, NaN where declined, and the sigmas."""
+        centre, area, sigma = run(None, seeds)
+        for _ in range(1, self.passes):
+            again = (centre - seeds).norm(dim=1) > self.recrop_over * radius
+            if not again.any():
+                break
+            moved, moved_area, moved_sigma = run(again, centre[again])
+            centre[again], area[again], sigma[again] = moved, moved_area, moved_sigma
+        declined = ((centre - seeds).norm(dim=1) >= MAX_SHIFT_FRACTION * radius) \
+            | (area <= 0.2 * math.pi * self.crop_radius ** 2) \
+            | (sigma >= self.max_sigma_fraction * radius)
+        centre[declined] = float("nan")
+        sigma[declined] = float("nan")
+        return centre, sigma
 
     @torch.no_grad()
     def refine(self, crops, centres, spot_radius, partner_crops=None, partner_centres=None):
@@ -238,25 +266,70 @@ class NetworkRefiner:
                 mirror_seeds = torch.as_tensor(np.asarray(partner_centres, np.float32),
                                                device=self.device)
                 partner = (partner_tensor, mirror_seeds)
-            centre, area, sigma = self._pass(crop_tensor, seeds, step, partner)
-            for _ in range(1, self.passes):
-                again = (centre - seeds).norm(dim=1) > self.recrop_over * radius
-                if not again.any():
-                    break
+
+            def run(select, centre):
+                if select is None:
+                    return self._pass(crop_tensor, centre, step, partner)
                 # a partner window follows the mirror of the moved centre
                 moved_partner = None if partner is None else (
-                    partner_tensor[again], mirror_seeds[again] - (centre[again] - seeds[again]))
-                moved, moved_area, moved_sigma = self._pass(
-                    crop_tensor[again], centre[again], step, moved_partner)
-                centre[again], area[again], sigma[again] = moved, moved_area, moved_sigma
-            declined = ((centre - seeds).norm(dim=1) >= MAX_SHIFT_FRACTION * radius) \
-                | (area <= 0.2 * math.pi * self.crop_radius ** 2) \
-                | (sigma >= self.max_sigma_fraction * radius)
-            centre[declined] = float("nan")
-            sigma[declined] = float("nan")
+                    partner_tensor[select], mirror_seeds[select] - (centre - seeds[select]))
+                return self._pass(crop_tensor[select], centre, step, moved_partner)
+
+            centre, sigma = self._passes(run, seeds, radius)
             result = centre.float().cpu().numpy()
             sigma = sigma.float().cpu().numpy()
         return result, sigma
+
+
+    @torch.no_grad()
+    def refine_in_frames(self, stack, frame_index, centres, spot_radius):
+        """:meth:`refine` with the grid read from the frames themselves
+        (:func:`sample_frames`) instead of from cut windows. *stack* is the
+        ``(N, H, W)`` float32 frames on the device, *frame_index* each disk's
+        frame (``(M,)`` long) and *centres* its ``(M, 2)`` ``[y, x]`` in frame
+        pixels, both on the device. Returns the refined centres in frame
+        pixels, NaN where declined, and the sigmas, on the device: nothing is
+        copied to the host. One-channel networks only."""
+        from spyde.device_lock import accelerator_lock
+
+        if self.needs_partner:
+            raise ValueError("this centre network needs each disk's Friedel-mirror window")
+        radius = float(spot_radius)
+        step = radius / self.crop_radius
+        offsets = self._offsets()
+        with accelerator_lock(self.device):
+            def run(select, centre):
+                index = frame_index if select is None else frame_index[select]
+                return self._infer(self._normalise(sample_frames(stack, index, centre, step, offsets)),
+                                   centre, step)
+
+            return self._passes(run, centres.float(), radius)
+
+
+def sample_frames(stack, frame_index, centres, step, offsets):
+    """The refiner's grid around each centre, read from the frames: bilinear,
+    zero outside a frame (as a window cut at a frame's edge is), ``(M, 1, S, S)``
+    for the ``S`` *offsets*. *stack* is ``(N, H, W)``, *frame_index* ``(M,)``,
+    *centres* ``(M, 2)`` ``[y, x]`` frame pixels, *step* frame pixels a grid
+    step. The same samples :meth:`NetworkRefiner._resample` takes from a window
+    cut around the disk."""
+    _, height, width = stack.shape
+    samples = len(offsets)
+    y = (centres[:, 0, None] + offsets[None] * step)[:, :, None].expand(-1, -1, samples)
+    x = (centres[:, 1, None] + offsets[None] * step)[:, None, :].expand(-1, samples, -1)
+    y0, x0 = torch.floor(y), torch.floor(x)
+    wy, wx = y - y0, x - x0
+    y0, x0 = y0.long(), x0.long()
+    flat = stack.reshape(-1)
+    first = frame_index[:, None, None] * (height * width)
+    out = torch.zeros_like(y)
+    for dy, dx, weight in ((0, 0, (1 - wy) * (1 - wx)), (0, 1, (1 - wy) * wx),
+                           (1, 0, wy * (1 - wx)), (1, 1, wy * wx)):
+        rows, columns = y0 + dy, x0 + dx
+        inside = (rows >= 0) & (rows < height) & (columns >= 0) & (columns < width)
+        index = first + rows.clamp(0, height - 1) * width + columns.clamp(0, width - 1)
+        out += torch.where(inside, flat[index], 0.0) * weight
+    return out[:, None]
 
 
 def _as_device_tensor(crops, device):
