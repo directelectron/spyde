@@ -141,13 +141,16 @@ def _neural_peaks(frame: np.ndarray, pred: np.ndarray, counts_radius: float,
     return np.column_stack([pos, intensity, pred[:, 2], sigma]).astype(np.float32)
 
 
-def _refined(frames, preds, spot_radius, refine=False, friedel=False, device=None):
+def _refined(frames, preds, spot_radius, refine=False, friedel=False, device=None,
+             device_frames=None):
     """Run the centre steps over a chunk's beam-stop-filtered ``(N, 4)``
     predictions, one batch per step for the whole chunk: the refine step, then,
     when ``friedel`` is set, the Friedel-partner step on the refined centres.
     Returns the predictions with refined ``[y, x]`` and, per frame, the
     uncertainty of the last step that moved each disk (``None`` with no step).
-    With ``refine`` off the predictions come back as they went in."""
+    With ``refine`` off the predictions come back as they went in.
+    ``device_frames`` is ``frames`` already on ``device`` (see
+    ``refine_centres``); both steps cut their windows from it."""
     from spyde.models.centre_refine import (CENTRE_MODEL, FRIEDEL_MODEL,
                                             load_step, refine_centres)
 
@@ -160,7 +163,8 @@ def _refined(frames, preds, spot_radius, refine=False, friedel=False, device=Non
         refiner = load_step(model_id, device)
         if refiner is None:
             continue
-        stepped, step_sigmas = refine_centres(frames, positions, spot_radius, refiner)
+        stepped, step_sigmas = refine_centres(frames, positions, spot_radius, refiner,
+                                              device_frames=device_frames)
         if step_sigmas is not None:
             if sigmas is None:
                 sigmas = step_sigmas
@@ -428,8 +432,14 @@ def _neural_block(b4d, threshold, min_dist, subpixel, beamstop_mask, model_id,
             # semaphore the numba NXCORR path uses).
             mps_lock = _mps_forward_lock() if dev_is_mps else None
             import contextlib
+            device_frames = None
             with (mps_lock or contextlib.nullcontext()):
                 with _gpu_slots():
+                    if device.type in ("cuda", "mps"):
+                        # Moved to the device once: the detector and both centre
+                        # steps read the frames from here.
+                        import torch
+                        device_frames = torch.as_tensor(flat, device=device)
                     # Sub-batched internally (SPYDE_NEURAL_BATCH) — NOT one forward
                     # pass for the whole chunk; see infer.detect_batch.
                     raw = models.detect_batch(
@@ -437,13 +447,14 @@ def _neural_block(b4d, threshold, min_dist, subpixel, beamstop_mask, model_id,
                         min_distance=int(min_dist),
                         bg_sigma=(float(bg_sigma) if bg_sigma is not None else None),
                         spot_diameter=(2.0 * spot_radius) if spot_radius else None,
-                        with_width=True)
+                        with_width=True, device_frames=device_frames)
             counts_radius = _counts_radius(flat[0], spot_radius)
             preds = [_apply_beamstop(np.asarray(p, np.float32).reshape(-1, 4),
                                      beamstop_mask, flat[i].shape)
                      for i, p in enumerate(raw)]
             preds, refined_sigmas = _refined(flat, preds, counts_radius,
-                                             refine_centres, friedel_partner, device)
+                                             refine_centres, friedel_partner, device,
+                                             device_frames)
             peaks_list = [_neural_peaks(flat[i], p, counts_radius, refined_sigmas[i])
                           for i, p in enumerate(preds)]
     except Exception as _e:

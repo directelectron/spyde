@@ -383,7 +383,8 @@ def _gpu_prep_enabled() -> bool:
 
 
 def _build_input_stack(frames: np.ndarray, device, factor: float, bg_sigma: float,
-                       levels: int, auto_scale: bool, mad_floor: float | None = None):
+                       levels: int, auto_scale: bool, mad_floor: float | None = None,
+                       device_frames=None):
     """Preprocess ``frames`` ((N,H,W)) into the padded ``(N,1,H',W')`` U-Net input
     tensor: scale → normalise → pad-to-multiple.
 
@@ -392,11 +393,13 @@ def _build_input_stack(frames: np.ndarray, device, factor: float, bg_sigma: floa
     see ``test_preprocess_torch_parity``), so nothing but the raw frames crosses
     the bus. On CPU (or if GPU-prep is disabled / a device op fails) it uses the
     canonical numpy/scipy path from ``preprocess.py`` and returns a CPU tensor.
-    ``factor``/``bg_sigma`` are the shared per-batch knobs resolved by the caller."""
+    ``factor``/``bg_sigma`` are the shared per-batch knobs resolved by the caller.
+    ``device_frames`` is ``frames`` already on ``device`` as float32; it is read,
+    never written."""
     if device.type in ("cuda", "mps") and _gpu_prep_enabled():
         try:
             from . import preprocess_torch as pt
-            x = torch.from_numpy(frames).to(device)                  # (N,H,W)
+            x = device_frames if device_frames is not None else torch.from_numpy(frames).to(device)
             if auto_scale and factor != 1.0:
                 x = pt.scale_batch(x, factor)
             x = pt.normalize_input_batch(x, bg_sigma=bg_sigma, local=True, mad_floor=mad_floor)
@@ -421,7 +424,7 @@ def detect_batch(model, frames, device, thresh: float = 0.3,
                  min_distance: int = 4, auto_scale: bool = True,
                  shared_scale: bool = True, bg_sigma: float | None = None,
                  spot_diameter: float | None = None,
-                 with_width: bool = False):
+                 with_width: bool = False, device_frames=None):
     """Detect spots in a STACK of frames in one forward pass.
 
     ``with_width`` as in :func:`detect`; the decode is the same, so the batch and
@@ -453,6 +456,8 @@ def detect_batch(model, frames, device, thresh: float = 0.3,
     (``_build_input_stack`` → ``preprocess_torch``), so nothing but the raw frames
     crosses the bus; on CPU it uses the numpy/scipy reference. Both produce the same
     result (parity-tested), so switching devices never changes the peaks.
+    ``device_frames``: the same frames already on ``device`` as one float32
+    tensor, so the caller can reuse the upload (the centre steps read it too).
     """
     frames = np.asarray(frames, dtype=np.float32)
     if frames.ndim == 2:
@@ -479,7 +484,8 @@ def detect_batch(model, frames, device, thresh: float = 0.3,
     # host (CPU); see _build_input_stack. Shared factor/bg_sigma keep every frame
     # one shape, so it's a single tensor sliced per sub-batch below.
     stack_t = _build_input_stack(frames, device, factor, bg_sigma, levels, auto_scale,
-                                 mad_floor=getattr(model, "mad_floor", None))
+                                 mad_floor=getattr(model, "mad_floor", None),
+                                 device_frames=device_frames)
     mask_radius = _mask_radius(work_diam)
 
     K = _neural_sub_batch_size()
