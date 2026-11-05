@@ -77,6 +77,11 @@ def _trim_process_memory() -> int:
     import sys
 
     gc.collect()
+    # The neural batch's per-worker frame buffers outlive each chunk on purpose;
+    # the end of the batch is when they go.
+    device_frames = sys.modules.get("spyde.models.device_frames")
+    if device_frames is not None:
+        device_frames.release_idle()
     try:
         import torch
         if torch.cuda.is_available():

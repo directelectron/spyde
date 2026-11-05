@@ -399,7 +399,9 @@ def _build_input_stack(frames: np.ndarray, device, factor: float, bg_sigma: floa
     if device.type in ("cuda", "mps") and _gpu_prep_enabled():
         try:
             from . import preprocess_torch as pt
-            x = device_frames if device_frames is not None else torch.from_numpy(frames).to(device)
+            x = device_frames
+            if x is None:
+                x = torch.from_numpy(np.asarray(frames, np.float32)).to(device)
             if auto_scale and factor != 1.0:
                 x = pt.scale_batch(x, factor)
             x = pt.normalize_input_batch(x, bg_sigma=bg_sigma, local=True, mad_floor=mad_floor)
@@ -410,6 +412,7 @@ def _build_input_stack(frames: np.ndarray, device, factor: float, bg_sigma: floa
     # Host numpy/scipy reference (CPU device, gpu-prep off, or a device-op failure).
     nrm_list = []
     for f in frames:
+        f = np.asarray(f, np.float32)
         if auto_scale and factor != 1.0:
             from scipy.ndimage import zoom
             f = zoom(f, factor, order=1)
@@ -459,23 +462,26 @@ def detect_batch(model, frames, device, thresh: float = 0.3,
     ``device_frames``: the same frames already on ``device`` as one float32
     tensor, so the caller can reuse the upload (the centre steps read it too).
     """
-    frames = np.asarray(frames, dtype=np.float32)
+    # Kept in the source dtype: casting the whole stack on the host is the cost
+    # ``device_frames`` exists to avoid. Each host step casts what it reads.
+    frames = np.asarray(frames)
     if frames.ndim == 2:
         frames = frames[None]
     N = frames.shape[0]
     if N == 0:
         return []
+    first = np.asarray(frames[0], np.float32)
 
     factor = 1.0
     if auto_scale:
         # One estimate for the whole stack (shared physical disk size); a known
         # ``spot_diameter`` (the user's Spot-size override) replaces the estimate.
-        _ref, factor = scale_to_canonical(frames[0], diameter=spot_diameter)
+        _ref, factor = scale_to_canonical(first, diameter=spot_diameter)
 
     # Shared physical disk size across the scan -> resolve the size-dependent
     # NMS window + background sigma ONCE from the first frame (like the scale).
     md = max(2, int(round(min_distance * factor)))
-    work_diam = _estimate_work_diam(frames[0], factor, spot_diameter)
+    work_diam = _estimate_work_diam(first, factor, spot_diameter)
     md, bg_sigma = _big_disk_params(md, bg_sigma, work_diam)
     radius = _width_radius(work_diam, md)
 

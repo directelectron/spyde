@@ -394,7 +394,9 @@ def _neural_block(b4d, threshold, min_dist, subpixel, beamstop_mask, model_id,
     from spyde.actions.find_vectors_torch import torch_gpu_device
 
     out = np.full((b4d.shape[0], b4d.shape[1], MAX_PEAKS, PEAK_COLS), np.nan, dtype=np.float32)
-    flat = b4d.reshape(-1, b4d.shape[2], b4d.shape[3]).astype(np.float32, copy=False)
+    # Left in the source dtype: the device casts the whole chunk, and the host
+    # steps below cast the one frame they read.
+    flat = b4d.reshape(-1, b4d.shape[2], b4d.shape[3])
 
     model, device = models.get_model(model_id)
 
@@ -432,39 +434,45 @@ def _neural_block(b4d, threshold, min_dist, subpixel, beamstop_mask, model_id,
             # semaphore the numba NXCORR path uses).
             mps_lock = _mps_forward_lock() if dev_is_mps else None
             import contextlib
+
+            from spyde.models.device_frames import leased_frame_buffers
             device_frames = None
-            with (mps_lock or contextlib.nullcontext()):
-                with _gpu_slots():
-                    if device.type in ("cuda", "mps"):
-                        # Moved to the device once: the detector and both centre
-                        # steps read the frames from here.
-                        import torch
-                        device_frames = torch.as_tensor(flat, device=device)
-                    # Sub-batched internally (SPYDE_NEURAL_BATCH) — NOT one forward
-                    # pass for the whole chunk; see infer.detect_batch.
-                    raw = models.detect_batch(
-                        model, flat, device, thresh=float(threshold),
-                        min_distance=int(min_dist),
-                        bg_sigma=(float(bg_sigma) if bg_sigma is not None else None),
-                        spot_diameter=(2.0 * spot_radius) if spot_radius else None,
-                        with_width=True, device_frames=device_frames)
-            counts_radius = _counts_radius(flat[0], spot_radius)
-            preds = [_apply_beamstop(np.asarray(p, np.float32).reshape(-1, 4),
-                                     beamstop_mask, flat[i].shape)
-                     for i, p in enumerate(raw)]
-            preds, refined_sigmas = _refined(flat, preds, counts_radius,
-                                             refine_centres, friedel_partner, device,
-                                             device_frames)
+            # The detector and both centre steps read the chunk from one upload,
+            # into buffers this worker reuses for its next chunk.
+            with leased_frame_buffers() as buffers:
+                with (mps_lock or contextlib.nullcontext()):
+                    with _gpu_slots():
+                        if device.type in ("cuda", "mps"):
+                            device_frames = buffers.upload(flat, device)
+                        # Sub-batched internally (SPYDE_NEURAL_BATCH) — NOT one forward
+                        # pass for the whole chunk; see infer.detect_batch.
+                        raw = models.detect_batch(
+                            model, flat, device, thresh=float(threshold),
+                            min_distance=int(min_dist),
+                            bg_sigma=(float(bg_sigma) if bg_sigma is not None else None),
+                            spot_diameter=(2.0 * spot_radius) if spot_radius else None,
+                            with_width=True, device_frames=device_frames)
+                counts_radius = _counts_radius(flat[0], spot_radius)
+                preds = [_apply_beamstop(np.asarray(p, np.float32).reshape(-1, 4),
+                                         beamstop_mask, flat[i].shape)
+                         for i, p in enumerate(raw)]
+                preds, refined_sigmas = _refined(flat, preds, counts_radius,
+                                                 refine_centres, friedel_partner, device,
+                                                 device_frames)
+                del device_frames
             peaks_list = [_neural_peaks(flat[i], p, counts_radius, refined_sigmas[i])
                           for i, p in enumerate(preds)]
     except Exception as _e:
         log.warning("[find_vectors] torch neural GPU path failed (%s); CPU per-frame", _e)
         peaks_list = None
         # The failure is often running out of device memory, and the CPU path
-        # below needs none: hand the cached blocks back so other processes
-        # sharing the card (other workers, a camera server) can have them.
+        # below needs none: hand the memory back so other processes sharing the
+        # card (other workers, a camera server) can have it.
         if getattr(device, "type", None) == "cuda":
             import torch
+
+            from spyde.models.device_frames import release_idle
+            release_idle()
             torch.cuda.empty_cache()
 
     if peaks_list is None:
