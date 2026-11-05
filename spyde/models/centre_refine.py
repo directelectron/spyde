@@ -170,7 +170,7 @@ def frame_beams(positions, frame_shape, spot_radius) -> np.ndarray:
 
 def refine_centres(frames: Sequence[np.ndarray], positions: Sequence[np.ndarray],
                    spot_radius: float, refiner: CentreRefiner,
-                   batch_size: int = DEFAULT_BATCH):
+                   batch_size: int = DEFAULT_BATCH, device_frames=None):
     """Refine every frame's ``(n, 2)`` ``[y, x]`` detections in ``frames``.
 
     Crops are cut and refined a batch at a time across frames, so a chunk's
@@ -179,7 +179,11 @@ def refine_centres(frames: Sequence[np.ndarray], positions: Sequence[np.ndarray]
     positions per frame, and per frame the refiner's ``(n,)`` uncertainty
     (NaN where the detection was kept) or ``None`` when the refiner reports
     none. Each disk's result depends only on its own crop, so refining one
-    frame alone gives the same answer as refining it inside a chunk."""
+    frame alone gives the same answer as refining it inside a chunk.
+
+    ``device_frames`` is the same frames as one ``(N, H, W)`` float32 tensor
+    already on the refiner's device; the windows are then cut from it instead
+    of moving every frame to the device again."""
     radius = float(spot_radius)
     refined = [np.asarray(p, np.float32).reshape(-1, 2).copy() for p in positions]
     if not (float(getattr(refiner, "min_spot_radius", 0.0)) <= radius
@@ -191,32 +195,43 @@ def refine_centres(frames: Sequence[np.ndarray], positions: Sequence[np.ndarray]
     needs_partner = bool(getattr(refiner, "needs_partner", False))
     beams = frame_beams(refined, np.asarray(frames[0]).shape, radius) if needs_partner else None
     device = _gpu_device(refiner)
+    if device_frames is not None and (device is None or device_frames.device.type != device.type):
+        device_frames = None
 
-    def _cut(pending, points_of, stack):
+    def _cut(pending, points_of, stack, stack_index):
         """The windows of every pending frame's ``points_of(frame_index)``;
-        on the GPU from ``stack``, the pending frames moved there once."""
+        on the GPU from ``stack``, where frame ``frame_index`` is
+        ``stack[stack_index[n]]`` for the ``n``-th pending frame."""
         if stack is None:
             cut = [extract_crops(frames[i], points_of(i), half_width) for i, _ in pending]
             return (np.concatenate([c for c, _ in cut]), np.concatenate([l for _, l in cut]))
-        frame_of = np.concatenate([np.full(len(points), n) for n, (_, points) in enumerate(pending)])
+        from spyde.device_lock import accelerator_lock
+
+        frame_of = np.concatenate([np.full(len(points), index)
+                                   for index, (_, points) in zip(stack_index, pending)])
         centres = np.concatenate([points_of(i) for i, _ in pending]).astype(np.float64)
-        return _extract_crops_on_device(stack, frame_of, centres, half_width)
+        with accelerator_lock(device):
+            return _extract_crops_on_device(stack, frame_of, centres, half_width)
 
     def _flush(pending):
         nonlocal has_sigma
-        stack = None
-        if device is not None:
+        stack, stack_index = None, None
+        if device_frames is not None:
+            stack, stack_index = device_frames, [i for i, _ in pending]
+        elif device is not None:
             import torch
 
             from spyde.device_lock import accelerator_lock
             with accelerator_lock(device):
                 stack = torch.stack([torch.as_tensor(np.asarray(frames[i], np.float32), device=device)
                                      for i, _ in pending])
-        crops, local = _cut(pending, lambda i: refined[i].astype(np.float64), stack)
+            stack_index = range(len(pending))
+        crops, local = _cut(pending, lambda i: refined[i].astype(np.float64), stack, stack_index)
         if needs_partner:
             # the window at each disk's Friedel mirror point, 2 x beam - p
             mirror_crops, mirror_local = _cut(
-                pending, lambda i: 2 * beams[i] - refined[i].astype(np.float64), stack)
+                pending, lambda i: 2 * beams[i] - refined[i].astype(np.float64), stack,
+                stack_index)
             new_local, sigma = refiner.refine(crops, local, radius, mirror_crops, mirror_local)
         else:
             new_local, sigma = refiner.refine(crops, local, radius)

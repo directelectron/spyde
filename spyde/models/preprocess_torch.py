@@ -19,9 +19,9 @@ The couplings that actually bite (and are pinned by ``test_preprocess_torch_pari
     reflect index map by hand (``_reflect_index_map``, valid for any radius, incl.
     radius > frame for big-disk bg_sigma).
   - Median / MAD: ``np.median`` AVERAGES the two middle order statistics on an
-    even-length input; ``torch.median`` returns the lower one. We sort and average
-    the two middles (``_median_lastdim``) to match numpy exactly, and it avoids
-    ``torch.quantile`` (which can silently fall back to CPU on MPS).
+    even-length input; ``torch.median`` returns the lower one. We select and
+    average the two middles (``_median_lastdim``) to match numpy exactly, and it
+    avoids ``torch.quantile`` (which can silently fall back to CPU on MPS).
   - ``scale_to_canonical`` zoom: ``scipy.ndimage.zoom(order=1)`` with the default
     ``grid_mode=False`` endpoint-aligns and sizes the output ``round(n*factor)``;
     reproduced with ``F.interpolate(size=round(n*factor), mode='bilinear',
@@ -79,14 +79,20 @@ def gaussian_blur2d(x: torch.Tensor, sigma: float, truncate: float = 4.0) -> tor
 
 def _median_lastdim(flat: torch.Tensor) -> torch.Tensor:
     """Per-row median matching ``np.median`` (averages the two middles on even
-    length). ``flat`` is ``(N, M)``; returns ``(N, 1)``. Sort-based (works on MPS;
-    avoids torch.quantile's possible CPU fallback there)."""
+    length). ``flat`` is ``(N, M)``; returns ``(N, 1)``.
+
+    Selects the middle values rather than sorting the rows: the same values,
+    without a sorted copy and its 64-bit index array (2 GiB for 1024 frames of
+    256 x 256) and in about half the time on a GPU. Apple-MPS keeps the sort,
+    which is known to run there; avoids torch.quantile's possible CPU fallback."""
     M = flat.shape[1]
-    xs, _ = flat.sort(dim=1)
-    if M % 2 == 1:
-        med = xs[:, M // 2]
+    if flat.device.type == "mps":
+        xs, _ = flat.sort(dim=1)
+        lower, upper = xs[:, (M - 1) // 2], xs[:, M // 2]
     else:
-        med = 0.5 * (xs[:, M // 2 - 1] + xs[:, M // 2])
+        upper = flat.kthvalue(M // 2 + 1, dim=1).values
+        lower = flat.kthvalue(M // 2, dim=1).values if M % 2 == 0 else upper
+    med = upper if M % 2 == 1 else 0.5 * (lower + upper)
     return med.unsqueeze(1)
 
 

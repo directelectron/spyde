@@ -383,7 +383,8 @@ def _gpu_prep_enabled() -> bool:
 
 
 def _build_input_stack(frames: np.ndarray, device, factor: float, bg_sigma: float,
-                       levels: int, auto_scale: bool, mad_floor: float | None = None):
+                       levels: int, auto_scale: bool, mad_floor: float | None = None,
+                       device_frames=None):
     """Preprocess ``frames`` ((N,H,W)) into the padded ``(N,1,H',W')`` U-Net input
     tensor: scale → normalise → pad-to-multiple.
 
@@ -392,11 +393,15 @@ def _build_input_stack(frames: np.ndarray, device, factor: float, bg_sigma: floa
     see ``test_preprocess_torch_parity``), so nothing but the raw frames crosses
     the bus. On CPU (or if GPU-prep is disabled / a device op fails) it uses the
     canonical numpy/scipy path from ``preprocess.py`` and returns a CPU tensor.
-    ``factor``/``bg_sigma`` are the shared per-batch knobs resolved by the caller."""
+    ``factor``/``bg_sigma`` are the shared per-batch knobs resolved by the caller.
+    ``device_frames`` is ``frames`` already on ``device`` as float32; it is read,
+    never written."""
     if device.type in ("cuda", "mps") and _gpu_prep_enabled():
         try:
             from . import preprocess_torch as pt
-            x = torch.from_numpy(frames).to(device)                  # (N,H,W)
+            x = device_frames
+            if x is None:
+                x = torch.from_numpy(np.asarray(frames, np.float32)).to(device)
             if auto_scale and factor != 1.0:
                 x = pt.scale_batch(x, factor)
             x = pt.normalize_input_batch(x, bg_sigma=bg_sigma, local=True, mad_floor=mad_floor)
@@ -407,6 +412,7 @@ def _build_input_stack(frames: np.ndarray, device, factor: float, bg_sigma: floa
     # Host numpy/scipy reference (CPU device, gpu-prep off, or a device-op failure).
     nrm_list = []
     for f in frames:
+        f = np.asarray(f, np.float32)
         if auto_scale and factor != 1.0:
             from scipy.ndimage import zoom
             f = zoom(f, factor, order=1)
@@ -421,7 +427,7 @@ def detect_batch(model, frames, device, thresh: float = 0.3,
                  min_distance: int = 4, auto_scale: bool = True,
                  shared_scale: bool = True, bg_sigma: float | None = None,
                  spot_diameter: float | None = None,
-                 with_width: bool = False):
+                 with_width: bool = False, device_frames=None):
     """Detect spots in a STACK of frames in one forward pass.
 
     ``with_width`` as in :func:`detect`; the decode is the same, so the batch and
@@ -441,6 +447,10 @@ def detect_batch(model, frames, device, thresh: float = 0.3,
     Memory: the padded stack is run through the U-Net in fixed sub-batches of
     ``SPYDE_NEURAL_BATCH`` frames (default 64), NOT as one (N,1,H,W) tensor — a
     single pass over a full nav chunk (1000+ frames) held ~16 GB of activations.
+    The sub-batches reuse each other's device memory: nothing here hands it back
+    to the driver, because every sub-batch would then allocate it afresh. The
+    post-batch trim (``dask_stats.trim_cluster_memory``) releases it once the
+    whole Find Vectors run is done.
     The scale/NMS-window/bg_sigma are resolved ONCE from ``frames[0]`` (below,
     outside the sub-batch loop) so results are bit-identical to a single pass;
     only the forward+decode is chunked.
@@ -449,24 +459,29 @@ def detect_batch(model, frames, device, thresh: float = 0.3,
     (``_build_input_stack`` → ``preprocess_torch``), so nothing but the raw frames
     crosses the bus; on CPU it uses the numpy/scipy reference. Both produce the same
     result (parity-tested), so switching devices never changes the peaks.
+    ``device_frames``: the same frames already on ``device`` as one float32
+    tensor, so the caller can reuse the upload (the centre steps read it too).
     """
-    frames = np.asarray(frames, dtype=np.float32)
+    # Kept in the source dtype: casting the whole stack on the host is the cost
+    # ``device_frames`` exists to avoid. Each host step casts what it reads.
+    frames = np.asarray(frames)
     if frames.ndim == 2:
         frames = frames[None]
     N = frames.shape[0]
     if N == 0:
         return []
+    first = np.asarray(frames[0], np.float32)
 
     factor = 1.0
     if auto_scale:
         # One estimate for the whole stack (shared physical disk size); a known
         # ``spot_diameter`` (the user's Spot-size override) replaces the estimate.
-        _ref, factor = scale_to_canonical(frames[0], diameter=spot_diameter)
+        _ref, factor = scale_to_canonical(first, diameter=spot_diameter)
 
     # Shared physical disk size across the scan -> resolve the size-dependent
     # NMS window + background sigma ONCE from the first frame (like the scale).
     md = max(2, int(round(min_distance * factor)))
-    work_diam = _estimate_work_diam(frames[0], factor, spot_diameter)
+    work_diam = _estimate_work_diam(first, factor, spot_diameter)
     md, bg_sigma = _big_disk_params(md, bg_sigma, work_diam)
     radius = _width_radius(work_diam, md)
 
@@ -475,11 +490,11 @@ def detect_batch(model, frames, device, thresh: float = 0.3,
     # host (CPU); see _build_input_stack. Shared factor/bg_sigma keep every frame
     # one shape, so it's a single tensor sliced per sub-batch below.
     stack_t = _build_input_stack(frames, device, factor, bg_sigma, levels, auto_scale,
-                                 mad_floor=getattr(model, "mad_floor", None))
+                                 mad_floor=getattr(model, "mad_floor", None),
+                                 device_frames=device_frames)
     mask_radius = _mask_radius(work_diam)
 
     K = _neural_sub_batch_size()
-    per_frame: list = []
     # ``device`` / ``model`` may flip to CPU mid-call if an MPS op raises a
     # catchable RuntimeError (fix 2): re-move the model to CPU ONCE, retry the
     # failing sub-batch on CPU, and stay on CPU for the remaining sub-batches so
@@ -487,6 +502,9 @@ def detect_batch(model, frames, device, thresh: float = 0.3,
     # to the coarser ``_neural_block`` catch (which drops to a slow per-frame CPU
     # loop for the whole chunk). ``cur_*`` is the live model/device the loop uses.
     cur_model, cur_device = model, device
+    # Each sub-batch's decoded rows stay where they were computed and come back
+    # to the host together, in one copy, once the loop is done.
+    found = []
     for i0 in range(0, N, K):
         chunk = stack_t[i0:i0 + K]
         # If even the CPU retry inside _forward_with_cpu_retry fails, the error
@@ -498,15 +516,19 @@ def detect_batch(model, frames, device, thresh: float = 0.3,
                                    radius=radius,
                                    mask_logits=outputs[2] if len(outputs) > 2 else None,
                                    mask_radius=mask_radius)
-        b = res[:, 0].long().cpu().numpy() if len(res) else np.zeros(0, np.int64)
-        res_np = res.cpu().numpy()
-        for f in range(chunk.shape[0]):
-            per_frame.append(_frame_rows(res_np[b == f], frames.shape[1:], factor, with_width))
+        res[:, 0] += i0      # frame index within the sub-batch -> within the stack
+        found.append(res)
         del outputs, res
-        if cur_device.type == "cuda":
-            torch.cuda.empty_cache()
 
-    return per_frame
+    if len({part.device for part in found}) == 1:
+        rows = torch.cat(found).cpu().numpy()
+    else:                    # the loop moved to the CPU part way through
+        rows = np.concatenate([part.cpu().numpy() for part in found])
+    frame_of = rows[:, 0].astype(np.int64)
+    # Stable, so each frame's rows stay in the order the decode gave them.
+    rows = rows[np.argsort(frame_of, kind="stable")]
+    per_frame_rows = np.split(rows, np.cumsum(np.bincount(frame_of, minlength=N))[:-1])
+    return [_frame_rows(r, frames.shape[1:], factor, with_width) for r in per_frame_rows]
 
 
 @torch.no_grad()

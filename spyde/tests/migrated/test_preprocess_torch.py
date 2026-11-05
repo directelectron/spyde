@@ -48,6 +48,15 @@ class TestPreprocessTorchParity:
         got = PT.normalize_input_batch(torch.from_numpy(f), 12.0).numpy()
         assert np.max(np.abs(ref - got)) < 1e-3
 
+    def test_median_is_numpys_for_odd_and_even_rows(self):
+        """The selected median equals np.median exactly, ties included, for
+        both an odd row (one middle) and an even row (two averaged)."""
+        rng = np.random.default_rng(3)
+        for width in (25, 24):
+            rows = np.round(rng.random((6, width)) * 10).astype(np.float32)
+            got = PT._median_lastdim(torch.from_numpy(rows)).numpy()[:, 0]
+            assert np.array_equal(got, np.median(rows, axis=1).astype(np.float32)), width
+
     def test_scale_matches_scipy_zoom(self):
         """scale_batch == scipy.ndimage.zoom(order=1): endpoint-aligned, output size
         round(n*factor)."""
