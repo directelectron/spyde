@@ -1,0 +1,1 @@
+The neural Find Vectors batch reused its GPU memory from one chunk to the next instead of reallocating it, which made a 13,312-pattern SPED-Ag scan 14% faster (28.0 s to 24.1 s on a TITAN X) with identical vectors.
