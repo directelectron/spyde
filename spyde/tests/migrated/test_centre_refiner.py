@@ -276,6 +276,28 @@ class TestRefineStep:
         np.testing.assert_allclose(got[np.isfinite(got)], sigma[np.isfinite(sigma)],
                                    rtol=0, atol=5e-5)
 
+    @pytest.mark.parametrize("fixture", sorted(F5_FIXTURES))
+    def test_reading_the_grid_from_the_frames_matches_the_training_code(self, f5, fixture):
+        """``refine_in_frames`` samples the same grid from the frames that
+        ``refine`` samples from a window cut around each disk, so it places
+        the disks the training code does, to the same tolerance."""
+        import torch
+
+        _, tolerance = F5_FIXTURES[fixture]
+        frames, seeds, radius, centres, sigma = _f5_reference(fixture)
+        stack = torch.from_numpy(np.stack(frames))
+        frame_index = torch.from_numpy(np.concatenate([np.full(len(s), i) for i, s in enumerate(seeds)]))
+        start = np.concatenate(seeds).astype(np.float32)
+        moved, got_sigma = f5.refine_in_frames(stack, frame_index, torch.from_numpy(start), radius)
+        moved, got_sigma = moved.numpy(), got_sigma.numpy()
+        accepted = np.isfinite(moved).all(1) & (
+            np.hypot(*(moved - start).T) <= centre_refine.MAX_SHIFT_FRACTION * radius)
+        positions = np.where(accepted[:, None], moved, start)
+        np.testing.assert_allclose(positions, centres, rtol=0, atol=tolerance)
+        assert (np.isnan(got_sigma) == np.isnan(sigma)).all()
+        np.testing.assert_allclose(got_sigma[np.isfinite(got_sigma)], sigma[np.isfinite(sigma)],
+                                   rtol=0, atol=5e-5)
+
     def test_runs_on_apple_mps(self):
         """MPS has no float64, so the centres stay float32 on the device — a
         float64 cast there failed every neural batch on a Mac."""
