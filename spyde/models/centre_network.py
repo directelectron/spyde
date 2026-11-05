@@ -217,15 +217,17 @@ class NetworkRefiner:
 
     def _infer(self, sampled, centre, step):
         """The network on normalised samples taken at ``centre``. Its outputs
-        are taken in float32, whatever precision it ran in."""
-        logits, log_sigmas = [], []
+        are taken in float32, whatever precision it ran in, and used up chunk
+        by chunk, so a network that reuses its output buffers from call to
+        call (a captured CUDA graph) can run here."""
+        offsets, areas, sigmas = [], [], []
         for start in range(0, len(sampled), FORWARD_BATCH):
             output, log_sigma = self.net(sampled[start:start + FORWARD_BATCH])
-            logits.append(output.float())
-            log_sigmas.append(log_sigma.float())
-        offset, area = self._coverage_centroid(torch.cat(logits))
-        sigma = torch.exp(torch.cat(log_sigmas)) * step * self.sigma_scale
-        return centre + offset * step, area, sigma
+            offset, area = self._coverage_centroid(output.float())
+            offsets.append(offset)
+            areas.append(area)
+            sigmas.append(torch.exp(log_sigma.float()) * step * self.sigma_scale)
+        return centre + torch.cat(offsets) * step, torch.cat(areas), torch.cat(sigmas)
 
     def _passes(self, run, seeds, radius):
         """The passes and the decline rule: ``run(select, centre)`` is one pass
