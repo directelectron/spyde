@@ -1,0 +1,1 @@
+A Direct Electron movie saved as a sum of camera frames now plays at its real frame rate, read from its per-frame timestamps rather than a calibration that was wrong by the square of the sum count, and a DE imaging exposure is calibrated in real-space nanometres instead of as diffraction.

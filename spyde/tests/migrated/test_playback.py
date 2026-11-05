@@ -220,13 +220,28 @@ class TestPlayback:
         assert pb.fast_forward() is True
         assert pb.is_playing is True
         assert pb.speed == 2
-        # Then 2→4→8→1 while playing.
+        # Then 2→4→8→16→32→1 while playing. The cycle reaches ×32 because an
+        # in-situ acquisition is often thousands of frames: 7914 frames of real
+        # data is 4.3 minutes at ×1 and still 32 s at ×8.
         pb.fast_forward(); assert pb.speed == 4
         pb.fast_forward(); assert pb.speed == 8
+        pb.fast_forward(); assert pb.speed == 16
+        pb.fast_forward(); assert pb.speed == 32
         pb.fast_forward(); assert pb.speed == 1     # wraps, still playing
         assert pb.is_playing is True
         pb.fast_forward(); assert pb.speed == 2
         pb.pause()
+
+    def test_speed_cycle_is_the_declared_one(self):
+        from spyde.actions.playback import SPEED_CYCLE
+        pb, _ = _controller(n=100000, scale=1.0, units="s")
+        seen = []
+        pb.fast_forward()
+        for _ in range(len(SPEED_CYCLE)):
+            seen.append(pb.speed)
+            pb.fast_forward()
+        pb.pause()
+        assert sorted(set(seen)) == sorted(SPEED_CYCLE)
 
     def test_fast_forward_emits_speed_in_state(self):
         # The playback_state emit carries the current speed.

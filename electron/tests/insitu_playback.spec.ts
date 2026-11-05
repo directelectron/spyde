@@ -214,7 +214,7 @@ test('in-situ movie: Play/FF gate, real-time playback, fast-forward badge, ' +
       `looping playback (band frozen) — backend painted ${sigPaints} SIG frames`)
       .toBeGreaterThan(0)
 
-    // ── 3. Fast Forward: badge cycles 2x -> 4x -> 8x -> gone (1x, still playing) ──
+    // ── 3. Fast Forward: badge cycles 2x -> 4x -> 8x -> 16x -> 32x -> gone (1x, still playing) ──
     await backendAction(page, 'playback', { command: 'play', loop: true })
     await page.waitForTimeout(500)
     await backendAction(page, 'playback', { command: 'pause' })
@@ -253,7 +253,15 @@ test('in-situ movie: Play/FF gate, real-time playback, fast-forward badge, ' +
     await expect(badge, 'FF badge should show 8x after third click').toHaveText('8x', { timeout: 5000 })
     await shot(page, ++shotN, 'ff-badge-8x')
 
-    await hoverAndClickFF()   // 8x -> 1x (badge disappears, still playing)
+    await hoverAndClickFF()   // 8x -> 16x
+    await nav.hover()
+    await expect(badge, 'FF badge should show 16x after fourth click').toHaveText('16x', { timeout: 5000 })
+
+    await hoverAndClickFF()   // 16x -> 32x
+    await nav.hover()
+    await expect(badge, 'FF badge should show 32x after fifth click').toHaveText('32x', { timeout: 5000 })
+
+    await hoverAndClickFF()   // 32x -> 1x (badge disappears, still playing)
     await nav.hover()
     await expect(nav.getByTestId('playback-speed-badge'),
       'badge must be gone at 1x').toHaveCount(0, { timeout: 5000 })

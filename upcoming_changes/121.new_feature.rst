@@ -1,0 +1,1 @@
+An in-situ movie now opens with its BioLogic EC-Lab potential and current as navigator lanes aligned to the real frame times (found beside the movie automatically, or chosen with File > Load In-Situ Data...), and the movie editor can burn those values, the timestamp and free text into the exported frames as one kind of movable overlay.
