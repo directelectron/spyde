@@ -234,7 +234,17 @@ class FileLoaderMixin:
         """Load a HyperSpy-compatible file and open it in the MDI.
 
         ``path`` may be a regular file OR a directory store (``.zspy``/``.zarr``,
-        which are Zarr nested-group folders, not single files)."""
+        which are Zarr nested-group folders, not single files), or an Autopilot
+        run folder (what its "Open in SpyDE" hands over)."""
+        from spyde.autopilot.run_folder import run_folder
+
+        if run_folder(path) is not None:
+            name = os.path.basename(os.path.normpath(path))
+            ipc.emit({"type": "loading", "busy": True, "text": f"Reading {name}…"})
+            threading.Thread(
+                target=self._load_run_thread, args=(path,), daemon=True, name=f"load-{name}"
+            ).start()
+            return
         ext = _path_ext(path)
         if ext not in SUPPORTED_EXTS:
             emit_error(f"Unsupported file type: {ext}")
@@ -524,6 +534,23 @@ class FileLoaderMixin:
         except Exception as e:
             ipc.emit({"type": "loading", "busy": False, "text": ""})
             emit_error(f"Failed to load {os.path.basename(path)}: {e}")
+
+    def _load_run_thread(self, path: str) -> None:
+        """An Autopilot run folder: its scan grid is in its record, so it
+        opens without the scan-shape prompt."""
+        from spyde.autopilot.run_folder import load_run
+
+        try:
+            self._await_dask()
+            signal = load_run(path)
+            ipc.emit({"type": "loading", "busy": False, "text": ""})
+            self._add_signal(signal, source_path=path,
+                             navigator_override=_reader_navigator(signal))
+            self._add_recent(path)
+            ipc.emit({"type": "recent_files", "paths": self._recent_files[:20]})
+        except Exception as e:
+            ipc.emit({"type": "loading", "busy": False, "text": ""})
+            emit_error(f"Failed to load {os.path.basename(os.path.normpath(path))}: {e}")
 
     @staticmethod
     def _is_self_describing(path: str) -> bool:

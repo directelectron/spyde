@@ -1,0 +1,1 @@
+SpyDE opens an Autopilot run folder — what Autopilot's "Open in SpyDE" hands over — as a lazy scan, read through Autopilot's own dataset reader: only the movie files the run marks complete, each checked against its record, so a run still going opens as far as its closed files reach.
