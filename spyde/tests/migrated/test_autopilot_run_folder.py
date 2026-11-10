@@ -65,7 +65,7 @@ def _run_folder(tmp_path, *, last_complete=True):
                  "navigation_shape": list(NAVIGATION), "repeats": 2,
                  "positions": "dataset/positions.npy"},
         "coordinates": [],
-        "timeline": "timeline",
+        "timeline": {"frames": "timeline/frames.csv"},
         "detectors": {"camera": {"files": files, "note": ""}},
         "derived": [],
         "vectors": [],

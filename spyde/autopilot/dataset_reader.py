@@ -1,4 +1,4 @@
-# Copied from directelectron/de_autopilot de_automate/dataset_reader.py at 1f805d5 by _sync.py; edit it there.
+# Copied from directelectron/de_autopilot de_automate/dataset_reader.py at a062374 by _sync.py; edit it there.
 """A run's dataset, read: the files DE-Server wrote, found through the index
 Autopilot kept beside them, and the derived signals made from them.
 
@@ -10,9 +10,11 @@ and recording"):
   their first frame, frame count, bytes, frame shape and type), each marked
   ``complete`` once the server closed it, and for each complete file its
   index (``dataset/<detector>_<first>.npy``): every frame's navigation point,
-  server frame number, pass and any series coordinates; the frame number
-  joins it to the run's timeline (``timeline/``), which says whether each
-  frame was settled;
+  server frame number, pass and any series coordinates;
+- the run's timeline files (``timeline/*.csv``): ``frames.csv`` labels each
+  range of server frame numbers with how many of its images were taken while
+  the instrument was still changing, joined to the index by ``frame``
+  (:meth:`DatasetReader.frame_ranges`);
 - the scan (type, field, navigation shape) and every navigation point's
   position in the field (``dataset/positions.npy``);
 - the derived signals and saved vectors, with the parameters that made them;
@@ -38,6 +40,7 @@ byte-identical copy rather than installing Autopilot's backend.
 from __future__ import annotations
 
 import bisect
+import csv
 import json
 import os
 import struct
@@ -71,9 +74,20 @@ VERSION = 1
 #: The fields every index has, a row per movie frame: the navigation point
 #: (-1 off the scan), the server's frame number (-1 unknown) and the pass.
 #: Series coordinates follow as float64 fields of their own names. Whether a
-#: frame was settled is the timeline's (``timeline/frames.csv``, by the same
-#: frame number), not repeated here.
+#: frame was settled is the timeline's (:meth:`DatasetReader.frame_ranges`),
+#: not repeated here.
 INDEX_FIELDS = (("point", "<i8"), ("frame", "<i8"), ("pass", "<i4"))
+#: The columns of the timeline's ``frames.csv`` this reads.
+_FRAME_RANGE = np.dtype(
+    [
+        ("first_frame", "<i8"),
+        ("last_frame", "<i8"),
+        ("step", "<i8"),
+        ("first_pass", "<i8"),
+        ("last_pass", "<i8"),
+        ("unsettled", "<i8"),
+    ]
+)
 
 #: The MRC modes DE-Server writes a movie in, by its output data format.
 #: Mode 0 is its unsigned 8-bit output (RAW8U), whatever MRC2014 says of
@@ -378,6 +392,23 @@ class DatasetReader:
         if not file["complete"]:
             raise NotComplete(f"{file['path']}: not complete, so not indexed yet")
         return np.load(self._here(file["index"]))
+
+    def frame_ranges(self, detector: str = "camera") -> np.ndarray | None:
+        """*detector*'s rows of the timeline's ``frames.csv``: each range of
+        server frame numbers (``first_frame`` to ``last_frame``, ``step``
+        apart), its passes, and how many of its images were ``unsettled``.
+        An index row belongs to the range its ``frame`` falls in. None while
+        the run has not written it (the timeline is labelled as it finishes)."""
+        relative = (self.record.get("timeline") or {}).get("frames")
+        path = self._here(relative) if relative else None
+        if path is None or not os.path.isfile(path):
+            return None
+        with open(path, encoding="utf-8", newline="") as fh:
+            rows = [row for row in csv.DictReader(fh) if row["detector"] == detector]
+        ranges = np.zeros(len(rows), _FRAME_RANGE)
+        for at, row in enumerate(rows):
+            ranges[at] = tuple(row[name] for name in _FRAME_RANGE.names)
+        return ranges
 
     # ── the data ──
     def point(self, at: int | Sequence[int]) -> int:
