@@ -1,0 +1,3 @@
+# Autopilot's dataset reader, copied byte for byte by spyde/autopilot/_sync.py:
+# its recorded SHA-256 covers the bytes exactly, so git must not change them.
+spyde/autopilot/dataset_reader.py -text

@@ -53,7 +53,12 @@ def load_run(path: str, *, detector: str = "camera"):
     movie = da.concatenate(stacks)
     blank = da.zeros((1, *movie.shape[1:]), movie.dtype)
     latest = reader.latest(detector)
-    rows = np.where(latest < 0, len(movie), latest)
+    # A movie index is a place in the whole movie; the stack holds only the
+    # complete files, each at the sum of the frames before it in the stack.
+    firsts = np.array([file["first"] for file in complete])
+    stacked = np.cumsum([0] + [file["frames"] for file in complete])[:-1]
+    owner = np.clip(np.searchsorted(firsts, latest, side="right") - 1, 0, None)
+    rows = np.where(latest < 0, len(movie), stacked[owner] + latest - firsts[owner])
     data = da.concatenate([movie, blank])[rows]
     data = data.reshape(*reader.navigation_shape, *movie.shape[1:])
     signal = hs.signals.Signal2D(data).as_lazy()

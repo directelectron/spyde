@@ -1,4 +1,4 @@
-# Copied from directelectron/de_autopilot de_automate/dataset_reader.py at a062374 by _sync.py; edit it there.
+# Copied from directelectron/de_autopilot de_automate/dataset_reader.py at 4a2c470 by _sync.py; edit it there. sha256 7279d5bae306fe88d3d2dff0b8a8a29dec2c27bba5e985750567b307ad189c71
 """A run's dataset, read: the files DE-Server wrote, found through the index
 Autopilot kept beside them, and the derived signals made from them.
 
@@ -94,11 +94,13 @@ _FRAME_RANGE = np.dtype(
 #: mode 0's sign.
 _MRC_MOVIE_MODES = {0: "u1", 1: "i2", 2: "f4", 6: "u2"}
 #: MRC2014's fixed header, and the machine stamp's first byte for each order.
-_MRC_HEADER_BYTES = 1024
+MRC_HEADER_BYTES = 1024
 _MRC_LITTLE, _MRC_BIG = 0x44, 0x11
-#: An EDAX UP2: version 3, 16-bit patterns after the header.
-_UP2_VERSION = 3
-_UP2_HEADER = struct.Struct("<4I")
+#: EDAX's pattern files, as DE-Server writes them (``File/FileWriterUP2``):
+#: by extension, the version in the header and the patterns' type. UP1 is
+#: what it writes for 8-bit patterns.
+_UP = {".up1": (1, "u1"), ".up2": (3, "<u2")}
+_UP_HEADER = struct.Struct("<4I")
 
 
 class Unreadable(ValueError):
@@ -134,21 +136,27 @@ class MovieFile:
 
     @property
     def format(self) -> str:
-        """``MRC`` or ``UP2``, by its extension."""
+        """``MRC``, ``UP1`` or ``UP2``, by its extension."""
         return os.path.splitext(self.path)[1].lstrip(".").upper()
+
+
+#: The extensions :func:`movie_file` reads.
+MOVIE_EXTENSIONS = (".mrc", *_UP)
 
 
 def movie_file(path: str) -> MovieFile:
     """*path*'s layout, as DE-Server writes a movie: MRC (``File/FileWriterMRC``)
-    or EDAX's UP2 (``File/FileWriterUP2``). Any other format is
+    or EDAX's UP1 and UP2 (``File/FileWriterUP2``). Any other format is
     :class:`Unreadable`, as is a file whose size disagrees with its header."""
     extension = os.path.splitext(path)[1].lower()
     if extension == ".mrc":
         found = _mrc(path)
-    elif extension == ".up2":
-        found = _up2(path)
+    elif extension in _UP:
+        found = _up(path, *_UP[extension])
     else:
-        raise Unreadable(f"{path}: recovery reads MRC and UP2 movies, not {extension or path}")
+        raise Unreadable(
+            f"{path}: this reads MRC, UP1 and UP2 movies, not {extension or 'a file without one'}"
+        )
     size = os.path.getsize(path)
     if size != found.offset + found.frames * found.frame_bytes:
         raise Unreadable(
@@ -158,52 +166,74 @@ def movie_file(path: str) -> MovieFile:
     return found
 
 
-def _mrc(path: str) -> MovieFile:
-    """The server writes the header, and with it the frame count, as it
-    closes the file. Read here rather than through ``de_automate.mrc`` so
-    this module stands alone."""
+def mrc_layout(path: str | os.PathLike) -> dict[str, Any]:
+    """Where an MRC file's pixels are, from its header alone: ``nx, ny, nz,
+    mode``, ``endian`` (``"<"`` or ``">"``), ``offset`` (the first pixel's
+    byte, past any extended header) and ``raw``, the header's 1024 bytes.
+    ``nz`` may be 0: a stack nothing was written to yet. The one MRC header
+    reader: ``de_automate.mrc`` reads through it too."""
     with open(path, "rb") as fh:
-        raw = fh.read(_MRC_HEADER_BYTES)
-    if len(raw) < _MRC_HEADER_BYTES:
+        raw = fh.read(MRC_HEADER_BYTES)
+    if len(raw) < MRC_HEADER_BYTES:
         raise Unreadable(f"{path}: {len(raw)} bytes is too short to be an MRC header")
-    stamp = raw[212]
-    endian = {_MRC_LITTLE: "<", _MRC_BIG: ">"}.get(stamp)
-    if endian is None:  # no stamp: whichever byte order gives a known mode
+    endian = {_MRC_LITTLE: "<", _MRC_BIG: ">"}.get(raw[212])
+    if endian is None:  # a file from before MRC2014 may carry no stamp
         endian = next(
             (e for e in "<>" if struct.unpack(e + "i", raw[12:16])[0] in _MRC_MOVIE_MODES), None
         )
     if endian is None:
         raise Unreadable(f"{path}: not an MRC file — no machine stamp and no readable mode")
     nx, ny, nz, mode = struct.unpack(endian + "4i", raw[:16])
-    (extended,) = struct.unpack(endian + "i", raw[92:96])
     if mode not in _MRC_MOVIE_MODES:
-        raise Unreadable(f"{path}: MRC mode {mode} is not one DE-Server writes a movie in")
+        raise Unreadable(
+            f"{path}: MRC mode {mode} is not one this reads {sorted(_MRC_MOVIE_MODES)}"
+        )
     if min(nx, ny) < 1 or nz < 0:
         raise Unreadable(f"{path}: not an MRC file — dimensions {nx}×{ny}×{nz}")
+    (extended,) = struct.unpack(endian + "i", raw[92:96])
+    return {
+        "nx": nx,
+        "ny": ny,
+        "nz": nz,
+        "mode": mode,
+        "endian": endian,
+        "offset": MRC_HEADER_BYTES + max(0, extended),
+        "raw": raw,
+    }
+
+
+def _mrc(path: str) -> MovieFile:
+    """The server writes the header, and with it the frame count, as it
+    closes the file."""
+    found = mrc_layout(path)
     return MovieFile(
         path,
-        np.dtype(endian + _MRC_MOVIE_MODES[mode]),
-        _MRC_HEADER_BYTES + max(0, extended),
-        nz,
-        (ny, nx),
+        np.dtype(found["endian"] + _MRC_MOVIE_MODES[found["mode"]]),
+        found["offset"],
+        found["nz"],
+        (found["ny"], found["nx"]),
     )
 
 
-def _up2(path: str) -> MovieFile:
-    """Version, width, height and the first pattern's byte, then uint16
-    patterns row by row; the count is what the file holds."""
+def _up(path: str, version: int, dtype: str) -> MovieFile:
+    """Version, width, height and the first pattern's byte, then the patterns
+    row by row; the count is what the file holds."""
     with open(path, "rb") as fh:
-        head = fh.read(_UP2_HEADER.size)
-    if len(head) < _UP2_HEADER.size:
-        raise Unreadable(f"{path}: too short to be a UP2")
-    version, width, height, offset = _UP2_HEADER.unpack(head)
-    if version != _UP2_VERSION or min(width, height) < 1:
-        raise Unreadable(f"{path}: not a 16-bit UP2 (version {version}, {width}×{height})")
-    frame_bytes = width * height * 2
+        head = fh.read(_UP_HEADER.size)
+    name = os.path.splitext(path)[1].lstrip(".").upper()
+    if len(head) < _UP_HEADER.size:
+        raise Unreadable(f"{path}: too short to be a {name}")
+    found, width, height, offset = _UP_HEADER.unpack(head)
+    if found != version or min(width, height) < 1:
+        raise Unreadable(
+            f"{path}: not a {name}: version {found}, {width}×{height}, where a {name} is"
+            f" version {version}"
+        )
+    frame_bytes = width * height * np.dtype(dtype).itemsize
     frames, extra = divmod(os.path.getsize(path) - offset, frame_bytes)
     if frames < 0 or extra:
         raise Unreadable(f"{path}: not a whole number of {width}×{height} patterns")
-    return MovieFile(path, np.dtype("<u2"), offset, frames, (height, width))
+    return MovieFile(path, np.dtype(dtype), offset, frames, (height, width))
 
 
 def _mapped(found: MovieFile) -> np.memmap:
@@ -436,7 +466,8 @@ class DatasetReader:
         if movie < 0:
             return None
         file = self._file_of(detector, movie)
-        return Frame(self.read(file, movie - file["first"]), point, movie, path=file["path"])
+        data = self.read(file, movie - file["first"])
+        return Frame(data, point, movie, path=self.path(file))
 
     def read(self, file: dict, number: int) -> np.ndarray:
         """Frame *number* of *file*, counted from its first, read lazily."""
@@ -446,7 +477,7 @@ class DatasetReader:
         """*file*'s frames, read-only and mapped: refused unless the index
         marks it complete, and only once its header and size agree with what
         the index says."""
-        path = file["path"]
+        path = self.path(file)
         if path in self._maps:
             return self._maps[path]
         if not file["complete"]:
@@ -491,9 +522,22 @@ class DatasetReader:
         frames = _mapped(movie_file(path))
         return frames[0] if len(frames) == 1 else frames
 
+    def path(self, file: dict) -> str:
+        """Where *file* is: the record keeps a path inside the run folder
+        relative to it, so a folder moved whole still reads."""
+        return os.path.normpath(os.path.join(self.folder, file["path"]))
+
     def close(self) -> None:
-        """Let go of every mapped file."""
+        """Let go of every mapped file. A map closes with its last reference:
+        a :class:`Frame` read from one is a view of it, and keeps it open
+        until the frame is dropped too."""
         self._maps.clear()
+
+    def __enter__(self) -> DatasetReader:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
 
     # ── helpers ──
     def _here(self, relative: str) -> str:

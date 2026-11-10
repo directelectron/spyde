@@ -34,9 +34,9 @@ def _de_mrc(path, frames):
     return str(path)
 
 
-def _run_folder(tmp_path, *, last_complete=True):
+def _run_folder(tmp_path, *, first_complete=True, last_complete=True):
     """Two raster passes of the scan, frame *n* filled with *n*, saved as
-    frames 0-5 and 6-11; the second file complete or still being written."""
+    frames 0-5 and 6-11, each complete or not."""
     points = int(np.prod(NAVIGATION))
     movie = np.repeat(np.arange(2 * points, dtype=np.float32), np.prod(SHAPE))
     movie = movie.reshape(-1, *SHAPE)
@@ -45,7 +45,7 @@ def _run_folder(tmp_path, *, last_complete=True):
     rows, columns = np.mgrid[0 : NAVIGATION[0], 0 : NAVIGATION[1]]
     np.save(arrays / "positions.npy", np.stack([rows.ravel(), columns.ravel()], axis=1))
     files = []
-    for first, complete in ((0, True), (points, last_complete)):
+    for first, complete in ((0, first_complete), (points, last_complete)):
         path = _de_mrc(tmp_path / f"run_{first}_movie.mrc", movie[first : first + points])
         entry = {"path": path, "first": first, "frames": points, "complete": complete,
                  "format": "MRC", "shape": list(SHAPE), "dtype": "<f4"}
@@ -121,3 +121,21 @@ def test_the_session_opens_a_run_folder_without_asking_its_scan_shape(window, tm
     assert getattr(session, "_pending_load", None) is None
     root = session.signal_trees[0].root
     assert tuple(root.axes_manager.navigation_shape) == NAVIGATION[::-1]
+
+
+def test_a_complete_file_is_read_from_its_own_place_in_the_movie(tmp_path):
+    """Only the second file complete: its frames are movie frames 6-11, not
+    the first six of anything."""
+    movie = _run_folder(tmp_path, first_complete=False)
+    signal = load_run(str(tmp_path))
+    np.testing.assert_array_equal(
+        np.asarray(signal.data.compute()), movie[6:].reshape(*NAVIGATION, *SHAPE)
+    )
+
+
+def test_the_copy_of_autopilots_reader_is_unedited():
+    """The copy is Autopilot's, byte for byte after its header: a fix made
+    here would be lost at the next sync, and the two apps would disagree."""
+    from spyde.autopilot import _sync
+
+    assert not _sync.drifted(), "re-run spyde.autopilot._sync rather than editing the copy"
