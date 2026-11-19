@@ -71,6 +71,7 @@ dependencies = [
     # 70 at 48 threads — numexpr's per-call setup and thread dispatch dominate
     # arrays this small). Do not "fix" the warning by adding it back.
     # GPU-accelerated batched compute (vector orientation mapping, etc.).
+    # Installed per machine for its GPU, not locked (see [tool.uv]).
     "torch",
     # Remote model registry for the SpotUNet disk detector: pulls upgraded
     # weights + registry.json from Hugging Face (spyde/models/registry.py).
@@ -102,28 +103,20 @@ requires-python = ">=3.10,<3.14"
 # When running via the PyCrucible launcher, install only core dependencies —
 # never optional extras (tests / doc) which aren't needed at runtime.
 extra-index-url = []
-# Auto-select the right torch wheel per platform/hardware: CUDA index on
-# Windows/Linux with an NVIDIA GPU, CPU wheel otherwise, MPS-capable default
-# wheel on macOS arm64. This is what gets the dist build a GPU-enabled torch
-# instead of the CPU-only default PyPI wheel. (uv >= 0.5 honours this; the
-# `uv pip install --torch-backend=auto` flag is the manual equivalent.)
-torch-backend = "auto"
-
-# Explicit PyTorch CUDA wheel index. torch-backend="auto" wasn't selecting CUDA at
-# LOCK time on this box (it fell back to the CPU PyPI wheel), so pin torch's source to
-# the CUDA index directly — this survives `uv run`'s re-sync. cu124 wheels still ship
-# sm_61 (Pascal / TITAN X), so the GPU tile backend works on this dev machine.
-# The index is win32-only: it publishes no macOS wheels (CI mac runners must fall
-# back to the default PyPI torch), and Linux CI keeps the PyPI wheel it always had.
-[[tool.uv.index]]
-name = "pytorch-cu124"
-url = "https://download.pytorch.org/whl/cu124"
-explicit = true
+# torch is installed per machine, never locked: which build a machine needs
+# (CUDA 12.x or 13, CPU, ROCm, macOS) depends on its GPU, and a lock holds one —
+# the cu124 build it held has no kernels for a Blackwell (sm_120) card. So uv
+# leaves torch out of the lock and every sync, and it is installed for the GPU
+# found:
+#
+#   uv pip install --no-config torch --torch-backend=auto
+#
+# `uv run` keeps it (it syncs inexactly); `uv sync` removes what the lock does
+# not name, so sync with `--inexact`. The installed app's first run does the
+# same through de-shell.
+exclude-dependencies = ["torch"]
 
 [tool.uv.sources]
-torch = [
-    { index = "pytorch-cu124", marker = "sys_platform == 'win32'" },
-]
 # anyplotlib is co-developed in the sibling checkout but resolved from PyPI
 # (releases track this repo's needs). The report builder needs the 0.4.0 widget/
 # layer/inset APIs (shape-widget linewidth, add_layer tint, inset_geometry_change

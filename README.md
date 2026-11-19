@@ -52,8 +52,10 @@ You need [Node.js](https://nodejs.org) (18+) and [uv](https://docs.astral.sh/uv/
 npm install
 
 # 2. Python backend env (resolves the git-pinned hyperspy/rosettasciio/anyplotlib
-#    forks + the right torch wheel from uv.lock).
-uv sync --extra tests
+#    forks from uv.lock), then torch for this machine's GPU, which is never
+#    locked. --inexact keeps that torch through later syncs.
+uv sync --inexact --extra tests
+uv pip install --no-config torch --torch-backend=auto
 
 # 3. Run the app in dev mode (electron-vite dev + the Python sidecar via `uv run`).
 npm run dev

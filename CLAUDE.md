@@ -12,7 +12,8 @@ SpyDE is a desktop application for visualizing and analyzing electron microscopy
 
 **Install the Python backend (dev):**
 ```bash
-pip install -e ".[tests]"   # or: uv pip install -e ".[tests]"
+uv sync --inexact --extra tests                          # --inexact: keep the torch below
+uv pip install --no-config torch --torch-backend=auto   # torch for this machine's GPU: never locked
 ```
 
 **Install the Electron frontend (dev):**
