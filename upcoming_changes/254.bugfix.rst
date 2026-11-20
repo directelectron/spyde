@@ -1,0 +1,1 @@
+Center Zero Beam now makes the centered beam the origin of the detector axes, on patterns and on vectors alike, so strain and orientation read every spot relative to the zero beam rather than to wherever the detector's offset put it.
