@@ -65,7 +65,7 @@ interface FvSaved {
   sigma1: number; sigma2: number; bgSigma: number
   threshold: number; minDist: number; subpixel: boolean; beamstop: boolean
   beamstopDilate: number; showTransform: boolean; persistence: boolean
-  friedelPartner: boolean; extraOpen: boolean
+  friedelPartner: boolean; centerBeam: boolean; extraOpen: boolean
 }
 const _fvStore = new Map<number, FvSaved>()
 
@@ -92,6 +92,7 @@ export function FindVectorsWizard({ caretPos, windowId, sendAction, onClose }: P
   const [showTransform, setShowTransform] = React.useState(saved?.showTransform ?? false)
   const [persistence, setPersistence] = React.useState(saved?.persistence ?? false)
   const [friedelPartner, setFriedelPartner] = React.useState(saved?.friedelPartner ?? true)
+  const [centerBeam, setCenterBeam] = React.useState(saved?.centerBeam ?? true)
   const [extraOpen, setExtraOpen] = React.useState(saved?.extraOpen ?? false)
   const [status, setStatus] = React.useState('Tune the parameters — peaks preview under the crosshair.')
   const [estimating, setEstimating] = React.useState(true)
@@ -106,14 +107,15 @@ export function FindVectorsWizard({ caretPos, windowId, sendAction, onClose }: P
   React.useEffect(() => {
     _fvStore.set(windowId, {
       method, modelId, sigma, radius, sigma1, sigma2, bgSigma, threshold, minDist, subpixel,
-      beamstop, beamstopDilate, showTransform, persistence, friedelPartner, extraOpen,
+      beamstop, beamstopDilate, showTransform, persistence, friedelPartner, centerBeam, extraOpen,
     })
   }, [windowId, method, modelId, sigma, radius, sigma1, sigma2, bgSigma, threshold, minDist,
-      subpixel, beamstop, beamstopDilate, showTransform, persistence, friedelPartner, extraOpen])
+      subpixel, beamstop, beamstopDilate, showTransform, persistence, friedelPartner, centerBeam,
+      extraOpen])
 
   // Live refs so the debounced tune always sends the latest of EVERY control.
-  const vals = React.useRef({ method, modelId, sigma, radius, sigma1, sigma2, bgSigma, threshold, minDist, subpixel, beamstop, beamstopDilate, showTransform, persistence, friedelPartner })
-  vals.current = { method, modelId, sigma, radius, sigma1, sigma2, bgSigma, threshold, minDist, subpixel, beamstop, beamstopDilate, showTransform, persistence, friedelPartner }
+  const vals = React.useRef({ method, modelId, sigma, radius, sigma1, sigma2, bgSigma, threshold, minDist, subpixel, beamstop, beamstopDilate, showTransform, persistence, friedelPartner, centerBeam })
+  vals.current = { method, modelId, sigma, radius, sigma1, sigma2, bgSigma, threshold, minDist, subpixel, beamstop, beamstopDilate, showTransform, persistence, friedelPartner, centerBeam }
   const params = () => {
     const v = vals.current
     const neural = v.method === 'neural'
@@ -134,6 +136,7 @@ export function FindVectorsWizard({ caretPos, windowId, sendAction, onClose }: P
       persistence: v.persistence,
       refine_centres: neural,
       friedel_partner: neural && v.friedelPartner,
+      center_beam: v.centerBeam,
     }
   }
 
@@ -362,6 +365,10 @@ export function FindVectorsWizard({ caretPos, windowId, sendAction, onClose }: P
           <Check testid="fv-persistence" checked={persistence} onChange={live(setPersistence)}
             label="Neighbor refine" />
         )}
+        {/* Compute only: the result is moved so the zero beam is the origin,
+            unless a beam stop hides it. The preview is not moved. */}
+        <Check testid="fv-center-beam" checked={centerBeam} onChange={setCenterBeam}
+          label="Center on zero beam" />
       </div>
       <Disclosure label="Extra" testid="fv-extra" open={extraOpen} onToggle={() => setExtraOpen((v) => !v)}>
         <Check testid="fv-beamstop" checked={beamstop} onChange={live(setBeamstop)}
