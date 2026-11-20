@@ -17,7 +17,7 @@ import { useWizardEvent, useWizardLifecycle } from './wizardHooks'
 import { WizardShell, NumInput, S } from './WizardShell'
 
 interface CropAxis {
-  key: string; group: string; label: string; name: string
+  key: string; navigate: boolean; name: string
   size: number; start: number; stop: number
   scale: number; offset: number; units: string
 }
@@ -97,78 +97,48 @@ export function CropWizard({ caretPos, windowId, sendAction, onClose }: Props) {
     sendAction('crop_set_range', { key, start, stop }, windowId)
   }
 
-  // Two rows: the navigation axes (time, scan), then the signal axes — the
-  // order a dataset is described in. Each row is a run of labelled groups.
-  const groups: [string, CropAxis[]][] = []
-  for (const axis of state?.axes ?? []) {
-    const group = groups.find(([name]) => name === axis.group)
-    if (group) group[1].push(axis)
-    else groups.push([axis.group, [axis]])
-  }
-  const isNavigation = (axes: CropAxis[]) => axes[0].key.startsWith('nav')
-  const rows = [groups.filter(([, axes]) => isNavigation(axes)),
-                groups.filter(([, axes]) => !isNavigation(axes))].filter((row) => row.length)
-  const widest = Math.max(1, ...rows.map((row) => row.reduce((n, [, axes]) => n + axes.length, 0)))
-
+  // One row per axis, in the axes manager's order — the dock's Axes table.
   return (
-    <WizardShell testid="crop-wizard" title="Crop" posStyle={caretPos}
-      width={Math.min(760, 24 + widest * 216)}
-      onClose={onClose} closeTestid="crop-close" statusTestid="crop-status"
-      status="">
+    <WizardShell testid="crop-wizard" title="Crop" posStyle={caretPos} width={460}
+      onClose={onClose} closeTestid="crop-close" statusTestid="crop-status" status="">
       <style>{SLIDER_CSS}</style>
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-        {rows.map((row, r) => (
-          <div key={r} style={{ display: 'flex', gap: 10, alignItems: 'stretch' }}>
-            {row.map(([group, axes], g) => (
-              <div key={group} data-testid={`crop-group-${group.toLowerCase()}`}
-                style={{ display: 'flex', flexDirection: 'column', gap: 2, flex: axes.length,
-                         minWidth: 0, ...(g ? { borderLeft: '1px solid #313244', paddingLeft: 10 } : {}) }}>
-                <span style={{ ...S.numLabel, fontSize: 9.5, letterSpacing: 0.4, textTransform: 'uppercase' }}>{group}</span>
-                <div style={{ display: 'flex', gap: 12 }}>
-                  {axes.map((axis) => (
-                    <div key={axis.key} data-testid={`crop-axis-${axis.key}`}
-                      title={`${axis.label}: keeps ${axis.stop - axis.start} of ${axis.size}`}
-                      style={{ display: 'flex', flexDirection: 'column', flex: 1, minWidth: 0 }}>
-                      <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-                        <span style={{ ...S.lbl, minWidth: 14, fontWeight: 600 }}>{axis.label}</span>
-                        <NumInput testid={`crop-${axis.key}-from`} value={axis.start} step="1" width={48}
-                          min={0} max={axis.size - 1} accept={Number.isInteger}
-                          style={{ padding: '2px 3px', fontSize: 10.5 }}
-                          onChange={(n) => setRange(axis.key, n, Math.max(axis.stop, n + 1))} />
-                        <RangeSlider axis={axis} onChange={(start, stop) => setRange(axis.key, start, stop)} />
-                        <NumInput testid={`crop-${axis.key}-to`} value={axis.stop - 1} step="1" width={48}
-                          min={0} max={axis.size - 1} accept={Number.isInteger}
-                          style={{ padding: '2px 3px', fontSize: 10.5 }}
-                          onChange={(n) => setRange(axis.key, Math.min(axis.start, n), n + 1)} />
-                      </div>
-                      <span data-testid={`crop-${axis.key}-value`}
-                        style={{ ...S.numLabel, fontSize: 9.5, textAlign: 'center', minHeight: 12 }}>
-                        {calibrated(axis)}
-                      </span>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            ))}
-          </div>
+      <div style={{ display: 'grid', gridTemplateColumns: 'auto auto 48px minmax(90px, 1fr) 48px auto',
+                    columnGap: 6, rowGap: 4, alignItems: 'center' }}>
+        {(state?.axes ?? []).map((axis) => (
+          <React.Fragment key={axis.key}>
+            <span style={{ ...S.numLabel, fontSize: 9.5 }}>{axis.navigate ? 'nav' : 'sig'}</span>
+            <span data-testid={`crop-axis-${axis.key}`} style={S.lbl}>{axis.name || '<undefined>'}</span>
+            <NumInput testid={`crop-${axis.key}-from`} value={axis.start} step="1" width={48}
+              min={0} max={axis.size - 1} accept={Number.isInteger}
+              style={{ padding: '2px 3px', fontSize: 10.5 }}
+              onChange={(n) => setRange(axis.key, n, Math.max(axis.stop, n + 1))} />
+            <RangeSlider axis={axis} onChange={(start, stop) => setRange(axis.key, start, stop)} />
+            <NumInput testid={`crop-${axis.key}-to`} value={axis.stop - 1} step="1" width={48}
+              min={0} max={axis.size - 1} accept={Number.isInteger}
+              style={{ padding: '2px 3px', fontSize: 10.5 }}
+              onChange={(n) => setRange(axis.key, Math.min(axis.start, n), n + 1)} />
+            <span data-testid={`crop-${axis.key}-value`} style={{ ...S.numLabel, whiteSpace: 'nowrap' }}>
+              {calibrated(axis)}
+            </span>
+          </React.Fragment>
         ))}
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, borderTop: '1px solid #313244', paddingTop: 6 }}>
-          <span data-testid="crop-summary" title={state ? `from ${state.before}` : undefined}
-            style={{ ...S.hint, fontStyle: 'normal', flex: 1, minWidth: 0, whiteSpace: 'nowrap',
-                     overflow: 'hidden', textOverflow: 'ellipsis' }}>
-            {state ? `→ ${state.after}` : 'Reading the dataset…'}
-          </span>
-          <button data-testid="crop-reset" style={{ ...S.fileBtn, alignSelf: 'center' }}
-            onClick={() => sendAction('crop_reset', {}, windowId)}>
-            Reset
-          </button>
-          <button data-testid="crop-run"
-            style={{ ...S.primary, alignSelf: 'center', ...(state?.is_crop ? {} : S.primaryBusy) }}
-            disabled={!state?.is_crop}
-            onClick={() => { sendAction('crop_run', {}, windowId); onClose() }}>
-            Crop to new dataset
-          </button>
-        </div>
+      </div>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, borderTop: '1px solid #313244', paddingTop: 6 }}>
+        <span data-testid="crop-summary" title={state ? `from ${state.before}` : undefined}
+          style={{ ...S.hint, fontStyle: 'normal', flex: 1, minWidth: 0, whiteSpace: 'nowrap',
+                   overflow: 'hidden', textOverflow: 'ellipsis' }}>
+          {state ? `→ ${state.after}` : 'Reading the dataset…'}
+        </span>
+        <button data-testid="crop-reset" style={{ ...S.fileBtn, alignSelf: 'center' }}
+          onClick={() => sendAction('crop_reset', {}, windowId)}>
+          Reset
+        </button>
+        <button data-testid="crop-run"
+          style={{ ...S.primary, alignSelf: 'center', ...(state?.is_crop ? {} : S.primaryBusy) }}
+          disabled={!state?.is_crop}
+          onClick={() => { sendAction('crop_run', {}, windowId); onClose() }}>
+          Crop to new dataset
+        </button>
       </div>
     </WizardShell>
   )

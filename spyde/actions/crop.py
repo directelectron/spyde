@@ -32,13 +32,6 @@ log = logging.getLogger(__name__)
 
 CROP_COLOR = "#f9e2af"
 
-_TIME_NAMES = {"time", "t", "frame", "frames"}
-_TIME_UNITS = {"s", "ms", "µs", "us", "ns", "ps", "fs", "min", "h"}
-
-# Panel order: how a dataset is described — time, then scan, then the frame.
-_GROUP_ORDER = ("Time", "Navigation", "Scan", "Image", "Detector", "Signal")
-
-
 # ── Cropping a signal ────────────────────────────────────────────────────────
 
 def clamp_range(start, stop, size: int) -> tuple[int, int]:
@@ -85,24 +78,11 @@ def time_axis_index(signal) -> int | None:
     return None
 
 
-def _looks_like_time(axis) -> bool:
-    name = str(getattr(axis, "name", "") or "").strip().lower()
-    units = str(getattr(axis, "units", "") or "").strip()
-    return name in _TIME_NAMES or units in _TIME_UNITS
-
-
-def _axis_name(axis, fallback: str) -> str:
-    name = str(getattr(axis, "name", "") or "")
-    return fallback if name in ("", "<undefined>") else name
-
-
 # ── The axes a crop has ──────────────────────────────────────────────────────
 
 @dataclass
 class CropAxis:
     key: str            # "nav0" / "sig1": the inav / isig index, display order
-    group: str          # what the panel files it under
-    label: str
     axis: object        # the hyperspy axis it crops
 
     @property
@@ -111,57 +91,33 @@ class CropAxis:
 
     def describe(self, start: int, stop: int) -> dict:
         from spyde.drawing.plots.plot import _clean_units
+        from spyde.metadata_extract import _clean
         units = str(getattr(self.axis, "units", "") or "")
-        units = "" if units in ("<undefined>", "px") else _clean_units(units)
+        units = "" if units in ("<undefined>", "px") else units
         return {
-            "key": self.key, "group": self.group, "label": self.label,
-            "name": _axis_name(self.axis, ""), "size": self.size,
+            "key": self.key, "navigate": self.key.startswith("nav"),
+            "name": _clean(getattr(self.axis, "name", "")), "size": self.size,
             "start": start, "stop": stop,
             "scale": float(getattr(self.axis, "scale", 1.0) or 1.0),
             "offset": float(getattr(self.axis, "offset", 0.0) or 0.0),
-            "units": units,
+            "units": _clean_units(units) if units else "",
         }
 
 
-def _labels(axes, fallback: list[str]) -> list[str]:
-    """The axes' own names when every one has a distinct name, else
-    *fallback* — a dataset that calls both detector axes ``kx`` would
-    otherwise get two rows that look the same."""
-    names = [_axis_name(axis, "") for axis in axes]
-    return names if all(names) and len(set(names)) == len(names) else fallback
-
-
 def crop_axes(signal) -> list[CropAxis]:
-    """One :class:`CropAxis` per axis of *signal*, in panel order."""
+    """One :class:`CropAxis` per axis of *signal*, in the axes manager's own
+    order — the order, and the names, the dock's Axes table shows."""
     am = signal.axes_manager
-    navigation = list(am.navigation_axes)
-    time_index = time_axis_index(signal)
-    axes = []
-    scan = [axis for index, axis in enumerate(navigation)
-            if index != time_index and len(navigation) >= 2 and index < 2]
-    scan_labels = iter(_labels(scan, ["x", "y"]))
-    for index, axis in enumerate(navigation):
-        if index == time_index:
-            group = "Time" if _looks_like_time(axis) else "Navigation"
-            label = "t" if group == "Time" else _axis_name(axis, "index")
-        elif len(navigation) >= 2 and index < 2:
-            group, label = "Scan", next(scan_labels)
-        else:
-            group, label = "Navigation", _axis_name(axis, f"axis {index}")
-        axes.append(CropAxis(f"nav{index}", group, label, axis))
-    signal_axes = list(am.signal_axes)
-    if len(signal_axes) == 2:
-        detector = len(navigation) >= 2
-        group = "Detector" if detector else "Image"
-        labels = _labels(signal_axes, ["kx", "ky"] if detector else ["x", "y"])
-        for index, (axis, label) in enumerate(zip(signal_axes, labels)):
-            axes.append(CropAxis(f"sig{index}", group, label, axis))
-    else:
-        for index, axis in enumerate(signal_axes):
-            axes.append(CropAxis(f"sig{index}", "Signal",
-                                 _axis_name(axis, f"axis {index}"), axis))
-    axes.sort(key=lambda each: _GROUP_ORDER.index(each.group))
-    return axes
+    navigation, signal_axes = list(am.navigation_axes), list(am.signal_axes)
+
+    def key(axis) -> str:
+        for prefix, axes in (("nav", navigation), ("sig", signal_axes)):
+            for index, each in enumerate(axes):
+                if each is axis:
+                    return f"{prefix}{index}"
+        raise ValueError(f"{axis} is not an axis of the signal")
+
+    return [CropAxis(key(axis), axis) for axis in am._axes]
 
 
 def shape_text(signal) -> str:

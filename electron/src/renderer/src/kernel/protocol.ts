@@ -1024,7 +1024,7 @@ export interface CropStateMessage extends MsgBase {
   type: 'crop_state'
   window_id: number | null
   axes: {
-    key: string; group: string; label: string; name: string
+    key: string; navigate: boolean; name: string
     size: number; start: number; stop: number
     scale: number; offset: number; units: string
   }[]

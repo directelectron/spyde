@@ -28,23 +28,18 @@ interface Case {
   loader: string
   payload: Record<string, unknown>
   windows: number                    // windows the dataset opens
-  groups: string[]                   // panel groups, in order
   ranges: Record<string, [number, number]>  // first / last kept, inclusive
   // The navigator box the mouse moves: which navigator window, which axis.
   drag?: { axis: string; navigator: number }
 }
 
 const CASES: Case[] = [
-  { name: '2d', loader: 'load_test_data_image', payload: {}, windows: 1,
-    groups: ['image'], ranges: { sig0: [64, 319], sig1: [32, 223] } },
-  { name: '3d', loader: 'load_test_data_movie', payload: { size: 512, frames: 12 }, windows: 2,
-    groups: ['time', 'image'], ranges: { nav0: [2, 8], sig0: [64, 447], sig1: [0, 255] },
+  { name: '2d', loader: 'load_test_data_image', payload: {}, windows: 1, ranges: { sig0: [64, 319], sig1: [32, 223] } },
+  { name: '3d', loader: 'load_test_data_movie', payload: { size: 512, frames: 12 }, windows: 2, ranges: { nav0: [2, 8], sig0: [64, 447], sig1: [0, 255] },
     drag: { axis: 'nav0', navigator: 0 } },
-  { name: '4d', loader: 'load_test_data_si_grains', payload: {}, windows: 2,
-    groups: ['scan', 'detector'], ranges: { nav0: [1, 3], nav1: [1, 4], sig0: [16, 111], sig1: [16, 111] },
+  { name: '4d', loader: 'load_test_data_si_grains', payload: {}, windows: 2, ranges: { nav0: [1, 3], nav1: [1, 4], sig0: [16, 111], sig1: [16, 111] },
     drag: { axis: 'nav0', navigator: 0 } },
   { name: '5d', loader: 'load_test_data_5d', payload: { frames: 6, nav: 24, sig: 32 }, windows: 3,
-    groups: ['time', 'scan', 'detector'],
     ranges: { nav2: [1, 4], nav0: [4, 15], nav1: [6, 17], sig0: [4, 27], sig1: [4, 27] },
     drag: { axis: 'nav0', navigator: 1 } },
 ]
@@ -114,10 +109,8 @@ for (const c of CASES) {
       await source.getByTestId('action-btn-Crop').click()
       const panel = page.getByTestId('crop-wizard')
       await expect(panel).toBeVisible()
-      for (const group of c.groups) {
-        await expect(panel.getByTestId(`crop-group-${group}`)).toBeVisible()
-      }
-      expect(await panel.locator('[data-testid^="crop-group-"]').count()).toBe(c.groups.length)
+      // One row per axis of the dataset, from its axes manager.
+      await expect(panel.locator('[data-testid^="crop-axis-"]')).toHaveCount(Object.keys(c.ranges).length)
       await shot('01-open')
 
       for (const [key, range] of Object.entries(c.ranges)) await setRange(page, key, range)

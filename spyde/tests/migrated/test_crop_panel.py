@@ -40,13 +40,12 @@ def _signal(shape, *, lazy=False, time_index=None, time_scale=0.05):
     return signal, data
 
 
-# name: (shape, lazy, time axis, groups the panel files the axes under)
+# name: (shape, lazy, time axis)
 CASES = {
-    "2D": ((20, 30), False, None, ["Image", "Image"]),
-    "3D": ((6, 20, 30), True, 0, ["Time", "Image", "Image"]),
-    "4D": ((5, 7, 20, 30), False, None, ["Scan", "Scan", "Detector", "Detector"]),
-    "5D": ((4, 5, 7, 20, 30), True, 2,
-           ["Time", "Scan", "Scan", "Detector", "Detector"]),
+    "2D": ((20, 30), False, None),
+    "3D": ((6, 20, 30), True, 0),
+    "4D": ((5, 7, 20, 30), False, None),
+    "5D": ((4, 5, 7, 20, 30), True, 2),
 }
 # The boxes each dimensionality gets: (on a navigator?, the axes it covers).
 BOXES = {
@@ -65,7 +64,7 @@ def opened(window, monkeypatch):
     session = window["window"]
 
     def load(name):
-        shape, lazy, time_index, _groups = CASES[name]
+        shape, lazy, time_index = CASES[name]
         signal, data = _signal(shape, lazy=lazy, time_index=time_index)
         tree = session._add_signal(signal, source_path=None)
         _settle(session, 4.0)
@@ -117,12 +116,19 @@ class TestCropSignal:
 
 class TestPanel:
     @pytest.mark.parametrize("name", sorted(CASES))
-    def test_every_axis_is_offered_under_its_kind(self, opened, name):
+    def test_the_axes_are_the_axes_managers(self, opened, name):
+        """One row per axis, in the axes manager's own order and with its own
+        name — what the dock's Axes table shows, nothing the panel made up."""
+        from spyde.metadata_extract import build_axes_list
+
         view = opened(name)
         axes = view.states[-1]["axes"]
-        assert [axis["group"] for axis in axes] == CASES[name][3]
+        dock = build_axes_list(view.tree)
+        assert [(axis["name"], axis["navigate"], axis["size"]) for axis in axes] == [
+            (row["name"], row["navigate"], row["size"]) for row in dock]
         assert all((axis["start"], axis["stop"]) == (0, axis["size"]) for axis in axes)
         assert view.states[-1]["is_crop"] is False
+        assert "<undefined>" not in [axis["units"] for axis in axes]
 
     @pytest.mark.parametrize("name", sorted(CASES))
     def test_every_plot_of_an_axis_carries_a_box(self, opened, name):
