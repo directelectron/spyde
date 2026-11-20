@@ -149,6 +149,10 @@ test('a second phase stacks under the first', async () => {
 })
 
 test('a diffraction dataset is simulated as TEM, with spots', async () => {
+  // The EBSD scan's last viewer is still docked beside the sidebar, where it
+  // can cover the new dataset's title bars on a smaller screen.
+  await card(0).getByRole('button', { name: 'Close phase viewer' }).click()
+  await expect(page.getByTestId('phase-popout').locator('section')).toHaveCount(0)
   await backendAction(page, 'load_test_data_si_grains')
   await page.waitForFunction(
     () => document.querySelectorAll('[data-testid="subwindow"]').length >= 4,
