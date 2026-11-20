@@ -123,30 +123,43 @@ class CropAxis:
         }
 
 
+def _labels(axes, fallback: list[str]) -> list[str]:
+    """The axes' own names when every one has a distinct name, else
+    *fallback* — a dataset that calls both detector axes ``kx`` would
+    otherwise get two rows that look the same."""
+    names = [_axis_name(axis, "") for axis in axes]
+    return names if all(names) and len(set(names)) == len(names) else fallback
+
+
 def crop_axes(signal) -> list[CropAxis]:
     """One :class:`CropAxis` per axis of *signal*, in panel order."""
     am = signal.axes_manager
     navigation = list(am.navigation_axes)
     time_index = time_axis_index(signal)
     axes = []
+    scan = [axis for index, axis in enumerate(navigation)
+            if index != time_index and len(navigation) >= 2 and index < 2]
+    scan_labels = iter(_labels(scan, ["x", "y"]))
     for index, axis in enumerate(navigation):
         if index == time_index:
             group = "Time" if _looks_like_time(axis) else "Navigation"
-            label = "Frames" if group == "Time" else _axis_name(axis, "Index")
+            label = "t" if group == "Time" else _axis_name(axis, "index")
         elif len(navigation) >= 2 and index < 2:
-            group, label = "Scan", "XY"[index]
+            group, label = "Scan", next(scan_labels)
         else:
-            group, label = "Navigation", _axis_name(axis, f"Axis {index}")
+            group, label = "Navigation", _axis_name(axis, f"axis {index}")
         axes.append(CropAxis(f"nav{index}", group, label, axis))
     signal_axes = list(am.signal_axes)
     if len(signal_axes) == 2:
-        group = "Detector" if len(navigation) >= 2 else "Image"
-        for index, axis in enumerate(signal_axes):
-            axes.append(CropAxis(f"sig{index}", group, "XY"[index], axis))
+        detector = len(navigation) >= 2
+        group = "Detector" if detector else "Image"
+        labels = _labels(signal_axes, ["kx", "ky"] if detector else ["x", "y"])
+        for index, (axis, label) in enumerate(zip(signal_axes, labels)):
+            axes.append(CropAxis(f"sig{index}", group, label, axis))
     else:
         for index, axis in enumerate(signal_axes):
             axes.append(CropAxis(f"sig{index}", "Signal",
-                                 _axis_name(axis, f"Axis {index}"), axis))
+                                 _axis_name(axis, f"axis {index}"), axis))
     axes.sort(key=lambda each: _GROUP_ORDER.index(each.group))
     return axes
 

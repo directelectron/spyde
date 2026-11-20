@@ -147,8 +147,9 @@ for (const c of CASES) {
         await page.mouse.up()
         await expect(from).not.toHaveValue(before)
         await shot('03-dragged')
-        // Dragging raised the navigator, which may now cover the panel.
-        await source.getByTestId('subwindow-titlebar').click({ position: { x: 8, y: 8 } })
+        // Dragging raised the navigator, which may now cover the panel; the
+        // panel may in turn cover its own title bar, so raise by the event.
+        await source.dispatchEvent('mousedown')
       }
 
       const summary = await page.getByTestId('crop-summary').innerText()
