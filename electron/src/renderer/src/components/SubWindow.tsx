@@ -1,5 +1,6 @@
 import React, { useCallback, useRef, useState } from 'react'
 import type { ToolbarAction } from '../kernel/SpyDEContext'
+import { ErrorBoundary, PartFailed } from './ErrorBoundary'
 import { FloatingToolbar } from './FloatingToolbar'
 import { WINDOW_DRAG_MIME } from '../kernel/dnd'
 import { Pill, type PillSegment, type WindowPillPayload } from './Pill'
@@ -381,13 +382,17 @@ export function SubWindow({
 
       {/* Figure body (clipped). The figure fills it; the toolbar floats over. */}
       <div style={{ ...styles.body, height: `calc(100% - ${headerH}px)` }}>
-        {children}
+        <ErrorBoundary scope={`window ${windowId}`}
+          fallback={(error, retry) => <PartFailed what="This window" error={error} retry={retry} />}>
+          {children}
+        </ErrorBoundary>
         {busy && <div data-testid="drag-shield" style={styles.dragShield} />}
       </div>
 
       {/* Floating toolbar is parented to the window root (overflow:visible), so
           it tracks move/resize live and its popouts can extend past the edges. */}
       {hasToolbar && (
+        <ErrorBoundary scope={`toolbar ${windowId}`} fallback={() => null}>
         <FloatingToolbar
           actions={toolbarActions}
           windowId={windowId}
@@ -400,6 +405,7 @@ export function SubWindow({
           inside={barInside}
           onCaretRectChange={onCaretRectChange}
         />
+        </ErrorBoundary>
       )}
 
       {/* Resize handle (bottom-right) */}

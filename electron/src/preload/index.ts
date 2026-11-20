@@ -151,6 +151,12 @@ contextBridge.exposeInMainWorld('electron', {
   /** What the Report a Problem dialog shows before anything is written: whether
    *  a report can be sent at all, and the machine facts it would include.
    *  Reading this sends nothing. */
+  /** A part of the interface failed to render (ErrorBoundary). Kept for a
+   *  problem report and in lifecycle.log; nothing is sent from here. */
+  reportRendererError: (detail: {
+    scope: string; message: string; stack: string; componentStack: string
+  }): void => ipcRenderer.send('spyde:renderer-error', detail),
+
   reportDiagnostics: (): Promise<{
     canSend: boolean
     diagnostics: Record<string, unknown>
