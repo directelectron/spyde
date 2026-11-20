@@ -92,7 +92,7 @@ jobs:
           fetch-depth: 0
 
       # uv everywhere (project rule). Resolves the git-pinned hyperspy /
-      # rosettasciio / anyplotlib forks + the CPU torch wheel from the lock.
+      # rosettasciio / anyplotlib forks from the lock.
       - name: Set up uv
         uses: astral-sh/setup-uv@v6
         with:
@@ -106,6 +106,11 @@ jobs:
 
       - name: Install (locked) + tests extra
         run: uv sync --frozen --extra tests --python ${{ matrix.python-version }}
+
+      # torch is not locked: the build for this runner's GPU, which on CI (no
+      # GPU) is the CPU one. See pyproject.toml's [tool.uv].
+      - name: Install torch for this machine
+        run: uv pip install --no-config torch --torch-backend=auto
 
       - name: Versions
         run: |
@@ -179,6 +184,9 @@ jobs:
       # and resolve differently per platform), so the lock cannot satisfy them.
       - name: Install with all domain extras
         run: uv sync --extra tests --extra all --python 3.12
+
+      - name: Install torch for this machine
+        run: uv pip install --no-config torch --torch-backend=auto
 
       - name: Versions
         run: |
@@ -338,6 +346,9 @@ jobs:
       # NOT --frozen: the extras resolve per-platform (same as `test-extras`).
       - name: Pre-sync the Python backend env
         run: uv sync --extra tests --extra all
+
+      - name: Install torch for this machine
+        run: uv pip install --no-config torch --torch-backend=auto
 
       # Root install: the root lockfile is the authoritative one, and its
       # postinstall links electron/shell to the shell's TypeScript.
