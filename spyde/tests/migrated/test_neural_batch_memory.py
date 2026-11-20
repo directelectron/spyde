@@ -4,8 +4,8 @@
 chunk (1000+ for a real 4D-STEM scan) in ONE forward pass — one (N,1,H,W) CUDA
 tensor whose activations scaled with N and ballooned per-worker memory to
 ~15 GB. ``detect_batch`` now loops in fixed sub-batches of
-``SPYDE_NEURAL_BATCH`` frames (default 64), freeing CUDA blocks between
-sub-batches, so peak activation memory scales with K, not N.
+``SPYDE_NEURAL_BATCH`` frames (default 64), each reusing the previous one's
+device memory, so peak activation memory scales with K, not N.
 
 Run in a SUBPROCESS that prints a JSON result and ``os._exit(0)`` after, matching
 ``test_neural_detect.py``: torch-CUDA

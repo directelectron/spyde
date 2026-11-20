@@ -416,6 +416,10 @@ class TestFindVectorsNeural:
             return [np.zeros((0, 3), np.float32) for _ in range(len(frames))]
 
         monkeypatch.setattr(smodels, "detect_batch", _fake_detect_batch)
+        # No Metal device here to upload the frames to.
+        from spyde.models import device_frames
+        monkeypatch.setattr(device_frames.FrameBuffers, "upload",
+                            lambda self, frames, device: None)
 
         b4d = np.zeros((2, 2, 16, 16), np.float32)
         fvn._neural_block(b4d, 0.3, 4, True, None, None)
