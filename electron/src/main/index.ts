@@ -397,6 +397,9 @@ const WORKSPACE_PROBE_JS = `(() => { try {
   }
 } catch (e) { return { probeError: String(e) } } })()`
 
+/** Writes to lifecycle.log once attachLifecycleDiagnostics has run. */
+let lifecycleLog: (what: string, detail?: unknown) => void = () => {}
+
 function attachLifecycleDiagnostics(w: BrowserWindow): void {
   const t = () => new Date().toISOString()
   // Tee to a file as well as the console. The failure happens when it happens —
@@ -416,6 +419,7 @@ function attachLifecycleDiagnostics(w: BrowserWindow): void {
     try { appendFileSync(logFile, line + '\n') } catch { /* never break on logging */ }
   }
   log('lifecycle log started', { file: logFile })
+  lifecycleLog = log
 
   /**
    * Snapshot the workspace. Raced against a timeout because a renderer that
@@ -1193,6 +1197,19 @@ ipcMain.on('spyde:resize', (_, figId: string, width: number, height: number) =>
 // could ask the OS to open arbitrary `file:`, custom-scheme, or `javascript:`
 // URLs — a classic shell.openExternal abuse. Allowlist web + mail only.
 const OPEN_EXTERNAL_ALLOWED = new Set(['https:', 'http:', 'mailto:'])
+// A part of the interface failed to render. The renderer shows a fallback in
+// its place; this keeps the error for a problem report and in lifecycle.log,
+// where a vanished interface used to leave no trace at all.
+ipcMain.on('spyde:renderer-error', (_, detail: {
+  scope?: string; message?: string; stack?: string; componentStack?: string
+}) => {
+  const text = `${detail?.scope ?? 'interface'}: ${detail?.message ?? ''}\n` +
+               `${detail?.stack ?? ''}\n${detail?.componentStack ?? ''}`
+  process.stderr.write(`[spyde renderer-error] ${text}\n`)
+  recordProblem('renderer', text)
+  lifecycleLog('renderer-error', { scope: detail?.scope, message: detail?.message })
+})
+
 ipcMain.on('open-external', (_, url: string) => {
   let parsed: URL
   try {

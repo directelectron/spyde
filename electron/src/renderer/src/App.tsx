@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react'
 import { SpyDEProvider, useSpyDE } from './kernel/SpyDEContext'
 import { MDIArea } from './components/MDIArea'
+import { ErrorBoundary, PartFailed } from './components/ErrorBoundary'
 import { PlotControlDock } from './components/PlotControlDock'
 import { ReportSidebar } from './components/ReportSidebar'
 import { ConsoleBar } from './components/ConsoleBar'
@@ -65,7 +66,12 @@ export function App() {
         />
         <div style={styles.body}>
           <MDIArea />
-          {sidebarOpen && <PlotControlDock />}
+          {sidebarOpen && (
+            <ErrorBoundary scope="dock"
+              fallback={(error, retry) => <PartFailed what="Plot Control" error={error} retry={retry} />}>
+              <PlotControlDock />
+            </ErrorBoundary>
+          )}
           {reportOpen && <ReportSidebar />}
         </div>
         <LogPanel open={logOpen} onClose={() => setLogOpen(false)} />

@@ -59,6 +59,9 @@ declare global {
         busy: boolean
       }>
       gpuFixTorch: () => Promise<{ ok: boolean; error?: string }>
+      reportRendererError?: (detail: {
+        scope: string; message: string; stack: string; componentStack: string
+      }) => void
       reportDiagnostics: () => Promise<{
         canSend: boolean
         diagnostics: Record<string, unknown>
