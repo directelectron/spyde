@@ -37,7 +37,8 @@ _TEST_ACTIONS = frozenset({
     "load_test_data", "load_test_data_lazy", "load_test_data_lazy_chunked",
     "load_test_data_si_grains", "load_test_data_sped_ag",
     "load_test_data_eels", "load_test_data_eds", "load_test_data_ebsd",
-    "load_test_data_line", "load_test_data_movie", "load_test_data_5d",
+    "load_test_data_line", "load_test_data_image", "load_test_data_movie",
+    "load_test_data_5d",
     "load_test_data_particles", "load_test_data_dpc",
     "test_nav_drag", "test_aim_ready_position",
     "test_region_scrub", "test_add_second_navigator",
@@ -145,6 +146,8 @@ class ActionRouterMixin:
             self._load_test_data_ebsd(payload)
         elif action == "load_test_data_line":
             self._load_test_data_line(payload)
+        elif action == "load_test_data_image":
+            self._load_test_data_image(payload)
         elif action == "load_test_data_movie":
             self._load_test_data_movie(payload)
         elif action == "load_test_data_5d":

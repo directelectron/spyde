@@ -1107,7 +1107,9 @@ class Plot:
             axes = self._display_axes()
             if len(axes) < 1 or data.ndim != 1:
                 return None, "", y_label
-            x_ax = axes[0]
+            # A time series of scans draws its slowest axis on the line
+            # navigator — the last in display order, not the scan's x.
+            x_ax = axes[-1] if self.is_navigator else axes[0]
             # hyperspy uses a `<undefined>` sentinel object (str() == "<undefined>"
             # but not == the string) for unset units/name — stringify before the
             # "is it meaningful?" check so the sentinel is treated as empty.

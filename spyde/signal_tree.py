@@ -1463,11 +1463,12 @@ class BaseSignalTree:
                     logger.debug("removing %s on tree close failed: %s", wiz_attr, e)
             if hasattr(self, wiz_attr):
                 setattr(self, wiz_attr, None)
-        # On-plot interactive widgets (the Crop box, the CZB search box and
-        # Manual crosshair: widgets have no remove(), only hide()) and the CZB
-        # found-center and corner-box marker groups (real remove()). All
-        # harmless when absent.
-        for attr in ("_crop_widget", "_czb_region_mg", "_czb_cross"):
+        from spyde.actions.crop import close_crop
+        close_crop(self)
+        # On-plot interactive widgets (the CZB search box and Manual crosshair:
+        # widgets have no remove(), only hide()) and the CZB found-center and
+        # corner-box marker groups (real remove()). All harmless when absent.
+        for attr in ("_czb_region_mg", "_czb_cross"):
             wdg = getattr(self, attr, None)
             if wdg is not None and hasattr(wdg, "hide"):
                 try:
@@ -1483,8 +1484,7 @@ class BaseSignalTree:
                     mg.remove()
                 except Exception as e:
                     logger.debug("removing czb found marker on tree close failed: %s", e)
-        for attr in ("_czb_found_mgs", "_czb_corner_mg", "_crop_widget_handler",
-                     "_czb_region_handler"):
+        for attr in ("_czb_found_mgs", "_czb_corner_mg", "_czb_region_handler"):
             if hasattr(self, attr):
                 setattr(self, attr, None)
         self.signal_plots = []

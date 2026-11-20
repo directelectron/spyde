@@ -339,9 +339,7 @@ def show_tree_node(plot, tree, new_signal) -> None:
     # then _czb_show_found) are unaffected; imports are lazy so this stays
     # cycle-free.
     try:
-        from spyde.actions.base import _crop_remove_widget
         from spyde.actions.center_zero_beam import _czb_clear_widgets
-        _crop_remove_widget(tree)
         _czb_clear_widgets(tree)
     except Exception as e:
         log.debug("node-switch widget teardown failed: %s", e)
@@ -349,6 +347,12 @@ def show_tree_node(plot, tree, new_signal) -> None:
         plot.set_plot_state(new_signal)
     except Exception as e:
         log.debug("switching plot to new node failed: %s", e)
+    # An open Crop panel describes the node being left: rebuild it for this one.
+    try:
+        from spyde.actions.crop import follow_node
+        follow_node(tree, plot)
+    except Exception as e:
+        log.debug("crop panel did not follow the node switch: %s", e)
     npm = getattr(tree, "navigator_plot_manager", None)
     if npm is not None:
         for sels in getattr(npm, "navigation_selectors", {}).values():

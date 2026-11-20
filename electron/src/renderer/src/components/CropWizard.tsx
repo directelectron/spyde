@@ -1,26 +1,30 @@
 /**
- * CropWizard.tsx — the Crop caret (laundry item #4: interactive rectangle ROI
- * instead of typed-in-only values).
+ * CropWizard.tsx — the Crop panel: a range on every axis of the dataset.
  *
- * Activating Crop drops a draggable/resizable rectangle widget on the source
- * plot (backend: crop_open) covering the full frame; the user drags it to the
- * desired spatial box. The widget is the PRIMARY input (mirrors the Center
- * Zero Beam search-window precedent) — Crop reads its LIVE geometry at Run
- * time, not the (possibly stale) typed fields. The numeric fields stay
- * editable and sync BOTH ways:
- *   - drag → fields: read the widget's own pointer_move/pointer_up geometry
- *     off the existing `spyde:figure_event` CustomEvent (already re-broadcast
- *     by SpyDEContext for every widget interaction) — no new IPC needed.
- *   - field edit → widget: dispatches `crop_set_region`, which repositions
- *     the live widget to match.
- * Closing the caret (✕, toggling Crop off, or the window closing) sends
- * `crop_close`, which hides the widget (crop_open/close mirror the Center
- * Zero Beam manual-crosshair teardown in center_zero_beam.py).
+ * The backend (spyde/actions/crop.py) owns the ranges. Opening the panel
+ * (`crop_open`) puts a box on every plot that draws an axis — a rectangle on
+ * the image / detector and on a scan navigator, a span on a time navigator —
+ * and sends `crop_state`, which this panel renders from: one row per axis with
+ * a from/to field pair and a two-thumb slider. A drag on any box, a slider or
+ * a field (`crop_set_range`) changes the one set of ranges, and the backend
+ * re-sends the state with every box moved to match.
+ *
+ * Indices are shown inclusive (first and last kept); the backend works in
+ * `[start, stop)`.
  */
 import React from 'react'
-import { WizardShell, Field, NumInput, S } from './WizardShell'
-import { useWizardLifecycle, useWizardEvent } from './wizardHooks'
-import { useSpyDE } from '../kernel/SpyDEContext'
+import { useWizardEvent, useWizardLifecycle } from './wizardHooks'
+import { WizardShell, NumInput, S } from './WizardShell'
+
+interface CropAxis {
+  key: string; group: string; label: string; name: string
+  size: number; start: number; stop: number
+  scale: number; offset: number; units: string
+}
+
+interface CropState {
+  axes: CropAxis[]; before: string; after: string; is_crop: boolean; boxes: number
+}
 
 interface Props {
   caretPos: React.CSSProperties
@@ -29,18 +33,48 @@ interface Props {
   onClose: () => void
 }
 
-export function CropWizard({ caretPos, windowId, sendAction, onClose }: Props) {
-  const { state } = useSpyDE()
-  const [box, setBox] = React.useState({ x0: 0, x1: 0, y0: 0, y1: 0 })
-  // The SCAN box, typed only: the on-plot rectangle lives on the diffraction
-  // pattern and so can only describe the detector. A 4-D dataset is usually
-  // far bigger in the scan, and there was no way to trim it here at all —
-  // the backend has taken a scan box for a while and this never sent one.
-  const [scan, setScan] = React.useState(
-    { scan_x0: 0, scan_x1: 0, scan_y0: 0, scan_y1: 0 })
-  const [status, setStatus] = React.useState(
-    'Drag the box to the region to keep, then Crop.',
+const SLIDER_CSS = `
+.crop-range { position: relative; height: 16px; flex: 1; min-width: 60px; }
+.crop-range::before { content: ""; position: absolute; left: 0; right: 0; top: 7px;
+  height: 2px; background: #313244; border-radius: 1px; }
+.crop-range .crop-fill { position: absolute; top: 7px; height: 2px; background: #f9e2af; }
+.crop-range input { position: absolute; left: 0; width: 100%; top: 0; height: 16px;
+  margin: 0; background: none; pointer-events: none; -webkit-appearance: none; appearance: none; }
+.crop-range input::-webkit-slider-thumb { -webkit-appearance: none; pointer-events: auto;
+  width: 10px; height: 10px; border-radius: 50%; background: #f9e2af; border: none; cursor: pointer; }
+.crop-range input::-webkit-slider-runnable-track { background: none; }
+`
+
+/** "0.05 – 0.15 s": the kept range in the axis's own units. */
+function calibrated(axis: CropAxis): string {
+  if (!axis.units && axis.scale === 1 && axis.offset === 0) return ''
+  const value = (index: number) => axis.offset + index * axis.scale
+  const digits = Math.max(0, Math.min(4, -Math.floor(Math.log10(Math.abs(axis.scale) || 1)) + 1))
+  const text = (n: number) => n.toFixed(digits)
+  return `${text(value(axis.start))} – ${text(value(axis.stop - 1))}${axis.units ? ` ${axis.units}` : ''}`
+}
+
+function RangeSlider({ axis, onChange }: {
+  axis: CropAxis; onChange: (start: number, stop: number) => void
+}) {
+  const last = Math.max(axis.size - 1, 1)
+  const first = axis.start, end = axis.stop - 1
+  return (
+    <div className="crop-range">
+      <div className="crop-fill"
+        style={{ left: `${(first / last) * 100}%`, width: `${((end - first) / last) * 100}%` }} />
+      <input data-testid={`crop-${axis.key}-slider-from`} type="range"
+        min={0} max={axis.size - 1} step={1} value={first}
+        onChange={(e) => onChange(Math.min(Number(e.target.value), end), axis.stop)} />
+      <input data-testid={`crop-${axis.key}-slider-to`} type="range"
+        min={0} max={axis.size - 1} step={1} value={end}
+        onChange={(e) => onChange(axis.start, Math.max(Number(e.target.value), first) + 1)} />
+    </div>
   )
+}
+
+export function CropWizard({ caretPos, windowId, sendAction, onClose }: Props) {
+  const [state, setState] = React.useState<CropState | null>(null)
 
   useWizardLifecycle({
     windowId, sendAction,
@@ -49,61 +83,76 @@ export function CropWizard({ caretPos, windowId, sendAction, onClose }: Props) {
     deps: [windowId],
   })
 
-  // The current window's live figId — spyde:figure_event carries {figId,
-  // event}, not windowId, so this resolves which events belong to OUR plot.
-  const figId = state.windows.get(windowId)?.figures.find(f => !f.isNavigator)?.figId
-    ?? state.windows.get(windowId)?.figures[0]?.figId
-
-  // Drag → fields: the rectangle widget's pointer_move/pointer_up events carry
-  // its full geometry (x, y, w, h). Cheap — no backend round trip.
-  useWizardEvent('figure_event', windowId, (detail) => {
-    const d = detail as { figId?: string; event?: Record<string, unknown> }
-    if (!figId || d.figId !== figId) return
-    const ev = d.event
-    if (!ev || ev.type !== 'rectangle') return
-    const x = Number(ev.x), y = Number(ev.y), w = Number(ev.w), h = Number(ev.h)
-    if (![x, y, w, h].every(Number.isFinite)) return
-    setBox({ x0: Math.round(x), x1: Math.round(x + w), y0: Math.round(y), y1: Math.round(y + h) })
+  useWizardEvent('spyde:crop_state', windowId, (detail) => {
+    setState(detail as unknown as CropState)
   })
 
-  // Field edit → widget: push the new box back so the on-plot rectangle stays
-  // in sync (crop_set_region repositions the live widget; cheap, no recompute).
-  const setField = (key: keyof typeof box, v: number) => {
-    const next = { ...box, [key]: v }
-    setBox(next)
-    sendAction('crop_set_region', next, windowId)
+  // Applied here at once so a slider tracks the pointer; the backend's echo
+  // carries the same numbers.
+  const setRange = (key: string, start: number, stop: number) => {
+    setState((current) => current && {
+      ...current,
+      axes: current.axes.map((axis) => axis.key === key ? { ...axis, start, stop } : axis),
+    })
+    sendAction('crop_set_range', { key, start, stop }, windowId)
   }
 
-  const setScanField = (key: keyof typeof scan, v: number) => {
-    // Not through crop_set_region: that moves the DETECTOR widget, which has
-    // nothing to say about the scan.
-    setScan({ ...scan, [key]: v })
-  }
-
-  const doCrop = () => {
-    setStatus('Cropping…')
-    // The backend reads the WIDGET's live geometry as the primary input (see
-    // CropAction.build_kwargs) — the typed fields ride along as a fallback for
-    // hosts with no widget (notebook/script use of CropAction directly).
-    sendAction('toolbar_action',
-      { name: 'Crop', params: { ...box, ...scan } }, windowId)
-    onClose()
+  const groups: [string, CropAxis[]][] = []
+  for (const axis of state?.axes ?? []) {
+    const group = groups.find(([name]) => name === axis.group)
+    if (group) group[1].push(axis)
+    else groups.push([axis.group, [axis]])
   }
 
   return (
-    <WizardShell testid="crop-wizard" title="Crop" posStyle={caretPos}
-      onClose={onClose} closeTestid="crop-close" status={status} statusTestid="crop-status">
+    <WizardShell testid="crop-wizard" title="Crop" posStyle={caretPos} width={300}
+      onClose={onClose} closeTestid="crop-close" statusTestid="crop-status"
+      status={state ? 'Drag the boxes on the plots, the sliders, or type a range.'
+                     : 'Reading the dataset…'}>
+      <style>{SLIDER_CSS}</style>
       <div style={S.page}>
-        <Field label="X start"><NumInput testid="crop-x0" value={box.x0} step="1" onChange={(v) => setField('x0', v)} /></Field>
-        <Field label="X end"><NumInput testid="crop-x1" value={box.x1} step="1" onChange={(v) => setField('x1', v)} /></Field>
-        <Field label="Y start"><NumInput testid="crop-y0" value={box.y0} step="1" onChange={(v) => setField('y0', v)} /></Field>
-        <Field label="Y end"><NumInput testid="crop-y1" value={box.y1} step="1" onChange={(v) => setField('y1', v)} /></Field>
-        <div style={S.groupLabel}>Scan (leave at 0 to keep it whole)</div>
-        <Field label="Scan X start"><NumInput testid="crop-scan-x0" value={scan.scan_x0} step="1" onChange={(v) => setScanField('scan_x0', v)} /></Field>
-        <Field label="Scan X end"><NumInput testid="crop-scan-x1" value={scan.scan_x1} step="1" onChange={(v) => setScanField('scan_x1', v)} /></Field>
-        <Field label="Scan Y start"><NumInput testid="crop-scan-y0" value={scan.scan_y0} step="1" onChange={(v) => setScanField('scan_y0', v)} /></Field>
-        <Field label="Scan Y end"><NumInput testid="crop-scan-y1" value={scan.scan_y1} step="1" onChange={(v) => setScanField('scan_y1', v)} /></Field>
-        <button data-testid="crop-run" style={S.primary} onClick={doCrop}>Crop</button>
+        {groups.map(([group, axes]) => (
+          <div key={group} data-testid={`crop-group-${group.toLowerCase()}`}
+            style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+            <div style={{ ...S.groupLabel, marginTop: 0 }}>{group}</div>
+            {axes.map((axis) => (
+              <div key={axis.key} data-testid={`crop-axis-${axis.key}`}
+                style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', gap: 6 }}>
+                  <span style={S.lbl}>{axis.label}
+                    <span style={{ color: '#6c7086' }}> · {axis.stop - axis.start} of {axis.size}</span>
+                  </span>
+                  <span data-testid={`crop-${axis.key}-value`} style={S.numLabel}>{calibrated(axis)}</span>
+                </div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                  <NumInput testid={`crop-${axis.key}-from`} value={axis.start} step="1" width={52}
+                    min={0} max={axis.size - 1} accept={Number.isInteger}
+                    onChange={(n) => setRange(axis.key, n, Math.max(axis.stop, n + 1))} />
+                  <RangeSlider axis={axis} onChange={(start, stop) => setRange(axis.key, start, stop)} />
+                  <NumInput testid={`crop-${axis.key}-to`} value={axis.stop - 1} step="1" width={52}
+                    min={0} max={axis.size - 1} accept={Number.isInteger}
+                    onChange={(n) => setRange(axis.key, Math.min(axis.start, n), n + 1)} />
+                </div>
+              </div>
+            ))}
+          </div>
+        ))}
+        {state && (
+          <div data-testid="crop-summary" style={{ ...S.hint, fontStyle: 'normal', borderTop: '1px solid #313244', paddingTop: 5 }}>
+            {state.before}<br />→ {state.after}
+          </div>
+        )}
+        <div style={{ display: 'flex', gap: 6 }}>
+          <button data-testid="crop-run" style={{ ...S.primary, ...(state?.is_crop ? {} : S.primaryBusy) }}
+            disabled={!state?.is_crop}
+            onClick={() => { sendAction('crop_run', {}, windowId); onClose() }}>
+            Crop to new dataset
+          </button>
+          <button data-testid="crop-reset" style={S.fileBtn}
+            onClick={() => sendAction('crop_reset', {}, windowId)}>
+            Reset
+          </button>
+        </div>
       </div>
     </WizardShell>
   )

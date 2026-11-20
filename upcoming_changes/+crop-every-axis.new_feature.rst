@@ -1,0 +1,1 @@
+Crop now cuts a dataset on every axis it has — the image or detector, the scan, and a movie's time axis — with a box on every plot that draws one and a slider and a from/to pair per axis in the panel, all kept in step whichever one you move.

@@ -265,11 +265,11 @@ class TestTheActionItselfCrops:
 class TestTheCropCaretSendsWhatTheBackendTakes:
     """The caret is the ONLY thing that reaches Crop from the app.
 
-    `CropWizard.tsx` is a hand-written panel with its own fields, so the
-    toolbar's declared parameters never reach the UI for this action. The
-    backend grew a scan box, every Python test passed, and the app went on
-    cropping only the detector — because the caret sent `{x0, x1, y0, y1}`
-    and nothing else. Reading the TSX is the only place that mismatch shows.
+    `CropWizard.tsx` is a hand-written panel, so nothing generated keeps it
+    and the backend in step. The backend once grew a scan box, every Python
+    test passed, and the app went on cropping only the detector — because the
+    caret never sent one. Reading the TSX is the only place that mismatch
+    shows.
     """
 
     def _caret(self):
@@ -280,52 +280,31 @@ class TestTheCropCaretSendsWhatTheBackendTakes:
         assert path.exists(), f"the Crop caret moved: {path}"
         return path.read_text(encoding="utf-8")
 
-    def test_the_caret_offers_the_scan_box(self):
-        caret = self._caret()
-        for testid in ("crop-scan-x0", "crop-scan-x1",
-                       "crop-scan-y0", "crop-scan-y1"):
-            assert testid in caret, (
-                f"{testid} is not in CropWizard.tsx — the backend takes a "
-                "scan box and the caret cannot send one")
+    def test_every_action_the_caret_sends_is_handled(self):
+        import re
 
-    def test_the_caret_sends_the_scan_box(self):
-        """Offering the fields is not sending them: they have to be in the
-        payload `doCrop` hands to `toolbar_action`."""
-        caret = self._caret()
-        start = caret.index("const doCrop")
-        payload = caret[start:caret.index("}", caret.index("toolbar_action",
-                                                           start))]
-        assert "scan" in payload, (
-            "doCrop does not put the scan box in the params it sends; it "
-            f"sends: {payload.strip()}")
+        from spyde.actions import registry
 
-    def test_what_it_sends_is_what_the_transform_takes(self):
-        """Every key the caret sends has to be one `_crop_signal` names, or it
-        is dropped without a word on the way through `build_kwargs`."""
+        sent = set(re.findall(r"'(crop_[a-z_]+)'", self._caret()))
+        assert {"crop_open", "crop_close", "crop_set_range", "crop_run"} <= sent
+        for action in sent - {"crop_state"}:
+            assert action in registry.STAGED_HANDLERS, (
+                f"the caret sends {action} and nothing handles it")
+
+    def test_a_range_edit_carries_what_the_handler_reads(self):
+        """`crop_set_range` reads `key`, `start` and `stop`; a renamed field
+        on either side would be dropped without a word."""
         import inspect
 
-        from spyde.actions.base import _crop_signal
+        from spyde.actions.crop import crop_set_range
 
-        accepted = set(inspect.signature(_crop_signal).parameters)
         caret = self._caret()
-        # The keys have to appear in the state `doCrop` spreads into its
-        # payload, not merely somewhere in the file: "x0" is a substring of
-        # "scan_x0", so a whole-file search passed with the detector box gone.
-        fields = {"box": ("x0", "x1", "y0", "y1"),
-                  "scan": ("scan_x0", "scan_x1", "scan_y0", "scan_y1")}
-        start = caret.index("const doCrop")
-        payload = caret[start:caret.index("}", caret.index("toolbar_action",
-                                                           start))]
-        for state, keys in fields.items():
-            assert f"...{state}" in payload, (
-                f"doCrop does not spread `{state}` into the params it sends")
-            declared = caret[caret.index(f"useState") if state == "box"
-                             else caret.index(f"const [{state}"):]
-            declared = declared[:declared.index(")")]
-            for key in keys:
-                assert key in accepted, f"_crop_signal does not take {key}"
-                assert f"{key}:" in declared, (
-                    f"the caret's `{state}` state has no field {key}")
+        start = caret.index("const setRange")
+        sent = caret[start:caret.index("}", caret.index("'crop_set_range'", start))]
+        handler = inspect.getsource(crop_set_range)
+        for field in ("key", "start", "stop"):
+            assert field in sent, f"setRange does not send {field}"
+            assert f'"{field}"' in handler, f"crop_set_range does not read {field}"
 
 
 class TestAMultiAngleAcquisitionReopensWhole:

@@ -1,0 +1,1 @@
+The time navigator of a time series of scans (5-D data) now draws the time axis's calibration instead of plain frame numbers, and :class:`~spyde.actions.base.CropAction`'s ``t0``/``t1`` on such data cut its time axis rather than the scan's x axis.
