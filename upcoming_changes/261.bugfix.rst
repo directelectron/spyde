@@ -1,0 +1,1 @@
+PyTorch is installed for the machine's GPU instead of one locked CUDA 12.4 build, which had no kernels for newer cards such as Blackwell (RTX 50-series).
