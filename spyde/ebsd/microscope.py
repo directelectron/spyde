@@ -96,9 +96,16 @@ class Setup:
 
 
 def microscope_of(signal) -> str:
-    """SEM for an EBSD scan or a signal with SEM metadata, else TEM."""
+    """SEM for an EBSD scan or a signal with SEM metadata, else TEM.
+
+    The recorded signal type is read as well as the class's: without
+    kikuchipy installed an EBSD scan loads as a plain Signal2D, and only its
+    metadata still says EBSD.
+    """
     try:
-        if "EBSD" in str(getattr(signal, "_signal_type", "") or "").upper():
+        signal_types = (getattr(signal, "_signal_type", ""),
+                        signal.metadata.get_item("Signal.signal_type", ""))
+        if any("EBSD" in str(kind or "").upper() for kind in signal_types):
             return "SEM"
         if signal.metadata.has_item("Acquisition_instrument.SEM"):
             return "SEM"

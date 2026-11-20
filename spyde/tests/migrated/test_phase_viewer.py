@@ -110,6 +110,13 @@ class TestSetup:
         assert microscope.microscope_of(
             hs.signals.Signal2D(np.zeros((8, 8)))) == "TEM"
 
+    def test_an_ebsd_scan_without_kikuchipy_is_sem(self):
+        """Without kikuchipy an EBSD scan is a plain Signal2D whose metadata
+        still records the type -- the packaged app installs no extras."""
+        signal = hs.signals.Signal2D(np.zeros((2, 2, 8, 8)))
+        signal.metadata.set_item("Signal.signal_type", "EBSD")
+        assert microscope.microscope_of(signal) == "SEM"
+
     def test_values_come_from_metadata_and_say_so(self):
         setup = microscope.read_setup(_sem_tree(beam_energy=15.0).root)
         assert setup.microscope == "SEM" and setup["beam_energy"] == 15.0
