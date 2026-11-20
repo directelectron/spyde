@@ -614,6 +614,9 @@ class TestComputeCancellation:
         "ipf_panel.py": "reads the sample's .cif files off disk to draw their "
                         "triangles; no dataset is read, and a panel that has "
                         "gone is a no-op for the phases that land",
+        "phase_viewer.py": "simulates a phase's bands from its .cif; no "
+                           "dataset is read, and a viewer that has gone "
+                           "ignores the sphere that lands",
     }
 
     def test_a_dispatched_compute_registers_a_cancel_token(self):

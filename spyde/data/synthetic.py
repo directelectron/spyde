@@ -387,12 +387,13 @@ def atom_lattice(grid=(8, 10), spacing: float = 16.0, *, sigma: float = 2.6,
 # mistake in the same place, and the overlay's lines cannot drift away from the
 # bands they are drawn on. Re-exported here under the names this module has
 # always used. (`spyde.ebsd.bands` is numpy-only and imports nothing from
-# spyde, so this cannot cycle.)
+# spyde outside `spyde.ebsd`, so this cannot cycle.)
 from spyde.ebsd.bands import (                                      # noqa: E402
     cubic_reflectors as _cubic_reflectors,
     detector_directions,
     euler_to_matrix as _euler_to_matrix,
     normals_to_sample as _normals_to_sample,
+    sample_directions as _sample_directions,
     simulate_patterns,
 )
 
@@ -443,9 +444,11 @@ def ebsd_patterns(nav=(16, 16), detector=(60, 60), *, pc=(0.5, 0.5, 0.55),
                                                np.deg2rad(40.0))
     rot = _euler_to_matrix(phi1, Phi, phi2)       # (ny, nx, 3, 3)
 
-    # --- detector directions (gnomonic) -----------------------------------
+    # --- detector directions (gnomonic), in the sample frame ---------------
+    # The standard EBSD geometry (70° sample tilt), the one the wizard assumes
+    # when a scan records none.
     gy, gx = np.mgrid[0:dy, 0:dx].astype(float)
-    r = detector_directions(detector, pc)               # (dy, dx, 3)
+    r = _sample_directions(detector, pc)                # (dy, dx, 3)
 
     refl = _cubic_reflectors()
     normals, weights, widths = refl.normals, refl.weights, refl.widths

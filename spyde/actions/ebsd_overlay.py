@@ -26,30 +26,33 @@ _NO_ZONE_AXES = np.zeros((0, 2), np.float32)
 
 
 def ebsd_bands(frame, *, indexer, reflectors, detector, pc, correct, n_bands,
-               show_zone_axes, linewidth) -> dict:
+               show_zone_axes, linewidth, geometry=None) -> dict:
     """The Kikuchi bands of the best-matching orientation for one pattern.
 
     The pattern is corrected the way the dictionary expects, matched against
     the resident dictionary, and that orientation's bands are projected onto
     the detector. ``match`` carries the orientation and its score for the
-    caret's readout."""
+    caret's readout. *geometry* is the detector's angles relative to the
+    sample, the same ones the dictionary was simulated with."""
     from spyde.ebsd.bands import band_lines, zone_axis_points
 
+    geometry = geometry or {}
     frame = np.asarray(frame, dtype=float)
     if correct is not None:
         frame = correct(frame)
     euler, score = indexer.best(frame)
     segments, _weights = band_lines(euler, reflectors, detector, pc,
-                                    max_bands=int(n_bands))
+                                    max_bands=int(n_bands), **geometry)
     zone_axes = (zone_axis_points(euler, reflectors.brightest(int(n_bands)),
-                                  detector, pc)
+                                  detector, pc, **geometry)
                  if show_zone_axes else _NO_ZONE_AXES)
     return {"bands": {"data": segments, "linewidths": float(linewidth)},
             "zone": zone_axes, "match": (euler, score)}
 
 
 def attach_ebsd_band_overlay(signal, indexer, reflectors, tree, *,
-                             detector, pc, correct=None, n_bands: int = 12,
+                             detector, pc, geometry=None, correct=None,
+                             n_bands: int = 12,
                              show_zone_axes: bool = False,
                              linewidth: float = 1.2, color: str = BAND_COLOR,
                              on_match=None):
@@ -68,7 +71,10 @@ def attach_ebsd_band_overlay(signal, indexer, reflectors, tree, *,
                                      "alpha": 1.0})},
         static={"indexer": indexer, "reflectors": reflectors,
                 "detector": (int(detector[0]), int(detector[1])),
-                "pc": tuple(float(v) for v in pc), "correct": correct,
+                "pc": tuple(float(v) for v in pc),
+                "geometry": {key: float(value)
+                             for key, value in (geometry or {}).items()},
+                "correct": correct,
                 "n_bands": int(n_bands),
                 "show_zone_axes": bool(show_zone_axes),
                 "linewidth": float(linewidth)},

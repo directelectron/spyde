@@ -12,11 +12,12 @@ reference implementation for EBSD detector geometry. The numbers below were
 captured from it (see ``TestAgainstLiveKikuchipy`` for the regeneration recipe,
 which re-derives them from scratch whenever kikuchipy is installed) with the
 detector configured ``sample_tilt=90, tilt=0, azimuthal=0, twist=90`` — which
-makes kikuchipy's sample-to-detector matrix exactly the identity, i.e. the same
-untilted geometry ``spyde.ebsd.bands`` assumes. The plane normals are therefore
-given directly in the DETECTOR frame and handed to :func:`band_lines` with the
-identity orientation, which isolates the projection and the pixel convention
-from the (separately pinned, see ``TestConventionAgreesWithOrix``) rotation.
+makes kikuchipy's sample-to-detector matrix exactly the identity. The plane
+normals are therefore given directly in the DETECTOR frame and handed to
+:func:`band_lines` with the identity orientation and that same identity
+geometry, which isolates the projection and the pixel convention from the
+rotations. ``TestTiltedDetectorMatchesKikuchipy`` then pins the rotations —
+crystal to sample to detector, at a real 70° set-up — against kikuchipy too.
 
 The one convention difference that survives is pixel INDEXING, and it is
 kikuchipy's: it maps the gnomonic bounds onto pixel indices ``0 … N-1``, i.e. it
@@ -38,8 +39,13 @@ import numpy as np
 import pytest
 
 from spyde.ebsd.bands import (
-    Reflectors, band_lines, detector_directions, zone_axis_points,
+    Reflectors, band_lines, detector_directions, euler_to_matrix,
+    normals_to_detector, sample_to_detector, simulate_patterns,
+    zone_axis_points,
 )
+
+#: kikuchipy's ``sample_tilt=90, twist=90``: sample and detector frames coincide.
+IDENTITY_FRAME = {"sample_tilt": 90.0, "twist": 90.0}
 
 # ── captured kikuchipy reference ─────────────────────────────────────────────
 # Ni (Fm-3m, a=3.52 A), reflectors from min_dspacing=1.2 A at 20 kV, orientation
@@ -157,12 +163,12 @@ def _line_through(p0, p1):
 def _spyde_segment(normal, shape, pc):
     """The band-centre segment SpyDE draws for one DETECTOR-frame plane normal.
 
-    Identity Euler angles, so ``normals_to_sample`` is a no-op and the normal
+    Identity Euler angles and the identity detector frame, so the normal
     reaches the projection untouched.
     """
     refl = Reflectors(np.asarray(normal, float).reshape(1, 3),
                       np.array([1.0]), np.array([0.05]))
-    segs, _w = band_lines(np.zeros(3), refl, shape, pc)
+    segs, _w = band_lines(np.zeros(3), refl, shape, pc, **IDENTITY_FRAME)
     return None if len(segs) == 0 else np.asarray(segs[0], float)
 
 
@@ -222,6 +228,12 @@ class TestMatchesKikuchipy:
         assert worst < 0.01, (
             f"band lines are rotated by up to {worst:.4f} deg relative to "
             f"kikuchipy's on a {shape} detector")
+
+
+class TestTheIdentityFrame:
+    def test_it_is_the_identity(self):
+        assert np.allclose(sample_to_detector(**IDENTITY_FRAME), np.eye(3),
+                           atol=1e-12)
 
 
 class TestTheTestHasTeeth:
@@ -423,3 +435,164 @@ class TestAgainstLiveKikuchipy:
                     f"kikuchipy's own line for {np.round(n, 4)} on {shape} has "
                     f"moved: {np.round(c_live[j], 4)} vs captured "
                     f"{np.round(kl, 4)}")
+
+
+# ── a tilted detector ────────────────────────────────────────────────────────
+# Captured from kikuchipy with the same Ni reflectors, orientation, detector
+# and PC as above, but a real EBSD set-up: EBSDDetector with each case's
+# angles. The bands are given by their Miller indices (crystal frame), so these
+# lines go through the WHOLE chain — the Bunge rotation into the sample frame
+# and the sample-to-detector rotation — that the cases above skip.
+TILTED_HKL = np.array([
+    (1, 0, 0), (0, 1, 0), (1, 1, 0), (-1, 1, 0), (0, 1, 1), (-1, 0, 1),
+    (0, -1, 1), (2, 1, 0), (-1, 2, 0), (0, 2, 1), (-2, 0, 1), (0, -2, 1),
+], float)
+TILTED_KP_LINES_70 = np.array([
+    [-13.359519, 73.442773, 60.676624, -14.923225],
+    [77.038754, 76.616292, -19.189263, 9.894428],
+    [27.685250, 95.765764, 9.820883, -16.888747],
+    [-25.805576, 40.830960, 91.464072, 27.424485],
+    [65.704191, 86.307425, -13.544228, 73.206544],
+    [73.342655, -6.003443, 17.118374, 93.805662],
+    [12.743809, -18.050292, 82.045437, 70.271037],
+    [7.303198, 90.079654, 29.671484, -21.576877],
+    [91.095040, 48.895830, -25.200431, 28.014235],
+    [72.873871, 80.771220, -25.892224, 38.975359],
+    [68.319278, -10.148398, 2.822202, 87.663232],
+    [-3.902668, -8.654200, 79.903553, 73.207412],
+])
+TILTED_KP_LINES_ALL_ANGLES = np.array([
+    [-10.718948, 76.571932, 49.815634, -19.301123],
+    [83.198249, 68.517158, -17.110230, 6.257348],
+    [38.739619, 95.759697, 6.555594, -15.370574],
+    [-25.918392, 36.730575, 88.675942, 16.932978],
+    [81.478633, 71.085894, -22.561121, 56.727448],
+    [73.139061, -6.190363, 11.977340, 92.103000],
+    [25.084745, -21.125972, 84.752234, 65.912019],
+    [16.026496, 93.487286, 21.947648, -20.608009],
+    [-24.167297, 22.943847, 92.255038, 38.881620],
+    [82.367186, 69.795082, -25.682510, 31.898983],
+    [64.570087, -12.693429, 2.049801, 87.194724],
+    [1.905423, -12.765349, 83.988711, 67.230199],
+])
+TILTED_CASES = [
+    pytest.param({"sample_tilt": 70.0, "detector_tilt": 0.0, "azimuthal": 0.0,
+                  "twist": 0.0}, TILTED_KP_LINES_70, id="tilt70"),
+    pytest.param({"sample_tilt": 65.0, "detector_tilt": 8.0, "azimuthal": 3.0,
+                  "twist": 2.0}, TILTED_KP_LINES_ALL_ANGLES, id="all-angles"),
+]
+
+
+def _single_band(hkl, width=0.01):
+    normal = np.asarray(hkl, float) / np.linalg.norm(hkl)
+    return Reflectors(normal.reshape(1, 3), np.array([1.0]), np.array([width]))
+
+
+def _from_kikuchipy_pixels(points, shape):
+    """The inverse of :func:`_to_kikuchipy_pixels`."""
+    dy, dx = int(shape[0]), int(shape[1])
+    return (np.asarray(points, float)
+            / np.array([(dx - 1) / dx, (dy - 1) / dy])) - 0.5
+
+
+def _tilted_misses(angles, kp_lines, frame):
+    """Each band's largest distance from kikuchipy's line, in pixels, when
+    drawn with *frame* as the geometry."""
+    euler = np.deg2rad(EULER_DEG)
+    misses = []
+    for hkl, kp_line in zip(TILTED_HKL, kp_lines):
+        segs, _w = band_lines(euler, _single_band(hkl), NONSQUARE_SHAPE,
+                              NONSQUARE_PC, **frame)
+        if len(segs):
+            misses.append(_max_distance_to_kp_line(
+                _to_kikuchipy_pixels(segs[0], NONSQUARE_SHAPE), kp_line))
+    return np.asarray(misses)
+
+
+class TestTiltedDetectorMatchesKikuchipy:
+    """At a real EBSD geometry the drawn lines AND the simulated bands are
+    kikuchipy's. Without the sample-to-detector rotation every band here is
+    tilted by the missing ~20°, tens of pixels off."""
+
+    @pytest.mark.parametrize("angles,kp_lines", TILTED_CASES)
+    def test_band_lines_match(self, angles, kp_lines):
+        misses = _tilted_misses(angles, kp_lines, angles)
+        assert len(misses) >= 8, "too few comparable bands to prove anything"
+        assert misses.max() < TOL_PX, (
+            f"band lines are up to {misses.max():.4f} px from kikuchipy's at "
+            f"{angles}")
+
+    @pytest.mark.parametrize("angles,kp_lines", TILTED_CASES)
+    def test_simulated_bands_are_centred_on_kikuchipy_lines(self, angles,
+                                                           kp_lines):
+        """The dictionary side: every pixel near a band's peak in
+        :func:`simulate_patterns` lies on kikuchipy's line for that band."""
+        euler = np.deg2rad(EULER_DEG)
+        worst, compared = 0.0, 0
+        for hkl, kp_line in zip(TILTED_HKL, kp_lines):
+            pattern = simulate_patterns(euler, _single_band(hkl),
+                                        NONSQUARE_SHAPE, NONSQUARE_PC,
+                                        **angles)[0]
+            rows, cols = np.nonzero(pattern > 0.9)
+            if len(rows) < 20:
+                continue
+            compared += 1
+            n, c = _line_through(*_from_kikuchipy_pixels(
+                kp_line.reshape(2, 2), NONSQUARE_SHAPE))
+            worst = max(worst, float(np.abs(
+                np.column_stack([cols, rows]) @ n + c).max()))
+        assert compared >= 8, "too few bands crossed the detector"
+        assert worst < 1.0, (
+            f"a simulated band peaks {worst:.2f} px off kikuchipy's line at "
+            f"{angles}")
+
+    @pytest.mark.parametrize("angles,kp_lines", TILTED_CASES)
+    def test_the_untilted_geometry_would_be_rejected(self, angles, kp_lines):
+        """The bug this class was written for: detector rays dotted with
+        sample-frame normals, which is the identity frame at every tilt."""
+        misses = _tilted_misses(angles, kp_lines, IDENTITY_FRAME)
+        assert np.median(misses) > 5.0, (
+            f"the untilted geometry is only {np.median(misses):.2f} px from "
+            f"kikuchipy's lines — this class cannot see the tilt")
+
+    @pytest.mark.parametrize("angles,kp_lines", TILTED_CASES)
+    def test_reference_still_matches_kikuchipy(self, angles, kp_lines):
+        kp = pytest.importorskip("kikuchipy")
+        pytest.importorskip("diffsims")
+        from diffpy.structure import Atom, Lattice, Structure
+        from diffsims.crystallography import ReciprocalLatticeVector
+        from orix.crystal_map import Phase
+        from orix.quaternion import Rotation
+
+        phase = Phase(name="ni", space_group=225,
+                      structure=Structure(atoms=[Atom("Ni", [0, 0, 0])],
+                                          lattice=Lattice(3.52, 3.52, 3.52,
+                                                          90, 90, 90)))
+        rlv = ReciprocalLatticeVector.from_min_dspacing(phase, 1.2)
+        rlv = rlv.unique(use_symmetry=True).symmetrise()
+        rlv.sanitise_phase()
+        rlv.calculate_structure_factor()
+        rlv.calculate_theta(20e3)
+        simulator = kp.simulations.KikuchiPatternSimulator(rlv)
+        detector = kp.detectors.EBSDDetector(
+            shape=NONSQUARE_SHAPE, pc=NONSQUARE_PC,
+            sample_tilt=angles["sample_tilt"], tilt=angles["detector_tilt"],
+            azimuthal=angles["azimuthal"], twist=angles["twist"])
+        assert np.allclose(detector.sample_to_detector.to_matrix().squeeze(),
+                           sample_to_detector(**angles), atol=1e-12)
+        geometry = simulator.on_detector(
+            detector, Rotation.from_euler(np.deg2rad([EULER_DEG])))
+        live_normals = np.asarray(
+            geometry._lines.vector_detector.data).reshape(-1, 3)
+        live_normals /= np.linalg.norm(live_normals, axis=1, keepdims=True)
+        live_lines = geometry.lines_coordinates(
+            coordinates="pixel", exclude_nan=False).reshape(-1, 4)
+        rotation = euler_to_matrix(*np.deg2rad(EULER_DEG))
+        for hkl, kp_line in zip(TILTED_HKL, kp_lines):
+            ours = normals_to_detector(hkl / np.linalg.norm(hkl), rotation,
+                                       **angles).reshape(3)
+            j = int(np.argmax(np.abs(live_normals @ ours)))
+            assert abs(abs(float(live_normals[j] @ ours)) - 1) < 1e-9, (
+                f"kikuchipy puts the {hkl.astype(int)} normal elsewhere in "
+                f"the detector frame")
+            assert np.allclose(live_lines[j], kp_line, atol=1e-4)

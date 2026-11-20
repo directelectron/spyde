@@ -30,6 +30,7 @@ import numpy as np
 
 from spyde.device_lock import accelerator_lock
 from spyde.ebsd._device import default_device, resolve_dtype
+from spyde.ebsd.bands import DETECTOR_TILT, SAMPLE_TILT
 
 log = logging.getLogger(__name__)
 
@@ -264,6 +265,8 @@ class SinglePatternIndexer:
 
 def simulate_dictionary(euler, detector=(60, 60), pc=(0.5, 0.5, 0.55), *,
                         reflectors=None, background_sigma=None, device=None,
+                        sample_tilt=SAMPLE_TILT, detector_tilt=DETECTOR_TILT,
+                        azimuthal=0.0, twist=0.0,
                         chunk: int = 4096,
                         progress: Callable[[int, int], None] | None = None,
                         stopped_flag=None):
@@ -284,6 +287,10 @@ def simulate_dictionary(euler, detector=(60, 60), pc=(0.5, 0.5, 0.55), *,
     experimental ones were corrected. Skipping it is the classic way to get
     mediocre scores that look like bad indexing — see
     :meth:`~spyde.ebsd.refine.BandSimulator._high_pass`.
+
+    The four angles place the detector relative to the sample (degrees; see
+    :func:`spyde.ebsd.bands.sample_to_detector`) and must be the scan's, or
+    every entry's bands are tilted off the experimental ones.
     """
     import torch
     from spyde.ebsd.refine import BandSimulator
@@ -291,7 +298,9 @@ def simulate_dictionary(euler, detector=(60, 60), pc=(0.5, 0.5, 0.55), *,
     device = device or default_device()
     eul = np.atleast_2d(np.asarray(euler, float))
     sim = BandSimulator(detector, pc, reflectors=reflectors,
-                        background_sigma=background_sigma, device=device)
+                        background_sigma=background_sigma, device=device,
+                        sample_tilt=sample_tilt, detector_tilt=detector_tilt,
+                        azimuthal=azimuthal, twist=twist)
     dy, dx = int(detector[0]), int(detector[1])
     out = np.empty((len(eul), dy, dx), np.float32)
     for lo in range(0, len(eul), int(chunk)):
