@@ -1049,6 +1049,22 @@ export interface StrainRotationMessage extends MsgBase {
   dpc_sources?: { index: number; label: string }[]
 }
 
+// Crop caret: every axis's range — re-sent after each box drag, slider or
+// field edit (spyde/actions/crop.py). Indices are [start, stop).
+export interface CropStateMessage extends MsgBase {
+  type: 'crop_state'
+  window_id: number | null
+  axes: {
+    key: string; navigate: boolean; name: string
+    size: number; start: number; stop: number
+    scale: number; offset: number; units: string
+  }[]
+  before: string
+  after: string
+  is_crop: boolean
+  boxes: number
+}
+
 export interface DpcRegionMessage extends MsgBase {
   type: 'dpc_region'
   window_id: number | null
@@ -1220,6 +1236,7 @@ export type PlotAppMessage =
   | DpcResultMessage
   | DpcRegionMessage
   | StrainRotationMessage
+  | CropStateMessage
 
 /**
  * Narrow a raw incoming message (`Record<string, unknown>` from the IPC bridge)

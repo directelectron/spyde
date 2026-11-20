@@ -1,0 +1,1 @@
+Crop now opens its result as a new dataset whose navigators show only the cropped scan and frames; it used to add a "Cropped" node whose navigator still showed the whole source, so positions outside the crop displayed the nearest edge frame.

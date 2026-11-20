@@ -51,7 +51,7 @@ export function WizardShell({
         </div>
       )}
       {children}
-      <div data-testid={statusTestid} style={S.status}>{status}</div>
+      {status && <div data-testid={statusTestid} style={S.status}>{status}</div>}
     </div>
   )
 }

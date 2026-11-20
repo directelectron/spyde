@@ -316,251 +316,57 @@ def _rebin_dtype(source_dtype, factors):
 
 def _crop_signal(signal, x0=0, x1=0, y0=0, y1=0, t0=0, t1=0,
                  scan_x0=0, scan_x1=0, scan_y0=0, scan_y1=0, **_):
-    """Crop a 2-D-signal dataset to a spatial (image) box and, for a movie /
-    navigated dataset, an optional leading-nav (time/first-nav-axis) range.
+    """:func:`spyde.actions.crop.crop_signal` with the Crop fields as keywords,
+    for scripts and the in-tree :class:`CropAction`.
 
-    All slicing is by PIXEL INDEX via hyperspy ``isig`` / ``inav`` — a lazy dask
-    view (a graph op, no materialise), so a huge in-situ movie is trimmed to a
-    smaller lazy movie with no data read (memory-safety rule respected). Empty /
-    zero ranges mean "keep the full extent" on that axis, so a pure spatial crop
-    leaves the nav axis whole and vice-versa.
-
-    ``x0:x1`` / ``y0:y1`` are signal-axis (image column / row) pixel bounds;
-    ``t0:t1`` is the FIRST navigation axis in DISPLAY order — a movie's time axis
-    (nav-dim 1) or, on a 4-D scan, the fast (x) scan axis. An ``end`` of 0 (the
-    default) means "keep the full extent" on that axis, so a pure spatial crop
-    leaves the nav axis whole; if every bound is 0 the signal is returned
-    UNCHANGED (no redundant node).
-
-    ``scan_x0:scan_x1`` / ``scan_y0:scan_y1`` are the SCAN box, both
-    navigation axes at once. Spelled out rather than shortened because the
-    detector branch below already binds ``sx0``/``sy0`` as LOCALS: sharing the
-    name let it overwrite the arguments before this read them, and the scan
-    was then cropped to the detector's box — a wrong answer that still
-    produced a plausible dataset.
-    ``t0:t1`` reaches only the first of them, which is a movie's time axis and,
-    on a 4-D scan, half of the answer — there was no way to trim the slow axis
-    at all, and so no way to cut a scan down to a region of interest before
-    saving it.
+    ``x0:x1`` / ``y0:y1`` cut the image or detector, ``scan_x0:scan_x1`` /
+    ``scan_y0:scan_y1`` the scan, and ``t0:t1`` the time axis — a movie's
+    only navigation axis, the slowest of a time series of scans (on a 4-D
+    scan, which has none, the first scan axis). An ``end`` of 0 keeps the axis
+    to its end, so a pure detector crop leaves the scan whole; when every
+    bound is 0 the signal is returned unchanged.
     """
+    from spyde.actions.crop import crop_signal, time_axis_index
+
     am = signal.axes_manager
-    sig_shape = tuple(int(s) for s in am.signal_shape)   # (x, y) display order
-    nav_shape = tuple(int(s) for s in am.navigation_shape)
 
-    def _bounds(lo, hi, n):
-        # An `end` of 0 (or out of range) means "to the end". An inverted /
-        # degenerate box is clamped to a >=1-px slice rather than raising.
-        lo = int(lo or 0)
-        hi = int(hi or 0)
-        if hi <= 0 or hi > n:
-            hi = n
-        lo = max(0, min(lo, n - 1))
-        hi = max(lo + 1, min(hi, n))
-        return lo, hi
+    def wanted(*bounds):
+        return any(int(bound or 0) for bound in bounds)
 
-    want_spatial = any(int(v or 0) for v in (x0, x1, y0, y1))
-    want_time = bool(int(t0 or 0) or int(t1 or 0))
-    want_scan = any(int(v or 0)
-                    for v in (scan_x0, scan_x1, scan_y0, scan_y1))
-    if not want_spatial and not want_time and not want_scan:
-        return signal          # all-zero crop → no-op, don't add a redundant node
+    def bounds(low, high, size):
+        high = int(high or 0)
+        return int(low or 0), (size if high <= 0 or high > size else high)
 
+    ranges = {}
+    if am.signal_dimension >= 2 and wanted(x0, x1, y0, y1):
+        width, height = (int(axis.size) for axis in am.signal_axes[:2])
+        ranges["sig0"] = bounds(x0, x1, width)
+        ranges["sig1"] = bounds(y0, y1, height)
     out = signal
-    if am.signal_dimension >= 2 and want_spatial:
-        sx0, sx1 = _bounds(x0, x1, sig_shape[0])
-        sy0, sy1 = _bounds(y0, y1, sig_shape[1])
-        # isig indexes signal axes in display (x, y) order → X=columns, Y=rows.
-        out = out.isig[sx0:sx1, sy0:sy1]
-    if am.navigation_dimension >= 1 and want_time:
-        nt0, nt1 = _bounds(t0, t1, nav_shape[0])
-        # inav indexes the FIRST navigation axis (display order): a movie's time
-        # axis, or a 4-D scan's fast (x) axis.
-        out = out.inav[nt0:nt1]
-    if am.navigation_dimension >= 1 and want_scan:
-        # inav takes the navigation axes in display order, fastest first, so
-        # this is (scan x, scan y) against an array shaped (scan y, scan x).
-        shape = tuple(int(size) for size in out.axes_manager.navigation_shape)
-        nx0, nx1 = _bounds(scan_x0, scan_x1, shape[0])
+    if am.navigation_dimension >= 1 and wanted(t0, t1):
+        index = time_axis_index(signal)
+        index = 0 if index is None else index
+        out = crop_signal(out, {f"nav{index}": bounds(
+            t0, t1, int(am.navigation_axes[index].size))})
+    if ranges:
+        out = crop_signal(out, ranges)
+    if am.navigation_dimension >= 1 and wanted(scan_x0, scan_x1, scan_y0, scan_y1):
+        # Against the axes as the time cut left them: on a movie the "scan"
+        # and the time axis are the same one.
+        axes = out.axes_manager.navigation_axes
+        scan = {"nav0": bounds(scan_x0, scan_x1, int(axes[0].size))}
         if am.navigation_dimension >= 2:
-            ny0, ny1 = _bounds(scan_y0, scan_y1, shape[1])
-            out = out.inav[nx0:nx1, ny0:ny1]
-        else:
-            out = out.inav[nx0:nx1]
+            scan["nav1"] = bounds(scan_y0, scan_y1, int(axes[1].size))
+        out = crop_signal(out, scan)
     return out
 
 
-_CROP_COLOR = "#f9e2af"
-
-
-def _crop_widget_bounds(tree, w: int, h: int) -> "tuple[int, int, int, int] | None":
-    """Read the live crop-rectangle widget's bounds as signal-axis pixel indices
-    (x0, x1, y0, y1), clamped to the [0, w] x [0, h] frame — a resize that drags
-    a handle past the detector edge, or leaves the box partially off-frame, is
-    clamped rather than producing an inverted/out-of-range crop. Returns
-    ``None`` when there is no widget (typed-field-only flow)."""
-    widget = getattr(tree, "_crop_widget", None) if tree is not None else None
-    if widget is None:
-        return None
-    x0 = max(0, min(int(round(float(widget.x))), w))
-    y0 = max(0, min(int(round(float(widget.y))), h))
-    x1 = max(0, min(int(round(float(widget.x) + float(widget.w))), w))
-    y1 = max(0, min(int(round(float(widget.y) + float(widget.h))), h))
-    x0, x1 = sorted((x0, x1))
-    y0, y1 = sorted((y0, y1))
-    if x1 <= x0:
-        x1 = min(w, x0 + 1)
-    if y1 <= y0:
-        y1 = min(h, y0 + 1)
-    return x0, x1, y0, y1
-
-
-def _crop_clamp_widget(widget, w: int, h: int) -> None:
-    """Clamp the crop widget's geometry to stay inside the [0,w] x [0,h] frame
-    (handle-drag past the edge, or a whole-box drag off-frame, is pinned back
-    in rather than allowed to produce an inverted/out-of-range crop). Callers
-    invoking this from a widget event handler MUST hold the ``_crop_clamping``
-    re-entrancy guard (see ``_on_drag`` in crop_open) — the ``set()`` here
-    fires ``pointer_move`` unconditionally and would recurse the handler."""
-    if widget is None:
-        return
-    try:
-        x = max(0.0, min(float(widget.x), float(w)))
-        y = max(0.0, min(float(widget.y), float(h)))
-        ww = max(1.0, min(float(widget.w), float(w) - x))
-        hh = max(1.0, min(float(widget.h), float(h) - y))
-        widget.set(x=x, y=y, w=ww, h=hh)
-    except Exception as e:
-        log.debug("crop widget clamp failed: %s", e)
-
-
-def crop_open(session, plot, payload) -> None:
-    """Activating Crop shows a draggable/resizable rectangle widget on the
-    source plot outlining the spatial crop box (image pixel coords). Starts
-    covering the FULL frame (a no-op box) unless the caret already has typed
-    field values, so the user drags handles in from the full extent rather
-    than starting from a to-be-guessed default."""
-    from spyde.actions.context import src_plot_tree as _src_plot_tree, current_signal as _current_signal
-    from de_shell.ipc import emit_error
-
-    src, tree = _src_plot_tree(session, plot)
-    signal = _current_signal(src)
-    plot2d = getattr(src, "_plot2d", None) if src is not None else None
-    if plot2d is None or signal is None or tree is None:
-        emit_error("Crop: no active 2-D plot to place the crop box on")
-        return
-    am = signal.axes_manager
-    if am.signal_dimension < 2:
-        emit_error("Crop: current signal is not 2-D")
-        return
-    sig_ax = am.signal_axes
-    w, h = int(sig_ax[0].size), int(sig_ax[1].size)
-
-    x0 = int(payload.get("x0", 0) or 0)
-    x1 = int(payload.get("x1", 0) or 0) or w
-    y0 = int(payload.get("y0", 0) or 0)
-    y1 = int(payload.get("y1", 0) or 0) or h
-    x0, x1 = max(0, min(x0, w)), max(0, min(x1, w))
-    y0, y1 = max(0, min(y0, h)), max(0, min(y1, h))
-    if x1 <= x0:
-        x0, x1 = 0, w
-    if y1 <= y0:
-        y0, y1 = 0, h
-
-    crop_close(session, plot, payload)   # replace any prior widget
-    try:
-        widget = plot2d.add_rectangle_widget(
-            x=float(x0), y=float(y0), w=float(x1 - x0), h=float(y1 - y0),
-            color=_CROP_COLOR, show_handles=True,
-        )
-        tree._crop_widget = widget
-
-        def _on_drag(event, _tree=tree, _w=w, _h=h):
-            # RE-ENTRANCY GUARD: anyplotlib Widget.set() fires pointer_move
-            # UNCONDITIONALLY (even when nothing changed, regardless of
-            # _push), so the clamp's set() re-invokes this handler
-            # synchronously — unguarded, ONE JS drag frame recursed ~2000
-            # deep before RecursionError. A hard per-tree flag breaks the
-            # cycle; compare-before-set is NOT sufficient (set() fires on a
-            # no-change write too).
-            if getattr(_tree, "_crop_clamping", False):
-                return
-            _tree._crop_clamping = True
-            try:
-                _crop_clamp_widget(getattr(_tree, "_crop_widget", None), _w, _h)
-            finally:
-                _tree._crop_clamping = False
-
-        from spyde.drawing.selectors.base_selector import event_handler_fn
-        handler = event_handler_fn(_on_drag)
-        widget.add_event_handler(handler, "pointer_move", "pointer_up")
-        tree._crop_widget_handler = handler   # keep a ref alive (weak callback)
-    except Exception as e:
-        log.debug("crop widget add failed: %s", e)
-
-
-def _crop_remove_widget(tree) -> None:
-    """Hide + drop the crop-box widget on *tree* (harmless when absent).
-    Shared by crop_close, the node-switch teardown in
-    ``lifecycle.show_tree_node``, and ``BaseSignalTree.close()``. Widgets have
-    no ``remove()``, only ``hide()`` (see the CZB precedent in
-    center_zero_beam.py)."""
-    widget = getattr(tree, "_crop_widget", None) if tree is not None else None
-    if widget is not None:
-        try:
-            widget.hide()
-        except Exception as e:
-            log.debug("hiding crop widget failed: %s", e)
-        tree._crop_widget = None
-        tree._crop_widget_handler = None
-
-
-def crop_close(session, plot, payload=None) -> None:
-    """Caret closed / action deselected / window closed → remove the crop box."""
-    from spyde.actions.context import src_plot_tree as _src_plot_tree
-    _src, tree = _src_plot_tree(session, plot)
-    _crop_remove_widget(tree)
-
-
-def crop_set_region(session, plot, payload) -> None:
-    """A typed-field edit (x0/x1/y0/y1) moves the live widget to match, so the
-    numeric fields and the on-plot box stay in sync in BOTH directions (drag →
-    field sync happens client-side by reading the widget's own pointer_move /
-    pointer_up events — see CropWizard.tsx)."""
-    from spyde.actions.context import src_plot_tree as _src_plot_tree, current_signal as _current_signal
-    src, tree = _src_plot_tree(session, plot)
-    signal = _current_signal(src)
-    widget = getattr(tree, "_crop_widget", None) if tree is not None else None
-    if widget is None or signal is None:
-        return
-    am = signal.axes_manager
-    if am.signal_dimension < 2:
-        return
-    sig_ax = am.signal_axes
-    w, h = int(sig_ax[0].size), int(sig_ax[1].size)
-    x0 = max(0, min(int(payload.get("x0", 0) or 0), w))
-    x1 = max(0, min(int(payload.get("x1", 0) or 0) or w, w))
-    y0 = max(0, min(int(payload.get("y0", 0) or 0), h))
-    y1 = max(0, min(int(payload.get("y1", 0) or 0) or h, h))
-    if x1 <= x0 or y1 <= y0:
-        return
-    try:
-        widget.set(x=float(x0), y=float(y0), w=float(x1 - x0), h=float(y1 - y0))
-    except Exception as e:
-        log.debug("crop widget field-sync failed: %s", e)
-
-
 class CropAction(TransformAction):
-    """Crop the dataset to a spatial (image) box + optional time range — a
-    TransformAction that adds a lazy "Cropped" node to the SAME tree. Nothing is
-    materialised (isig/inav are dask-view slices), so a multi-GB movie crops for
-    free. Zero ranges keep the full extent on that axis.
-
-    The spatial box (x0/x1/y0/y1) is set by an interactive rectangle widget on
-    the source plot (see crop_open/crop_close/crop_set_region) rather than
-    typed-in-only values — the widget is the PRIMARY input (matches the CZB
-    search-window precedent): when the caret's widget is present, its LIVE
-    geometry overrides the (possibly stale) typed fields. The optional t0/t1
-    nav-range stays a plain typed field (no on-plot widget for it)."""
+    """Crop to a box on any axis as a lazy "Cropped" node of the SAME tree —
+    for scripts. The app's Crop panel (``spyde.actions.crop``) opens the
+    result as a new dataset instead, so its navigators match the crop.
+    Nothing is materialised: ``isig`` / ``inav`` are dask-view slices. Zero
+    ranges keep the full extent on that axis."""
 
     name = "Crop"
     function = staticmethod(_crop_signal)
@@ -590,36 +396,15 @@ class CropAction(TransformAction):
 
     def build_kwargs(self, signal, x0=0, x1=0, y0=0, y1=0, t0=0, t1=0,
                      scan_x0=0, scan_x1=0, scan_y0=0, scan_y1=0, **_):
-        am = signal.axes_manager
-        if am.signal_dimension >= 2:
-            sig_ax = am.signal_axes
-            w, h = int(sig_ax[0].size), int(sig_ax[1].size)
-            live = _crop_widget_bounds(self.signal_tree, w, h)
-            if live is not None:
-                x0, x1, y0, y1 = live
-                if (x0, x1, y0, y1) == (0, w, 0, h):
-                    # Widget covers the full frame (opened, never adjusted) —
-                    # a real no-op crop. Zero it out so _crop_signal's existing
-                    # all-zero-means-noop contract applies and no redundant
-                    # "Cropped" node is created.
-                    x0 = x1 = y0 = y1 = 0
         return {"x0": x0, "x1": x1, "y0": y0, "y1": y1, "t0": t0, "t1": t1,
                 "scan_x0": scan_x0, "scan_x1": scan_x1,
                 "scan_y0": scan_y0, "scan_y1": scan_y1}
 
     def run(self, **params):
-        # True no-op (full-frame box / all-zero fields): skip the tree
-        # entirely — add_transformation has no identity check, so letting it
-        # run would add a redundant "Cropped" node pointing at the SAME
-        # signal. The box stays up so the user can adjust and try again.
+        # A no-op crop returns the source itself; add_transformation has no
+        # identity check and would hang a redundant "Cropped" node on it.
         resolved = self._resolved_params(params)
         kwargs = self.build_kwargs(self.signal, **resolved)
         if not any(int(v or 0) for v in kwargs.values()):
             return self.signal
-        new = super().run(**params)
-        if new is not None:
-            # The box no longer describes the (now different) displayed node —
-            # show_tree_node already hid it on the node switch; this covers
-            # any path that returned a node without switching. Idempotent.
-            crop_close(self.session, self.plot, {})
-        return new
+        return super().run(**params)

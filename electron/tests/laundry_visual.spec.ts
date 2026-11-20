@@ -299,7 +299,7 @@ test.describe('Group A · 4D-STEM (si_grains)', () => {
   })
 
   // ── #4 Crop ROI ──────────────────────────────────────────────────────────────
-  test('#4 Crop: full-frame yellow ROI → drag smaller → Crop → box gone, Cropped node', async () => {
+  test('#4 Crop: full-frame yellow ROI → shrink → Crop → box gone, cropped dataset', async () => {
     const dp = dpWindow(page)
     await dp.getByTestId('subwindow-titlebar').click()   // back on root
     await dp.getByTestId('subwindow-titlebar').hover()
@@ -311,22 +311,24 @@ test.describe('Group A · 4D-STEM (si_grains)', () => {
     }).toBeGreaterThan(20)
     await page.screenshot({ path: join(SHOTS, '09-crop-full-box.png') })
 
-    // Shrink the box via the caret fields (drives crop_set_region → widget).
-    await page.getByTestId('crop-x1').fill('60')
-    await page.getByTestId('crop-y1').fill('60')
+    // Shrink the box via the caret fields (drives crop_set_range → widget).
+    await page.getByTestId('crop-sig0-to').fill('59')
+    await page.getByTestId('crop-sig1-to').fill('59')
     await page.waitForTimeout(600)
     await page.screenshot({ path: join(SHOTS, '10-crop-shrunk.png') })
 
-    // Apply → a Cropped node appears + the box tears down (no yellow left).
+    // Apply → the crop opens as a new dataset + the box tears down (no yellow left).
     await page.getByTestId('crop-run').click()
-    await expect(page.getByTestId('tree-node-Cropped'),
-      'Crop did not add a Cropped workflow node').toBeVisible({ timeout: 20_000 })
+    await expect(page.getByTestId('subwindow').filter({ hasText: '(cropped)' }).first(),
+      'Crop did not open the cropped dataset').toBeVisible({ timeout: 20_000 })
     await expect.poll(() => countYellowPixels(page), {
       timeout: 10_000, message: 'crop box did not tear down after Crop',
     }).toBeLessThan(20)
     await page.screenshot({ path: join(SHOTS, '11-crop-applied.png') })
 
-    // Reopen Crop, close the caret WITHOUT cropping → box gone again.
+    // Reopen Crop, close the caret WITHOUT cropping → box gone again. The
+    // cropped dataset's windows can land over this one's toolbar: raise it.
+    await dp.getByTestId('subwindow-titlebar').click({ position: { x: 8, y: 8 } })
     await dp.getByTestId('subwindow-titlebar').hover()
     await dp.getByTestId('action-btn-Crop').click()
     await expect(page.getByTestId('crop-wizard')).toBeVisible({ timeout: 10_000 })

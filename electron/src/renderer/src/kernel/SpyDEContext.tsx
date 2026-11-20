@@ -1497,6 +1497,9 @@ export function SpyDEProvider({ children }: { children: React.ReactNode }) {
         case 'dpc_region':
         // Strain caret — the rotation/flip taken over from a DPC run.
         case 'strain_rotation':
+        // Crop caret (spyde/actions/crop.py) — every axis's range, re-sent
+        // after each box drag, slider or field edit. Consumed by CropWizard.
+        case 'crop_state':
         // Multi-Angle 4D STEM loader — ONE snapshot of the whole acquisition
         // (members, shells, reference, both alignment solves, can_commit),
         // re-sent after every maped_* action. Consumed by MultiAngleLoader,

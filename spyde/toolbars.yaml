@@ -78,53 +78,16 @@ functions:
     navigation: False
     toggle: True
   Crop:
-    description: Crop the dataset to a detector box, a scan box, or both. Produces a smaller lazy dataset (no data copied). Leave a range at 0 to keep that axis whole.
+    description: >-
+      Crop the dataset on any of its axes: the image or detector, the scan,
+      the time axis of a movie. Drag the boxes on the plots, the sliders, or
+      type a range. The result opens as a new dataset, lazily (no data is
+      copied).
     icon: drawing/toolbars/icons/crop.svg
-    function: spyde.actions.base.CropAction
+    function: spyde.actions.crop.crop
     plot_dim: [ 2 ]
     toolbar_side: bottom
     navigation: False
-    parameters:
-      x0:
-        name: X start
-        type: int
-        default: 0
-      x1:
-        name: X end
-        type: int
-        default: 0
-      y0:
-        name: Y start
-        type: int
-        default: 0
-      y1:
-        name: Y end
-        type: int
-        default: 0
-      t0:
-        name: T start
-        type: int
-        default: 0
-      t1:
-        name: T end
-        type: int
-        default: 0
-      scan_x0:
-        name: Scan X start
-        type: int
-        default: 0
-      scan_x1:
-        name: Scan X end
-        type: int
-        default: 0
-      scan_y0:
-        name: Scan Y start
-        type: int
-        default: 0
-      scan_y1:
-        name: Scan Y end
-        type: int
-        default: 0
   Center Zero Beam:
     description: >-
       Centers the zero beam in diffraction patterns (Automatic / Manual). On a

@@ -125,9 +125,12 @@ _SPYDE_STAGED_HANDLERS: dict[str, str] = {
     "dpc_set_view":        "spyde.actions.dpc_action.dpc_set_view",
     "dpc_run":             "spyde.actions.dpc_action.dpc_run",
     "dpc_commit":          "spyde.actions.dpc_action.dpc_commit",
-    "crop_open":           "spyde.actions.base.crop_open",
-    "crop_close":          "spyde.actions.base.crop_close",
-    "crop_set_region":     "spyde.actions.base.crop_set_region",
+    # Crop (spyde/actions/crop.py).
+    "crop_open":           "spyde.actions.crop.crop_open",
+    "crop_close":          "spyde.actions.crop.crop_close",
+    "crop_set_range":      "spyde.actions.crop.crop_set_range",
+    "crop_reset":          "spyde.actions.crop.crop_reset",
+    "crop_run":            "spyde.actions.crop.crop_run",
     # Drift Correction (spyde/actions/drift_action.py).
     "drift_open":          "spyde.actions.drift_action.drift_open",
     "drift_close":         "spyde.actions.drift_action.drift_close",

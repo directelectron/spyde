@@ -693,6 +693,30 @@ class TestHarnessMixin:
         s.metadata.set_item("General.title", "1D Spectrum")
         self._add_signal(s, source_path="test_data_line")
 
+    def _load_test_data_image(self, payload: dict | None = None) -> None:
+        """Test-only: a single calibrated 2-D image (``Signal2D``, NO navigation
+        axes) — one signal window, no navigator. The 2-D case of the Crop
+        panel's e2e.
+
+        Asymmetric on purpose: a bright block in the top-left corner, a ramp
+        that rises left to right and a grid every 32 px, so a crop that
+        transposes or mirrors is visible at a glance, and the frame is wider
+        than it is tall so the two axes cannot be confused."""
+        import numpy as np
+        from spyde.backend.heavy_imports import ensure_heavy_imports
+        ensure_heavy_imports()   # see _load_test_data — don't race the prewarm
+        payload = payload or {}
+        height, width = int(payload.get("height", 384)), int(payload.get("width", 512))
+        rows, columns = np.mgrid[0:height, 0:width]
+        image = 50.0 + 150.0 * columns / width
+        image[(rows % 32 == 0) | (columns % 32 == 0)] = 20.0
+        image[:height // 6, :width // 6] = 255.0
+        s = hs.signals.Signal2D(image.astype(np.float32))
+        for axis, name in zip(s.axes_manager.signal_axes, ("x", "y")):
+            axis.name, axis.units, axis.scale = name, "nm", 0.5
+        s.metadata.set_item("General.title", "test_image")
+        self._add_signal(s, source_path="test_data_image")
+
     def _load_test_data_movie(self, payload: dict | None = None) -> None:
         """Test-only: synthetic in-situ MOVIE (1-D time nav × LARGE 2-D frames) —
         the GPU large-image consumer, with NO file and NO download so the
