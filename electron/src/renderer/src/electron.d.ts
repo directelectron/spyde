@@ -33,8 +33,7 @@ declare global {
       savePng: (dataUrl: string, suggestedName: string) => Promise<{
         ok: boolean; path?: string; canceled?: boolean; error?: string
       }>
-      startRecording: (ext: 'mp4' | 'webm') => Promise<string | null>
-      recordChunk: (bytes: Uint8Array) => Promise<void>
+      recorder: import('@de/shell-renderer').RecorderApi
       pathForFile?: (file: File) => string | null
       figureEvent: (figId: string, eventJson: string) => void
       resizeFigure: (figId: string, width: number, height: number) => void

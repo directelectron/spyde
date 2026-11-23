@@ -651,7 +651,7 @@ array = [
 
 [[package]]
 name = "de-shell"
-version = "0.2.0"
+version = "0.5.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "anyplotlib" },
@@ -659,9 +659,9 @@ dependencies = [
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "pyyaml" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/a6/1f/6f6e3859cd25b096754c7a39ca4dc3dc78fd353647f2ac3e9e1e3ec5e23c/de_shell-0.2.0.tar.gz", hash = "sha256:ffe6cb788beb58a4dfb2e227bbc86b1d9b795b4633d6f3b7dda4d82cbc1ac125", size = 115386, upload-time = "2026-09-02T18:21:05.771Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/14/c5/7cd0a994ec17754443df902b732af2884bfc2538350f8730f6f21f72829f/de_shell-0.5.1.tar.gz", hash = "sha256:66b14fc1a433103496230b7e35536a2de87f42144dfa4195ef851da48fce9752", size = 225753, upload-time = "2026-11-20T07:11:22.66Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/f0/3d/35e928d968cf9fcd752f9143f2ce2fd0189c33a1d30f815242d93d6a0559/de_shell-0.2.0-py3-none-any.whl", hash = "sha256:b0f99cb315865a37365bdb0f050c339f40f265c6459795c1298188dd6de8e02b", size = 122640, upload-time = "2026-09-02T18:21:04.183Z" },
+    { url = "https://files.pythonhosted.org/packages/de/00/866625941ec05427251c4de00c0dd5313a7196995ee7afd40f09d35e4d5d/de_shell-0.5.1-py3-none-any.whl", hash = "sha256:9e7d4c5cc29b07bbf03e4ad45773dc980e1ecaf19ccc7f7280df301f99fc184d", size = 242389, upload-time = "2026-11-20T07:11:21.247Z" },
 ]
 
 [[package]]
@@ -3728,7 +3728,7 @@ requires-dist = [
     { name = "atomap", marker = "extra == 'atoms'", specifier = ">=0.4.1" },
     { name = "bokeh" },
     { name = "dask" },
-    { name = "de-shell", specifier = ">=0.2,<0.3" },
+    { name = "de-shell", specifier = ">=0.5.1,<0.6" },
     { name = "distributed" },
     { name = "em-database", marker = "python_full_version >= '3.12'", specifier = ">=0.2.0" },
     { name = "exspy", marker = "extra == 'eels'", specifier = ">=0.3.2" },

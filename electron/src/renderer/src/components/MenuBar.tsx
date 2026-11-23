@@ -12,6 +12,7 @@
 import React, { useEffect, useRef, useState } from 'react'
 import { useSpyDE } from '../kernel/SpyDEContext'
 import { GUIDES, type Guide } from '@guides/index'
+import { toggleScreenRecording } from '@de/shell-renderer'
 
 // Curated, ALWAYS-AVAILABLE small in-memory tutorial datasets — unlike the real
 // examples (downloaded via em-database), these fire the ungated `tutorial_load`
@@ -284,10 +285,9 @@ export function MenuBar({ onStartGuide, onShowInfo }: {
       { label: 'GPU & CUDA', onClick: () => openGpuHelpDialog() },
       { label: 'GPU Status…', onClick: () => openGpuStatusDialog() },
       { separator: true },
-      // Toggles the ScreenRecorderGate. Dispatched from HERE rather than the
-      // native menu because getDisplayMedia needs a real click to count as user
-      // activation.
-      { label: 'Record Screen', onClick: () => window.dispatchEvent(new CustomEvent('spyde:toggle_record')) },
+      // Here rather than the native menu: getDisplayMedia needs a real click
+      // to count as user activation.
+      { label: 'Record Screen', onClick: () => toggleScreenRecording() },
       { separator: true },
       { label: 'Report a Problem…', onClick: () => openReportDialog() },
     ],
