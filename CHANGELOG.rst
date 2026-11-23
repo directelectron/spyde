@@ -12,6 +12,43 @@ Earlier releases are described by their GitHub release notes and tags.
 
 .. towncrier release notes start
 
+0.6.0 (2026-11-23)
+==================
+
+API and Behaviour Changes
+-------------------------
+
+- Crop now opens its result as a new dataset whose navigators show only the cropped scan and frames; it used to add a "Cropped" node whose navigator still showed the whole source, so positions outside the crop displayed the nearest edge frame. (`#262 <https://github.com/directelectron/spyde/pull/262>`_)
+
+
+New Features
+------------
+
+- Find Diffraction Vectors now centers its result on the zero beam and makes the beam the origin ("Center on zero beam", on by default), and says so in the status bar when it leaves the vectors alone because no vector stands out as the beam, as behind a beam stop. (`#254 <https://github.com/directelectron/spyde/pull/254>`_)
+- Crop now cuts a dataset on every axis it has — the image or detector, the scan, and a movie's time axis — with a box on every plot that draws one and a slider and a from/to pair per axis in the panel, all kept in step whichever one you move. (`#262 <https://github.com/directelectron/spyde/pull/262>`_)
+- Clicking a phase's structure in the Composition dock now pops its viewer out beside the sidebar: the master pattern on a sphere with the detector's outline, the unit cell, and the detector pattern, all turning together as you drag. Under them is the microscope geometry, read from (and written back to) the metadata — SEM for an EBSD scan, TEM for diffraction data — with a choice between kinematic bands and a full dynamical master pattern (with de_ebsd installed), and diffraction spots in TEM. On an EBSD scan, "Solve from data" fits the pattern centre to patterns read across the scan, and writes it only when the fit is good enough to trust. Several open phases stack.
+
+
+Bug Fixes
+---------
+
+- Center Zero Beam now makes the centered beam the origin of the detector axes, on patterns and on vectors alike, so strain and orientation read every spot relative to the zero beam rather than to wherever the detector's offset put it. (`#254 <https://github.com/directelectron/spyde/pull/254>`_)
+- The neural Find Diffraction Vectors method no longer reports one disk two or three times when refining moves two of its detections onto the same center, which inflated vector counts and anything summed over vectors. (`#254 <https://github.com/directelectron/spyde/pull/254>`_)
+- The time navigator of a time series of scans (5-D data) now draws the time axis's calibration instead of plain frame numbers, and :class:`~spyde.actions.base.CropAction`'s ``t0``/``t1`` on such data cut its time axis rather than the scan's x axis. (`#262 <https://github.com/directelectron/spyde/pull/262>`_)
+- The crop box now sits on the pixel edges of the region it keeps; it was drawn half a pixel right of and below it. (`#262 <https://github.com/directelectron/spyde/pull/262>`_)
+- A part of the interface that fails to draw now shows its error in its own place — one window, its toolbar or the Plot Control dock — while the rest keeps working; the whole window used to go blank. The error is kept for Help → Report a Problem and in lifecycle.log. (`#263 <https://github.com/directelectron/spyde/pull/263>`_)
+- On Windows, an update no longer stalls at "SpyDE cannot be closed. Please close it manually and click Retry" because the analysis backend was running from the install folder: it now runs from its Python environment. The Python that first-run setup downloads now lives in SpyDE's own data folder, so uninstalling can remove it, and setup works behind an institutional proxy that re-signs HTTPS. (`#264 <https://github.com/directelectron/spyde/pull/264>`_)
+- Fixed fcc and bcc phases loaded from a CIF losing their {200} and {220} Kikuchi bands in the EBSD wizard's dictionary and band overlay: an extinct reflection along the same line was kept in their place.
+- Fixed the EBSD wizard simulating its dictionary and drawing its band overlay for an untilted detector: both now use the scan's sample and detector tilt (70° by default), so the bands line up with real patterns at every orientation rather than only some.
+
+
+Performance
+-----------
+
+- Solving a scan's EBSD pattern center from its own patterns now takes about 25 s, down from minutes, because the candidate orientations are sampled once and reused across the search. (`#246 <https://github.com/directelectron/spyde/pull/246>`_)
+- The neural Find Vectors batch reused its GPU memory from one chunk to the next instead of reallocating it, which made a 13,312-pattern SPED-Ag scan 14% faster (28.0 s to 24.1 s on a TITAN X) with identical vectors. (`#256 <https://github.com/directelectron/spyde/pull/256>`_)
+
+
 0.6.0-rc.4 (2026-10-26)
 =======================
 

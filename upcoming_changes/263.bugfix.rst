@@ -1,1 +1,0 @@
-A part of the interface that fails to draw now shows its error in its own place — one window, its toolbar or the Plot Control dock — while the rest keeps working; the whole window used to go blank. The error is kept for Help → Report a Problem and in lifecycle.log.
