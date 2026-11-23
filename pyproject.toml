@@ -23,7 +23,7 @@ dependencies = [
     # 0.x: a breaking change to the sidecar protocol bumps the minor, so the
     # pin is a minor range. To hack on the shell and SpyDE together:
     # `uv pip install -e ../de-shell` after a sync overlays a checkout.
-    "de-shell>=0.2,<0.3",
+    "de-shell>=0.5.1,<0.6",
     "numpy>=1.20.0",
     "pillow",
     "matplotlib",
